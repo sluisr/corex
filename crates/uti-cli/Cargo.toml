@@ -1,0 +1,26 @@
+[package]
+name = "uti-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uti"
+path = "src/main.rs"
+
+[dependencies]
+uti-core = { workspace = true }
+uti-tools = { workspace = true }
+uti-prompt = { workspace = true }
+uti-tui = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+colored = { workspace = true }
+directories = { workspace = true }

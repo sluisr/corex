@@ -1,0 +1,16 @@
+[package]
+name = "uti-prompt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+uti-core = { workspace = true }
+uti-tools = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+directories = { workspace = true }
+chrono = { workspace = true }

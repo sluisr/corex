@@ -1,0 +1,27 @@
+[package]
+name = "uti-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+uti-core = { workspace = true }
+uti-tools = { workspace = true }
+uti-prompt = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+pulldown-cmark = { workspace = true }
+textwrap = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+open = { workspace = true }
+unicode-width = "0.2"
+

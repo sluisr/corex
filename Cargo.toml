@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/uti-core",
+    "crates/uti-tools",
+    "crates/uti-prompt",
+    "crates/uti-tui",
+    "crates/uti-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["sluisr <contact@sluisr.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/sluisr/uti-cli"
+
+[workspace.dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+ratatui = { version = "0.29", features = ["crossterm", "serde"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+similar = "2.7"
+diffy = "0.4"
+walkdir = "2.5"
+ignore = "0.4"
+regex = "1.11"
+glob = "0.3"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+colored = "3.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5.0"
+shell-words = "1.1"
+open = "5.3"
+pulldown-cmark = "0.12"
+textwrap = "0.16"
+async-trait = "0.1"
+base64 = "0.22"
+
+# Internal crates
+uti-core = { path = "crates/uti-core" }
+uti-tools = { path = "crates/uti-tools" }
+uti-prompt = { path = "crates/uti-prompt" }
+uti-tui = { path = "crates/uti-tui" }
