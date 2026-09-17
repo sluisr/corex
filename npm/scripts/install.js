@@ -3,6 +3,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 const VERSION = 'v0.2.0';
@@ -13,27 +14,31 @@ const PLATFORM_MAP = {
     x64: {
       archive: `uti-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
       binName: 'uti',
-      type: 'tar'
+      type: 'tar',
+      sha256: '7b67e49b4bbc44eb5ac8f41fad69f9610b6c4486c77b8963c4affaadd307aac6'
     }
   },
   darwin: {
     arm64: {
       archive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
       binName: 'uti',
-      type: 'tar'
+      type: 'tar',
+      sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
     },
     x64: {
       // Fallback for Intel macs or Rosetta
       archive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
       binName: 'uti',
-      type: 'tar'
+      type: 'tar',
+      sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
     }
   },
   win32: {
     x64: {
       archive: `uti-${VERSION}-x86_64-pc-windows-msvc.zip`,
       binName: 'uti.exe',
-      type: 'zip'
+      type: 'zip',
+      sha256: 'e2bde564c8e59745b279fd9a9b060ae50ab2a1c5872d15666b323dfd18cf148a'
     }
   }
 };
@@ -106,6 +111,20 @@ async function install() {
   console.log(`[uti-cli] Downloading native binary for ${process.platform}-${process.arch} from GitHub...`);
   await downloadFile(url, archivePath);
 
+  // Corporate-grade cryptographic integrity verification
+  if (target.sha256) {
+    console.log(`[uti-cli] Verifying SHA-256 checksum (${target.sha256.slice(0, 16)}...)...`);
+    const fileBuffer = fs.readFileSync(archivePath);
+    const calculatedHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    if (calculatedHash.toLowerCase() !== target.sha256.toLowerCase()) {
+      try { fs.unlinkSync(archivePath); } catch (_) {}
+      throw new Error(
+        `SHA-256 verification failed! Potential corrupted download or security tampering.\nExpected: ${target.sha256}\nReceived: ${calculatedHash}`
+      );
+    }
+    console.log('[uti-cli] SHA-256 checksum verified successfully.');
+  }
+
   console.log('[uti-cli] Extracting binary...');
   try {
     if (target.type === 'tar') {
@@ -131,7 +150,7 @@ async function install() {
     fs.chmodSync(targetBinPath, 0o755);
   }
 
-  console.log(`[uti-cli] UTI CLI v0.2.0 successfully installed to ${targetBinPath}`);
+  console.log(`[uti-cli] UTI CLI ${VERSION} successfully verified and installed to ${targetBinPath}`);
 }
 
 if (require.main === module) {
