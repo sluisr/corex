@@ -10,3 +10,5 @@
 .idea/
 .vscode/
 .uti/
+npm/bin/uti
+npm/bin/uti.exe

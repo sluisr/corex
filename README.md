@@ -153,6 +153,16 @@ cargo build --release
 sudo cp target/release/uti /usr/local/bin/
 ```
 
+### Option 4: Via npm / npx
+
+```bash
+# Run instantly without installing:
+npx @sluisr/uti-cli
+
+# Or install globally:
+npm install -g @sluisr/uti-cli
+```
+
 ---
 
 ## 🔐 Authentication & Setup
