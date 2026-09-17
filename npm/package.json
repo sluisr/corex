@@ -3,8 +3,8 @@
   "version": "0.2.0",
   "description": "Universal Terminal Intelligence — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs",
   "bin": {
-    "uti": "./bin/uti.js",
-    "uti-cli": "./bin/uti.js"
+    "uti": "bin/uti.js",
+    "uti-cli": "bin/uti.js"
   },
   "files": [
     "bin/",
@@ -34,7 +34,7 @@
   "homepage": "https://uti.sluisr.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sluisr/uti-cli.git"
+    "url": "git+https://github.com/sluisr/uti-cli.git"
   },
   "bugs": {
     "url": "https://github.com/sluisr/uti-cli/issues"
