@@ -14,7 +14,7 @@ pub mod user_dialog;
 
 pub use app::{restore_terminal, run_tui, App, TerminalGuard};
 pub use auth_dialog::AuthDialogState;
-pub use markdown::render_markdown;
+pub use markdown::{render_markdown, render_markdown_to_ansi};
 pub use model_dialog::ModelDialogState;
 pub use session_dialog::SessionDialogState;
 pub use sudo_dialog::SudoDialogState;

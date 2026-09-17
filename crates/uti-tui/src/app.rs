@@ -6,14 +6,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListState, Paragraph};
@@ -41,6 +41,143 @@ use crate::sudo_dialog::{render_sudo_dialog, SudoDialogState};
 use crate::theme::Theme;
 use crate::thinking_view::ThinkingState;
 use crate::user_dialog::{parse_questions, render_user_dialog, UserDialogState};
+
+#[derive(Debug, Clone)]
+pub struct StatusTransition {
+    pub current_text: String,
+    pub target_text: String,
+    pub start_time: Instant,
+    pub duration: Duration,
+}
+
+impl StatusTransition {
+    pub fn new() -> Self {
+        Self {
+            current_text: String::new(),
+            target_text: String::new(),
+            start_time: Instant::now(),
+            duration: Duration::from_millis(220),
+        }
+    }
+
+    pub fn set_target(&mut self, new_text: &str) {
+        if self.target_text == new_text {
+            return;
+        }
+        if self.target_text.is_empty() {
+            self.current_text = new_text.to_string();
+            self.target_text = new_text.to_string();
+            self.start_time = Instant::now();
+            return;
+        }
+        let snapshot = if self.start_time.elapsed() < self.duration {
+            if self.start_time.elapsed().as_secs_f32() / self.duration.as_secs_f32() > 0.4 {
+                self.target_text.clone()
+            } else {
+                self.current_text.clone()
+            }
+        } else {
+            self.target_text.clone()
+        };
+        self.current_text = snapshot;
+        self.target_text = new_text.to_string();
+        self.start_time = Instant::now();
+    }
+
+    pub fn clear(&mut self) {
+        self.current_text.clear();
+        self.target_text.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.target_text.is_empty()
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.start_time.elapsed() < self.duration && self.current_text != self.target_text
+    }
+
+    pub fn render_spans(&self, _theme: &Theme) -> Vec<Span<'static>> {
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        let total = self.duration.as_secs_f32();
+        let normal_color = Color::Rgb(150, 155, 170);
+
+        if elapsed >= total || self.current_text == self.target_text || self.current_text.is_empty() {
+            return vec![Span::styled(self.target_text.clone(), Style::default().fg(normal_color))];
+        }
+
+        let progress = (elapsed / total).clamp(0.0, 1.0);
+        let target_chars: Vec<char> = self.target_text.chars().collect();
+        let current_chars: Vec<char> = self.current_text.chars().collect();
+
+        let max_len = target_chars.len().max(current_chars.len());
+        if max_len == 0 {
+            return Vec::new();
+        }
+
+        // Smooth wave front advancing left-to-right
+        let wave_pos = progress * (max_len as f32 + 2.5);
+
+        let mut spans = Vec::new();
+        let mut text_buf = String::new();
+        let mut last_color = None;
+
+        for i in 0..max_len {
+            let fi = i as f32;
+            let dist = wave_pos - fi;
+
+            let (ch, col) = if dist >= 1.5 {
+                // Wave has fully passed this character: render target_text in settled color
+                if i < target_chars.len() {
+                    (target_chars[i], normal_color)
+                } else {
+                    continue; // Old character has dissolved behind the wave
+                }
+            } else if dist >= 0.0 {
+                // Crest of the wave: gentle satin sheen as character emerges
+                if i < target_chars.len() {
+                    let intensity = (dist / 1.5).clamp(0.0, 1.0);
+                    let r = (180.0 - (180.0 - 150.0) * intensity) as u8;
+                    let g = (186.0 - (186.0 - 155.0) * intensity) as u8;
+                    let b = (202.0 - (202.0 - 170.0) * intensity) as u8;
+                    (target_chars[i], Color::Rgb(r, g, b))
+                } else if i < current_chars.len() {
+                    // Dissolving old tail character
+                    (current_chars[i], Color::Rgb(118, 124, 138))
+                } else {
+                    continue;
+                }
+            } else {
+                // Ahead of the wave: smoothly display previous character awaiting replacement
+                if i < current_chars.len() {
+                    (current_chars[i], Color::Rgb(128, 134, 148))
+                } else {
+                    continue;
+                }
+            };
+
+            if Some(col) == last_color {
+                text_buf.push(ch);
+            } else {
+                if let Some(c) = last_color {
+                    if !text_buf.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut text_buf), Style::default().fg(c)));
+                    }
+                }
+                text_buf.push(ch);
+                last_color = Some(col);
+            }
+        }
+
+        if let Some(c) = last_color {
+            if !text_buf.is_empty() {
+                spans.push(Span::styled(text_buf, Style::default().fg(c)));
+            }
+        }
+
+        spans
+    }
+}
 
 pub struct PendingToolBatch {
     pub calls: Vec<ToolCall>,
@@ -98,6 +235,11 @@ pub struct App {
     pub cached_session_id: String,
     pub active_background_pids: std::collections::HashSet<u32>,
     pub current_generation_id: u64,
+    pub update_available: Arc<std::sync::Mutex<Option<String>>>,
+    pub active_status: Option<String>,
+    pub status_transition: StatusTransition,
+    pub last_chat_rect: Option<Rect>,
+    pub last_rendered_text_lines: Vec<String>,
 }
 
 impl App {
@@ -161,9 +303,36 @@ impl App {
             cached_session_id: String::new(),
             active_background_pids: std::collections::HashSet::new(),
             current_generation_id: 0,
+            update_available: Arc::new(std::sync::Mutex::new(uti_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
+            active_status: None,
+            status_transition: StatusTransition::new(),
+            last_chat_rect: None,
+            last_rendered_text_lines: Vec::new(),
         };
         app.trigger_local_health_check();
+        app.trigger_update_check();
         app
+    }
+
+    pub fn set_status(&mut self, text: &str) {
+        self.status_transition.set_target(text);
+        self.active_status = Some(text.to_string());
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_transition.clear();
+        self.active_status = None;
+    }
+
+    pub fn trigger_update_check(&self) {
+        let update_arc = self.update_available.clone();
+        tokio::spawn(async move {
+            if let Some(newer) = uti_core::update::check_for_update_online(env!("CARGO_PKG_VERSION")).await {
+                if let Ok(mut lock) = update_arc.lock() {
+                    *lock = Some(newer);
+                }
+            }
+        });
     }
 
     pub fn slash_popup_target_height(&self) -> f32 {
@@ -279,6 +448,7 @@ impl App {
         self.thinking_state.reset();
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
+        self.active_status = Some("Generando...".to_string());
         self.auto_scroll = true;
         self.last_turn_start = Some(Instant::now());
 
@@ -695,28 +865,46 @@ impl App {
                 }
                 true
             }
-            "/info" | "/author" | "/credits" => {
+            "/info" | "/author" | "/credits" | "/about" => {
                 let cfg = self.llm_client.get_config();
                 let info = format!(
-                    "UTI CLI (Universal Terminal Intelligence) v0.1.0\n\
-                    - Author: sluisr <contact@sluisr.com> (https://sluisr.com/)\n\
-                    - Repository: https://github.com/sluisr/uti-cli\n\
-                    - Architecture: Pure Native Rust 2021 (Tokio, Ratatui, Crossterm)\n\
-                    - Active Model: {}\n\
-                    - Base URL: {}\n\
-                    - Local SLM Engine: {} (Enabled: {})\n\
-                    - Session ID: {}\n\
-                    - Workspace: {}\n\
-                    - Git Branch: {}",
-                    cfg.model,
-                    cfg.base_url,
-                    cfg.local_llm_url,
-                    cfg.local_llm_enabled,
-                    self.session.id,
-                    self.workspace_dir.display(),
-                    self.git_branch
+                    "UTI_INFO_CARD|{version}|{model}|{base_url}|{local_engine}|{local_enabled}|{session_id}|{workspace}|{branch}",
+                    version = env!("CARGO_PKG_VERSION"),
+                    model = cfg.model,
+                    base_url = cfg.base_url,
+                    local_engine = cfg.local_llm_url,
+                    local_enabled = cfg.local_llm_enabled,
+                    session_id = self.session.id,
+                    workspace = self.workspace_dir.display(),
+                    branch = self.git_branch
                 );
                 self.session.add_message(Message::system(info));
+                true
+            }
+            "/update" => {
+                let current = env!("CARGO_PKG_VERSION");
+                let maybe_newer = self.update_available.lock().ok().and_then(|l| l.clone());
+                let msg = if let Some(newer) = maybe_newer {
+                    format!(
+                        "⚡ A new version of UTI CLI is available: v{} → v{}\n\n\
+                        To update your installation, run in your terminal:\n\
+                        • Via npm:       npm install -g uti-cli\n\
+                        • From source:   cargo install --git https://github.com/sluisr/uti-cli.git --force\n\
+                        • Or download precompiled binaries from:\n\
+                          https://github.com/sluisr/uti-cli/releases/latest",
+                        current, newer
+                    )
+                } else {
+                    format!(
+                        "✓ UTI CLI is up to date (v{}).\n\n\
+                        If you wish to reinstall or update manually:\n\
+                        • npm install -g uti-cli\n\
+                        • cargo install --git https://github.com/sluisr/uti-cli.git --force\n\
+                        • https://github.com/sluisr/uti-cli/releases",
+                        current
+                    )
+                };
+                self.session.add_message(Message::system(msg));
                 true
             }
             "/prefix" => {
@@ -999,7 +1187,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         let has_active_tasks = !app.active_background_pids.is_empty();
-        let is_animating = app.is_slash_animating();
+        let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
 
         if needs_redraw || app.is_streaming || has_active_tasks || is_animating {
             terminal.draw(|f| {
@@ -1017,9 +1205,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             match event {
                 StreamEvent::ReasoningDelta(delta) => {
                     app.thinking_state.content.push_str(&delta);
+                    app.set_status("Thinking...");
                 }
                 StreamEvent::ContentDelta(delta) => {
                     app.streaming_text.push_str(&delta);
+                    app.set_status("Generating response...");
                 }
                 StreamEvent::ToolCallDelta { index, id, name, arguments } => {
                     while app.streaming_tool_calls.len() <= index {
@@ -1044,6 +1234,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 StreamEvent::UsageUpdate(usage) => {
                     app.session.update_usage(&usage);
+                }
+                StreamEvent::ToolExecutionStarting { summary, .. } => {
+                    app.set_status(&summary);
                 }
                 StreamEvent::ToolExecutionDone { call_id, output } => {
                     if output.contains("incorrect password attempt")
@@ -1152,10 +1345,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }) {
                             app.is_streaming = false;
                             app.thinking_state.reset();
+                            app.clear_status();
                             app.user_dialog.open(questions, calls.clone(), ask_call.id.clone());
                         } else if let Some(sudo_cmd) = sudo_needed_cmd {
                             app.is_streaming = false;
                             app.thinking_state.reset();
+                            app.clear_status();
                             app.sudo_dialog.open_batch(calls.clone(), sudo_cmd);
                         } else if requires_confirmation {
                             let combined_preview = if previews.is_empty() {
@@ -1166,6 +1361,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                             app.is_streaming = false;
                             app.thinking_state.reset();
+                            app.clear_status();
                             app.pending_confirmation = Some(PendingToolBatch {
                                 calls: calls.clone(),
                                 diff_preview: combined_preview,
@@ -1180,6 +1376,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let gen = app.current_generation_id;
 
                             tokio::spawn(async move {
+                                let calls_count = calls.len();
+                                if calls_count > 1 {
+                                    let summary = if calls.iter().all(|c| c.function.name == "run_shell_command" || c.function.name == "execute_command") {
+                                        format!("Running {} commands in parallel...", calls_count)
+                                    } else {
+                                        format!("Running {} tasks in parallel...", calls_count)
+                                    };
+                                    let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
+                                        call_id: "batch".to_string(),
+                                        name: "batch".to_string(),
+                                        summary,
+                                    })).await;
+                                }
+
                                 let mut handles = Vec::new();
                                 for call in calls {
                                     let reg = registry.clone();
@@ -1190,6 +1400,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let args_str = call.function.arguments.clone();
 
                                     handles.push(tokio::spawn(async move {
+                                        if calls_count == 1 {
+                                            let summary = format_tool_call_summary(&tool_name, &args_str);
+                                            let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
+                                                call_id: call_id.clone(),
+                                                name: tool_name.clone(),
+                                                summary,
+                                            })).await;
+                                        }
                                         let start_tool = std::time::Instant::now();
                                         let args_json = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
                                         let result = reg.execute(&tool_name, args_json, &ctx).await;
@@ -1219,6 +1437,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         // No tool calls — final model answer received!
                         app.is_streaming = false;
                         app.thinking_state.reset();
+                        app.clear_status();
 
                         if let Some(txt) = assistant_text {
                             app.session.add_message(Message::assistant(txt, reasoning));
@@ -1242,6 +1461,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 StreamEvent::Error(err) => {
                     app.is_streaming = false;
                     app.thinking_state.reset();
+                    app.clear_status();
                     app.session.add_message(Message::system(format!("Error: {}", err)));
                     app.streaming_text.clear();
                     app.streaming_tool_calls.clear();
@@ -1305,6 +1525,25 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.auto_scroll = true;
                         }
                     }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some(rect) = app.last_chat_rect {
+                            if mouse.column >= rect.x
+                                && mouse.column < rect.x + rect.width
+                                && mouse.row >= rect.y
+                                && mouse.row < rect.y + rect.height
+                            {
+                                let rel_y = (mouse.row - rect.y) as usize;
+                                let line_idx = app.scroll_offset as usize + rel_y;
+                                if line_idx < app.last_rendered_text_lines.len() {
+                                    let line_text = &app.last_rendered_text_lines[line_idx];
+                                    let click_col = mouse.column.saturating_sub(rect.x) as usize;
+                                    if let Some(url) = find_url_in_line(line_text, Some(click_col)) {
+                                        let _ = open::that(&url);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -1319,6 +1558,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.current_generation_id = app.current_generation_id.wrapping_add(1);
                             app.is_streaming = false;
                             app.thinking_state.is_streaming = false;
+                            app.clear_status();
 
                             let partial_text = if app.streaming_text.is_empty() {
                                 None
@@ -1400,6 +1640,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         };
                                         app.is_streaming = true;
                                         tokio::spawn(async move {
+                                            let calls_count = calls.len();
+                                            if calls_count > 1 {
+                                                let summary = if calls.iter().all(|c| c.function.name == "run_shell_command" || c.function.name == "execute_command") {
+                                                    format!("Running {} commands in parallel...", calls_count)
+                                                } else {
+                                                    format!("Running {} tasks in parallel...", calls_count)
+                                                };
+                                                let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
+                                                    call_id: "batch".to_string(),
+                                                    name: "batch".to_string(),
+                                                    summary,
+                                                })).await;
+                                            }
+
                                             let mut handles = Vec::new();
                                             for call in calls {
                                                 let reg = registry.clone();
@@ -1410,6 +1664,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                 let args_str = call.function.arguments.clone();
 
                                                 handles.push(tokio::spawn(async move {
+                                                    if calls_count == 1 {
+                                                        let summary = format_tool_call_summary(&tool_name, &args_str);
+                                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
+                                                            call_id: call_id.clone(),
+                                                            name: tool_name.clone(),
+                                                            summary,
+                                                        })).await;
+                                                    }
                                                     let args_json = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
                                                     let output = match reg.execute(&tool_name, args_json, &ctx).await {
                                                         Ok(o) => o.output,
@@ -1923,8 +2185,23 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let registry = app.tool_registry.clone();
                             let gen = app.current_generation_id;
                             app.is_streaming = true;
+                            app.last_turn_start = Some(Instant::now());
 
                             tokio::spawn(async move {
+                                let calls_count = calls.len();
+                                if calls_count > 1 {
+                                    let summary = if calls.iter().all(|c| c.function.name == "run_shell_command" || c.function.name == "execute_command") {
+                                        format!("Running {} commands in parallel...", calls_count)
+                                    } else {
+                                        format!("Running {} tasks in parallel...", calls_count)
+                                    };
+                                    let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
+                                        call_id: "batch".to_string(),
+                                        name: "batch".to_string(),
+                                        summary,
+                                    })).await;
+                                }
+
                                 let mut handles = Vec::new();
                                 for call in calls {
                                     let reg = registry.clone();
@@ -1935,6 +2212,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let args_str = call.function.arguments.clone();
 
                                     handles.push(tokio::spawn(async move {
+                                        if calls_count == 1 {
+                                            let summary = format_tool_call_summary(&tool_name, &args_str);
+                                            let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
+                                                call_id: call_id.clone(),
+                                                name: tool_name.clone(),
+                                                summary,
+                                            })).await;
+                                        }
                                         let args_json = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
                                         let output = match reg.execute(&tool_name, args_json, &ctx).await {
                                             Ok(o) => o.output,
@@ -2362,6 +2647,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         token.cancel();
                                     }
                                     app.is_streaming = false;
+                                    app.clear_status();
                                 }
 
                                 app.session.add_message(Message::user(user_prompt_clean));
@@ -2375,7 +2661,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 _ => {}
             }
-        } else if is_animating {
+        } else if is_animating || app.is_streaming {
             needs_redraw = true;
         }
 
@@ -2386,8 +2672,96 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     drop(_guard);
 
-    println!("Session saved. Resume anytime with `uti --resume {}`", app.session.id);
+    print_session_summary(&app);
     Ok(())
+}
+
+fn print_session_summary(app: &App) {
+    let cfg = app.llm_client.get_config();
+    let is_local = cfg.local_llm_enabled;
+
+    let model_display = if is_local {
+        if !cfg.local_llm_model.is_empty() {
+            format!("Local Offline Assistant ({})", cfg.local_llm_model)
+        } else {
+            "Local Offline Assistant (Air-gapped SLM)".to_string()
+        }
+    } else if cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" {
+        "DeepSeek-V4.1-Flash".to_string()
+    } else if cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" {
+        "DeepSeek-V4-Pro".to_string()
+    } else {
+        cfg.model.clone()
+    };
+
+    let elapsed = chrono::Utc::now().signed_duration_since(app.session.created_at).num_seconds().max(0);
+    let duration_str = if elapsed < 60 {
+        format!("{}s", elapsed)
+    } else {
+        format!("{}m {}s", elapsed / 60, elapsed % 60)
+    };
+
+    let msg_count = app.session.messages.len();
+    let u = &app.session.total_usage;
+
+    let (cost_str, tokens_str, cache_str) = if is_local {
+        (
+            "\x1b[38;2;105;240;174m$0.000000 USD\x1b[0m \x1b[90m(100% Free Local Hardware)\x1b[0m".to_string(),
+            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            None,
+        )
+    } else if u.total_tokens > 0 {
+        let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
+        let (cached_rate, miss_rate, comp_rate) = if is_pro {
+            (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
+        } else {
+            (0.014 / 1_000_000.0, 0.14 / 1_000_000.0, 0.28 / 1_000_000.0)
+        };
+        let miss = u.prompt_tokens.saturating_sub(u.prompt_cache_hit_tokens);
+        let actual_cost = (u.prompt_cache_hit_tokens as f64 * cached_rate)
+            + (miss as f64 * miss_rate)
+            + (u.completion_tokens as f64 * comp_rate);
+        let un_cached = (u.prompt_tokens as f64 * miss_rate) + (u.completion_tokens as f64 * comp_rate);
+        let saved = (un_cached - actual_cost).max(0.0);
+
+        let hit_rate = u.cache_hit_percentage();
+        let cost_text = if saved > 0.00001 {
+            format!("\x1b[38;2;105;240;174m${:.6} USD\x1b[0m \x1b[90m(Saved ${:.6} with KV Cache)\x1b[0m", actual_cost, saved)
+        } else {
+            format!("\x1b[38;2;105;240;174m${:.6} USD\x1b[0m", actual_cost)
+        };
+
+        let cache_info = if u.prompt_tokens > 0 {
+            Some(format!("{:.1}% Hit Rate ({} cached / {} in)", hit_rate, u.prompt_cache_hit_tokens, u.prompt_tokens))
+        } else {
+            None
+        };
+
+        (
+            cost_text,
+            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            cache_info,
+        )
+    } else {
+        (
+            "\x1b[90m$0.000000 USD (No LLM turns)\x1b[0m".to_string(),
+            "0 total".to_string(),
+            None,
+        )
+    };
+
+    println!();
+    println!("\x1b[1;38;2;56;189;248m✦ UTI Session Summary\x1b[0m");
+    println!("  \x1b[90mModel:\x1b[0m     \x1b[1m{}\x1b[0m", model_display);
+    println!("  \x1b[90mDuration:\x1b[0m  {} \x1b[90m·\x1b[0m {} messages", duration_str, msg_count);
+    println!("  \x1b[90mTokens:\x1b[0m    {}", tokens_str);
+    if let Some(c_info) = cache_str {
+        println!("  \x1b[90mKV Cache:\x1b[0m  {}", c_info);
+    }
+    println!("  \x1b[90mCost:\x1b[0m      {}", cost_str);
+    println!();
+    println!("  \x1b[90mResume:\x1b[0m    \x1b[38;2;135;215;215muti --resume {}\x1b[0m", app.session.id);
+    println!();
 }
 
 /// Finishes the interactive ask_user dialog: executes the pending tool batch
@@ -2441,6 +2815,93 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
         }
         let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
     });
+}
+
+pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<String> {
+    let mut urls = Vec::new();
+    let mut start = 0;
+    while start < line_text.len() {
+        let remainder = &line_text[start..];
+        let pos = remainder.find("https://").or_else(|| remainder.find("http://"));
+        let p = match pos {
+            Some(idx) => idx,
+            None => break,
+        };
+        let abs_start = start + p;
+        let url_rem = &line_text[abs_start..];
+        let end = url_rem
+            .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>' || c == '"' || c == '\'' || c == '│' || c == '|' || c == '}' || c == '<')
+            .unwrap_or(url_rem.len());
+        let mut url = url_rem[..end].to_string();
+        while url.ends_with('.') || url.ends_with(',') || url.ends_with(';') {
+            url.pop();
+        }
+        let abs_end = abs_start + url.len();
+        if !url.is_empty() {
+            urls.push((abs_start, abs_end, url));
+        }
+        start = abs_start + end.max(1);
+    }
+
+    if urls.is_empty() {
+        return None;
+    }
+
+    if let Some(col) = click_col {
+        for (s, e, u) in &urls {
+            if col + 3 >= *s && col <= *e + 3 {
+                return Some(u.clone());
+            }
+        }
+    }
+
+    if urls.len() == 1 {
+        return Some(urls[0].2.clone());
+    }
+
+    None
+}
+
+pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
+    let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
+    match name {
+        "run_shell_command" | "shell" | "run_command" => {
+            let cmd = args_val.as_ref()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args)
+                .trim();
+            if cmd.is_empty() {
+                "Running command...".to_string()
+            } else {
+                format!("Running command: {}", uti_core::truncate_ellipsis(cmd, 50))
+            }
+        }
+        "read_file" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            format!("Reading file: {}", path)
+        }
+        "write_file" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            format!("Writing file: {}", path)
+        }
+        "edit" | "apply_patch" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            format!("Editing file: {}", path)
+        }
+        "list_directory" | "list_dir" | "glob" | "ls" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("dir_path").or_else(|| v.get("path")).or_else(|| v.get("dir")).and_then(|p| p.as_str()))
+                .unwrap_or(".");
+            format!("Exploring directory: {}", path)
+        }
+        _ => format!("Executing: {}", name),
+    }
 }
 
 fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span<'static>> {
@@ -2623,7 +3084,124 @@ fn format_input_with_cursor<'a>(
     (spans, cursor_col)
 }
 
-fn format_system_message(text: &str, _theme: &Theme, content_max_width: usize) -> Vec<Line<'static>> {
+fn render_about_card(
+    version: &str,
+    model: &str,
+    base_url: &str,
+    local_engine: &str,
+    local_enabled: bool,
+    session_id: &str,
+    workspace: &str,
+    branch: &str,
+    theme: &Theme,
+    content_max_width: usize,
+) -> Vec<Line<'static>> {
+    // Total inner width between left border and right border
+    let inner_width = (content_max_width.saturating_sub(6)).clamp(44, 72);
+    let label_w = 23;
+    let usable_w = inner_width.saturating_sub(4); // 3 spaces left, 1 space right
+
+    let make_row = |label: &str, val_spans: Vec<Span<'static>>| -> Line<'static> {
+        let mut line_spans = vec![
+            Span::styled("  │   ", Style::default().fg(theme.dark_gray)),
+            Span::styled(format!("{:<width$}", label, width = label_w), Style::default().fg(Color::Rgb(160, 172, 190)).add_modifier(Modifier::BOLD)),
+        ];
+        let val_used: usize = val_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+        line_spans.extend(val_spans);
+        let rem = usable_w.saturating_sub(label_w + val_used);
+        if rem > 0 {
+            line_spans.push(Span::raw(" ".repeat(rem)));
+        }
+        line_spans.push(Span::styled(" │", Style::default().fg(theme.dark_gray)));
+        Line::from(line_spans)
+    };
+
+    let empty_row = || -> Line<'static> {
+        Line::from(vec![
+            Span::styled("  │", Style::default().fg(theme.dark_gray)),
+            Span::raw(" ".repeat(inner_width)),
+            Span::styled("│", Style::default().fg(theme.dark_gray)),
+        ])
+    };
+
+    // Top line: ╭─ UTI CLI v0.2.0 ───────╮
+    let title = format!(" UTI CLI v{} ", version);
+    let title_w = unicode_width::UnicodeWidthStr::width(title.as_str());
+    let top_fill = inner_width.saturating_sub(1 + title_w);
+    let top_line = Line::from(vec![
+        Span::styled("  ╭─", Style::default().fg(theme.dark_gray)),
+        Span::styled(title, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}╮", "─".repeat(top_fill)), Style::default().fg(theme.dark_gray)),
+    ]);
+
+    // Section divider: ├─ Session Telemetry ──────┤
+    let div_title = "─ Session Telemetry ";
+    let div_w = unicode_width::UnicodeWidthStr::width(div_title);
+    let div_fill = inner_width.saturating_sub(div_w);
+    let div_line = Line::from(vec![
+        Span::styled("  ├", Style::default().fg(theme.dark_gray)),
+        Span::styled(div_title, Style::default().fg(Color::Rgb(95, 115, 140)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}┤", "─".repeat(div_fill)), Style::default().fg(theme.dark_gray)),
+    ]);
+
+    // Bottom line: ╰────────────────────────╯
+    let bot_line = Line::from(Span::styled(
+        format!("  ╰{}╯", "─".repeat(inner_width)),
+        Style::default().fg(theme.dark_gray),
+    ));
+
+    let local_status = if local_enabled { "(Active)" } else { "(Disabled)" };
+    let local_color = if local_enabled { Color::Rgb(115, 185, 140) } else { Color::Rgb(110, 120, 135) };
+
+    let val_max = usable_w.saturating_sub(label_w + 1);
+
+    vec![
+        top_line,
+        empty_row(),
+        make_row("Creator & Maintainer", vec![
+            Span::styled("sluisr", Style::default().fg(Color::Rgb(225, 230, 242)).add_modifier(Modifier::BOLD)),
+            Span::styled(" (https://sluisr.com)", Style::default().fg(Color::Rgb(115, 160, 220))),
+        ]),
+        make_row("Official Website", vec![
+            Span::styled(uti_core::truncate_ellipsis("https://uti.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+        ]),
+        make_row("Changelog & Releases", vec![
+            Span::styled(uti_core::truncate_ellipsis("https://uti.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+        ]),
+        make_row("Report Issues & Bugs", vec![
+            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/uti-cli/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+        ]),
+        make_row("GitHub Repository", vec![
+            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/uti-cli", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+        ]),
+        empty_row(),
+        div_line,
+        empty_row(),
+        make_row("Active Model", vec![
+            Span::styled(uti_core::truncate_ellipsis(model, val_max), Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
+        ]),
+        make_row("API Base URL", vec![
+            Span::styled(uti_core::truncate_ellipsis(base_url, val_max), Style::default().fg(Color::Rgb(140, 150, 170))),
+        ]),
+        make_row("Local SLM Engine", vec![
+            Span::styled(format!("{} ", uti_core::truncate_ellipsis(local_engine, val_max.saturating_sub(12))), Style::default().fg(Color::Rgb(140, 150, 170))),
+            Span::styled(local_status, Style::default().fg(local_color)),
+        ]),
+        make_row("Session ID", vec![
+            Span::styled(uti_core::truncate_ellipsis(session_id, val_max), Style::default().fg(Color::Rgb(125, 135, 150))),
+        ]),
+        make_row("Workspace", vec![
+            Span::styled(uti_core::truncate_ellipsis(workspace, val_max), Style::default().fg(Color::Rgb(150, 180, 135))),
+        ]),
+        make_row("Git Branch", vec![
+            Span::styled(uti_core::truncate_ellipsis(branch, val_max), Style::default().fg(Color::Rgb(210, 165, 105))),
+        ]),
+        empty_row(),
+        bot_line,
+    ]
+}
+
+fn format_system_message(text: &str, theme: &Theme, content_max_width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let raw_lines: Vec<&str> = text.lines().collect();
 
@@ -2632,6 +3210,25 @@ fn format_system_message(text: &str, _theme: &Theme, content_max_width: usize) -
     }
 
     let first_line = raw_lines[0].trim();
+
+    // 0. Dedicated UTI CLI Info Card
+    if first_line.starts_with("UTI_INFO_CARD|") {
+        let parts: Vec<&str> = first_line.split('|').collect();
+        if parts.len() >= 9 {
+            return render_about_card(
+                parts[1],
+                parts[2],
+                parts[3],
+                parts[4],
+                parts[5] == "true",
+                parts[6],
+                parts[7],
+                parts[8],
+                theme,
+                content_max_width,
+            );
+        }
+    }
 
     // Soft, muted color palette for discreet visual presence (opaco / disimulado)
     let muted_dim = Color::Rgb(70, 82, 98);
@@ -2723,7 +3320,12 @@ fn format_system_message(text: &str, _theme: &Theme, content_max_width: usize) -
         return lines;
     }
 
-    // 5. Default General Multi-line or Single-line System Message
+    // 5. Rich Markdown Formatted System Messages (e.g. headers, rules, code blocks)
+    if text.contains('#') || text.contains("```") || text.contains("---") {
+        return crate::markdown::render_markdown(text, theme, content_max_width);
+    }
+
+    // 6. Default General Multi-line or Single-line System Message
     let mut is_first = true;
     for line in raw_lines {
         let trimmed = line.trim();
@@ -2915,12 +3517,19 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         0
     };
 
+    let show_activity = (app.is_streaming || !app.status_transition.is_empty())
+        && app.pending_confirmation.is_none()
+        && !app.user_dialog.is_open
+        && !app.sudo_dialog.is_open;
+    let activity_height = if show_activity { 1 } else { 0 };
+
     let chunks = if popup_height > 0 {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),               // Chat Feed
                 Constraint::Length(popup_height), // Autocomplete Popup Slot
+                Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(3),            // Input Composer
                 Constraint::Length(1),            // Status Footer Bar
             ])
@@ -2930,6 +3539,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),               // Chat Feed
+                Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(3),            // Input Composer
                 Constraint::Length(1),            // Status Footer Bar
             ])
@@ -2937,10 +3547,10 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let chat_chunk = chunks[0];
-    let (popup_chunk, composer_chunk, status_chunk) = if popup_height > 0 {
-        (Some(chunks[1]), chunks[2], chunks[3])
+    let (popup_chunk, activity_chunk, composer_chunk, status_chunk) = if popup_height > 0 {
+        (Some(chunks[1]), chunks[2], chunks[3], chunks[4])
     } else {
-        (None, chunks[1], chunks[2])
+        (None, chunks[1], chunks[2], chunks[3])
     };
 
     let content_max_width = (chat_chunk.width as usize).saturating_sub(4).max(20);
@@ -2950,7 +3560,13 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     let cfg = app.llm_client.get_config();
     let is_auth = !cfg.api_key.trim().is_empty();
     let is_local = cfg.local_llm_enabled;
-    let header_lines = render_gradient_logo("0.1.0", is_auth, is_local);
+    let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
+    let header_lines = render_gradient_logo(
+        env!("CARGO_PKG_VERSION"),
+        is_auth,
+        is_local,
+        update_notice.as_deref(),
+    );
     all_lines.extend(header_lines);
 
     // 2. Cached Messages & Tool Executions List
@@ -3024,10 +3640,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 
     if app.is_streaming {
-        let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let elapsed = app.last_turn_start.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
-        let idx = ((elapsed * 10.0) as usize) % spinner_frames.len();
-        let spinner_char = spinner_frames[idx];
 
         if !app.streaming_text.is_empty() {
             let mut stream_lines = render_markdown(&app.streaming_text, &app.theme, content_max_width);
@@ -3043,12 +3656,6 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
                 &app.theme,
             );
             all_lines.extend(preview_lines);
-        } else if app.streaming_text.is_empty() {
-            all_lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", spinner_char), Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)),
-                Span::styled("Generating...", Style::default().fg(app.theme.gray)),
-            ]));
-            all_lines.push(Line::from(""));
         }
     }
 
@@ -3064,10 +3671,58 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         app.scroll_offset = app.scroll_offset.min(max_scroll);
     }
 
+    app.last_chat_rect = Some(chat_chunk);
+    app.last_rendered_text_lines = all_lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .collect();
+
     let message_paragraph = Paragraph::new(all_lines)
         .block(Block::default().borders(Borders::NONE))
         .scroll((app.scroll_offset, 0));
     frame.render_widget(message_paragraph, chat_chunk);
+
+    // 2.5. Fixed Activity / Status Bar (Directly above the Composer!)
+    if show_activity {
+        let spinner_frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+        let elapsed = app.last_turn_start.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
+        let idx = ((elapsed * 10.0) as usize) % spinner_frames.len();
+        let spinner_char = spinner_frames[idx];
+
+        if app.status_transition.is_empty() {
+            if app.thinking_state.is_streaming {
+                app.set_status("Thinking...");
+            } else if !app.streaming_text.is_empty() {
+                app.set_status("Generating response...");
+            } else {
+                app.set_status("Generating...");
+            }
+        }
+
+        let text_spans = app.status_transition.render_spans(&app.theme);
+
+        let mut left_spans = vec![
+            Span::raw(" "),
+            Span::styled(spinner_char, Style::default().fg(app.theme.accent_purple)),
+            Span::raw("  "),
+        ];
+        left_spans.extend(text_spans);
+
+        let right_span = Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray));
+
+        let left_len: usize = left_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+        let right_len = unicode_width::UnicodeWidthStr::width(right_span.content.as_ref());
+        let bar_width = activity_chunk.width as usize;
+
+        let mut spans = left_spans;
+        if bar_width > left_len + right_len {
+            let pad = bar_width - (left_len + right_len);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(right_span);
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
+    }
 
     // 3. Input Prompt Composer
     let prompt_prefix = if app.always_allow_tools {
@@ -3478,6 +4133,26 @@ mod tests {
         assert!(lines[0].spans.iter().any(|s| s.content.contains("[model]")));
         assert!(lines[1].spans.iter().any(|s| s.content.contains("Reasoning Depth:")));
         assert!(lines[2].spans.iter().any(|s| s.content.contains("Search CoT:")));
+    }
+
+    #[test]
+    fn test_find_url_in_line() {
+        assert_eq!(
+            find_url_in_line("Creator: sluisr (https://sluisr.com)", None),
+            Some("https://sluisr.com".to_string())
+        );
+        assert_eq!(
+            find_url_in_line("│   Official Website       https://uti.sluisr.com                            │", None),
+            Some("https://uti.sluisr.com".to_string())
+        );
+        assert_eq!(
+            find_url_in_line("Visit https://github.com/sluisr/uti-cli/issues.", None),
+            Some("https://github.com/sluisr/uti-cli/issues".to_string())
+        );
+        assert_eq!(
+            find_url_in_line("Active Model: deepseek-flash", None),
+            None
+        );
     }
 }
 

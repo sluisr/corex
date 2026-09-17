@@ -37,6 +37,11 @@ pub enum StreamEvent {
     Completed {
         finish_reason: Option<String>,
     },
+    ToolExecutionStarting {
+        call_id: String,
+        name: String,
+        summary: String,
+    },
     ToolExecutionDone {
         call_id: String,
         output: String,

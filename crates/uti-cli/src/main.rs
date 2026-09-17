@@ -15,21 +15,21 @@ use uti_tui::{run_tui, App};
 #[derive(Parser, Debug)]
 #[command(
     name = "uti",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     author = "sluisr <contact@sluisr.com>",
     about = "Universal Terminal Intelligence — High-Performance Autonomous Coding Agent"
 )]
 struct Cli {
-    /// Non-interactive headless prompt to execute directly
-    #[arg(short = 'p', long)]
-    prompt: Option<String>,
+    /// Non-interactive headless message/prompt to execute directly (e.g. -m "..." or -p "...")
+    #[arg(short = 'm', short_alias = 'p', long = "message", alias = "prompt")]
+    message: Option<String>,
 
-    /// Positional query (if provided without -p, runs headlessly)
+    /// Positional query (if provided without -m/-p, runs headlessly)
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 
-    /// Model name override (e.g. deepseek-flash, deepseek-v4-pro)
-    #[arg(short = 'm', long)]
+    /// Model name override (e.g. --model deepseek-flash, -M deepseek-v4-pro)
+    #[arg(short = 'M', long = "model")]
     model: Option<String>,
 
     /// Custom API base URL (e.g. https://api.deepseek.com)
@@ -108,13 +108,39 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Handle "uti update" command directly
+    if cli.message.is_none() && cli.query.len() == 1 && (cli.query[0] == "update" || cli.query[0] == "--update") {
+        let current = env!("CARGO_PKG_VERSION");
+        println!("Checking for UTI CLI updates...");
+        if let Some(newer) = uti_core::update::check_for_update_online(current).await {
+            println!("\n⚡ Update available: v{} → v{}\n", current, newer);
+            println!("To update UTI CLI, run in your terminal:");
+            println!("  • Via npm:       npm install -g uti-cli");
+            println!("  • From source:   cargo install --git https://github.com/sluisr/uti-cli.git --force");
+            println!("  • Or download precompiled binaries from:");
+            println!("    https://github.com/sluisr/uti-cli/releases/latest\n");
+        } else {
+            println!("✓ UTI CLI is already on the latest version (v{}).", current);
+        }
+        return Ok(());
+    }
+
     // Initialize forensic audit log system (~/.uti/logs/uti-forensic-YYYY-MM-DD.log)
     let log_path = uti_core::ForensicLogger::init(Some(&workspace_dir));
     tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
 
     let mut config = Config::load_with_workspace(Some(&workspace_dir));
+    let mut headless_prompt = cli.message;
+
     if let Some(m) = cli.model {
-        config.model = m;
+        // Smart fallback: If a sentence with spaces or question mark was passed to --model, treat as headless prompt!
+        if (m.contains(' ') || m.ends_with('?') || m.starts_with("arregla") || m.starts_with("que ") || m.starts_with("fix"))
+            && headless_prompt.is_none()
+        {
+            headless_prompt = Some(m);
+        } else {
+            config.model = m;
+        }
     }
     if let Some(u) = cli.base_url {
         config.base_url = u;
@@ -134,11 +160,13 @@ async fn main() -> Result<()> {
     if cli.no_hybrid_compression {
         config.hybrid_compression = false;
     }
+    if cli.yolo {
+        config.yolo_mode = true;
+    }
 
     let llm_client = LlmClient::new(config.clone());
 
-    // Check if headless mode requested via -p or positional args
-    let mut headless_prompt = cli.prompt;
+    // Check if headless mode requested via -m, -p, or positional args
     if headless_prompt.is_none() && !cli.query.is_empty() {
         headless_prompt = Some(cli.query.join(" "));
     }
@@ -204,6 +232,54 @@ async fn run_headless(
         allowed_commands: client.get_config().allowed_commands.clone(),
     };
 
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdout().is_terminal();
+    let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+
+    struct StatusSpinner {
+        stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl StatusSpinner {
+        fn start(is_tty: bool, prefix_color: &'static str, message: String) -> Self {
+            if !is_tty {
+                return Self { stop_tx: None, handle: None };
+            }
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let mut i = 0;
+                loop {
+                    print!("\r\x1b[2K{}{}\x1b[0m {}", prefix_color, frames[i], message);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    i = (i + 1) % frames.len();
+                    tokio::select! {
+                        _ = &mut rx => break,
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(70)) => {}
+                    }
+                }
+                print!("\r\x1b[2K");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            });
+            Self {
+                stop_tx: Some(tx),
+                handle: Some(handle),
+            }
+        }
+
+        async fn stop(&mut self) {
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.await;
+            }
+        }
+    }
+
     loop {
         let cancel_token = CancellationToken::new();
         let mut rx = client
@@ -213,17 +289,38 @@ async fn run_headless(
         let mut current_tool_calls: Vec<ToolCall> = Vec::new();
         let mut assistant_text = String::new();
         let mut reasoning_text = String::new();
+        let mut active_spinner: Option<StatusSpinner> = None;
+        let mut current_stage: u8 = 0; // 0 = idle, 1 = reasoning, 2 = content
 
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::ReasoningDelta(delta) => {
                     reasoning_text.push_str(&delta);
+                    if current_stage != 1 {
+                        if let Some(mut s) = active_spinner.take() {
+                            s.stop().await;
+                        }
+                        active_spinner = Some(StatusSpinner::start(
+                            is_tty,
+                            "\x1b[90m",
+                            "Thinking...".to_string(),
+                        ));
+                        current_stage = 1;
+                    }
                 }
                 StreamEvent::ContentDelta(delta) => {
-                    print!("{}", delta);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
                     assistant_text.push_str(&delta);
+                    if current_stage != 2 {
+                        if let Some(mut s) = active_spinner.take() {
+                            s.stop().await;
+                        }
+                        active_spinner = Some(StatusSpinner::start(
+                            is_tty,
+                            "\x1b[36m",
+                            "Generating response...".to_string(),
+                        ));
+                        current_stage = 2;
+                    }
                 }
                 StreamEvent::ToolCallDelta { index, id, name, arguments } => {
                     while current_tool_calls.len() <= index {
@@ -247,13 +344,22 @@ async fn run_headless(
                     }
                 }
                 StreamEvent::Notice(msg) => {
+                    if let Some(mut s) = active_spinner.take() {
+                        s.stop().await;
+                    }
                     println!("\n[INFO] {}\n", msg);
                 }
                 StreamEvent::ContextCompacted { notice, .. } => {
+                    if let Some(mut s) = active_spinner.take() {
+                        s.stop().await;
+                    }
                     println!("\n[INFO] {}\n", notice);
                 }
                 StreamEvent::Completed { .. } => {}
                 StreamEvent::Error(err) => {
+                    if let Some(mut s) = active_spinner.take() {
+                        s.stop().await;
+                    }
                     eprintln!("\nError: {}", err);
                     return Ok(());
                 }
@@ -261,7 +367,19 @@ async fn run_headless(
             }
         }
 
-        println!();
+        if let Some(mut s) = active_spinner.take() {
+            s.stop().await;
+        }
+
+        if !assistant_text.trim().is_empty() {
+            if is_tty {
+                let theme = uti_tui::Theme::default();
+                let rendered = uti_tui::render_markdown_to_ansi(&assistant_text, &theme, term_width);
+                println!("{}\n", rendered);
+            } else {
+                println!("{}\n", assistant_text);
+            }
+        }
 
         if !current_tool_calls.is_empty() {
             let text_opt = if assistant_text.is_empty() { None } else { Some(assistant_text) };
@@ -276,6 +394,27 @@ async fn run_headless(
             for call in &current_tool_calls {
                 let args_json = serde_json::from_str(&call.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
+
+                let (action_label, target_detail) = if call.function.name == "run_shell_command" || call.function.name == "shell" || call.function.name == "run_command" {
+                    let cmd = args_json.get("command").and_then(|c| c.as_str()).unwrap_or("").trim();
+                    ("Running command", cmd)
+                } else if call.function.name == "read_file" {
+                    let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
+                    ("Reading file", p)
+                } else if call.function.name == "write_file" {
+                    let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
+                    ("Writing file", p)
+                } else if call.function.name == "edit" || call.function.name == "apply_patch" {
+                    let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
+                    ("Editing file", p)
+                } else if call.function.name == "glob" || call.function.name == "ls" || call.function.name == "list_directory" {
+                    let p = args_json.get("path").or_else(|| args_json.get("dir")).and_then(|c| c.as_str()).unwrap_or(".");
+                    ("Exploring directory", p)
+                } else {
+                    ("Running tool", call.function.name.as_str())
+                };
+
+                let display_detail = uti_core::truncate_ellipsis(target_detail, 70);
 
                 // Prompt user for confirmation on potentially mutating/dangerous actions unless YOLO mode is enabled
                 if !context.yolo_mode {
@@ -306,17 +445,29 @@ async fn run_headless(
                     }
                 }
 
+                // Show real-time animated spinner while the tool executes
+                let mut tool_spinner = StatusSpinner::start(
+                    is_tty,
+                    "\x1b[33m",
+                    format!("\x1b[1m{}:\x1b[0m \x1b[36m{}\x1b[0m", action_label, display_detail),
+                );
+
                 let output = match tool_registry
                     .execute(&call.function.name, args_json, &context)
                     .await
                 {
                     Ok(o) => {
-                        if !o.output.trim().is_empty() {
-                            println!("{}", o.output.trim_end());
+                        tool_spinner.stop().await;
+                        if is_tty {
+                            println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m", action_label, display_detail);
                         }
                         o.output
                     }
                     Err(e) => {
+                        tool_spinner.stop().await;
+                        if is_tty {
+                            println!("\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m ({})", action_label, display_detail, e);
+                        }
                         let msg = format!("Error executing {}: {}", call.function.name, e);
                         eprintln!("{}", msg);
                         msg

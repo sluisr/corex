@@ -657,6 +657,89 @@ fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'s
     result_lines
 }
 
+/// Converts a Ratatui Span with styling into a string with standard ANSI escape sequences.
+pub fn span_to_ansi(span: &Span) -> String {
+    let mut prefix = String::new();
+
+    if span.style.add_modifier.contains(Modifier::BOLD) {
+        prefix.push_str("\x1b[1m");
+    }
+    if span.style.add_modifier.contains(Modifier::DIM) {
+        prefix.push_str("\x1b[2m");
+    }
+    if span.style.add_modifier.contains(Modifier::ITALIC) {
+        prefix.push_str("\x1b[3m");
+    }
+    if span.style.add_modifier.contains(Modifier::UNDERLINED) {
+        prefix.push_str("\x1b[4m");
+    }
+
+    if let Some(fg) = span.style.fg {
+        match fg {
+            Color::Reset => prefix.push_str("\x1b[39m"),
+            Color::Black => prefix.push_str("\x1b[30m"),
+            Color::Red => prefix.push_str("\x1b[31m"),
+            Color::Green => prefix.push_str("\x1b[32m"),
+            Color::Yellow => prefix.push_str("\x1b[33m"),
+            Color::Blue => prefix.push_str("\x1b[34m"),
+            Color::Magenta => prefix.push_str("\x1b[35m"),
+            Color::Cyan => prefix.push_str("\x1b[36m"),
+            Color::Gray => prefix.push_str("\x1b[37m"),
+            Color::DarkGray => prefix.push_str("\x1b[90m"),
+            Color::LightRed => prefix.push_str("\x1b[91m"),
+            Color::LightGreen => prefix.push_str("\x1b[92m"),
+            Color::LightYellow => prefix.push_str("\x1b[93m"),
+            Color::LightBlue => prefix.push_str("\x1b[94m"),
+            Color::LightMagenta => prefix.push_str("\x1b[95m"),
+            Color::LightCyan => prefix.push_str("\x1b[96m"),
+            Color::White => prefix.push_str("\x1b[97m"),
+            Color::Rgb(r, g, b) => prefix.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b)),
+            Color::Indexed(i) => prefix.push_str(&format!("\x1b[38;5;{}m", i)),
+        }
+    }
+
+    if let Some(bg) = span.style.bg {
+        match bg {
+            Color::Reset => prefix.push_str("\x1b[49m"),
+            Color::Black => prefix.push_str("\x1b[40m"),
+            Color::Red => prefix.push_str("\x1b[41m"),
+            Color::Green => prefix.push_str("\x1b[42m"),
+            Color::Yellow => prefix.push_str("\x1b[43m"),
+            Color::Blue => prefix.push_str("\x1b[44m"),
+            Color::Magenta => prefix.push_str("\x1b[45m"),
+            Color::Cyan => prefix.push_str("\x1b[46m"),
+            Color::Gray => prefix.push_str("\x1b[47m"),
+            Color::DarkGray => prefix.push_str("\x1b[100m"),
+            Color::LightRed => prefix.push_str("\x1b[101m"),
+            Color::LightGreen => prefix.push_str("\x1b[102m"),
+            Color::LightYellow => prefix.push_str("\x1b[103m"),
+            Color::LightBlue => prefix.push_str("\x1b[104m"),
+            Color::LightMagenta => prefix.push_str("\x1b[105m"),
+            Color::LightCyan => prefix.push_str("\x1b[106m"),
+            Color::White => prefix.push_str("\x1b[107m"),
+            Color::Rgb(r, g, b) => prefix.push_str(&format!("\x1b[48;2;{};{};{}m", r, g, b)),
+            Color::Indexed(i) => prefix.push_str(&format!("\x1b[48;5;{}m", i)),
+        }
+    }
+
+    if prefix.is_empty() {
+        span.content.to_string()
+    } else {
+        format!("{}{}\x1b[0m", prefix, span.content)
+    }
+}
+
+/// Converts a Ratatui Line into an ANSI-formatted string.
+pub fn line_to_ansi(line: &Line) -> String {
+    line.spans.iter().map(span_to_ansi).collect()
+}
+
+/// Renders markdown directly into ANSI-formatted text suitable for terminal stdout.
+pub fn render_markdown_to_ansi(text: &str, theme: &Theme, max_width: usize) -> String {
+    let lines = render_markdown(text, theme, max_width);
+    lines.iter().map(line_to_ansi).collect::<Vec<_>>().join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

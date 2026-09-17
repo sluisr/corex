@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -39,9 +40,12 @@ fi
 "#;
 
     if fs::write(&script_path, script_content).is_ok() {
-        let mut perms = fs::metadata(&script_path).map(|m| m.permissions()).unwrap_or_else(|_| fs::Permissions::from_mode(0o755));
-        perms.set_mode(0o755);
-        let _ = fs::set_permissions(&script_path, perms);
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&script_path).map(|m| m.permissions()).unwrap_or_else(|_| fs::Permissions::from_mode(0o755));
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(&script_path, perms);
+        }
     }
 
     script_path

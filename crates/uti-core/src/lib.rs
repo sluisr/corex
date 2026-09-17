@@ -6,6 +6,7 @@ pub mod local_client;
 pub mod reasoning_cache;
 pub mod session;
 pub mod types;
+pub mod update;
 
 pub use client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
 pub use config::{Config, McpServerConfig};

@@ -79,7 +79,11 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/info",
-        description: "Display UTI CLI version, system telemetry, and author credits",
+        description: "Display UTI CLI version, creator credits, official links, and session telemetry",
+    },
+    CommandItem {
+        name: "/update",
+        description: "Check for new UTI CLI updates and display upgrade instructions",
     },
     CommandItem {
         name: "/clear",

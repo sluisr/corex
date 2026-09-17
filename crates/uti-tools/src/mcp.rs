@@ -112,7 +112,7 @@ impl McpClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "uti-cli",
-                    "version": "0.1.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }
         });
