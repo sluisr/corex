@@ -1,12 +1,13 @@
 use std::fs;
-use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::json;
 
+use crate::fs_tools::{is_binary_file, resolve_path};
 use crate::types::{Tool, ToolContext, ToolOutput};
+use uti_core::safe_truncate_str;
 
 pub struct GrepTool;
 
@@ -75,14 +76,7 @@ impl Tool for GrepTool {
         let root_dir = args
             .get("dir_path")
             .and_then(|v| v.as_str())
-            .map(|p| {
-                let path = Path::new(p);
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    context.workspace_dir.join(path)
-                }
-            })
+            .map(|p| resolve_path(&context.workspace_dir, p))
             .unwrap_or_else(|| context.workspace_dir.clone());
 
         let include_filter = args
@@ -104,11 +98,15 @@ impl Tool for GrepTool {
         let walker = WalkBuilder::new(&root_dir)
             .hidden(false)
             .git_ignore(true)
+            .filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                name != ".git"
+            })
             .build();
 
         for entry in walker.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_binary_file(path) {
                 continue;
             }
 
@@ -139,7 +137,12 @@ impl Tool for GrepTool {
                     for (i, l) in lines[start..end].iter().enumerate() {
                         let line_num = start + i + 1;
                         let marker = if line_num == idx + 1 { ">" } else { " " };
-                        output.push(format!("{}{:4} | {}", marker, line_num, l));
+                        let display_line = if l.len() > 350 {
+                            format!("{}... [truncated]", safe_truncate_str(l, 350))
+                        } else {
+                            l.to_string()
+                        };
+                        output.push(format!("{}{:4} | {}", marker, line_num, display_line));
                     }
                     output.push(String::new());
 

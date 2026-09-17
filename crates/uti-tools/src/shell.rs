@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::Result;
 use async_trait::async_trait;
 use directories::BaseDirs;
+use chrono::Utc;
 use regex::Regex;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::background::get_task_manager;
@@ -37,7 +38,7 @@ else
 fi
 "#;
 
-    if let Ok(_) = fs::write(&script_path, script_content) {
+    if fs::write(&script_path, script_content).is_ok() {
         let mut perms = fs::metadata(&script_path).map(|m| m.permissions()).unwrap_or_else(|_| fs::Permissions::from_mode(0o755));
         perms.set_mode(0o755);
         let _ = fs::set_permissions(&script_path, perms);
@@ -99,6 +100,155 @@ pub fn is_known_safe_command_with_allowed(cmd_str: &str, allowed: &HashSet<Strin
     !segments.is_empty() && segments.iter().all(|seg| segment_matches_allowed(seg, allowed))
 }
 
+/// Returns true if the given shell command requires sudo, doas, or pkexec privileges.
+pub fn command_requires_sudo(cmd_str: &str) -> bool {
+    let trimmed = cmd_str.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let segments = split_segments(trimmed);
+    for segment in segments {
+        if is_single_segment_sudo(segment) {
+            return true;
+        }
+    }
+    // Also check for command substitutions like $(sudo ...) or `sudo ...`
+    if cmd_str.contains("$(sudo") || cmd_str.contains("`sudo") || cmd_str.contains("$(doas") || cmd_str.contains("`doas") {
+        return true;
+    }
+    false
+}
+
+/// Extracts the first command segment that requires sudo, doas, or pkexec privileges.
+/// For compound commands (e.g. `echo "===..." && sudo sed -i ...` or `echo 123 | sudo tee ...`),
+/// this isolates the actual privileged command to display cleanly in prompts and dialogs.
+pub fn extract_first_sudo_command(cmd_str: &str) -> Option<String> {
+    let trimmed = cmd_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let segments = split_segments(trimmed);
+    for segment in segments {
+        if is_single_segment_sudo(segment) {
+            let mut clean = segment.trim();
+            // Strip outer subshell parenthesis if present: (sudo ...) -> sudo ...
+            while clean.starts_with('(') && clean.ends_with(')') {
+                clean = clean[1..clean.len() - 1].trim();
+            }
+            while clean.starts_with('(') {
+                clean = clean[1..].trim();
+            }
+            while clean.ends_with(')') {
+                clean = clean[..clean.len() - 1].trim();
+            }
+            // If bash -c "sudo ...", unwrap inner command
+            let parts: Vec<&str> = clean.split_whitespace().collect();
+            let raw_cmd = parts.first().map(|p| p.trim_matches(|c| c == '\'' || c == '"')).unwrap_or("");
+            let base_cmd = Path::new(raw_cmd).file_name().and_then(|f| f.to_str()).unwrap_or(raw_cmd);
+            if (base_cmd == "bash" || base_cmd == "sh" || base_cmd == "zsh") && parts.len() > 2 && parts[1] == "-c" {
+                let subcmd = parts[2..].join(" ");
+                let unquoted = subcmd.trim_matches(|c| c == '\'' || c == '"');
+                if let Some(inner) = extract_first_sudo_command(unquoted) {
+                    return Some(inner);
+                }
+            }
+            return Some(clean.to_string());
+        }
+    }
+
+    // Fallback check for command substitutions like $(sudo ...) or `sudo ...`
+    for prefix in &["$(sudo", "$(doas", "$(pkexec"] {
+        if let Some(pos) = trimmed.find(prefix) {
+            if let Some(end) = trimmed[pos..].find(')') {
+                let inner = &trimmed[pos + 2..pos + end];
+                return Some(inner.trim().to_string());
+            }
+        }
+    }
+    for prefix in &["`sudo", "`doas", "`pkexec"] {
+        if let Some(pos) = trimmed.find(prefix) {
+            if let Some(end) = trimmed[pos + 1..].find('`') {
+                let inner = &trimmed[pos + 1..pos + 1 + end];
+                return Some(inner.trim().to_string());
+            }
+        }
+    }
+
+    if command_requires_sudo(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn is_single_segment_sudo(segment: &str) -> bool {
+    let mut cleaned = segment.trim();
+    // Strip leading subshell parenthesis if present
+    while cleaned.starts_with('(') {
+        cleaned = cleaned[1..].trim();
+    }
+    let mut parts: Vec<&str> = cleaned.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+
+    // Skip leading VAR=value environment assignments
+    while !parts.is_empty() && is_env_assignment(parts[0]) {
+        parts.remove(0);
+    }
+
+    if parts.is_empty() {
+        return false;
+    }
+
+    let raw_cmd = parts[0].trim_matches(|c| c == '\'' || c == '"');
+    let cmd = Path::new(raw_cmd)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(raw_cmd);
+
+    if cmd == "sudo" || cmd == "doas" || cmd == "pkexec" {
+        return true;
+    }
+
+    // Check wrappers like `env`, `nohup`, `nice`, `time`, `timeout`, `stdbuf`, `watch`, `xargs`, `exec`
+    if is_wrapper(cmd) || cmd == "xargs" || cmd == "exec" {
+        let mut j = 1;
+        while j < parts.len() && (parts[j].starts_with('-') || parts[j].chars().all(|c| c.is_ascii_digit())) {
+            j += 1;
+        }
+        while j < parts.len() && is_env_assignment(parts[j]) {
+            j += 1;
+        }
+        if j < parts.len() {
+            return is_single_segment_sudo(&parts[j..].join(" "));
+        }
+    }
+
+    // Check find with -exec or -ok
+    if cmd == "find" {
+        for (i, part) in parts.iter().enumerate() {
+            if (*part == "-exec" || *part == "-ok") && i + 1 < parts.len() {
+                let target = parts[i + 1].trim_matches(|c| c == '\'' || c == '"');
+                let base = Path::new(target).file_name().and_then(|f| f.to_str()).unwrap_or(target);
+                if base == "sudo" || base == "doas" || base == "pkexec" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check bash -c "sudo ..." or sh -c "sudo ..."
+    if (cmd == "bash" || cmd == "sh" || cmd == "zsh") && parts.len() > 2 && parts[1] == "-c" {
+        let subcmd = parts[2..].join(" ");
+        let unquoted = subcmd.trim_matches(|c| c == '\'' || c == '"');
+        return command_requires_sudo(unquoted);
+    }
+
+    false
+}
+
 /// Removes redirections that never write to a real file: `/dev/null` targets
 /// (with or without spaces), fd duplication (`2>&1`, `>&2`) and stdin
 /// here-strings/here-docs. Anything else containing `>`/`<` still requires
@@ -115,7 +265,7 @@ fn strip_benign_redirects(s: &str) -> String {
 }
 
 fn split_segments(cmd: &str) -> Vec<&str> {
-    cmd.split(|c| c == ';' || c == '&' || c == '|')
+    cmd.split([';', '&', '|'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect()
@@ -642,6 +792,17 @@ fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
     })
 }
 
+fn append_and_truncate_output(buf: &mut String, text: &str, max_len: usize) {
+    buf.push_str(text);
+    if buf.len() > max_len {
+        let mut cut = buf.len() - max_len;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        *buf = buf[cut..].to_string();
+    }
+}
+
 pub struct ShellTool;
 
 #[async_trait]
@@ -651,7 +812,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &'static str {
-        "Executes a bash shell command. Set 'is_background: true' for long-running servers, deep scans, or watchers. [USE ONLY when no purpose-built tool applies]"
+        "Executes a bash shell command with adaptive execution timeout. By default waits up to 5000ms; if the command completes within that window, returns output immediately. If it runs longer (e.g. servers, long builds, watchers), it automatically detaches to a background task with a Task ID (PID). Set 'wait_ms_before_async' to configure the wait window or 'is_background: true' to detach immediately."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -660,11 +821,19 @@ impl Tool for ShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The exact shell command line to execute."
+                    "description": "The exact shell command line to execute. Execute direct, clean commands; never prepend decorative echo banners."
+                },
+                "wait_ms_before_async": {
+                    "type": "integer",
+                    "description": "Milliseconds to wait before automatically detaching to background (default: 5000ms). If the command completes within this time, returns output synchronously. If it runs longer, detaches into a background task."
                 },
                 "is_background": {
                     "type": "boolean",
-                    "description": "Set to true to launch in background and receive PID."
+                    "description": "Set to true to immediately launch in background without waiting (equivalent to wait_ms_before_async=0)."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory for the command (defaults to current workspace directory)."
                 }
             },
             "required": ["command"]
@@ -672,21 +841,49 @@ impl Tool for ShellTool {
     }
 
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
-        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let cmd = args.get("command")
+            .or_else(|| args.get("CommandLine"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let allowed: HashSet<String> = context.allowed_commands.iter().cloned().collect();
         !is_known_safe_command_with_allowed(cmd, &allowed)
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
-        let command_str = match args.get("command").and_then(|v| v.as_str()) {
+        let command_str = match args.get("command")
+            .or_else(|| args.get("CommandLine"))
+            .and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return Ok(ToolOutput::error("Missing 'command' parameter.")),
         };
 
         let is_background = args
             .get("is_background")
+            .or_else(|| args.get("isBackground"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        let wait_ms = if is_background {
+            0
+        } else {
+            args.get("wait_ms_before_async")
+                .or_else(|| args.get("WaitMsBeforeAsync"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5000)
+        };
+
+        let working_dir = if let Some(cwd_str) = args.get("cwd")
+            .or_else(|| args.get("Cwd"))
+            .and_then(|v| v.as_str()) {
+            let p = PathBuf::from(cwd_str);
+            if p.is_absolute() {
+                p
+            } else {
+                context.workspace_dir.join(p)
+            }
+        } else {
+            context.workspace_dir.clone()
+        };
 
         let askpass_path = get_or_create_askpass_script();
         let full_script = format!("{} {}", BASH_SHOPT_GUARD, command_str);
@@ -694,139 +891,226 @@ impl Tool for ShellTool {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
             .arg(&full_script)
-            .current_dir(&context.workspace_dir)
+            .current_dir(&working_dir)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("SUDO_ASKPASS", &askpass_path)
             .env("SSH_ASKPASS", &askpass_path);
+
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
 
         if let Some(ref pwd) = context.sudo_password {
             cmd.env("UTI_SUDO_PASSWORD", pwd);
             cmd.env("DEEPSEEK_SUDO_PASSWORD", pwd);
         }
 
-        if is_background {
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => return Ok(ToolOutput::error(format!("Failed to launch background process: {}", e))),
-            };
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Ok(ToolOutput::error(format!("Failed to execute command: {}", e))),
+        };
 
-            let pid = child.id().unwrap_or(0);
-            let output_buffer = Arc::new(Mutex::new(String::new()));
-            let is_running = Arc::new(Mutex::new(true));
+        let pid = child.id().unwrap_or(0);
+        let output_buffer = Arc::new(Mutex::new(String::new()));
+        let is_running = Arc::new(Mutex::new(true));
+        let finished_at = Arc::new(Mutex::new(None));
+        let exit_code = Arc::new(Mutex::new(None));
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<String>(32);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
 
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let mut stdin = child.stdin.take();
 
-            let buf_clone = output_buffer.clone();
-            let running_clone = is_running.clone();
+        let buf_clone = output_buffer.clone();
+        let running_clone = is_running.clone();
+        let finished_at_clone = finished_at.clone();
+        let exit_code_clone = exit_code.clone();
 
-            tokio::spawn(async move {
-                let mut reader_stdout = stdout.map(BufReader::new);
-                let mut reader_stderr = stderr.map(BufReader::new);
+        tokio::spawn(async move {
+            let mut reader_stdout = stdout.map(BufReader::new);
+            let mut reader_stderr = stderr.map(BufReader::new);
 
-                let mut line_out = String::new();
-                let mut line_err = String::new();
+            let mut line_out = String::new();
+            let mut line_err = String::new();
+            let mut done_tx_opt = Some(done_tx);
 
-                loop {
-                    tokio::select! {
-                        res = async {
-                            if let Some(ref mut r) = reader_stdout {
-                                line_out.clear();
-                                r.read_line(&mut line_out).await
-                            } else {
-                                std::future::pending().await
-                            }
-                        } => {
-                            match res {
-                                Ok(0) | Err(_) => reader_stdout = None,
-                                Ok(_) => {
-                                    if let Ok(mut buf) = buf_clone.lock() {
-                                        buf.push_str(&line_out);
-                                        if buf.len() > 100_000 {
-                                            let cut = buf.len() - 100_000;
-                                            *buf = buf[cut..].to_string();
-                                        }
-                                    }
+            loop {
+                tokio::select! {
+                    res = async {
+                        if let Some(ref mut r) = reader_stdout {
+                            line_out.clear();
+                            r.read_line(&mut line_out).await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        match res {
+                            Ok(0) | Err(_) => reader_stdout = None,
+                            Ok(_) => {
+                                if let Ok(mut buf) = buf_clone.lock() {
+                                    append_and_truncate_output(&mut buf, &line_out, 200_000);
                                 }
                             }
-                        }
-                        res = async {
-                            if let Some(ref mut r) = reader_stderr {
-                                line_err.clear();
-                                r.read_line(&mut line_err).await
-                            } else {
-                                std::future::pending().await
-                            }
-                        } => {
-                            match res {
-                                Ok(0) | Err(_) => reader_stderr = None,
-                                Ok(_) => {
-                                    if let Ok(mut buf) = buf_clone.lock() {
-                                        buf.push_str(&line_err);
-                                        if buf.len() > 100_000 {
-                                            let cut = buf.len() - 100_000;
-                                            *buf = buf[cut..].to_string();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ = child.wait() => {
-                            if let Ok(mut r) = running_clone.lock() {
-                                *r = false;
-                            }
-                            break;
                         }
                     }
+                    res = async {
+                        if let Some(ref mut r) = reader_stderr {
+                            line_err.clear();
+                            r.read_line(&mut line_err).await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        match res {
+                            Ok(0) | Err(_) => reader_stderr = None,
+                            Ok(_) => {
+                                if let Ok(mut buf) = buf_clone.lock() {
+                                    append_and_truncate_output(&mut buf, &line_err, 200_000);
+                                }
+                            }
+                        }
+                    }
+                    input_msg = stdin_rx.recv() => {
+                        if let Some(data) = input_msg {
+                            if let Some(ref mut sin) = stdin {
+                                let _ = sin.write_all(data.as_bytes()).await;
+                                let _ = sin.flush().await;
+                            }
+                        }
+                    }
+                    wait_res = child.wait() => {
+                        if let Some(ref mut r) = reader_stdout {
+                            let mut rest_bytes = Vec::new();
+                            if r.take(200_000).read_to_end(&mut rest_bytes).await.is_ok() && !rest_bytes.is_empty() {
+                                let rest = String::from_utf8_lossy(&rest_bytes);
+                                if let Ok(mut buf) = buf_clone.lock() {
+                                    append_and_truncate_output(&mut buf, &rest, 200_000);
+                                }
+                            }
+                        }
+                        if let Some(ref mut r) = reader_stderr {
+                            let mut rest_bytes = Vec::new();
+                            if r.take(200_000).read_to_end(&mut rest_bytes).await.is_ok() && !rest_bytes.is_empty() {
+                                let rest = String::from_utf8_lossy(&rest_bytes);
+                                if let Ok(mut buf) = buf_clone.lock() {
+                                    append_and_truncate_output(&mut buf, &rest, 200_000);
+                                }
+                            }
+                        }
 
-                    if reader_stdout.is_none() && reader_stderr.is_none() {
+                        let status_val = wait_res.ok();
+                        let code = status_val.as_ref().and_then(|s| s.code());
                         if let Ok(mut r) = running_clone.lock() {
                             *r = false;
+                        }
+                        if let Ok(mut ec) = exit_code_clone.lock() {
+                            *ec = code;
+                        }
+                        if let Ok(mut fa) = finished_at_clone.lock() {
+                            *fa = Some(Utc::now());
+                        }
+                        if let Some(tx) = done_tx_opt.take() {
+                            if let Some(s) = status_val {
+                                let _ = tx.send(s);
+                            }
                         }
                         break;
                     }
                 }
-            });
 
-            if let Ok(mut mgr) = get_task_manager().lock() {
-                mgr.register(pid, command_str.to_string(), output_buffer, is_running, None);
-            }
-
-            Ok(ToolOutput::success_with_summary(
-                format!("Process launched in background (PID: {}). Command: {}", pid, command_str),
-                format!("Background PID: {}", pid),
-            ))
-        } else {
-            let output = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => return Ok(ToolOutput::error(format!("Failed to execute command: {}", e))),
-                Err(_) => return Ok(ToolOutput::error("Command execution timed out after 30s.".to_string())),
-            };
-
-            let stdout_str = String::from_utf8_lossy(&output.stdout);
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-            let mut combined = String::new();
-            if !stdout_str.is_empty() {
-                combined.push_str(&stdout_str);
-            }
-            if !stderr_str.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
+                if reader_stdout.is_none() && reader_stderr.is_none() {
+                    if let Ok(r) = running_clone.lock() {
+                        if !*r {
+                            break;
+                        }
+                    }
                 }
-                combined.push_str(&stderr_str);
             }
+        });
 
-            if combined.is_empty() {
-                combined = "(Command completed with no output)".to_string();
+        // Register with TaskManager
+        let mgr = get_task_manager();
+        if let Ok(mut m) = mgr.lock() {
+            m.register(
+                pid,
+                command_str.to_string(),
+                output_buffer.clone(),
+                is_running.clone(),
+                finished_at.clone(),
+                exit_code.clone(),
+                Some(stdin_tx),
+            );
+        }
+
+        if wait_ms == 0 {
+            return Ok(ToolOutput::success_with_summary(
+                format!(
+                    "[BACKGROUND TASK LAUNCHED]\n\
+                     Task ID (PID): {}\n\
+                     Command: {}\n\
+                     Status: RUNNING in background.\n\
+                     Use 'manage_task' (action: 'status' | 'kill' | 'send_input') or '/tasks' to monitor.",
+                    pid, command_str
+                ),
+                format!("Background PID: {}", pid),
+            ));
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(wait_ms), done_rx).await {
+            Ok(Ok(status)) => {
+                let output = output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+                let display_output = if output.trim().is_empty() {
+                    "(Command completed with no output)".to_string()
+                } else {
+                    output
+                };
+
+                if status.success() {
+                    Ok(ToolOutput::success(display_output))
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    Ok(ToolOutput::error(format!("Command exited with status code {}:\n{}", code, display_output)))
+                }
             }
+            Ok(Err(_)) => {
+                let output = output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+                let code = exit_code.lock().ok().and_then(|c| *c).unwrap_or(-1);
+                if code == 0 {
+                    Ok(ToolOutput::success(output))
+                } else {
+                    Ok(ToolOutput::error(format!("Command exited with status code {}:\n{}", code, output)))
+                }
+            }
+            Err(_) => {
+                let partial_output = output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+                let snippet = if partial_output.trim().is_empty() {
+                    "(No output produced yet)".to_string()
+                } else {
+                    let lines: Vec<&str> = partial_output.lines().collect();
+                    if lines.len() > 10 {
+                        format!("... [truncated]\n{}", lines[lines.len() - 10..].join("\n"))
+                    } else {
+                        partial_output
+                    }
+                };
 
-            if output.status.success() {
-                Ok(ToolOutput::success(combined))
-            } else {
-                let code = output.status.code().unwrap_or(-1);
-                Ok(ToolOutput::error(format!("Command exited with status code {}:\n{}", code, combined)))
+                Ok(ToolOutput::success_with_summary(
+                    format!(
+                        "[COMMAND SENT TO BACKGROUND]\n\
+                         Command exceeded wait limit ({}ms) and is continuing in background.\n\
+                         Task ID (PID): {}\n\
+                         Command: {}\n\
+                         Status: RUNNING\n\
+                         Recent output:\n{}\n\n\
+                         Use tool 'manage_task' (action: 'status' | 'kill' | 'send_input') or '/tasks' to manage.",
+                        wait_ms, pid, command_str, snippet
+                    ),
+                    format!("Sent to background: PID {}", pid),
+                ))
             }
         }
     }
@@ -957,5 +1241,132 @@ mod tests {
         assert!(is_known_safe_command_with_allowed("MYVAR=1 mycli do-stuff", &allowed));
         assert!(!is_known_safe_command_with_allowed("mycli do-stuff > /tmp/out", &allowed));
         assert!(!is_known_safe_command_with_allowed("othercli do-stuff", &allowed));
+    }
+
+    #[test]
+    fn test_command_requires_sudo() {
+        assert!(command_requires_sudo("sudo apt update"));
+        assert!(command_requires_sudo("sudo -E systemctl restart nginx"));
+        assert!(command_requires_sudo("/usr/bin/sudo ls -la /root"));
+        assert!(command_requires_sudo("echo 123 | sudo tee /proc/sys/vm/drop_caches"));
+        assert!(command_requires_sudo("cd /var/log && sudo cat syslog"));
+        assert!(command_requires_sudo("VAR=val sudo whoami"));
+        assert!(command_requires_sudo("env PATH=/usr/bin sudo systemctl stop docker"));
+        assert!(command_requires_sudo("xargs sudo kill -9"));
+        assert!(command_requires_sudo("find /var/log -name '*.log' -exec sudo rm {} +"));
+        assert!(command_requires_sudo("bash -c 'sudo reboot'"));
+        assert!(command_requires_sudo("doas reboot"));
+        assert!(command_requires_sudo("pkexec systemctl restart bluetooth"));
+        assert!(command_requires_sudo("(sudo ls)"));
+
+        // Non-sudo commands should not trigger
+        assert!(!command_requires_sudo("ls -la"));
+        assert!(!command_requires_sudo("cat /etc/passwd"));
+        assert!(!command_requires_sudo("grep sudo /var/log/auth.log"));
+        assert!(!command_requires_sudo("echo 'I like sudo'"));
+        assert!(!command_requires_sudo("git commit -m 'Fixed sudo bug'"));
+        assert!(!command_requires_sudo(""));
+    }
+
+    #[test]
+    fn test_extract_first_sudo_command() {
+        assert_eq!(
+            extract_first_sudo_command("sudo apt update"),
+            Some("sudo apt update".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("echo '════════ 1) ARREGLAR nsswitch ════════' && sudo sed -i 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf"),
+            Some("sudo sed -i 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("echo 123 | sudo tee /proc/sys/vm/drop_caches"),
+            Some("sudo tee /proc/sys/vm/drop_caches".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("cd /var/log && sudo cat syslog"),
+            Some("sudo cat syslog".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("(sudo ls -la)"),
+            Some("sudo ls -la".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("bash -c 'sudo reboot'"),
+            Some("sudo reboot".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("echo $(sudo cat /etc/shadow)"),
+            Some("sudo cat /etc/shadow".to_string())
+        );
+        assert_eq!(
+            extract_first_sudo_command("VAR=123 sudo systemctl restart nginx"),
+            Some("VAR=123 sudo systemctl restart nginx".to_string())
+        );
+        assert_eq!(extract_first_sudo_command("ls -la"), None);
+        assert_eq!(extract_first_sudo_command("echo 'sudo'"), None);
+        assert_eq!(extract_first_sudo_command(""), None);
+    }
+
+    #[tokio::test]
+    async fn test_shell_tool_fast_command_synchronous() {
+        let tool = ShellTool;
+        let ctx = ToolContext {
+            workspace_dir: std::env::current_dir().unwrap(),
+            yolo_mode: true,
+            allowed_commands: vec![],
+            sudo_password: None,
+        };
+
+        let res = tool
+            .execute(
+                json!({
+                    "command": "echo 'antigravity test'",
+                    "wait_ms_before_async": 2000
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        assert!(res.output.contains("antigravity test"));
+        assert!(res.display_summary.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_shell_tool_slow_command_auto_background() {
+        let tool = ShellTool;
+        let ctx = ToolContext {
+            workspace_dir: std::env::current_dir().unwrap(),
+            yolo_mode: true,
+            allowed_commands: vec![],
+            sudo_password: None,
+        };
+
+        let res = tool
+            .execute(
+                json!({
+                    "command": "sleep 1.5 && echo 'done sleeping'",
+                    "wait_ms_before_async": 200
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!res.is_error);
+        assert!(res.output.contains("[COMMAND SENT TO BACKGROUND]"));
+        assert!(res.display_summary.is_some());
+    }
+
+    #[test]
+    fn test_append_and_truncate_output_utf8() {
+        let mut buf = String::new();
+        // '€' is 3 bytes in UTF-8
+        let euro_text = "a".to_string() + &"€".repeat(10);
+        append_and_truncate_output(&mut buf, &euro_text, 10);
+        assert!(buf.len() <= 10);
+        // Valid UTF-8 must be maintained without panicking
+        assert!(!buf.is_empty());
     }
 }

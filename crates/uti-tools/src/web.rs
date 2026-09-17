@@ -1,8 +1,47 @@
+use std::sync::OnceLock;
 use anyhow::Result;
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::json;
+use uti_core::safe_truncate_str;
 
 use crate::types::{Tool, ToolContext, ToolOutput};
+
+fn get_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+fn tag_strip_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"<[^>]+>"#).unwrap())
+}
+
+fn script_strip_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<script[^>]*>.*?</script>"#).unwrap())
+}
+
+fn style_strip_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<style[^>]*>.*?</style>"#).unwrap())
+}
+
+fn snippet_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?s)<a class="result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap())
+}
+
+fn title_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?s)<a class="result__url"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap())
+}
 
 // --- WebSearchTool (google_web_search) ---
 pub struct WebSearchTool;
@@ -36,11 +75,7 @@ impl Tool for WebSearchTool {
             None => return Ok(ToolOutput::error("Missing 'query' argument.")),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
-
+        let client = get_http_client();
         let encoded_query = query.replace(' ', "+");
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
@@ -49,24 +84,19 @@ impl Tool for WebSearchTool {
             Err(e) => return Ok(ToolOutput::error(format!("Search request failed: {}", e))),
         };
 
-        // Extract result snippets using regex
-        let snippet_re = regex::Regex::new(r#"(?s)<a class="result__snippet[^"]*"[^>]*>(.*?)</a>"#).unwrap();
-        let title_re = regex::Regex::new(r#"(?s)<a class="result__url"[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
-        let tag_strip_re = regex::Regex::new(r#"<[^>]+>"#).unwrap();
-
         let mut results = Vec::new();
-        let snippets: Vec<String> = snippet_re
+        let snippets: Vec<String> = snippet_re()
             .captures_iter(&resp)
             .take(5)
-            .map(|c| tag_strip_re.replace_all(&c[1], "").trim().to_string())
+            .map(|c| tag_strip_re().replace_all(&c[1], "").trim().to_string())
             .collect();
 
-        let titles: Vec<(String, String)> = title_re
+        let titles: Vec<(String, String)> = title_re()
             .captures_iter(&resp)
             .take(5)
             .map(|c| {
                 let url = c[1].trim().to_string();
-                let title = tag_strip_re.replace_all(&c[2], "").trim().to_string();
+                let title = tag_strip_re().replace_all(&c[2], "").trim().to_string();
                 (title, url)
             })
             .collect();
@@ -132,10 +162,7 @@ impl Tool for WebFetchTool {
             None => return Ok(ToolOutput::error("No valid http:// or https:// URL found in prompt.")),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
+        let client = get_http_client();
 
         let body = match client.get(&url).send().await {
             Ok(resp) => resp.text().await.unwrap_or_default(),
@@ -143,13 +170,9 @@ impl Tool for WebFetchTool {
         };
 
         // Basic HTML stripping and newline normalization
-        let tag_strip_re = regex::Regex::new(r#"<[^>]+>"#).unwrap();
-        let script_strip_re = regex::Regex::new(r#"(?is)<script[^>]*>.*?</script>"#).unwrap();
-        let style_strip_re = regex::Regex::new(r#"(?is)<style[^>]*>.*?</style>"#).unwrap();
-
-        let clean_html = script_strip_re.replace_all(&body, "");
-        let clean_html = style_strip_re.replace_all(&clean_html, "");
-        let text = tag_strip_re.replace_all(&clean_html, " ");
+        let clean_html = script_strip_re().replace_all(&body, "");
+        let clean_html = style_strip_re().replace_all(&clean_html, "");
+        let text = tag_strip_re().replace_all(&clean_html, " ");
         let normalized = text
             .lines()
             .map(|l| l.trim())
@@ -158,7 +181,8 @@ impl Tool for WebFetchTool {
             .join("\n");
 
         let truncated = if normalized.len() > 15000 {
-            format!("{}\n\n[Content truncated after 15,000 characters]", &normalized[..15000])
+            let cut = safe_truncate_str(&normalized, 15000);
+            format!("{}\n\n[Content truncated after 15,000 characters]", cut)
         } else {
             normalized
         };

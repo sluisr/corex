@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub fn render_gradient_logo(version: &str) -> Vec<Line<'static>> {
+pub fn render_gradient_logo(version: &str, authenticated: bool, local_mode: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     // Top padding line
@@ -24,12 +24,20 @@ pub fn render_gradient_logo(version: &str) -> Vec<Line<'static>> {
         Span::styled("   \u{259D}\u{259C}\u{2584}", Style::default().fg(c2).add_modifier(Modifier::BOLD)),
     ]));
 
-    // Row 3: "  ▗▟▀    Authenticated with DeepSeek API Key /auth"
+    // Row 3: Dynamic authentication status
+    let (status_text, cmd_hint, status_color) = if local_mode {
+        ("Local LLM Mode (Offline)", " /model", Color::Rgb(105, 240, 174))
+    } else if authenticated {
+        ("Authenticated with DeepSeek API Key", " /key", Color::Reset)
+    } else {
+        ("API Key Missing (Type /key <sk-...> to connect)", " /key", Color::Rgb(255, 170, 0))
+    };
+
     lines.push(Line::from(vec![
         Span::styled("  \u{2597}\u{259F}\u{2580}", Style::default().fg(c3).add_modifier(Modifier::BOLD)),
         Span::raw("    "),
-        Span::styled("Authenticated with DeepSeek API Key", Style::default().fg(Color::Reset)),
-        Span::styled(" /auth", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_text, Style::default().fg(status_color)),
+        Span::styled(cmd_hint, Style::default().fg(Color::DarkGray)),
     ]));
 
     // Row 4: " ▝▀"

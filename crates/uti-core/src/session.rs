@@ -29,7 +29,7 @@ pub struct Session {
 }
 
 fn default_session_model() -> String {
-    "deepseek-v4-flash".to_string()
+    "deepseek-flash".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,9 +43,15 @@ pub struct SessionSummary {
     pub workspace_dir: Option<String>,
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Session {
     pub fn new() -> Self {
-        Self::new_with_params("deepseek-v4-flash", 1.0, "high", None)
+        Self::new_with_params("deepseek-flash", 1.0, "high", None)
     }
 
     pub fn new_with_params(
@@ -187,7 +193,7 @@ impl Session {
                 }
             }
         }
-        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         list
     }
 

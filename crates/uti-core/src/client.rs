@@ -42,6 +42,11 @@ pub enum StreamEvent {
         output: String,
     },
     AllToolsDone,
+    Notice(String),
+    ContextCompacted {
+        compacted_messages: Vec<Message>,
+        notice: String,
+    },
     Error(String),
 }
 
@@ -56,7 +61,7 @@ pub struct LlmClient {
 impl LlmClient {
     pub fn new(config: Config) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
@@ -109,7 +114,7 @@ impl LlmClient {
             if messages[i].role == "tool" {
                 let tool_id = messages[i].tool_call_id.as_deref().unwrap_or("");
                 let mut k = i as isize - 1;
-                while k >= 0 && messages[k as usize].role == "tool" {
+                while k >= 0 && (messages[k as usize].role == "tool" || messages[k as usize].role == "system") {
                     k -= 1;
                 }
 
@@ -132,16 +137,22 @@ impl LlmClient {
             i += 1;
         }
 
-        // Fill missing tool responses for any tool_calls
+        // Fill missing tool responses for any tool_calls and ensure tool messages directly follow assistant
         let mut idx = 0;
         while idx < messages.len() {
             if messages[idx].role == "assistant" {
                 if let Some(ref calls) = messages[idx].tool_calls.clone() {
                     let mut following_ids = Vec::new();
                     let mut next_idx = idx + 1;
-                    while next_idx < messages.len() && messages[next_idx].role == "tool" {
-                        if let Some(ref tid) = messages[next_idx].tool_call_id {
-                            following_ids.push(tid.clone());
+                    // Scan forward to find all tool responses belonging to this assistant turn
+                    while next_idx < messages.len()
+                        && messages[next_idx].role != "assistant"
+                        && messages[next_idx].role != "user"
+                    {
+                        if messages[next_idx].role == "tool" {
+                            if let Some(ref tid) = messages[next_idx].tool_call_id {
+                                following_ids.push(tid.clone());
+                            }
                         }
                         next_idx += 1;
                     }
@@ -159,6 +170,25 @@ impl LlmClient {
                             next_idx += 1;
                         }
                     }
+
+                    // Strict API ordering: Ensure all tool responses for this assistant message
+                    // immediately follow it, with no intervening system messages.
+                    let mut insert_pos = idx + 1;
+                    let mut check_pos = idx + 1;
+                    while check_pos < messages.len()
+                        && messages[check_pos].role != "assistant"
+                        && messages[check_pos].role != "user"
+                    {
+                        if messages[check_pos].role == "tool" {
+                            if check_pos != insert_pos {
+                                let tool_msg = messages.remove(check_pos);
+                                messages.insert(insert_pos, tool_msg);
+                            }
+                            insert_pos += 1;
+                        }
+                        check_pos += 1;
+                    }
+                    idx = check_pos - 1;
                 }
             }
             idx += 1;
@@ -178,7 +208,7 @@ impl LlmClient {
     /// result, but not enough to break the bank.
     const TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
 
-    pub async fn compress_or_truncate_tool_outputs(&self, messages: &mut Vec<Message>) {
+    pub async fn compress_or_truncate_tool_outputs(&self, messages: &mut [Message]) {
         let cfg = self.get_config();
         let local_available = cfg.local_llm_enabled && (cfg.hybrid_compression || cfg.hybrid_settings.auto_compression);
 
@@ -193,9 +223,18 @@ impl LlmClient {
             None
         };
 
-        // Collect indices of tool messages that need local compression
+        // ⚡ KV CACHE IMMUTABILITY GUARANTEE:
+        // Find the boundary of the current turn's tool outputs (trailing block of tool messages).
+        // Historical messages prior to the latest assistant message MUST remain strictly immutable
+        // to guarantee a 100% KV Cache hit rate on DeepSeek / OpenAI prefix caching.
+        let first_active_tool_idx = match messages.iter().rposition(|m| m.role == "assistant") {
+            Some(pos) => pos + 1,
+            None => 0,
+        };
+
+        // Collect indices of active tool messages that need local compression
         let mut compression_candidates = Vec::new();
-        for (idx, msg) in messages.iter().enumerate() {
+        for (idx, msg) in messages.iter().enumerate().skip(first_active_tool_idx) {
             if msg.role == "tool" {
                 if let Some(content) = msg.text_content() {
                     // Only compress if not already compressed (preserves Prefix KV Cache for past turns!)
@@ -237,13 +276,13 @@ impl LlmClient {
             }
         }
 
-        // Final safety truncation for any tool output still exceeding TOOL_OUTPUT_MAX_CHARS
-        for msg in messages.iter_mut() {
+        // Final safety truncation for any newly generated active tool output still exceeding TOOL_OUTPUT_MAX_CHARS
+        for msg in messages[first_active_tool_idx..].iter_mut() {
             if msg.role == "tool" {
                 if let Some(content) = msg.text_content().map(|s| s.to_string()) {
                     if content.len() > Self::TOOL_OUTPUT_MAX_CHARS && !content.contains("chars truncated to save tokens") {
-                        let truncated = &content[..Self::TOOL_OUTPUT_MAX_CHARS];
-                        let omitted = content.len() - Self::TOOL_OUTPUT_MAX_CHARS;
+                        let truncated = crate::types::safe_truncate_str(&content, Self::TOOL_OUTPUT_MAX_CHARS);
+                        let omitted = content.len() - truncated.len();
                         msg.content = Some(format!(
                             "{}\n\n[... {} chars truncated to save tokens ...]",
                             truncated, omitted
@@ -262,16 +301,199 @@ impl LlmClient {
     /// Rough total token estimate for a message list (prompt side only).
     fn estimate_messages_tokens(messages: &[Message]) -> usize {
         messages.iter().map(|m| {
-            let content_toks = m.text_content().map(Self::estimate_tokens).unwrap_or(0);
+            let content_toks = match &m.content {
+                Some(MessageContent::Text(s)) => Self::estimate_tokens(s),
+                Some(MessageContent::Parts(parts)) => parts.iter().map(|p| {
+                    let text_toks = p.text.as_deref().map(Self::estimate_tokens).unwrap_or(0);
+                    let img_toks = if p.image_url.is_some() { 1024 } else { 0 };
+                    text_toks + img_toks
+                }).sum(),
+                None => 0,
+            };
             let reasoning_toks = m.reasoning_content.as_deref().map(Self::estimate_tokens).unwrap_or(0);
             content_toks + reasoning_toks + 4 // per-message overhead
         }).sum()
     }
 
+    /// Automatically or manually compacts older conversation turns into a dense, structured memory block.
+    /// Preserves system prompt and root user prompt (anchor) and latest active turns.
+    pub async fn compact_messages(
+        &self,
+        messages: &mut Vec<Message>,
+        force: bool,
+    ) -> Result<Option<String>> {
+        let cfg = self.get_config();
+        let current_tokens = Self::estimate_messages_tokens(messages);
+
+        let effective_threshold = if cfg.model.starts_with("local") {
+            cfg.compact_threshold_tokens.min(24_000)
+        } else {
+            cfg.compact_threshold_tokens
+        };
+
+        if !force && (!cfg.auto_compact || current_tokens <= effective_threshold) {
+            return Ok(None);
+        }
+
+        let total_msgs = messages.len();
+        if total_msgs < 8 {
+            return Ok(None);
+        }
+
+        // Find system prompt end index (first non-system message = Root User Anchor)
+        let first_non_system = messages.iter().position(|m| m.role != "system").unwrap_or(0);
+
+        // Keep the latest 8-10 messages (representing current active turns / tools / reasoning)
+        let keep_recent = 10.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
+        let split_at = total_msgs.saturating_sub(keep_recent);
+
+        // The root user prompt (anchor) is preserved at first_non_system.
+        // We only compact the middle turns between the anchor and recent active turns.
+        let middle_start = first_non_system + 1;
+        if middle_start >= split_at || split_at.saturating_sub(middle_start) < 2 {
+            return Ok(None);
+        }
+
+        let older_slice = &messages[middle_start..split_at];
+        let older_count = older_slice.len();
+
+        // Extract intermediate user requests, tool actions, and errors
+        let mut user_requests = Vec::new();
+        let mut tool_actions = Vec::new();
+        let mut prev_summary: Option<String> = None;
+
+        for m in older_slice {
+            let text = m.text_content().unwrap_or("").trim();
+            if m.role == "system" && text.contains("<CONTEXT_SUMMARY>") {
+                prev_summary = Some(text.to_string());
+                continue;
+            }
+
+            if m.role == "user" {
+                if !text.is_empty() {
+                    user_requests.push(crate::types::truncate_ellipsis(text, 250));
+                }
+            } else if m.role == "assistant" {
+                if let Some(ref calls) = m.tool_calls {
+                    for c in calls {
+                        let short_args = crate::types::truncate_ellipsis(&c.function.arguments, 120);
+                        tool_actions.push(format!("{}({})", c.function.name, short_args));
+                    }
+                }
+            } else if m.role == "tool" && (text.starts_with("Error") || text.contains("failed") || text.contains("error:")) {
+                let err_snip = crate::types::truncate_ellipsis(text, 120);
+                tool_actions.push(format!("Tool result error: {}", err_snip));
+            }
+        }
+
+        let mut summary_opt: Option<String> = None;
+
+        // 1. Try local SLM first (100% free @ $0.00)
+        let local_client = self.local_client();
+        if local_client.health_check().await {
+            let digest = format!(
+                "User Requests in Compacted Turns:\n{}\n\nTool Actions:\n{}",
+                user_requests.join("\n"),
+                tool_actions.join("\n")
+            );
+            if let Ok(local_sum) = local_client.compact_conversation(&digest).await {
+                if !local_sum.trim().is_empty() {
+                    summary_opt = Some(local_sum.trim().to_string());
+                }
+            }
+        }
+
+        // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
+        if summary_opt.is_none() && !cfg.api_key.trim().is_empty() {
+            let summary_system = "You are the Context Compactor for UTI CLI. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
+            let digest = format!(
+                "User Requests:\n{}\n\nTool Actions:\n{}",
+                user_requests.join("\n"),
+                tool_actions.join("\n")
+            );
+            let request_body = serde_json::json!({
+                "model": if cfg.base_url.contains("deepseek.com") { "deepseek-chat" } else { "deepseek-flash" },
+                "messages": [
+                    {"role": "system", "content": summary_system},
+                    {"role": "user", "content": digest}
+                ],
+                "max_tokens": 600,
+                "temperature": 0.3
+            });
+
+            let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+            if let Ok(resp) = self.http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", cfg.api_key))
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await
+            {
+                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                    if let Some(text) = json_resp
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|t| t.as_str())
+                    {
+                        summary_opt = Some(text.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        // 3. Fallback: structured deterministic extractive summary
+        let summary_text = summary_opt.unwrap_or_else(|| {
+            let mut parts = Vec::new();
+            if let Some(ref prev) = prev_summary {
+                parts.push(format!("## Previous Compacted History:\n{}", prev));
+            }
+            if !user_requests.is_empty() {
+                parts.push(format!(
+                    "## User Directives in Compacted Turns:\n{}",
+                    user_requests.iter().map(|u| format!("- {}", u)).collect::<Vec<_>>().join("\n")
+                ));
+            }
+            if !tool_actions.is_empty() {
+                parts.push(format!(
+                    "## Touched Files & Actions:\n{}",
+                    tool_actions.iter().take(30).map(|a| format!("- {}", a)).collect::<Vec<_>>().join("\n")
+                ));
+            }
+            if parts.is_empty() {
+                parts.push("Intermediate conversation history compacted to conserve context window.".to_string());
+            }
+            parts.join("\n\n")
+        });
+
+        let compacted_content = format!(
+            "<CONTEXT_SUMMARY>\nThe following is a structured memory compaction of {} intermediate turns to fit within the context window:\n\n{}\n</CONTEXT_SUMMARY>",
+            older_count,
+            summary_text.trim()
+        );
+
+        // Drain ONLY the middle slice and insert the compacted block
+        messages.drain(middle_start..split_at);
+        let compacted_message = Message::system(compacted_content);
+        messages.insert(middle_start, compacted_message);
+
+        let new_tokens = Self::estimate_messages_tokens(messages);
+        let saved_tokens = current_tokens.saturating_sub(new_tokens);
+        let notice = format!(
+            "Context compacted: preserved initial user prompt + active window (saved ~{} tokens).",
+            saved_tokens
+        );
+
+        Ok(Some(notice))
+    }
+
     /// If the estimated prompt token count is above the threshold, drop the oldest
     /// non-system messages (in message pairs to preserve tool call integrity) until
     /// we are back under the limit or only the system + last turn remains.
-    const HISTORY_TOKEN_LIMIT: usize = 60_000;
+    /// DeepSeek-V4.1-Flash features a 1M token context window (1,048,576 tokens).
+    const HISTORY_TOKEN_LIMIT: usize = 256_000;
 
     pub fn cap_history_if_needed(messages: &mut Vec<Message>) {
         if Self::estimate_messages_tokens(messages) <= Self::HISTORY_TOKEN_LIMIT {
@@ -307,7 +529,7 @@ impl LlmClient {
             let local_client = self.local_client();
             if local_client.health_check().await {
                 crate::forensic::ForensicLogger::log_hybrid_decision(
-                    &messages.last().and_then(|m| m.text_content()).unwrap_or(""),
+                    messages.last().and_then(|m| m.text_content()).unwrap_or(""),
                     false,
                     "LOCAL_LLM (STANDALONE_OFFLINE)",
                     "Running 100% offline on Local LLM (zero Cloud dependency, $0.00)."
@@ -323,12 +545,21 @@ impl LlmClient {
             }
         }
 
+        let mut offline_fallback_notice: Option<String> = None;
+
         // ⚡ MULTI-MODE DYNAMIC HYBRID ROUTING:
         if cfg.local_llm_enabled {
             let local_client = self.local_client();
             let is_local_online = local_client.health_check().await;
 
             if !is_local_online {
+                let is_tool_call_in_progress = messages.last().map(|m| m.role == "tool").unwrap_or(false);
+                if !is_tool_call_in_progress {
+                    offline_fallback_notice = Some(format!(
+                        "Local LLM is offline at {}. Using Cloud API.",
+                        cfg.local_llm_url
+                    ));
+                }
                 // Graceful fallback to DeepSeek Cloud without crashing or blocking the session!
                 crate::forensic::ForensicLogger::log_event(
                     "HYBRID_FALLBACK",
@@ -337,102 +568,9 @@ impl LlmClient {
                 );
                 debug!("[HYBRID_ROUTER] Local server offline at {}; fallback to DeepSeek Cloud", cfg.local_llm_url);
             } else {
-                let last_user_msg = messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "user")
-                    .and_then(|m| m.text_content())
-                    .unwrap_or("")
-                    .to_string();
-
-                // Multi-turn context snippet (last 2 non-tool messages before the current prompt)
-                let context = messages
-                    .iter()
-                    .rev()
-                    .filter(|m| m.role == "assistant" || m.role == "user")
-                    .take(3)
-                    .filter_map(|m| m.text_content().map(|t| format!("{}: {}", m.role, t)))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let is_tool_call_in_progress = messages.last().map(|m| m.role == "tool").unwrap_or(false);
-
-                match cfg.hybrid_settings.mode {
-                    crate::config::HybridMode::CompressionOnly => {
-                        // All prompts go to DeepSeek Cloud; Local LLM only handles parallel output compression
-                        debug!("[HYBRID_ROUTER] HybridMode::CompressionOnly active; delegating turn to Cloud");
-                    }
-                    crate::config::HybridMode::AutoTriage => {
-                        if !is_tool_call_in_progress {
-                            let decision = local_client.classify_intent(&last_user_msg, if context.is_empty() { None } else { Some(&context) }).await;
-                            match decision {
-                                crate::local_client::IntentDecision::LocalChat => {
-                                    crate::forensic::ForensicLogger::log_hybrid_decision(
-                                        &last_user_msg,
-                                        false,
-                                        "LOCAL_LLM (Auto-Triage / Pure Chat)",
-                                        "Zero-cost local conversation / theory / developer guidance at $0.00 (no tools)."
-                                    );
-                                    return local_client.stream_chat(messages, None, cancel_token).await;
-                                }
-                                crate::local_client::IntentDecision::LocalInspection => {
-                                    crate::forensic::ForensicLogger::log_hybrid_decision(
-                                        &last_user_msg,
-                                        true,
-                                        "DEEPSEEK_CLOUD (Auto-Triage / Inspection & Commands)",
-                                        "System inspection, hardware checks, and command executions delegated safely to DeepSeek."
-                                    );
-                                }
-                                crate::local_client::IntentDecision::HeavyCoding => {
-                                    crate::forensic::ForensicLogger::log_hybrid_decision(
-                                        &last_user_msg,
-                                        true,
-                                        "DEEPSEEK_CLOUD (Auto-Triage / Code & Architecture)",
-                                        "High-IQ reasoning, editing, and code generation delegated to DeepSeek."
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    crate::config::HybridMode::LocalScout => {
-                        if !is_tool_call_in_progress {
-                            let decision = local_client.classify_intent(&last_user_msg, if context.is_empty() { None } else { Some(&context) }).await;
-                            if decision.can_handle_locally() {
-                                crate::forensic::ForensicLogger::log_hybrid_decision(
-                                    &last_user_msg,
-                                    false,
-                                    "LOCAL_LLM (Local Scout)",
-                                    "Exploring repository, reading files & diagnostics at $0.00."
-                                );
-                                return local_client.stream_chat(messages, tools, cancel_token).await;
-                            } else {
-                                crate::forensic::ForensicLogger::log_hybrid_decision(
-                                    &last_user_msg,
-                                    true,
-                                    "DEEPSEEK_CLOUD (Local Scout Patch Maker)",
-                                    "Generating high-precision code patch on DeepSeek Cloud."
-                                );
-                            }
-                        }
-                    }
-                    crate::config::HybridMode::DraftAndReview => {
-                        if !is_tool_call_in_progress {
-                            let decision = local_client.classify_intent(&last_user_msg, if context.is_empty() { None } else { Some(&context) }).await;
-                            if decision.is_local_chat() || decision.is_local_inspection() {
-                                crate::forensic::ForensicLogger::log_hybrid_decision(
-                                    &last_user_msg,
-                                    false,
-                                    "LOCAL_LLM (Draft & Review Chat)",
-                                    "Answered locally by assistant at $0.00."
-                                );
-                                return local_client.stream_chat(messages, tools, cancel_token).await;
-                            }
-                        }
-                    }
-                }
+                // Hybrid Mode: All agent turns run on DeepSeek Cloud with full tools,
+                // while the Local LLM handles parallel output compression & token reduction.
+                debug!("[HYBRID_ROUTER] Hybrid active; delegating agent turn to DeepSeek Cloud");
             }
         }
 
@@ -443,11 +581,23 @@ impl LlmClient {
         }
 
         // ⚡ ORDER OF INTEGRITY:
-        // 1. Cap history limit first
+        // 1. Auto-compact conversation turns if threshold is reached (Gemini CLI / Antigravity spec)
+        let auto_compact_event = match self.compact_messages(&mut messages, false).await {
+            Ok(Some(notice)) => {
+                let compacted_session_messages = if messages.len() > 1 {
+                    messages[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                Some((compacted_session_messages, notice))
+            }
+            _ => None,
+        };
+        // 2. Cap history limit as emergency fallback
         Self::cap_history_if_needed(&mut messages);
-        // 2. Sanitize tool call sequences so no orphaned messages exist
+        // 3. Sanitize tool call sequences so no orphaned messages exist
         Self::sanitize_tool_call_sequences(&mut messages);
-        // 3. Compress tool outputs in parallel (preserving past turns for KV Cache hit)
+        // 4. Compress tool outputs in parallel (preserving past turns for KV Cache hit)
         self.compress_or_truncate_tool_outputs(&mut messages).await;
 
         if let Some(ref mut t_list) = tools {
@@ -481,12 +631,33 @@ impl LlmClient {
             }
         }
 
-        let api_model = if cfg.model.contains("pro") || cfg.model.contains("reasoner") || cfg.model.contains("Pro") {
-            "deepseek-v4-pro".to_string()
-        } else if cfg.model.contains("vision") || cfg.model.contains("Vision") {
-            "deepseek-v4-flash-vision-exp".to_string()
+        let is_official_deepseek = cfg.base_url.contains("deepseek.com");
+        let api_model = if cfg.model == "deepseek-chat" {
+            "deepseek-chat".to_string()
+        } else if cfg.model == "deepseek-reasoner" {
+            "deepseek-reasoner".to_string()
+        } else if cfg.model.contains("pro") || cfg.model.contains("reasoner") || cfg.model.contains("Pro") {
+            if is_official_deepseek {
+                "deepseek-reasoner".to_string()
+            } else {
+                "deepseek-v4-pro".to_string()
+            }
+        } else if cfg.model == "deepseek-flash"
+            || cfg.model == "deepseek-v4.1-flash"
+            || cfg.model == "deepseek-v4-flash"
+            || cfg.model == "deepseek-v4-flash-vision-exp"
+            || cfg.model.contains("flash")
+            || cfg.model.contains("Flash")
+            || cfg.model.contains("vision")
+            || cfg.model.contains("Vision")
+        {
+            if is_official_deepseek {
+                "deepseek-chat".to_string()
+            } else {
+                "deepseek-flash".to_string()
+            }
         } else {
-            "deepseek-v4-flash".to_string()
+            cfg.model.clone()
         };
 
         let base_url = cfg.base_url.trim_end_matches('/');
@@ -498,43 +669,44 @@ impl LlmClient {
         // When configured as "dynamic" (default for flash), adapt depth per turn:
         // - Tool Call Rounds / System Inspection / Command Execution / Quick Queries -> command_reasoning_effort (default "low" ~200ms)
         // - Heavy Code Generation / Patch Creation / Architecture -> code_reasoning_effort (default "high" Deep CoT)
-        let effective_reasoning_effort = if cfg.reasoning_effort == "dynamic" || cfg.flash_settings.reasoning_effort == "dynamic" {
+        let raw_reasoning_effort = if cfg.local_llm_enabled || cfg.reasoning_effort == "dynamic" || cfg.flash_settings.reasoning_effort == "dynamic" {
             let is_tool_response_turn = messages.last().map(|m| m.role == "tool").unwrap_or(false);
             if is_tool_response_turn {
                 cfg.flash_settings.command_reasoning_effort.clone()
             } else {
-                let last_user_text = messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "user")
-                    .and_then(|m| m.text_content())
-                    .unwrap_or("");
-
-                let heuristic = crate::local_client::fast_heuristic_intent(last_user_text);
-                match heuristic {
-                    Some(crate::local_client::IntentDecision::HeavyCoding) => cfg.flash_settings.code_reasoning_effort.clone(),
-                    Some(crate::local_client::IntentDecision::LocalInspection) => cfg.flash_settings.command_reasoning_effort.clone(),
-                    Some(crate::local_client::IntentDecision::LocalChat) => cfg.flash_settings.command_reasoning_effort.clone(),
-                    None => {
-                        let lower = last_user_text.to_lowercase();
-                        if lower.contains("refactor")
-                            || lower.contains("implement")
-                            || lower.contains("fix")
-                            || lower.contains("patch")
-                            || lower.contains("test")
-                            || lower.contains("rust")
-                            || lower.contains("código")
-                            || lower.contains("codigo")
-                        {
-                            cfg.flash_settings.code_reasoning_effort.clone()
-                        } else {
-                            cfg.flash_settings.command_reasoning_effort.clone()
-                        }
-                    }
-                }
+                cfg.flash_settings.code_reasoning_effort.clone()
             }
         } else {
             cfg.reasoning_effort.clone()
+        };
+
+        // DeepSeek-V4.1-Flash reasoning_effort normalization:
+        // 'minimal' and 'medium' are rejected by DeepSeek-V4.1.
+        // Allowed: 'none', 'low' (25), 'high' (50), 'xhigh' (75), 'max' (100)
+        let normalized_reasoning_effort = match raw_reasoning_effort.to_lowercase().as_str() {
+            "medium" => "high".to_string(),
+            "minimal" => "low".to_string(),
+            other => other.to_string(),
+        };
+
+        let is_thinking_disabled = normalized_reasoning_effort == "none"
+            || normalized_reasoning_effort == "off"
+            || normalized_reasoning_effort == "false";
+
+        let thinking_config = if is_thinking_disabled {
+            Some(ThinkingConfig {
+                thinking_type: "disabled".to_string(),
+            })
+        } else {
+            Some(ThinkingConfig {
+                thinking_type: "enabled".to_string(),
+            })
+        };
+
+        let effective_reasoning_effort = if is_thinking_disabled {
+            Some("none".to_string())
+        } else {
+            Some(normalized_reasoning_effort)
         };
 
         let effective_temperature = if api_model.contains("flash") {
@@ -548,10 +720,8 @@ impl LlmClient {
             messages,
             tools,
             stream: true,
-            thinking: Some(ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-            }),
-            reasoning_effort: Some(effective_reasoning_effort),
+            thinking: thinking_config,
+            reasoning_effort: effective_reasoning_effort,
             temperature: effective_temperature,
             top_p: None,
             max_tokens: None,
@@ -584,9 +754,15 @@ impl LlmClient {
 
         let api_model_clone = api_model.clone();
         tokio::spawn(async move {
+            if let Some((compacted_messages, notice)) = auto_compact_event {
+                let _ = tx.send(StreamEvent::ContextCompacted { compacted_messages, notice }).await;
+            }
+            if let Some(notice) = offline_fallback_notice {
+                let _ = tx.send(StreamEvent::Notice(notice)).await;
+            }
             let start_time = std::time::Instant::now();
             let mut first_token_time = None;
-            let timeout_duration = std::time::Duration::from_secs(60);
+            let timeout_duration = std::time::Duration::from_secs(180);
             let mut total_content_chars = 0;
             let mut total_reasoning_chars = 0;
             let mut final_usage: Option<Usage> = None;
@@ -600,8 +776,8 @@ impl LlmClient {
                         break;
                     }
                     _ = tokio::time::sleep(timeout_duration) => {
-                        crate::forensic::ForensicLogger::log_error("stream_chat", "Stream idle timeout: DeepSeek API did not respond for 60 seconds.");
-                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: DeepSeek API did not respond for 60 seconds.".to_string())).await;
+                        crate::forensic::ForensicLogger::log_error("stream_chat", "Stream idle timeout: DeepSeek API did not respond for 180 seconds.");
+                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: DeepSeek API did not respond for 180 seconds.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
@@ -775,6 +951,65 @@ mod tests {
         LlmClient::sanitize_tool_call_sequences(&mut messages);
         // Orphan should be stripped
         assert_eq!(messages.len(), 4);
+
+        // Test intervening system message between assistant tool call and tool response
+        let mut messages_with_intervening = vec![
+            Message::assistant_with_tools(
+                None,
+                None,
+                vec![ToolCall {
+                    id: "call_sudo".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "run_shell_command".to_string(),
+                        arguments: "{\"command\":\"sudo whoami\"}".to_string(),
+                    },
+                }],
+            ),
+            Message::system("Sudo password saved in session RAM"),
+            Message::tool_response("call_sudo", "root\n"),
+        ];
+
+        LlmClient::sanitize_tool_call_sequences(&mut messages_with_intervening);
+        // Should not insert "cancelled", should put tool response right after assistant!
+        assert_eq!(messages_with_intervening.len(), 3);
+        assert_eq!(messages_with_intervening[0].role, "assistant");
+        assert_eq!(messages_with_intervening[1].role, "tool");
+        assert_eq!(messages_with_intervening[1].tool_call_id.as_deref(), Some("call_sudo"));
+        assert_eq!(messages_with_intervening[1].text_content(), Some("root\n"));
+        assert_eq!(messages_with_intervening[2].role, "system");
+    }
+
+    #[tokio::test]
+    async fn test_compact_messages_force() {
+        let client = LlmClient::new(Config::default());
+        let mut messages = vec![
+            Message::system("System prompt instructions"),
+            Message::user("Hello 1"),
+            Message::assistant("Answer 1", None),
+            Message::user("Hello 2"),
+            Message::assistant("Answer 2", None),
+            Message::user("Hello 3"),
+            Message::assistant("Answer 3", None),
+            Message::user("Hello 4"),
+            Message::assistant("Answer 4", None),
+            Message::user("Hello 5"),
+            Message::assistant("Answer 5", None),
+            Message::user("Hello 6"),
+            Message::assistant("Answer 6", None),
+        ];
+
+        let initial_count = messages.len();
+        let result = client.compact_messages(&mut messages, true).await;
+        assert!(result.is_ok());
+        let notice = result.unwrap();
+        assert!(notice.is_some());
+        // Should have compacted middle turns, keeping system, root user prompt (anchor), and active window
+        assert!(messages.len() < initial_count);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].text_content().unwrap(), "Hello 1");
+        assert!(messages[2].text_content().unwrap().contains("<CONTEXT_SUMMARY>"));
     }
 }
 

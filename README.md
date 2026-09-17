@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/sluisr/uti-cli/releases"><img src="https://img.shields.io/github/v/release/sluisr/uti-cli?color=blue&label=version" alt="Release"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/language-Rust%202021-orange.svg" alt="Rust 2021"></a>
-  <a href="https://platform.deepseek.com/"><img src="https://img.shields.io/badge/AI-DeepSeek%20V4%20Flash%20%7C%20Pro-blueviolet" alt="DeepSeek V4"></a>
+  <a href="https://platform.deepseek.com/"><img src="https://img.shields.io/badge/AI-DeepSeek%20V4.1%20Flash%20%7C%20Pro-blueviolet" alt="DeepSeek V4.1"></a>
   <a href="https://github.com/ggerganov/llama.cpp"><img src="https://img.shields.io/badge/Local%20LLM-llama.cpp%20%7C%20Ollama-green" alt="Local LLM"></a>
   <a href="https://github.com/sluisr/uti-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
   <a href="https://sluisr.com/"><img src="https://img.shields.io/badge/author-sluisr.com-purple" alt="Author"></a>
@@ -27,8 +27,8 @@ While `deepseek-cli` was born as a TypeScript adaptation of Google's Gemini CLI,
 
 * 🦀 **100% Native Rust Architecture:** Single standalone static binary. Zero Node.js runtime, zero `npm` dependencies, instant terminal startup (< 10ms), and minimal RAM footprint.
 * 💰 **Hybrid Intelligence (@ $0.00 Local Routing):** Seamlessly pairs DeepSeek Cloud with your local SLM (`llama-server`, `llama.cpp`, or `Ollama`) on port 8080. Non-coding questions and greetings are handled locally at **$0.00**, saving up to 70% in API costs.
-* 🧠 **DeepSeek V4 Cloud Engine:** Full native support for `deepseek-v4-flash` and `deepseek-v4-pro` (Reasoning / Thinking CoT mode).
-* ⚡ **Dynamic Adaptive Reasoning CoT:** Automatically uses ultra-fast reasoning (~200ms TTFT) for shell commands and system inspection, reserving deep multi-stage CoT for complex code generation and refactoring.
+* 🧠 **DeepSeek V4.1 Cloud Engine:** Full native support for `deepseek-flash` (DeepSeek-V4.1-Flash 522B vision-language MoE, native vision, 1M token context) and `deepseek-v4-pro` (Reasoning / Thinking CoT mode).
+* ⚡ **Dynamic Adaptive Reasoning CoT:** Automatically uses ultra-fast reasoning (~200ms TTFT) for shell commands and system inspection, reserving deep multi-stage CoT (`high` / `xhigh` / `max`) for complex code generation and refactoring.
 * 🛡️ **96%+ KV Cache Hit Rate:** Zero-invalidation architecture. Background tool-log compression keeps the KV cache intact, slashing DeepSeek API costs by up to ~90%.
 * 📝 **Atomic Code Patching (`apply_patch`):** Precise unified diff patching for token-efficient file modifications without rewrites.
 * 🔍 **Forensic Audit Telemetry:** Real-time tracking of Time-To-First-Token (TTFT), generation throughput (tokens/sec), exact financial costs ($USD), and KV cache savings.
@@ -59,7 +59,7 @@ UTI CLI offers 3 distinct execution modes switchable in real-time via `/model`:
 ```
 
 ### 1. ☁️ Mode 1: 100% Cloud API Models (DeepSeek Cloud)
-* **Engines:** `deepseek-v4-flash`, `deepseek-v4-pro` (Reasoning / Thinking CoT), and `deepseek-v4-flash-vision-exp`.
+* **Engines:** `deepseek-flash` (DeepSeek-V4.1-Flash multimodal with native vision & 1M context), `deepseek-v4-pro` (Reasoning / Thinking CoT), with backward-compatibility for `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`.
 * **Behavior:** All turns, reasoning, and tool calls run directly against the high-capacity DeepSeek Cloud API.
 * **Best For:** Heavy architectural redesigns, complex multi-file coding, and maximum AI capability.
 
@@ -87,7 +87,7 @@ Inside Hybrid Mode, you can choose between **4 specialized strategies**:
                  ▼                                               ▼
     ┌─────────────────────────┐                     ┌─────────────────────────┐
     │     LOCAL ASSISTANT     │                     │     DEEPSEEK CLOUD      │
-    │  (llama-server @ $0.00) │                     │   (deepseek-v4-flash)   │
+    │  (llama-server @ $0.00) │                     │    (deepseek-flash)     │
     └─────────────────────────┘                     └─────────────────────────┘
 ```
 
@@ -184,6 +184,7 @@ Inside the interactive TUI, type `/` to access built-in commands:
 | `/rewind` | Rewind conversation history to a previous turn. |
 | `/compress` | Manually compress conversation context to stay within token limits. |
 | `/mcp` | Manage Model Context Protocol (MCP) servers and tools. |
+| `/tasks` | Inspect and manage background tasks (`/tasks`, `/tasks status <pid>`, `/tasks kill <pid>`). |
 | `/plan` | Enter interactive planning mode for multi-file architectural changes. |
 | `/stats` | View session token metrics, cache hit rate, and financial costs. |
 | `/clear` | Clear the terminal conversation view. |
@@ -197,7 +198,8 @@ UTI CLI equips DeepSeek with native developer tools for autonomous development:
 
 * **⚡ `apply_patch`:** Unified diff atomic patching for safe, token-efficient code edits.
 * **📁 File Operations:** `read_file`, `write_file`, `smart_replace`, `list_directory`, `glob`, and `grep`.
-* **💻 Shell Execution (`run_shell_command`):** Autonomous bash command execution with silent, non-blocking AskPass for `sudo`.
+* **💻 Shell Execution (`run_shell_command` / `run_command`):** Autonomous bash command execution with adaptive execution timeout (`wait_ms_before_async`, default 5000ms). Fast commands return immediately, while long commands automatically detach to background tasks with silent AskPass for `sudo`.
+* **⚙️ Background Task Management (`manage_task`):** Unified task controller matching Antigravity architecture (`list`, `status`, `kill`, `send_input`).
 * **🌐 Web Fetch (`web_fetch`):** HTTP fetching and markdown extraction for online documentation and APIs.
 * **📋 Task Tracking (`write_todos`):** Dynamic multi-step task list tracking and progress monitoring.
 * **🧠 Persistent Memory:** Project-level (`./UTI.md`) and global (`~/.uti/UTI.md`) persistent context.
@@ -209,10 +211,10 @@ UTI CLI equips DeepSeek with native developer tools for autonomous development:
 UTI CLI logs complete telemetry to `~/.uti/logs/uti-forensic-YYYY-MM-DD.log`:
 
 ```text
-[2026-08-30 14:43:18.542][LLM_RESP    ] ─── INBOUND <- DeepSeek Cloud (deepseek-v4-flash) [1613 ms] ───
+[2026-08-30 14:43:18.542][LLM_RESP    ] ─── INBOUND <- DeepSeek Cloud (deepseek-flash) [1613 ms] ───
 Telemetry:
   • Engine:              DeepSeek Cloud
-  • Model:               deepseek-v4-flash
+  • Model:               deepseek-flash (DeepSeek-V4.1-Flash)
   • TTFT (First Token):  722 ms
   • Total Duration:      1613 ms
   • Output Speed:        78.7 tokens/sec
@@ -235,7 +237,7 @@ Token & Cost Forensics:
 Settings are stored in `~/.uti/`:
 
 * `~/.uti/settings.json` — API credentials, base URL, default models.
-* `~/.uti/flash_settings.json` — CoT reasoning effort depths (`low` / `medium` / `high`).
+* `~/.uti/flash_settings.json` — CoT reasoning effort depths (`none` / `low` / `high` / `xhigh` / `max`).
 * `~/.uti/hybrid_settings.json` — Strategy, local server endpoint, scout settings.
 * `~/.uti/logs/` — Forensic audit logs.
 

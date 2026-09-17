@@ -136,9 +136,33 @@ impl Tool for ReadManyFilesTool {
         }
 
         let mut concatenated = String::new();
+        let max_total_bytes = 1_000_000; // 1 MB total limit
+        let max_file_bytes = 200_000; // 200 KB per file limit
+
         for file in matched_files.iter().take(20) { // Limit to 20 files to avoid context blowout
+            if concatenated.len() >= max_total_bytes {
+                concatenated.push_str("\n[Output capped: Reached 1MB multi-file content limit]\n");
+                break;
+            }
+
             let rel = file.strip_prefix(&context.workspace_dir).unwrap_or(file);
             concatenated.push_str(&format!("=== FILE: {} ===\n", rel.display()));
+
+            if crate::fs_tools::is_binary_file(file) {
+                concatenated.push_str("(Skipped binary file)\n\n");
+                continue;
+            }
+
+            let file_size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            if file_size > max_file_bytes as u64 {
+                concatenated.push_str(&format!(
+                    "(Skipped: file size {} exceeds {} per-file limit)\n\n",
+                    crate::fs_tools::format_size(file_size),
+                    crate::fs_tools::format_size(max_file_bytes as u64)
+                ));
+                continue;
+            }
+
             match fs::read_to_string(file) {
                 Ok(content) => {
                     concatenated.push_str(&content);
@@ -285,7 +309,7 @@ impl Tool for ActivateSkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Loads specialized procedural expertise from the .gemini/skills directory."
+        "Loads specialized procedural expertise from .uti/skills or ~/.uti/skills directory."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -307,15 +331,25 @@ impl Tool for ActivateSkillTool {
             None => return Ok(ToolOutput::error("Missing 'name' argument.")),
         };
 
-        let skill_path = context.workspace_dir.join(".gemini").join("skills").join(name).join("SKILL.md");
-        if skill_path.exists() {
-            match fs::read_to_string(&skill_path) {
-                Ok(content) => Ok(ToolOutput::success(content)),
-                Err(e) => Ok(ToolOutput::error(format!("Failed to read skill {}: {}", name, e))),
+        // Search precedence: 1. Workspace .uti/skills 2. Global ~/.uti/skills 3. Fallback .gemini/skills
+        let candidates = [
+            context.workspace_dir.join(".uti").join("skills").join(name).join("SKILL.md"),
+            directories::BaseDirs::new()
+                .map(|b| b.home_dir().join(".uti").join("skills").join(name).join("SKILL.md"))
+                .unwrap_or_else(|| Path::new("").to_path_buf()),
+            context.workspace_dir.join(".gemini").join("skills").join(name).join("SKILL.md"),
+        ];
+
+        for path in &candidates {
+            if path.exists() {
+                match fs::read_to_string(path) {
+                    Ok(content) => return Ok(ToolOutput::success(content)),
+                    Err(e) => return Ok(ToolOutput::error(format!("Failed to read skill {}: {}", name, e))),
+                }
             }
-        } else {
-            Ok(ToolOutput::error(format!("Skill '{}' not found at {}", name, skill_path.display())))
         }
+
+        Ok(ToolOutput::error(format!("Skill '{}' not found in .uti/skills or ~/.uti/skills", name)))
     }
 }
 
@@ -328,7 +362,7 @@ impl Tool for GetInternalDocsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Accesses Gemini CLI's own documentation for accurate answers about its capabilities."
+        "Accesses UTI CLI's own documentation for accurate answers about its capabilities."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -337,7 +371,7 @@ impl Tool for GetInternalDocsTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to documentation."
+                    "description": "Path or topic in documentation."
                 }
             },
             "required": ["path"]
@@ -346,12 +380,25 @@ impl Tool for GetInternalDocsTool {
 
     async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let docs = r#"
-UTI CLI Documentation:
-- Model Selection: Supports deepseek-chat, deepseek-reasoner, deepseek-v4-flash, and deepseek-v4-pro.
-- Commands: 
-  * /clear : Clears conversational history.
-  * /plan : Toggles planning mode (read-only safe environment).
-- Tools: Fully equipped with filesystem, search, background shell command execution, and task tracking tools.
+UTI CLI (Universal Terminal Intelligence) Documentation:
+- Architecture: 100% Native Rust autonomous agent with hybrid Cloud (DeepSeek) & Local (llama.cpp/Ollama) routing.
+- Model Selection: Supports deepseek-flash, deepseek-v4-pro, deepseek-chat, deepseek-reasoner, and local SLM on :8080.
+- Operating Modes:
+  * Pure Cloud (DeepSeek Cloud API)
+  * Offline Local ($0.00 air-gapped llama-server)
+  * Hybrid (Auto-Triage, Local Scout, Draft & Review, Compression Only)
+- Built-in Slash Commands:
+  * /chat, /resume, /save, /new : Session lifecycle management
+  * /model : Model switcher and hybrid settings
+  * /plan : Architectural planning mode (read-only safe exploration)
+  * /balance : DeepSeek account balance lookup
+  * /fim : Fill-in-the-Middle code autocompletion
+  * /rewind : Step back turns in the current session
+  * /compress : Context compaction
+  * /mcp : Model Context Protocol server inspector
+  * /sudo : Session RAM AskPass authentication
+  * /clear, /help, /info, /stats, /quit
+- Primary Tools: apply_patch, edit, read_file, write_file, grep, glob, list_directory, run_shell_command, web_search, web_fetch.
 "#;
         Ok(ToolOutput::success(docs))
     }
@@ -749,7 +796,7 @@ impl Tool for TrackerVisualizeTool {
         for (i, root) in root_tasks.iter().enumerate() {
             print_task_tree(&tasks, &root.id, "", i == len - 1, &mut visited, &mut output);
             if i < len - 1 {
-                output.push_str("\n");
+                output.push('\n');
             }
         }
 

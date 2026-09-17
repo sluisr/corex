@@ -25,3 +25,6 @@ async-trait = { workspace = true }
 shell-words = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

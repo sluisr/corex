@@ -5,7 +5,7 @@ use uti_core::types::ToolDefinition;
 
 use crate::apply_patch::ApplyPatchTool;
 use crate::background::{
-    KillBackgroundProcessTool, ListBackgroundProcessesTool, ReadBackgroundOutputTool,
+    KillBackgroundProcessTool, ListBackgroundProcessesTool, ManageTaskTool, ReadBackgroundOutputTool,
     WriteBackgroundInputTool,
 };
 use crate::fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, WriteFileTool};
@@ -41,6 +41,7 @@ impl ToolRegistry {
         let glob = Arc::new(GlobTool);
         let list_directory = Arc::new(LsTool);
         let run_shell_command = Arc::new(ShellTool);
+        let manage_task = Arc::new(ManageTaskTool);
         let list_background_processes = Arc::new(ListBackgroundProcessesTool);
         let read_background_output = Arc::new(ReadBackgroundOutputTool);
         let kill_background_process = Arc::new(KillBackgroundProcessTool);
@@ -70,6 +71,7 @@ impl ToolRegistry {
         registry.register_primary(glob.clone());
         registry.register_primary(list_directory.clone());
         registry.register_primary(run_shell_command.clone());
+        registry.register_primary(manage_task.clone());
         registry.register_primary(list_background_processes.clone());
         registry.register_primary(read_background_output.clone());
         registry.register_primary(kill_background_process.clone());
@@ -90,11 +92,20 @@ impl ToolRegistry {
         registry.register_primary(tracker_visualize);
         registry.register_primary(update_topic);
 
-        // Dynamic 1:1 aliases so DeepSeek / Gemini can invoke either canonical name or alias:
-        registry.tools.insert("replace".to_string(), edit);
-        registry.tools.insert("grep".to_string(), grep_search);
+        // Dynamic 1:1 aliases so DeepSeek / Codex / Gemini can invoke either canonical name or alias:
+        registry.tools.insert("replace".to_string(), edit.clone());
+        registry.tools.insert("edit_file".to_string(), edit);
+        registry.tools.insert("grep".to_string(), grep_search.clone());
+        registry.tools.insert("search_files".to_string(), grep_search);
         registry.tools.insert("web_search".to_string(), google_web_search);
-        registry.tools.insert("ls".to_string(), list_directory);
+        registry.tools.insert("ls".to_string(), list_directory.clone());
+        registry.tools.insert("read_dir".to_string(), list_directory);
+        registry.tools.insert("run_command".to_string(), run_shell_command.clone());
+        registry.tools.insert("execute_command".to_string(), run_shell_command.clone());
+        registry.tools.insert("bash".to_string(), run_shell_command);
+        registry.tools.insert("view_file".to_string(), read_file);
+        registry.tools.insert("find_files".to_string(), glob.clone());
+        registry.tools.insert("tasks".to_string(), manage_task);
 
         registry
     }
@@ -134,3 +145,28 @@ impl Default for ToolRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_codex_aliases_registered() {
+        let reg = ToolRegistry::new();
+        assert!(reg.get("execute_command").is_some());
+        assert_eq!(reg.get("execute_command").unwrap().name(), "run_shell_command");
+
+        assert!(reg.get("view_file").is_some());
+        assert_eq!(reg.get("view_file").unwrap().name(), "read_file");
+
+        assert!(reg.get("search_files").is_some());
+        assert_eq!(reg.get("search_files").unwrap().name(), "grep_search");
+
+        assert!(reg.get("find_files").is_some());
+        assert_eq!(reg.get("find_files").unwrap().name(), "glob");
+
+        assert!(reg.get("edit_file").is_some());
+        assert_eq!(reg.get("edit_file").unwrap().name(), "edit");
+    }
+}
+

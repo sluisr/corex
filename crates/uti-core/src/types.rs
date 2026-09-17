@@ -50,7 +50,15 @@ impl ContentPart {
         Self {
             part_type: "image_url".to_string(),
             text: None,
-            image_url: Some(ImageUrl { url: url.into() }),
+            image_url: Some(ImageUrl::new(url)),
+        }
+    }
+
+    pub fn image_url_with_detail(url: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            part_type: "image_url".to_string(),
+            text: None,
+            image_url: Some(ImageUrl::with_detail(url, detail)),
         }
     }
 }
@@ -58,6 +66,24 @@ impl ContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>, // "low" | "high" | "original" | "auto"
+}
+
+impl ImageUrl {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(url: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            detail: Some(detail.into()),
+        }
+    }
 }
 
 /// Message content — either a plain string (all existing messages) or a
@@ -350,4 +376,56 @@ pub struct BalanceInfo {
 pub struct BalanceResponse {
     pub is_available: bool,
     pub balance_infos: Vec<BalanceInfo>,
+}
+
+/// Safely slices a string up to `max_bytes` without panicking on multi-byte UTF-8 character boundaries.
+pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Safely truncates a string and appends "..." if it exceeds `max_len` display/byte length,
+/// never panicking on UTF-8 character boundaries.
+pub fn truncate_ellipsis(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let target = max_len.saturating_sub(3);
+    let mut cut = target;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &s[..cut])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_truncate_str_utf8() {
+        // '€' is 3 bytes (0xE2, 0x82, 0xAC)
+        let s = "abc€def";
+        // byte indices: 0:'a', 1:'b', 2:'c', 3..6:'€', 6:'d', 7:'e', 8:'f'
+        assert_eq!(safe_truncate_str(s, 3), "abc");
+        assert_eq!(safe_truncate_str(s, 4), "abc"); // cannot cut inside '€', rolls back to "abc"
+        assert_eq!(safe_truncate_str(s, 5), "abc");
+        assert_eq!(safe_truncate_str(s, 6), "abc€");
+        assert_eq!(safe_truncate_str(s, 100), "abc€def");
+    }
+
+    #[test]
+    fn test_truncate_ellipsis_utf8() {
+        let s = "abc€def";
+        let res = truncate_ellipsis(s, 6);
+        assert!(res.ends_with("..."));
+        // Never panics
+        assert_eq!(truncate_ellipsis(s, 100), s);
+    }
 }

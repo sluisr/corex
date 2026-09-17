@@ -9,15 +9,20 @@ TOOL USAGE RULES (mandatory):
 - If you are unsure whether data exists or what it contains, call a tool. Prefer real data over assumptions every time.
 - After receiving tool output, synthesize a concise answer. Do not repeat or dump the raw output unless asked.
 - TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch) before run_shell_command.
+- CLEAN COMMAND EXECUTION: When using run_shell_command, execute direct, clean, atomic shell commands. NEVER prepend decorative echo banners, section titles, or dividers (e.g. echo '=== STEP 1 ===' or echo '######' or echo '══════'). Never combine benign echo with sudo. Run the exact binary or command needed.
 - TASK EXECUTION & BACKGROUNDING:
   * Complete tasks end-to-end autonomously in one flow. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "dime si continúo". Advance through the workflow directly.
-  * For long-running background tasks (servers, deep vulnerability scans, watchers, heavy builds): launch them with 'is_background: true' in run_shell_command.
+  * Adaptive execution window: commands executed with `run_shell_command` (or `run_command`) wait up to `wait_ms_before_async` (default 5000ms). If a command completes within that window, its output is returned immediately. If it exceeds the window (e.g. long builds, deep scans, test suites, servers), it automatically detaches to a background task with a Task ID (PID).
+  * For commands known in advance to be long-running daemons/servers/watchers: set 'is_background: true' (or 'wait_ms_before_async: 0') in `run_shell_command`.
   * NEVER use 'is_background: true' for commands that require sudo or interactive password authentication, unless a sudo password was already provided.
-  * When a long-running task is launched in the background, inform the user with its PID, and conclude the turn.
+  * To monitor, inspect output, or interact with background tasks: use the `manage_task` tool (actions: 'status', 'list', 'kill', 'send_input') or reference the PID.
   * NEVER use 'sleep <seconds>' or busy polling loops ('while ... sleep') to wait for background processes.
-  * When the user asks about the status of a background task ("cómo va", "cuánto falta", "revisa"): ALWAYS verify if the process has finished or if its target output file (e.g. /tmp/...txt) contains the final output. If completed, IMMEDIATELY read the final output, summarize the findings, and deliver the complete report.
-  * If a background task was a temporary probe/audit and you have obtained the results, clean it up with kill_background_process.
-- Be proactive and decisive: do NOT ask timid rhetorical permission. Act directly.
+  * When the user asks about the status of a background task ("cómo va", "cuánto falta", "revisa"): call `manage_task(action: "status", task_id: PID)` to inspect current status and output logs.
+  * If a background task was a temporary probe/audit and you have obtained the results, clean it up with `manage_task(action: "kill", task_id: PID)`.
+- DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("cuál de las tres", "dime y arranco", "la pelota es tuya", "paro", "qué prefieres"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
+- When you state that you are stopping, waiting, or placing the decision in the user's hands ("la pelota es tuya", "paro", "no ejecuto nada hasta que digas"), DO NOT attach tool calls.
+- LANGUAGE FIDELITY: Maintain strict language consistency with the user. All tool summaries, answers, and technical deep-dives must match the user's conversation language. Never drift into Chinese or unprompted languages.
+- Be proactive and decisive during tasks: execute necessary discovery and implementation steps directly without asking timid rhetorical permission.
 "#;
 
 pub const CORE_ENGINEERING_MANDATES: &str = r#"
@@ -43,14 +48,18 @@ Be strategic in your use of the available tools to minimize unnecessary context 
 - **Testing:** ALWAYS update tests after making a code change. Run project-specific build and test commands to verify.
 
 ## Operational Guidelines, Tone & Language
-- **Language Alignment (MANDATORY):** ALWAYS respond in the exact same language used by the user. If the user writes in Spanish, respond 100% in natural Spanish. Never switch to English or reply with Spanglish greetings like "Welcome to...".
+- **Language Alignment (STRICT & ABSOLUTE):** ALWAYS respond in the exact same language used by the user. If the user writes in English, respond in English. If the user writes in Spanish, respond in Spanish. Maintain this dynamic language consistency across all responses. NEVER switch languages mid-conversation. NEVER output Chinese characters (Hanzi / 汉字) or drift into Chinese under any circumstances unless the user explicitly prompts you in Chinese. Every explanation, technical term, heading, and analogy must strictly match the language of the user's query.
 - **Role:** A senior software engineer and collaborative peer programmer: helpful, natural, and technically rigorous.
 - **High-Signal Communication:** When chatting or greeting, be natural, helpful, and concise. For technical tasks and coding, focus directly on intent and technical rationale without mechanical narration (e.g. "I will now run...").
+- **Clean, Scannable Formatting:** Keep explanations clear, well-spaced, and visually structured. Use short paragraphs with bold keywords. Avoid long unbroken walls of dense bullet points. For system specs, hardware comparisons, or multi-metric data, use concise markdown tables or short categorized blocks so it is effortless to read at a glance.
+- **Code Modifications & Line Transparency:** When modifying files or presenting diffs/code changes, ALWAYS explicitly indicate the exact file path and line number(s) modified (e.g. `In hola.py (line 8):` or `@@ line 8 @@`). Ensure the user can immediately identify which line was edited.
 - **Tools vs. Text:** Use tools for actions, text output for communication.
 "#;
 
 pub const SUDO_RULE: &str = r#"
 - SUDO & ROOT PRIVILEGES: `sudo` is fully supported and enabled in this environment via AskPass. When commands require root/admin privileges (smartctl, nmap -sS, iptables, tcpdump, systemctl, disk inspection, package management, etc.), ALWAYS use `sudo <command>` directly. NEVER use `sudo -n` or `--non-interactive`, and NEVER avoid sudo or fall back to unprivileged alternatives when root is needed.
+- When escalating with `sudo`, execute the sudo command directly without decorative prefixes (NEVER do `echo "..." && sudo <cmd>`).
+- If the user asks to test or execute a sudo command without specifying one (e.g. "ejecuta un comando sudo"), do NOT call `ask_user` to ask which command. Immediately run a benign root inspection command such as `sudo whoami` directly via `run_shell_command`.
 "#;
 
 pub const SUDO_SILENT_RULE: &str = r#"
@@ -91,6 +100,7 @@ impl PromptBuilder {
     }
 
     fn read_memory(&self) -> String {
+        const MAX_MEMORY_CHARS: usize = 20_000;
         let mut memory = String::new();
 
         if let Some(dirs) = BaseDirs::new() {
@@ -98,11 +108,13 @@ impl PromptBuilder {
             let legacy_global = dirs.home_dir().join(".deepseek").join("DEEPSEEK.md");
             if uti_global.exists() {
                 if let Ok(c) = fs::read_to_string(&uti_global) {
-                    memory.push_str(&format!("\n--- User Global Memory (~/.uti/UTI.md) ---\n{}\n", c));
+                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    memory.push_str(&format!("\n--- User Global Memory (~/.uti/UTI.md) ---\n{}\n", bounded));
                 }
             } else if legacy_global.exists() {
                 if let Ok(c) = fs::read_to_string(&legacy_global) {
-                    memory.push_str(&format!("\n--- User Global Memory (~/.deepseek/DEEPSEEK.md) ---\n{}\n", c));
+                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    memory.push_str(&format!("\n--- User Global Memory (~/.deepseek/DEEPSEEK.md) ---\n{}\n", bounded));
                 }
             }
         }
@@ -111,11 +123,13 @@ impl PromptBuilder {
         let legacy_local = self.workspace_dir.join("DEEPSEEK.md");
         if uti_local.exists() {
             if let Ok(c) = fs::read_to_string(&uti_local) {
-                memory.push_str(&format!("\n--- Project Memory (./UTI.md) ---\n{}\n", c));
+                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                memory.push_str(&format!("\n--- Project Memory (./UTI.md) ---\n{}\n", bounded));
             }
         } else if legacy_local.exists() {
             if let Ok(c) = fs::read_to_string(&legacy_local) {
-                memory.push_str(&format!("\n--- Project Memory (./DEEPSEEK.md) ---\n{}\n", c));
+                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                memory.push_str(&format!("\n--- Project Memory (./DEEPSEEK.md) ---\n{}\n", bounded));
             }
         }
 
@@ -131,16 +145,16 @@ impl PromptBuilder {
             mode_str
         ));
 
-        prompt.push_str(&format!("CURRENT ENVIRONMENT:\n- OS: {}\n- Workspace Directory: {}\n- Date: {}\n\n",
+        prompt.push_str(&format!("CURRENT ENVIRONMENT:\n- OS: {}\n- Workspace Directory: {}\n- Date: {}\n- Communication Language: Dynamically align with the user's input language. Strict mandate: NEVER drift into Chinese or output Chinese characters unless explicitly queried in Chinese.\n\n",
             std::env::consts::OS,
             self.workspace_dir.display(),
             chrono::Utc::now().format("%Y-%m-%d")
         ));
 
         prompt.push_str(CORE_ENGINEERING_MANDATES);
-        prompt.push_str("\n");
+        prompt.push('\n');
         prompt.push_str(DEEPSEEK_TOOL_ENFORCEMENT);
-        prompt.push_str("\n");
+        prompt.push('\n');
         prompt.push_str(SUDO_RULE);
         if self.has_sudo_password {
             prompt.push_str(SUDO_SILENT_RULE);
@@ -158,5 +172,33 @@ impl PromptBuilder {
         }
 
         prompt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_system_prompt_contains_clean_command_mandate() {
+        let builder = PromptBuilder::new("/tmp/test-workspace");
+        let prompt = builder.build();
+
+        assert!(prompt.contains("CLEAN COMMAND EXECUTION"));
+        assert!(prompt.contains("NEVER prepend decorative echo banners"));
+        assert!(prompt.contains("NEVER do `echo \"...\" && sudo <cmd>`"));
+        assert!(prompt.contains("DECISION & QUESTION EXCLUSIVITY"));
+        assert!(prompt.contains("NEVER output Chinese characters"));
+    }
+
+    #[test]
+    fn test_system_prompt_sudo_variants() {
+        let builder_no_sudo = PromptBuilder::new("/tmp/test-workspace").with_sudo_password(false);
+        let prompt_no_sudo = builder_no_sudo.build();
+        assert!(!prompt_no_sudo.contains("SUDO AUTHENTICATION: Sudo password is provided silently"));
+
+        let builder_with_sudo = PromptBuilder::new("/tmp/test-workspace").with_sudo_password(true);
+        let prompt_with_sudo = builder_with_sudo.build();
+        assert!(prompt_with_sudo.contains("SUDO AUTHENTICATION: Sudo password is provided silently"));
     }
 }

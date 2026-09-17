@@ -28,7 +28,7 @@ impl HistoryStore {
 
         let reader = BufReader::new(file);
         let mut lines = Vec::new();
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
                 // Deduplicate consecutive entries

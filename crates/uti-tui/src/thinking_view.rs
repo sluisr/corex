@@ -10,6 +10,12 @@ pub struct ThinkingState {
     pub elapsed_secs: f32,
 }
 
+impl Default for ThinkingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ThinkingState {
     pub fn new() -> Self {
         Self {

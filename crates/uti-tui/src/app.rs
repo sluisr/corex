@@ -1,10 +1,12 @@
 use std::io::stdout;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -26,16 +28,13 @@ use uti_core::types::{Message, ToolCall};
 use uti_prompt::PromptBuilder;
 use uti_tools::registry::ToolRegistry;
 use uti_tools::types::ToolContext;
+use uti_tools::{command_requires_sudo, extract_first_sudo_command};
 
 use crate::ascii::render_gradient_logo;
 use crate::auth_dialog::{render_auth_dialog, AuthDialogState};
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::markdown::render_markdown;
-use crate::model_dialog::{
-    render_model_dialog, FlashConfigRow, HybridConfigRow, ModelDialogState, ModelDialogView,
-    ProConfigRow, HYBRID_LOCAL_MODELS, HYBRID_PRIMARY_MODELS, PRO_REASONING_LEVELS,
-    REASONING_LEVELS, SEARCH_REASONING_LEVELS, TEMPERATURE_PRESETS,
-};
+use crate::model_dialog::{render_model_dialog, ModelDialogState, ModelTab};
 use crate::session_dialog::{render_session_dialog, SessionDialogState};
 use crate::slash_commands::{render_command_popup, ALL_COMMANDS};
 use crate::sudo_dialog::{render_sudo_dialog, SudoDialogState};
@@ -62,6 +61,9 @@ pub struct App {
     pub history_idx: Option<usize>,
     pub saved_draft: String,
     pub slash_selected_idx: usize,
+    pub pastes: std::collections::HashMap<usize, String>,
+    pub next_paste_id: usize,
+    pub cursor_idx: usize,
 
     pub is_streaming: bool,
     pub thinking_state: ThinkingState,
@@ -87,6 +89,15 @@ pub struct App {
     pub last_esc_press: Option<Instant>,
     pub last_ctrl_c_press: Option<Instant>,
     pub slash_popup_height_current: f32,
+    pub last_slash_filter: String,
+    pub local_llm_online: Arc<AtomicBool>,
+    pub last_local_check: Option<Instant>,
+    pub cached_message_lines: Vec<Line<'static>>,
+    pub cached_message_count: usize,
+    pub cached_render_width: usize,
+    pub cached_session_id: String,
+    pub active_background_pids: std::collections::HashSet<u32>,
+    pub current_generation_id: u64,
 }
 
 impl App {
@@ -96,13 +107,14 @@ impl App {
         let persistent_history = uti_core::HistoryStore::load();
 
         let mut auth_dialog = AuthDialogState::new();
-        if cfg.api_key.trim().is_empty() {
+        if cfg.api_key.trim().is_empty() && !cfg.local_llm_enabled {
             auth_dialog.open();
         }
 
-        Self {
+        let is_online = Arc::new(AtomicBool::new(false));
+        let app = Self {
             session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir)),
-            llm_client,
+            llm_client: llm_client.clone(),
             tool_registry: ToolRegistry::new(),
             theme: Theme::default(),
             workspace_dir,
@@ -112,6 +124,9 @@ impl App {
             history_idx: None,
             saved_draft: String::new(),
             slash_selected_idx: 0,
+            pastes: std::collections::HashMap::new(),
+            next_paste_id: 1,
+            cursor_idx: 0,
 
             is_streaming: false,
             thinking_state: ThinkingState::new(),
@@ -137,6 +152,85 @@ impl App {
             last_esc_press: None,
             last_ctrl_c_press: None,
             slash_popup_height_current: 0.0,
+            last_slash_filter: String::new(),
+            local_llm_online: is_online,
+            last_local_check: None,
+            cached_message_lines: Vec::new(),
+            cached_message_count: 0,
+            cached_render_width: 0,
+            cached_session_id: String::new(),
+            active_background_pids: std::collections::HashSet::new(),
+            current_generation_id: 0,
+        };
+        app.trigger_local_health_check();
+        app
+    }
+
+    pub fn slash_popup_target_height(&self) -> f32 {
+        let is_modal_open = self.sudo_dialog.is_open
+            || self.model_dialog.is_open
+            || self.auth_dialog.is_open
+            || self.session_dialog.is_open
+            || self.user_dialog.is_open;
+
+        if !is_modal_open && self.input_buffer.starts_with('/') {
+            let filter = self.input_buffer.to_lowercase();
+            let count = ALL_COMMANDS
+                .iter()
+                .filter(|c| c.name.starts_with(&filter))
+                .count();
+            if count > 0 {
+                (count as f32 + 2.0).min(10.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }
+
+    pub fn is_slash_animating(&self) -> bool {
+        let target = self.slash_popup_target_height();
+        (target - self.slash_popup_height_current).abs() > 0.05
+    }
+
+    pub fn invalidate_message_cache(&mut self) {
+        self.cached_message_lines.clear();
+        self.cached_message_count = 0;
+        self.cached_render_width = 0;
+        self.cached_session_id.clear();
+    }
+
+    pub fn trigger_local_health_check(&self) {
+        let flag = self.local_llm_online.clone();
+        let local_client = self.llm_client.local_client();
+        tokio::spawn(async move {
+            let online = local_client.health_check().await;
+            flag.store(online, Ordering::Relaxed);
+        });
+    }
+
+    pub async fn reload_mcp_servers(&mut self) -> Vec<uti_tools::McpServerStatus> {
+        let cfg = self.llm_client.get_config();
+        let (tools, statuses) = uti_tools::load_mcp_servers(&cfg.mcp_servers).await;
+        for t in tools {
+            self.tool_registry.register(t);
+        }
+        statuses
+    }
+
+    pub fn poll_local_health_check(&mut self) {
+        let cfg = self.llm_client.get_config();
+        if !cfg.local_llm_enabled && !cfg.model.starts_with("local") {
+            return;
+        }
+        let should_check = match self.last_local_check {
+            None => true,
+            Some(t) => t.elapsed() >= Duration::from_secs(3),
+        };
+        if should_check {
+            self.last_local_check = Some(Instant::now());
+            self.trigger_local_health_check();
         }
     }
 
@@ -162,7 +256,32 @@ impl App {
         self.workspace_dir.display().to_string()
     }
 
-    pub fn start_stream_turn(&mut self, tx: mpsc::Sender<StreamEvent>) {
+    pub fn clamp_cursor(&mut self) {
+        if self.cursor_idx > self.input_buffer.len() {
+            self.cursor_idx = self.input_buffer.len();
+        }
+        while !self.input_buffer.is_char_boundary(self.cursor_idx) {
+            self.cursor_idx = self.cursor_idx.saturating_sub(1);
+        }
+    }
+
+    pub fn start_stream_turn(&mut self, tx: mpsc::Sender<(u64, StreamEvent)>) {
+        // Cancel any previous in-flight generation immediately
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+
+        self.current_generation_id = self.current_generation_id.wrapping_add(1);
+        let turn_gen = self.current_generation_id;
+
+        self.streaming_text.clear();
+        self.streaming_tool_calls.clear();
+        self.thinking_state.reset();
+        self.thinking_state.is_streaming = true;
+        self.is_streaming = true;
+        self.auto_scroll = true;
+        self.last_turn_start = Some(Instant::now());
+
         let prompt_builder = PromptBuilder::new(&self.workspace_dir)
             .with_sudo_password(get_sudo_password().is_some())
             .with_plan_mode(self.plan_mode);
@@ -174,22 +293,21 @@ impl App {
         let cancel_token = CancellationToken::new();
         self.cancel_token = Some(cancel_token.clone());
 
-        self.is_streaming = true;
-        self.auto_scroll = true;
-        self.thinking_state.reset();
-        self.thinking_state.is_streaming = true;
-        self.last_turn_start = Some(Instant::now());
-
         let client = self.llm_client.clone();
         tokio::spawn(async move {
-            match client.stream_chat(messages, Some(tools), cancel_token).await {
+            match client.stream_chat(messages, Some(tools), cancel_token.clone()).await {
                 Ok(mut rx) => {
                     while let Some(evt) = rx.recv().await {
-                        let _ = tx.send(evt).await;
+                        if cancel_token.is_cancelled() {
+                            break;
+                        }
+                        let _ = tx.send((turn_gen, evt)).await;
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    if !cancel_token.is_cancelled() {
+                        let _ = tx.send((turn_gen, StreamEvent::Error(e.to_string()))).await;
+                    }
                 }
             }
         });
@@ -202,15 +320,16 @@ impl App {
         match name {
             "/clear" => {
                 self.session.messages.clear();
+                self.invalidate_message_cache();
                 self.thinking_state.reset();
                 self.streaming_text.clear();
-                return true;
+                true
             }
             "/plan" => {
                 self.plan_mode = !self.plan_mode;
                 let status = if self.plan_mode { "ENABLED" } else { "DISABLED" };
                 self.session.add_message(Message::system(format!("Architectural Plan Mode {}", status)));
-                return true;
+                true
             }
             "/stats" => {
                 let u = &self.session.total_usage;
@@ -220,7 +339,7 @@ impl App {
                     u.prompt_tokens, u.prompt_cache_hit_tokens, ratio, u.completion_tokens, u.total_tokens
                 );
                 self.session.add_message(Message::system(msg));
-                return true;
+                true
             }
             "/local" => {
                 if parts.len() > 1 && parts[1] == "status" {
@@ -261,7 +380,7 @@ impl App {
                 } else {
                     self.session.add_message(Message::system("Usage: /local <prompt> (ask local LLM directly) or /local status"));
                 }
-                return true;
+                true
             }
             "/hybrid" => {
                 let mut cfg = self.llm_client.get_config();
@@ -273,8 +392,8 @@ impl App {
                                     cfg.hybrid_settings.mode = m;
                                     cfg.local_llm_enabled = true;
                                     self.llm_client.update_config(cfg.clone());
-                                    let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                    let _ = cfg.save();
+                                    let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
+                                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                                     self.session.add_message(Message::system(format!(
                                         "Hybrid Strategy set to: {}\n{}",
                                         m.display_name(), m.description()
@@ -288,15 +407,15 @@ impl App {
                                 self.session.add_message(Message::system(format!(
                                     "Current Hybrid Strategy: {}\nUsage: /hybrid mode <triage|scout|review|compress>",
                                     cfg.hybrid_settings.mode.display_name()
-                                )));
+                                )) );
                             }
                         }
                         "on" | "true" | "1" => {
                             cfg.hybrid_compression = true;
                             cfg.local_llm_enabled = true;
                             self.llm_client.update_config(cfg.clone());
-                            let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                            let _ = cfg.save();
+                            let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
+                            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                             self.session.add_message(Message::system(format!(
                                 "Hybrid Mode ENABLED!\n- Strategy: {}\n- Primary Model: {}\n- Local Server: {}",
                                 cfg.hybrid_settings.mode.display_name(),
@@ -308,8 +427,8 @@ impl App {
                             cfg.hybrid_compression = false;
                             cfg.local_llm_enabled = false;
                             self.llm_client.update_config(cfg.clone());
-                            let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                            let _ = cfg.save();
+                            let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
+                            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                             self.session.add_message(Message::system("Hybrid Mode DISABLED (Pure Cloud active)."));
                         }
                         "status" => {
@@ -331,11 +450,11 @@ impl App {
                     cfg.local_llm_enabled = !cfg.local_llm_enabled;
                     let state = if cfg.local_llm_enabled { "ENABLED" } else { "DISABLED" };
                     self.llm_client.update_config(cfg.clone());
-                    let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                    let _ = cfg.save();
+                    let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
+                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.session.add_message(Message::system(format!("Hybrid Mode {}", state)));
                 }
-                return true;
+                true
             }
             "/balance" | "/wallet" => {
                 match self.llm_client.check_balance().await {
@@ -355,7 +474,7 @@ impl App {
                         self.session.add_message(Message::system(format!("Failed to retrieve balance: {}", e)));
                     }
                 }
-                return true;
+                true
             }
             "/chat" | "/sessions" => {
                 let subcmd = parts.get(1).copied().unwrap_or("list");
@@ -429,7 +548,7 @@ impl App {
                         self.session.add_message(Message::system("Usage: /chat list | /chat save <tag> | /chat resume <tag/id> | /chat delete <tag/id> | /chat new"));
                     }
                 }
-                return true;
+                true
             }
             "/resume" => {
                 if parts.len() > 1 {
@@ -455,9 +574,10 @@ impl App {
                         }
                     }
                 } else {
+                    self.slash_popup_height_current = 0.0;
                     self.session_dialog.open(&self.workspace_dir.display().to_string());
                 }
-                return true;
+                true
             }
             "/save" => {
                 if parts.len() > 1 {
@@ -470,7 +590,7 @@ impl App {
                 } else {
                     self.session.add_message(Message::system("Missing tag. Usage: /save <tag>"));
                 }
-                return true;
+                true
             }
             "/new" => {
                 let _ = self.session.save();
@@ -479,21 +599,27 @@ impl App {
                 self.streaming_text.clear();
                 self.thinking_state.reset();
                 self.session.add_message(Message::system(format!("Started new chat session (Model: {}).", cfg.model)));
-                return true;
+                true
             }
             "/model" => {
                 if parts.len() > 1 {
                     let new_model = parts[1];
                     let mut cfg = self.llm_client.get_config();
                     cfg.model = new_model.to_string();
+                    if !new_model.contains("local") {
+                        cfg.local_llm_enabled = false;
+                        cfg.hybrid_compression = false;
+                    }
+                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg.clone());
                     self.session.model = new_model.to_string();
                     self.session.temperature = Some(cfg.temperature);
                     self.session.reasoning_effort = Some(cfg.reasoning_effort);
                     let _ = self.session.save();
-                    self.session.add_message(Message::system(format!("Switched active model to '{}'.", new_model)));
+                    self.session.add_message(Message::system(format!("Switched and saved active model to '{}'.", new_model)));
                 } else {
                     let cfg = self.llm_client.get_config();
+                    self.slash_popup_height_current = 0.0;
                     self.model_dialog.open(
                         &cfg.model,
                         &cfg.flash_settings,
@@ -502,7 +628,7 @@ impl App {
                         cfg.local_llm_enabled && cfg.hybrid_compression,
                     );
                 }
-                return true;
+                true
             }
             "/sudo" => {
                 if parts.len() > 1 {
@@ -513,41 +639,381 @@ impl App {
                     set_sudo_password(None);
                     self.session.add_message(Message::system("Sudo password cleared from session RAM."));
                 }
-                return true;
+                true
+            }
+            "/key" | "/auth" => {
+                if parts.len() > 1 {
+                    let key_str = parts[1..].join(" ").trim().to_string();
+                    let mut cfg = self.llm_client.get_config();
+                    cfg.api_key = key_str.clone();
+                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
+                    self.llm_client.update_config(cfg);
+                    self.session.add_message(Message::system("DeepSeek API key updated and saved to ~/.uti/settings.json."));
+                } else {
+                    self.auth_dialog.open();
+                }
+                true
+            }
+            "/rewind" => {
+                if self.session.messages.is_empty() {
+                    self.session.add_message(Message::system("Conversation history is already empty."));
+                } else {
+                    let mut found_user = false;
+                    while let Some(msg) = self.session.messages.pop() {
+                        if msg.role == "user" {
+                            found_user = true;
+                            break;
+                        }
+                    }
+                    self.invalidate_message_cache();
+                    let _ = self.session.save();
+                    if found_user {
+                        self.session.add_message(Message::system("Rewound last conversation turn."));
+                    } else {
+                        self.session.add_message(Message::system("Cleared remaining messages."));
+                    }
+                }
+                true
+            }
+            "/compact" | "/compress" => {
+                match self.llm_client.compact_messages(&mut self.session.messages, true).await {
+                    Ok(Some(notice)) => {
+                        self.invalidate_message_cache();
+                        let _ = self.session.save();
+                        self.session.add_message(Message::system(notice));
+                    }
+                    Ok(None) => {
+                        self.session.add_message(Message::system(
+                            "Conversation history is too short to require compaction."
+                        ));
+                    }
+                    Err(e) => {
+                        self.session.add_message(Message::system(format!(
+                            "Failed to compact conversation: {}", e
+                        )));
+                    }
+                }
+                true
+            }
+            "/info" | "/author" | "/credits" => {
+                let cfg = self.llm_client.get_config();
+                let info = format!(
+                    "UTI CLI (Universal Terminal Intelligence) v0.1.0\n\
+                    - Author: sluisr <contact@sluisr.com> (https://sluisr.com/)\n\
+                    - Repository: https://github.com/sluisr/uti-cli\n\
+                    - Architecture: Pure Native Rust 2021 (Tokio, Ratatui, Crossterm)\n\
+                    - Active Model: {}\n\
+                    - Base URL: {}\n\
+                    - Local SLM Engine: {} (Enabled: {})\n\
+                    - Session ID: {}\n\
+                    - Workspace: {}\n\
+                    - Git Branch: {}",
+                    cfg.model,
+                    cfg.base_url,
+                    cfg.local_llm_url,
+                    cfg.local_llm_enabled,
+                    self.session.id,
+                    self.workspace_dir.display(),
+                    self.git_branch
+                );
+                self.session.add_message(Message::system(info));
+                true
+            }
+            "/prefix" => {
+                if parts.len() > 1 {
+                    let prefix_text = parts[1..].join(" ");
+                    self.session.add_message(Message::system(format!(
+                        "Response formatting prefix configured: '{}'. DeepSeek will direct its next output with this prefix.",
+                        prefix_text
+                    )));
+                } else {
+                    self.session.add_message(Message::system("Usage: /prefix <text> (e.g. /prefix Output: or /prefix ```json)"));
+                }
+                true
+            }
+            "/fim" => {
+                if parts.len() > 1 {
+                    let file_arg = parts[1];
+                    let file_path = if file_arg.starts_with('/') {
+                        PathBuf::from(file_arg)
+                    } else {
+                        self.workspace_dir.join(file_arg)
+                    };
+
+                    if !file_path.exists() {
+                        self.session.add_message(Message::system(format!("File '{}' not found.", file_arg)));
+                    } else {
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(content) => {
+                                if content.contains("<FIM_HOLE>") {
+                                    let prompt = format!(
+                                        "Please perform Fill-in-the-Middle (FIM) code completion for `{}`. Complete the exact code that belongs strictly inside `<FIM_HOLE>`:\n\n```\n{}\n```",
+                                        file_arg,
+                                        content
+                                    );
+                                    self.session.add_message(Message::user(prompt));
+                                    self.session.add_message(Message::system("FIM prompt loaded. Ready to stream completion."));
+                                } else {
+                                    self.session.add_message(Message::system(format!(
+                                        "FIM for '{}': Insert `<FIM_HOLE>` at the exact position in `{}` where code should be filled, then run `/fim {}` again.",
+                                        file_arg, file_arg, file_arg
+                                    )));
+                                }
+                            }
+                            Err(e) => {
+                                self.session.add_message(Message::system(format!("Error reading {}: {}", file_arg, e)));
+                            }
+                        }
+                    }
+                } else {
+                    self.session.add_message(Message::system("Usage: /fim <path/to/file> (Fill-in-the-Middle code completion using <FIM_HOLE>)"));
+                }
+                true
+            }
+            "/mcp" => {
+                let sub = parts.get(1).copied().unwrap_or("status");
+                match sub {
+                    "reload" => {
+                        let statuses = self.reload_mcp_servers().await;
+                        let mut msg = format!("Reloaded MCP Servers ({} configured):\n", statuses.len());
+                        if statuses.is_empty() {
+                            msg.push_str("  No servers in config. Add them to ~/.uti/settings.json under 'mcp_servers'.\n");
+                        }
+                        for s in &statuses {
+                            let icon = if s.is_connected { "[OK]" } else { "[ERR]" };
+                            msg.push_str(&format!("{} {} ({}): {} tools discovered\n", icon, s.name, s.command, s.tools_count));
+                            if let Some(ref e) = s.error {
+                                msg.push_str(&format!("   Error: {}\n", e));
+                            }
+                        }
+                        self.session.add_message(Message::system(msg));
+                    }
+                    _ => {
+                        let cfg = self.llm_client.get_config();
+                        if cfg.mcp_servers.is_empty() {
+                            let help = "No MCP (Model Context Protocol) servers configured.\n\
+                                To add MCP servers, configure ~/.uti/settings.json or .uti/settings.json:\n\
+                                {\n\
+                                  \"mcp_servers\": {\n\
+                                    \"github\": {\n\
+                                      \"command\": \"npx\",\n\
+                                      \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"],\n\
+                                      \"env\": { \"GITHUB_PERSONAL_ACCESS_TOKEN\": \"ghp_...\" }\n\
+                                    }\n\
+                                  }\n\
+                                }\n\
+                                Then run '/mcp reload' to connect.";
+                            self.session.add_message(Message::system(help));
+                        } else {
+                            let mut msg = format!("Configured MCP Servers ({}):\n", cfg.mcp_servers.len());
+                            for (name, scfg) in &cfg.mcp_servers {
+                                msg.push_str(&format!("- {}: {} {}\n", name, scfg.command, scfg.args.join(" ")));
+                            }
+                            msg.push_str("\nRun '/mcp reload' to spawn and register tools dynamically.");
+                            self.session.add_message(Message::system(msg));
+                        }
+                    }
+                }
+                true
+            }
+            "/tasks" | "/background" => {
+                let mgr = uti_tools::background::get_task_manager();
+                if parts.len() == 1 {
+                    let guard = mgr.lock().unwrap();
+                    let list = guard.list();
+                    self.session.add_message(Message::system(format!("Background Tasks:\n\n{}", list)));
+                } else {
+                    let sub = parts[1].to_lowercase();
+                    match sub.as_str() {
+                        "list" => {
+                            let guard = mgr.lock().unwrap();
+                            let list = guard.list();
+                            self.session.add_message(Message::system(format!("Background Tasks:\n\n{}", list)));
+                        }
+                        "status" | "log" | "output" => {
+                            if parts.len() > 2 {
+                                if let Ok(pid) = parts[2].parse::<u32>() {
+                                    let guard = mgr.lock().unwrap();
+                                    match guard.get_status(pid) {
+                                        Some(st) => self.session.add_message(Message::system(st)),
+                                        None => self.session.add_message(Message::system(format!("Task {} not found.", pid))),
+                                    }
+                                } else {
+                                    self.session.add_message(Message::system("Invalid Task ID / PID. Usage: /tasks status <pid>"));
+                                }
+                            } else {
+                                self.session.add_message(Message::system("Usage: /tasks status <pid>"));
+                            }
+                        }
+                        "kill" | "stop" => {
+                            if parts.len() > 2 {
+                                if let Ok(pid) = parts[2].parse::<u32>() {
+                                    let mut guard = mgr.lock().unwrap();
+                                    if guard.kill(pid) {
+                                        self.session.add_message(Message::system(format!("Terminated background task {}.", pid)));
+                                    } else {
+                                        self.session.add_message(Message::system(format!("Task {} not found.", pid)));
+                                    }
+                                } else {
+                                    self.session.add_message(Message::system("Invalid Task ID / PID. Usage: /tasks kill <pid>"));
+                                }
+                            } else {
+                                self.session.add_message(Message::system("Usage: /tasks kill <pid>"));
+                            }
+                        }
+                        "send" | "input" => {
+                            if parts.len() > 3 {
+                                if let Ok(pid) = parts[2].parse::<u32>() {
+                                    let input = parts[3..].join(" ");
+                                    let guard = mgr.lock().unwrap();
+                                    match guard.send_input(pid, input) {
+                                        Ok(true) => self.session.add_message(Message::system(format!("Sent input to task {}.", pid))),
+                                        _ => self.session.add_message(Message::system(format!("Failed to send input to task {}. (Task might be inactive)", pid))),
+                                    }
+                                } else {
+                                    self.session.add_message(Message::system("Invalid Task ID / PID. Usage: /tasks send <pid> <input>"));
+                                }
+                            } else {
+                                self.session.add_message(Message::system("Usage: /tasks send <pid> <input text>"));
+                            }
+                        }
+                        _ => {
+                            if let Ok(pid) = parts[1].parse::<u32>() {
+                                let guard = mgr.lock().unwrap();
+                                match guard.get_status(pid) {
+                                    Some(st) => self.session.add_message(Message::system(st)),
+                                    None => self.session.add_message(Message::system(format!("Task {} not found.", pid))),
+                                }
+                            } else {
+                                self.session.add_message(Message::system("Usage: /tasks [list] | /tasks status <pid> | /tasks kill <pid> | /tasks send <pid> <input>"));
+                            }
+                        }
+                    }
+                }
+                true
             }
             "/help" => {
                 let mut help = "Available Commands:\n".to_string();
                 for c in ALL_COMMANDS {
                     help.push_str(&format!("  {:<12} {}\n", c.name, c.description));
                 }
+                help.push_str("  /key <sk..>  Set or update your DeepSeek API key\n");
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
                 help.push_str("\nKeyboard Shortcuts:\n  Enter: Submit | Ctrl+T: Toggle Thought Box | Ctrl+C: Cancel/Exit | Up/Down: History / Command Nav");
                 self.session.add_message(Message::system(help));
-                return true;
+                true
             }
             _ => false,
         }
     }
 }
 
+/// Restores the terminal to its standard state by disabling raw mode,
+/// leaving alternate screen, disabling mouse capture/bracketed paste, and showing the cursor.
+pub fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut stdout = stdout();
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        crossterm::cursor::Show
+    );
+}
+
+/// RAII guard ensuring the terminal is always cleanly restored on drop (including panics and early returns).
+pub struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 pub async fn run_tui(mut app: App) -> Result<()> {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal();
+        default_hook(panic_info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(100);
+    let (event_tx, mut event_rx) = mpsc::channel::<(u64, StreamEvent)>(100);
 
-    let tick_rate = Duration::from_millis(16);
     let mut last_tick = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
-        terminal.draw(|f| {
-            render_ui(f, &mut app);
-        })?;
+        app.poll_local_health_check();
 
-        while let Ok(event) = event_rx.try_recv() {
+        // Check for finished background tasks and notify the user/session
+        let newly_finished: Vec<(u32, Option<i32>)> = {
+            if let Ok(mgr) = uti_tools::background::get_task_manager().lock() {
+                let mut finished = Vec::new();
+                let mut still_active = std::collections::HashSet::new();
+
+                for &pid in &app.active_background_pids {
+                    if let Some(proc) = mgr.get_process(pid) {
+                        if proc.is_active() {
+                            still_active.insert(pid);
+                        } else {
+                            finished.push((pid, proc.get_exit_code()));
+                        }
+                    } else {
+                        finished.push((pid, None));
+                    }
+                }
+
+                for (pid, proc) in mgr.all_processes() {
+                    if proc.is_active() {
+                        still_active.insert(*pid);
+                    }
+                }
+
+                app.active_background_pids = still_active;
+                finished
+            } else {
+                Vec::new()
+            }
+        };
+
+        for (pid, exit_code) in newly_finished {
+            let code_str = match exit_code {
+                Some(0) => "success (exit code: 0)".to_string(),
+                Some(c) => format!("exit code {}", c),
+                None => "stopped".to_string(),
+            };
+            app.session.add_message(Message::system(format!(
+                "[TASK FINISHED] Background task {} finished with {}. Use '/tasks status {}' to inspect output.",
+                pid, code_str, pid
+            )));
+            app.invalidate_message_cache();
+            needs_redraw = true;
+        }
+
+        let has_active_tasks = !app.active_background_pids.is_empty();
+        let is_animating = app.is_slash_animating();
+
+        if needs_redraw || app.is_streaming || has_active_tasks || is_animating {
+            terminal.draw(|f| {
+                render_ui(f, &mut app);
+            })?;
+            needs_redraw = false;
+        }
+
+        while let Ok((event_gen, event)) = event_rx.try_recv() {
+            if event_gen != app.current_generation_id {
+                // Drop stale/cancelled turn event to prevent concurrent interleaving
+                continue;
+            }
+            needs_redraw = true;
             match event {
                 StreamEvent::ReasoningDelta(delta) => {
                     app.thinking_state.content.push_str(&delta);
@@ -580,6 +1046,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.session.update_usage(&usage);
                 }
                 StreamEvent::ToolExecutionDone { call_id, output } => {
+                    if output.contains("incorrect password attempt")
+                        || output.contains("sudo: a password is required")
+                        || output.contains("sudo: PAM authentication")
+                    {
+                        set_sudo_password(None);
+                    }
                     app.session.add_message(Message::tool_response(call_id, output));
                 }
                 StreamEvent::AllToolsDone => {
@@ -607,8 +1079,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.llm_client.reasoning_cache().insert(key, cot.clone());
                     }
 
-                    if !app.streaming_tool_calls.is_empty() {
-                        let calls = app.streaming_tool_calls.clone();
+                    let valid_calls: Vec<ToolCall> = app.streaming_tool_calls
+                        .drain(..)
+                        .filter(|c| !c.function.name.trim().is_empty())
+                        .collect();
+
+                    if !valid_calls.is_empty() {
+                        let calls = valid_calls;
                         app.session.add_message(Message::assistant_with_tools(
                             assistant_text,
                             reasoning,
@@ -616,7 +1093,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         ));
 
                         app.streaming_text.clear();
-                        app.streaming_tool_calls.clear();
                         let _ = app.session.save();
 
                         // 1. Check if ANY tool in the batch needs user confirmation
@@ -658,11 +1134,29 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             .find(|c| c.function.name == "ask_user")
                             .and_then(|c| parse_questions(&c.function.arguments));
 
-                        if let Some(questions) = ask_questions {
-                            let ask_call = calls.iter().find(|c| c.function.name == "ask_user").unwrap();
+                        // Detect if any shell command requires sudo escalation
+                        let sudo_needed_cmd = calls.iter().find_map(|c| {
+                            if c.function.name == "run_shell_command" {
+                                let args_json: serde_json::Value = serde_json::from_str(&c.function.arguments).ok()?;
+                                let cmd = args_json.get("command")?.as_str()?;
+                                if command_requires_sudo(cmd) {
+                                    let extracted = extract_first_sudo_command(cmd).unwrap_or_else(|| cmd.to_string());
+                                    return Some(extracted);
+                                }
+                            }
+                            None
+                        });
+
+                        if let Some((questions, ask_call)) = ask_questions.and_then(|q| {
+                            calls.iter().find(|c| c.function.name == "ask_user").map(|c| (q, c))
+                        }) {
                             app.is_streaming = false;
                             app.thinking_state.reset();
                             app.user_dialog.open(questions, calls.clone(), ask_call.id.clone());
+                        } else if let Some(sudo_cmd) = sudo_needed_cmd {
+                            app.is_streaming = false;
+                            app.thinking_state.reset();
+                            app.sudo_dialog.open_batch(calls.clone(), sudo_cmd);
                         } else if requires_confirmation {
                             let combined_preview = if previews.is_empty() {
                                 None
@@ -683,6 +1177,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let tx = event_tx.clone();
                             let registry = app.tool_registry.clone();
                             let context = confirmation_context;
+                            let gen = app.current_generation_id;
 
                             tokio::spawn(async move {
                                 let mut handles = Vec::new();
@@ -711,13 +1206,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             duration_ms,
                                             success
                                         );
-                                        let _ = tx_call.send(StreamEvent::ToolExecutionDone { call_id, output }).await;
+                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
                                     }));
                                 }
                                 for h in handles {
                                     let _ = h.await;
                                 }
-                                let _ = tx.send(StreamEvent::AllToolsDone).await;
+                                let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
                             });
                         }
                     } else {
@@ -733,6 +1228,16 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.streaming_tool_calls.clear();
                         let _ = app.session.save();
                     }
+                }
+                StreamEvent::ContextCompacted { compacted_messages, notice } => {
+                    app.session.messages = compacted_messages;
+                    app.session.add_message(Message::system(notice));
+                    app.invalidate_message_cache();
+                    let _ = app.session.save();
+                }
+                StreamEvent::Notice(notice) => {
+                    app.session.add_message(Message::system(notice));
+                    app.invalidate_message_cache();
                 }
                 StreamEvent::Error(err) => {
                     app.is_streaming = false;
@@ -750,9 +1255,44 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         }
 
+        let tick_rate = if app.is_streaming || is_animating {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(80)
+        };
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
+            needs_redraw = true;
             match event::read()? {
+                Event::Paste(pasted) => {
+                    if app.sudo_dialog.is_open {
+                        app.sudo_dialog.password_input.push_str(pasted.trim());
+                    } else if app.auth_dialog.is_open {
+                        app.auth_dialog.input_buffer.push_str(pasted.trim());
+                    } else if app.user_dialog.is_open {
+                        let cur = app.user_dialog.current;
+                        if cur < app.user_dialog.questions.len() && !app.user_dialog.questions[cur].has_options {
+                            app.user_dialog.text_input[cur].push_str(&pasted);
+                        }
+                    } else if !app.is_streaming {
+                        app.clamp_cursor();
+                        let line_count = pasted.lines().count();
+                        if line_count > 1 || pasted.len() > 120 {
+                            let id = app.next_paste_id;
+                            app.next_paste_id += 1;
+                            let extra_lines = line_count.saturating_sub(1);
+                            let tag = format!("[Pasted text #{} +{} lines]", id, extra_lines);
+                            app.pastes.insert(id, pasted);
+                            app.input_buffer.insert_str(app.cursor_idx, &tag);
+                            app.cursor_idx += tag.len();
+                        } else {
+                            app.input_buffer.insert_str(app.cursor_idx, &pasted);
+                            app.cursor_idx += pasted.len();
+                        }
+                        app.slash_selected_idx = 0;
+                        app.last_esc_press = None;
+                    }
+                }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
                         app.auto_scroll = false;
@@ -769,13 +1309,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // --- 0. Cancel active streaming / generation immediately on Esc or Ctrl+C ---
-                    if app.is_streaming {
-                        if key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+                    if app.is_streaming
+                        && (key.code == KeyCode::Esc
+                            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
                         {
                             if let Some(token) = app.cancel_token.take() {
                                 token.cancel();
                             }
+                            app.current_generation_id = app.current_generation_id.wrapping_add(1);
                             app.is_streaming = false;
                             app.thinking_state.is_streaming = false;
 
@@ -802,19 +1343,25 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let _ = app.session.save();
                             continue;
                         }
-                    }
 
                     // --- 1. Sudo Password Dialog Active ---
                     if app.sudo_dialog.is_open {
                         match key.code {
                             KeyCode::Esc => {
-                                if let Some(call) = app.sudo_dialog.pending_call.take() {
+                                let calls = if !app.sudo_dialog.pending_calls.is_empty() {
+                                    std::mem::take(&mut app.sudo_dialog.pending_calls)
+                                } else if let Some(call) = app.sudo_dialog.pending_call.take() {
+                                    vec![call]
+                                } else {
+                                    Vec::new()
+                                };
+                                for call in calls {
                                     app.session.add_message(Message::tool_response(
                                         call.id,
                                         "Sudo authentication cancelled by user.",
                                     ));
-                                    app.start_stream_turn(event_tx.clone());
                                 }
+                                app.start_stream_turn(event_tx.clone());
                                 app.sudo_dialog.close();
                             }
                             KeyCode::Backspace => {
@@ -828,16 +1375,23 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 if pwd.is_empty() {
                                     app.sudo_dialog.error_msg = Some("Password cannot be empty.".to_string());
                                 } else {
-                                    set_sudo_password(Some(pwd));
-                                    app.session.add_message(Message::system("Sudo password saved in session RAM (silent AskPass enabled)."));
-                                    if let Some(call) = app.sudo_dialog.pending_call.take() {
+                                    // Sudo password is not persisted across commands
+                                    set_sudo_password(None);
+                                    let calls = if !app.sudo_dialog.pending_calls.is_empty() {
+                                        std::mem::take(&mut app.sudo_dialog.pending_calls)
+                                    } else if let Some(call) = app.sudo_dialog.pending_call.take() {
+                                        vec![call]
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    if !calls.is_empty() {
                                         let tx = event_tx.clone();
                                         let registry = app.tool_registry.clone();
-                                        let args_json = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+                                        let gen = app.current_generation_id;
                                         let context = ToolContext {
                                             workspace_dir: app.workspace_dir.clone(),
                                             yolo_mode: app.always_allow_tools,
-                                            sudo_password: get_sudo_password(),
+                                            sudo_password: Some(pwd),
                                             allowed_commands: app
                                                 .llm_client
                                                 .get_config()
@@ -846,12 +1400,28 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         };
                                         app.is_streaming = true;
                                         tokio::spawn(async move {
-                                            let output = match registry.execute(&call.function.name, args_json, &context).await {
-                                                Ok(o) => o.output,
-                                                Err(e) => format!("Execution error: {}", e),
-                                            };
-                                            let _ = tx.send(StreamEvent::ToolExecutionDone { call_id: call.id, output }).await;
-                                            let _ = tx.send(StreamEvent::AllToolsDone).await;
+                                            let mut handles = Vec::new();
+                                            for call in calls {
+                                                let reg = registry.clone();
+                                                let ctx = context.clone();
+                                                let tx_call = tx.clone();
+                                                let call_id = call.id.clone();
+                                                let tool_name = call.function.name.clone();
+                                                let args_str = call.function.arguments.clone();
+
+                                                handles.push(tokio::spawn(async move {
+                                                    let args_json = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
+                                                    let output = match reg.execute(&tool_name, args_json, &ctx).await {
+                                                        Ok(o) => o.output,
+                                                        Err(e) => format!("Execution error: {}", e),
+                                                    };
+                                                    let _ = tx_call.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
+                                                }));
+                                            }
+                                            for h in handles {
+                                                let _ = h.await;
+                                            }
+                                            let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
                                         });
                                     }
                                     app.sudo_dialog.close();
@@ -866,7 +1436,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     if app.auth_dialog.is_open {
                         match key.code {
                             KeyCode::Esc => {
-                                break;
+                                app.auth_dialog.close();
+                                app.session.add_message(Message::system(
+                                    "Auth dialog skipped. Set your API key anytime via /key <sk-...> or select offline models via /model."
+                                ));
                             }
                             KeyCode::Backspace => {
                                 app.auth_dialog.input_buffer.pop();
@@ -881,7 +1454,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 } else {
                                     let mut cfg = app.llm_client.get_config();
                                     cfg.api_key = key_str.clone();
-                                    let _ = cfg.save();
+                                    let _ = cfg.save_with_workspace(Some(&app.workspace_dir));
                                     app.llm_client.update_config(cfg);
                                     app.auth_dialog.close();
                                     app.session.add_message(Message::system("API key saved successfully to ~/.uti/settings.json. Ready to assist!"));
@@ -931,6 +1504,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             }
                                             app.llm_client.update_config(cfg);
                                             app.session = loaded;
+                                            app.invalidate_message_cache();
                                             app.session.add_message(Message::system(format!(
                                                 "Resumed session '{}' (Model: {}).",
                                                 app.session.title, app.session.model
@@ -950,598 +1524,328 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                     // --- 2. Model Dialog Active ---
                     if app.model_dialog.is_open {
-                        match app.model_dialog.view {
-                            ModelDialogView::Main => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.close();
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.selected_main_idx =
-                                            app.model_dialog.selected_main_idx.saturating_sub(1);
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.selected_main_idx =
-                                            (app.model_dialog.selected_main_idx + 1).min(2);
-                                    }
-                                    KeyCode::Char('1') => {
-                                        app.model_dialog.view = ModelDialogView::CloudMenu;
-                                    }
-                                    KeyCode::Char('2') => {
-                                        app.model_dialog.view = ModelDialogView::LocalMenu;
-                                    }
-                                    KeyCode::Char('3') => {
-                                        app.model_dialog.view = ModelDialogView::HybridConfig;
-                                    }
-                                    KeyCode::Enter => {
-                                        match app.model_dialog.selected_main_idx {
-                                            0 => {
-                                                app.model_dialog.view = ModelDialogView::CloudMenu;
-                                            }
-                                            1 => {
-                                                app.model_dialog.view = ModelDialogView::LocalMenu;
-                                            }
-                                            2 => {
-                                                app.model_dialog.view = ModelDialogView::HybridConfig;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                        match key.code {
+                            KeyCode::Esc => {
+                                app.model_dialog.close();
                             }
-                            ModelDialogView::CloudMenu => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.view = ModelDialogView::Main;
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.selected_cloud_idx =
-                                            app.model_dialog.selected_cloud_idx.saturating_sub(1);
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.selected_cloud_idx =
-                                            (app.model_dialog.selected_cloud_idx + 1).min(3);
-                                    }
-                                    KeyCode::Tab => {
+                            KeyCode::Tab => {
+                                app.model_dialog.next_tab();
+                            }
+                            KeyCode::BackTab => {
+                                app.model_dialog.prev_tab();
+                            }
+                            KeyCode::Char('1') => {
+                                app.model_dialog.current_tab = ModelTab::Models;
+                            }
+                            KeyCode::Char('2') => {
+                                app.model_dialog.current_tab = ModelTab::Flash;
+                            }
+                            KeyCode::Char('3') => {
+                                app.model_dialog.current_tab = ModelTab::Pro;
+                            }
+                            KeyCode::Char('4') => {
+                                app.model_dialog.current_tab = ModelTab::Hybrid;
+                            }
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                match app.model_dialog.current_tab {
+                                    ModelTab::Models => {
                                         app.model_dialog.persist_model = !app.model_dialog.persist_model;
                                     }
-                                    KeyCode::Char('1') => {
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.model = "deepseek-v4-flash".to_string();
-                                        cfg.local_llm_enabled = false;
-                                        cfg.hybrid_compression = false;
-                                        cfg.temperature = app.model_dialog.temperature;
-                                        cfg.reasoning_effort = app.model_dialog.flash_reasoning.clone();
-                                        if app.model_dialog.persist_model {
-                                            let _ = cfg.save();
+                                    ModelTab::Flash => {
+                                        app.model_dialog.flash_persist_permanent =
+                                            !app.model_dialog.flash_persist_permanent;
+                                        if app.model_dialog.flash_persist_permanent {
+                                            let flash_settings = app.model_dialog.to_flash_settings();
+                                            let _ = Config::save_flash_settings(&flash_settings);
                                         }
-                                        app.llm_client.update_config(cfg.clone());
-                                        app.session.model = cfg.model;
-                                        app.session.temperature = Some(cfg.temperature);
-                                        app.session.reasoning_effort = Some(cfg.reasoning_effort);
-                                        let _ = app.session.save();
-                                        app.session.add_message(Message::system("Selected Model: DeepSeek-V4-Flash (Standard Cloud Mode)"));
-                                        app.model_dialog.close();
                                     }
-                                    KeyCode::Char('2') => {
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.model = "deepseek-v4-pro".to_string();
-                                        cfg.local_llm_enabled = false;
-                                        cfg.hybrid_compression = false;
-                                        cfg.reasoning_effort = app.model_dialog.pro_reasoning.clone();
-                                        if app.model_dialog.persist_model {
-                                            let _ = cfg.save();
+                                    ModelTab::Pro => {
+                                        app.model_dialog.pro_persist_permanent =
+                                            !app.model_dialog.pro_persist_permanent;
+                                        if app.model_dialog.pro_persist_permanent {
+                                            let pro_settings = app.model_dialog.to_pro_settings();
+                                            let _ = Config::save_pro_settings(&pro_settings);
                                         }
-                                        app.llm_client.update_config(cfg.clone());
-                                        app.session.model = cfg.model;
-                                        app.session.temperature = Some(cfg.temperature);
-                                        app.session.reasoning_effort = Some(cfg.reasoning_effort);
-                                        let _ = app.session.save();
-                                        app.session.add_message(Message::system("Selected Model: DeepSeek-V4-Pro (Thinking Cloud Mode)"));
-                                        app.model_dialog.close();
                                     }
-                                    KeyCode::Char('3') => {
-                                        app.model_dialog.view = ModelDialogView::FlashConfig;
+                                    ModelTab::Hybrid => {
+                                        app.model_dialog.hybrid_persist_permanent =
+                                            !app.model_dialog.hybrid_persist_permanent;
+                                        if app.model_dialog.hybrid_persist_permanent {
+                                            let hybrid_settings = app.model_dialog.to_hybrid_settings();
+                                            let _ = Config::save_hybrid_settings(&hybrid_settings);
+                                        }
                                     }
-                                    KeyCode::Char('4') => {
-                                        app.model_dialog.view = ModelDialogView::ProConfig;
-                                    }
-                                    KeyCode::Enter => {
-                                        match app.model_dialog.selected_cloud_idx {
-                                            0 => {
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.model = "deepseek-v4-flash".to_string();
-                                                cfg.local_llm_enabled = false;
-                                                cfg.hybrid_compression = false;
-                                                cfg.temperature = app.model_dialog.temperature;
-                                                cfg.reasoning_effort = app.model_dialog.flash_reasoning.clone();
-                                                if app.model_dialog.persist_model {
-                                                    let _ = cfg.save();
+                                }
+                            }
+                            _ => {
+                                match app.model_dialog.current_tab {
+                                    ModelTab::Models => {
+                                        match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.model_dialog.selected_model_idx =
+                                                    app.model_dialog.selected_model_idx.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.model_dialog.selected_model_idx =
+                                                    (app.model_dialog.selected_model_idx + 1).min(3);
+                                            }
+                                            KeyCode::Enter => {
+                                                match app.model_dialog.selected_model_idx {
+                                                    0 => {
+                                                        app.model_dialog.active_engine = 0;
+                                                        let mut cfg = app.llm_client.get_config();
+                                                        cfg.model = "deepseek-flash".to_string();
+                                                        cfg.local_llm_enabled = false;
+                                                        cfg.hybrid_compression = false;
+                                                        cfg.flash_settings = app.model_dialog.to_flash_settings();
+                                                        cfg.temperature = cfg.flash_settings.temperature;
+                                                        cfg.reasoning_effort = cfg.flash_settings.reasoning_effort.clone();
+                                                        if app.model_dialog.persist_model {
+                                                            let _ = cfg.save();
+                                                        }
+                                                        app.llm_client.update_config(cfg.clone());
+                                                        app.session.model = cfg.model.clone();
+                                                        app.session.temperature = Some(cfg.temperature);
+                                                        app.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
+                                                        let _ = app.session.save();
+                                                        app.session.add_message(Message::system(format!(
+                                                            "Activated DeepSeek-V4.1-Flash (Fast MoE Engine)\n- Temperature: {:.1}\n- General Reasoning: {}\n- Command CoT: {}\n- Code CoT: {}",
+                                                            cfg.temperature,
+                                                            cfg.reasoning_effort,
+                                                            cfg.flash_settings.command_reasoning_effort,
+                                                            cfg.flash_settings.code_reasoning_effort
+                                                        )));
+                                                        app.model_dialog.close();
+                                                    }
+                                                    1 => {
+                                                        app.model_dialog.active_engine = 1;
+                                                        let mut cfg = app.llm_client.get_config();
+                                                        cfg.model = "deepseek-pro".to_string();
+                                                        cfg.local_llm_enabled = false;
+                                                        cfg.hybrid_compression = false;
+                                                        cfg.pro_settings = app.model_dialog.to_pro_settings();
+                                                        cfg.reasoning_effort = cfg.pro_settings.reasoning_effort.clone();
+                                                        if app.model_dialog.persist_model {
+                                                            let _ = cfg.save();
+                                                        }
+                                                        app.llm_client.update_config(cfg.clone());
+                                                        app.session.model = cfg.model.clone();
+                                                        app.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
+                                                        let _ = app.session.save();
+                                                        app.session.add_message(Message::system(format!(
+                                                            "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: {}\n- Search CoT: {}",
+                                                            cfg.pro_settings.reasoning_effort,
+                                                            cfg.pro_settings.search_reasoning_effort
+                                                        )));
+                                                        app.model_dialog.close();
+                                                    }
+                                                    2 => {
+                                                        app.model_dialog.active_engine = 2;
+                                                        let mut cfg = app.llm_client.get_config();
+                                                        cfg.model = "local-assistant".to_string();
+                                                        cfg.local_llm_enabled = true;
+                                                        cfg.hybrid_compression = false;
+                                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
+                                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
+                                                        if app.model_dialog.persist_model {
+                                                            let _ = cfg.save();
+                                                        }
+                                                        app.llm_client.update_config(cfg.clone());
+                                                        app.session.model = cfg.model.clone();
+                                                        let _ = app.session.save();
+                                                        app.session.add_message(Message::system(format!(
+                                                            "Activated 100% Standalone Offline Local Assistant\n- Engine: {}\n- Endpoint: {}\n- Cost: $0.00 (Zero cloud telemetry)",
+                                                            cfg.local_llm_model, cfg.local_llm_url
+                                                        )));
+                                                        app.model_dialog.close();
+                                                    }
+                                                    3 => {
+                                                        app.model_dialog.active_engine = 3;
+                                                        let mut cfg = app.llm_client.get_config();
+                                                        cfg.model = "deepseek-flash".to_string();
+                                                        cfg.local_llm_enabled = true;
+                                                        cfg.hybrid_compression = true;
+                                                        cfg.hybrid_settings = app.model_dialog.to_hybrid_settings();
+                                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
+                                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
+                                                        if app.model_dialog.persist_model {
+                                                            let _ = cfg.save();
+                                                            let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
+                                                        }
+                                                        app.llm_client.update_config(cfg.clone());
+                                                        app.session.model = cfg.model.clone();
+                                                        let _ = app.session.save();
+                                                        app.session.add_message(Message::system(format!(
+                                                            "Activated Smart Hybrid Dual-Engine Mode\n- Strategy: {}\n- Local SLM: {}\n- Endpoint: {}\n- Auto Compression: {}",
+                                                            cfg.hybrid_settings.mode.display_name(),
+                                                            cfg.local_llm_model,
+                                                            cfg.local_llm_url,
+                                                            if cfg.hybrid_settings.auto_compression { "Enabled (~70% token savings)" } else { "Disabled" }
+                                                        )));
+                                                        app.model_dialog.close();
+                                                    }
+                                                    _ => {}
                                                 }
-                                                app.llm_client.update_config(cfg.clone());
-                                                app.session.model = cfg.model;
-                                                app.session.temperature = Some(cfg.temperature);
-                                                app.session.reasoning_effort = Some(cfg.reasoning_effort);
-                                                let _ = app.session.save();
-                                                app.session.add_message(Message::system("Selected Model: DeepSeek-V4-Flash (Standard Cloud Mode)"));
-                                                app.model_dialog.close();
-                                            }
-                                            1 => {
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.model = "deepseek-v4-pro".to_string();
-                                                cfg.local_llm_enabled = false;
-                                                cfg.hybrid_compression = false;
-                                                cfg.reasoning_effort = app.model_dialog.pro_reasoning.clone();
-                                                if app.model_dialog.persist_model {
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg.clone());
-                                                app.session.model = cfg.model;
-                                                app.session.temperature = Some(cfg.temperature);
-                                                app.session.reasoning_effort = Some(cfg.reasoning_effort);
-                                                let _ = app.session.save();
-                                                app.session.add_message(Message::system("Selected Model: DeepSeek-V4-Pro (Thinking Cloud Mode)"));
-                                                app.model_dialog.close();
-                                            }
-                                            2 => {
-                                                app.model_dialog.view = ModelDialogView::FlashConfig;
-                                            }
-                                            3 => {
-                                                app.model_dialog.view = ModelDialogView::ProConfig;
                                             }
                                             _ => {}
                                         }
                                     }
-                                    _ => {}
-                                }
-                            }
-                            ModelDialogView::LocalMenu => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.view = ModelDialogView::Main;
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.selected_local_idx =
-                                            app.model_dialog.selected_local_idx.saturating_sub(1);
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.selected_local_idx =
-                                            (app.model_dialog.selected_local_idx + 1).min(3);
-                                    }
-                                    KeyCode::Char('1') => {
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.model = "local-assistant".to_string();
-                                        cfg.local_llm_enabled = true;
-                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                        let _ = cfg.save();
-                                        app.llm_client.update_config(cfg.clone());
-                                        app.session.model = cfg.model.clone();
-                                        let _ = app.session.save();
-                                        app.session.add_message(Message::system(format!(
-                                            "Activated 100% Standalone Offline Local Assistant!\n- Engine: Local LLM ({})\n- Endpoint: {}\n- Cost: $0.00 (Zero Cloud Calls)",
-                                            cfg.local_llm_model, cfg.local_llm_url
-                                        )));
-                                        app.model_dialog.close();
-                                    }
-                                    KeyCode::Char('2') => {
-                                        let cfg = app.llm_client.get_config();
-                                        let is_up = app.llm_client.local_client().health_check().await;
-                                        app.session.add_message(Message::system(format!(
-                                            "Local LLM Server Status:\n- Reachable: {}\n- Endpoint: {}\n- Model: {}",
-                                            if is_up { "ONLINE (Active)" } else { "OFFLINE (Unreachable)" },
-                                            cfg.local_llm_url,
-                                            cfg.local_llm_model
-                                        )));
-                                        app.model_dialog.close();
-                                    }
-                                    KeyCode::Char('3') => {
-                                        let curr_idx = HYBRID_LOCAL_MODELS
-                                            .iter()
-                                            .position(|&m| m == app.model_dialog.hybrid_secondary_local_model)
-                                            .unwrap_or(0);
-                                        let next_idx = (curr_idx + 1) % HYBRID_LOCAL_MODELS.len();
-                                        app.model_dialog.hybrid_secondary_local_model =
-                                            HYBRID_LOCAL_MODELS[next_idx].to_string();
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                        cfg.hybrid_settings.secondary_local_model = cfg.local_llm_model.clone();
-                                        let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                        app.llm_client.update_config(cfg);
-                                    }
-                                    KeyCode::Char('4') => {
-                                        if app.model_dialog.hybrid_local_url == "http://127.0.0.1:8080/v1" {
-                                            app.model_dialog.hybrid_local_url = "http://localhost:11434/v1".to_string();
-                                        } else {
-                                            app.model_dialog.hybrid_local_url = "http://127.0.0.1:8080/v1".to_string();
-                                        }
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                        cfg.hybrid_settings.local_url = cfg.local_llm_url.clone();
-                                        let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                        app.llm_client.update_config(cfg);
-                                    }
-                                    KeyCode::Enter => {
-                                        match app.model_dialog.selected_local_idx {
-                                            0 => {
+                                    ModelTab::Flash => {
+                                        match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.model_dialog.flash_row_idx =
+                                                    app.model_dialog.flash_row_idx.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.model_dialog.flash_row_idx =
+                                                    (app.model_dialog.flash_row_idx + 1).min(5);
+                                            }
+                                            KeyCode::Left | KeyCode::Char('h') => {
+                                                app.model_dialog.cycle_flash_row(false);
+                                                let flash_settings = app.model_dialog.to_flash_settings();
                                                 let mut cfg = app.llm_client.get_config();
-                                                cfg.model = "local-assistant".to_string();
+                                                cfg.flash_settings = flash_settings.clone();
+                                                cfg.temperature = flash_settings.temperature;
+                                                cfg.reasoning_effort = flash_settings.reasoning_effort.clone();
+                                                if app.model_dialog.flash_persist_permanent {
+                                                    let _ = Config::save_flash_settings(&flash_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            KeyCode::Right | KeyCode::Char('l') => {
+                                                app.model_dialog.cycle_flash_row(true);
+                                                let flash_settings = app.model_dialog.to_flash_settings();
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.flash_settings = flash_settings.clone();
+                                                cfg.temperature = flash_settings.temperature;
+                                                cfg.reasoning_effort = flash_settings.reasoning_effort.clone();
+                                                if app.model_dialog.flash_persist_permanent {
+                                                    let _ = Config::save_flash_settings(&flash_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    ModelTab::Pro => {
+                                        match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.model_dialog.pro_row_idx =
+                                                    app.model_dialog.pro_row_idx.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.model_dialog.pro_row_idx =
+                                                    (app.model_dialog.pro_row_idx + 1).min(2);
+                                            }
+                                            KeyCode::Left | KeyCode::Char('h') => {
+                                                app.model_dialog.cycle_pro_row(false);
+                                                let pro_settings = app.model_dialog.to_pro_settings();
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.pro_settings = pro_settings.clone();
+                                                cfg.reasoning_effort = pro_settings.reasoning_effort.clone();
+                                                if app.model_dialog.pro_persist_permanent {
+                                                    let _ = Config::save_pro_settings(&pro_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            KeyCode::Right | KeyCode::Char('l') => {
+                                                app.model_dialog.cycle_pro_row(true);
+                                                let pro_settings = app.model_dialog.to_pro_settings();
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.pro_settings = pro_settings.clone();
+                                                cfg.reasoning_effort = pro_settings.reasoning_effort.clone();
+                                                if app.model_dialog.pro_persist_permanent {
+                                                    let _ = Config::save_pro_settings(&pro_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    ModelTab::Hybrid => {
+                                        match key.code {
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app.model_dialog.hybrid_row_idx =
+                                                    app.model_dialog.hybrid_row_idx.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app.model_dialog.hybrid_row_idx =
+                                                    (app.model_dialog.hybrid_row_idx + 1).min(4);
+                                            }
+                                            KeyCode::Left | KeyCode::Char('h') => {
+                                                app.model_dialog.cycle_hybrid_row(false);
+                                                let hybrid_settings = app.model_dialog.to_hybrid_settings();
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.hybrid_settings = hybrid_settings.clone();
+                                                cfg.local_llm_url = hybrid_settings.local_url.clone();
+                                                cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
+                                                cfg.hybrid_compression = hybrid_settings.auto_compression;
+                                                if app.model_dialog.hybrid_persist_permanent {
+                                                    let _ = Config::save_hybrid_settings(&hybrid_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            KeyCode::Right | KeyCode::Char('l') => {
+                                                app.model_dialog.cycle_hybrid_row(true);
+                                                let hybrid_settings = app.model_dialog.to_hybrid_settings();
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.hybrid_settings = hybrid_settings.clone();
+                                                cfg.local_llm_url = hybrid_settings.local_url.clone();
+                                                cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
+                                                cfg.hybrid_compression = hybrid_settings.auto_compression;
+                                                if app.model_dialog.hybrid_persist_permanent {
+                                                    let _ = Config::save_hybrid_settings(&hybrid_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.llm_client.update_config(cfg);
+                                            }
+                                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                                let is_up = app.llm_client.local_client().health_check().await;
+                                                if is_up {
+                                                    app.model_dialog.server_status_msg = Some((
+                                                        format!("ONLINE (Reachable at {})", app.model_dialog.hybrid_local_url),
+                                                        ratatui::style::Color::Rgb(105, 240, 174),
+                                                    ));
+                                                } else {
+                                                    app.model_dialog.server_status_msg = Some((
+                                                        format!("OFFLINE (Cannot connect to {})", app.model_dialog.hybrid_local_url),
+                                                        ratatui::style::Color::Rgb(244, 67, 54),
+                                                    ));
+                                                }
+                                            }
+                                            KeyCode::Enter => {
+                                                let mut cfg = app.llm_client.get_config();
+                                                cfg.model = "deepseek-flash".to_string();
                                                 cfg.local_llm_enabled = true;
+                                                cfg.hybrid_compression = true;
+                                                cfg.hybrid_settings = app.model_dialog.to_hybrid_settings();
                                                 cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
                                                 cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                                let _ = cfg.save();
+                                                if app.model_dialog.hybrid_persist_permanent {
+                                                    let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
+                                                    let _ = cfg.save();
+                                                }
+                                                app.model_dialog.active_engine = 3;
                                                 app.llm_client.update_config(cfg.clone());
                                                 app.session.model = cfg.model.clone();
                                                 let _ = app.session.save();
                                                 app.session.add_message(Message::system(format!(
-                                                    "Activated 100% Standalone Offline Local Assistant!\n- Engine: Local LLM ({})\n- Endpoint: {}\n- Cost: $0.00 (Zero Cloud Calls)",
-                                                    cfg.local_llm_model, cfg.local_llm_url
-                                                )));
-                                                app.model_dialog.close();
-                                            }
-                                            1 => {
-                                                let cfg = app.llm_client.get_config();
-                                                let is_up = app.llm_client.local_client().health_check().await;
-                                                app.session.add_message(Message::system(format!(
-                                                    "Local LLM Server Status:\n- Reachable: {}\n- Endpoint: {}\n- Model: {}",
-                                                    if is_up { "ONLINE (Active)" } else { "OFFLINE (Unreachable)" },
+                                                    "Activated Smart Hybrid Dual-Engine Mode\n- Strategy: {}\n- Local SLM: {}\n- Endpoint: {}\n- Auto Compression: {}",
+                                                    cfg.hybrid_settings.mode.display_name(),
+                                                    cfg.local_llm_model,
                                                     cfg.local_llm_url,
-                                                    cfg.local_llm_model
+                                                    if cfg.hybrid_settings.auto_compression { "Enabled (~70% token savings)" } else { "Disabled" }
                                                 )));
                                                 app.model_dialog.close();
-                                            }
-                                            2 => {
-                                                let curr_idx = HYBRID_LOCAL_MODELS
-                                                    .iter()
-                                                    .position(|&m| m == app.model_dialog.hybrid_secondary_local_model)
-                                                    .unwrap_or(0);
-                                                let next_idx = (curr_idx + 1) % HYBRID_LOCAL_MODELS.len();
-                                                app.model_dialog.hybrid_secondary_local_model =
-                                                    HYBRID_LOCAL_MODELS[next_idx].to_string();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                                cfg.hybrid_settings.secondary_local_model = cfg.local_llm_model.clone();
-                                                let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            3 => {
-                                                if app.model_dialog.hybrid_local_url == "http://127.0.0.1:8080/v1" {
-                                                    app.model_dialog.hybrid_local_url = "http://localhost:11434/v1".to_string();
-                                                } else {
-                                                    app.model_dialog.hybrid_local_url = "http://127.0.0.1:8080/v1".to_string();
-                                                }
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                                cfg.hybrid_settings.local_url = cfg.local_llm_url.clone();
-                                                let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                                app.llm_client.update_config(cfg);
                                             }
                                             _ => {}
                                         }
                                     }
-                                    _ => {}
-                                }
-                            }
-                            ModelDialogView::FlashConfig => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.view = ModelDialogView::CloudMenu;
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.flash_row = match app.model_dialog.flash_row {
-                                            FlashConfigRow::Temperature => FlashConfigRow::Temperature,
-                                            FlashConfigRow::ModelReasoning => FlashConfigRow::Temperature,
-                                            FlashConfigRow::CommandReasoning => FlashConfigRow::ModelReasoning,
-                                            FlashConfigRow::CodeReasoning => FlashConfigRow::CommandReasoning,
-                                            FlashConfigRow::SearchReasoning => FlashConfigRow::CodeReasoning,
-                                            FlashConfigRow::Persistence => FlashConfigRow::SearchReasoning,
-                                        };
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.flash_row = match app.model_dialog.flash_row {
-                                            FlashConfigRow::Temperature => FlashConfigRow::ModelReasoning,
-                                            FlashConfigRow::ModelReasoning => FlashConfigRow::CommandReasoning,
-                                            FlashConfigRow::CommandReasoning => FlashConfigRow::CodeReasoning,
-                                            FlashConfigRow::CodeReasoning => FlashConfigRow::SearchReasoning,
-                                            FlashConfigRow::SearchReasoning => FlashConfigRow::Persistence,
-                                            FlashConfigRow::Persistence => FlashConfigRow::Persistence,
-                                        };
-                                    }
-                                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                                        let is_right = key.code == KeyCode::Right;
-                                        match app.model_dialog.flash_row {
-                                            FlashConfigRow::Temperature => {
-                                                let curr_idx = TEMPERATURE_PRESETS.iter().position(|&t| (t - app.model_dialog.temperature).abs() < 0.05).unwrap_or(6);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(TEMPERATURE_PRESETS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.temperature = TEMPERATURE_PRESETS[next_idx];
-                                            }
-                                            FlashConfigRow::ModelReasoning => {
-                                                let curr_idx = REASONING_LEVELS.iter().position(|&r| r == app.model_dialog.flash_reasoning).unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.flash_reasoning = REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            FlashConfigRow::CommandReasoning => {
-                                                let curr_idx = crate::model_dialog::COMMAND_REASONING_LEVELS
-                                                    .iter()
-                                                    .position(|&r| r == app.model_dialog.flash_command_reasoning)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(crate::model_dialog::COMMAND_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.flash_command_reasoning =
-                                                    crate::model_dialog::COMMAND_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            FlashConfigRow::CodeReasoning => {
-                                                let curr_idx = crate::model_dialog::CODE_REASONING_LEVELS
-                                                    .iter()
-                                                    .position(|&r| r == app.model_dialog.flash_code_reasoning)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(crate::model_dialog::CODE_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.flash_code_reasoning =
-                                                    crate::model_dialog::CODE_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            FlashConfigRow::SearchReasoning => {
-                                                let curr_idx = SEARCH_REASONING_LEVELS.iter().position(|&s| s == app.model_dialog.flash_search_reasoning).unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(SEARCH_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.flash_search_reasoning = SEARCH_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            FlashConfigRow::Persistence => {
-                                                app.model_dialog.flash_persist_permanent = !app.model_dialog.flash_persist_permanent;
-                                            }
-                                        }
-
-                                        let flash_settings = app.model_dialog.to_flash_settings();
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.flash_settings = flash_settings.clone();
-                                        if cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" {
-                                            cfg.temperature = flash_settings.temperature;
-                                            cfg.reasoning_effort = flash_settings.reasoning_effort.clone();
-                                        }
-                                        if app.model_dialog.flash_persist_permanent {
-                                            let _ = Config::save_flash_settings(&flash_settings);
-                                        }
-                                        app.llm_client.update_config(cfg);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            ModelDialogView::ProConfig => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.view = ModelDialogView::CloudMenu;
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.pro_row = match app.model_dialog.pro_row {
-                                            ProConfigRow::ModelReasoning => ProConfigRow::ModelReasoning,
-                                            ProConfigRow::SearchReasoning => ProConfigRow::ModelReasoning,
-                                            ProConfigRow::Persistence => ProConfigRow::SearchReasoning,
-                                        };
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.pro_row = match app.model_dialog.pro_row {
-                                            ProConfigRow::ModelReasoning => ProConfigRow::SearchReasoning,
-                                            ProConfigRow::SearchReasoning => ProConfigRow::Persistence,
-                                            ProConfigRow::Persistence => ProConfigRow::Persistence,
-                                        };
-                                    }
-                                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                                        let is_right = key.code == KeyCode::Right;
-                                        match app.model_dialog.pro_row {
-                                            ProConfigRow::ModelReasoning => {
-                                                let curr_idx = PRO_REASONING_LEVELS.iter().position(|&r| r == app.model_dialog.pro_reasoning).unwrap_or(3);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(PRO_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.pro_reasoning = PRO_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            ProConfigRow::SearchReasoning => {
-                                                let curr_idx = SEARCH_REASONING_LEVELS.iter().position(|&s| s == app.model_dialog.pro_search_reasoning).unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(SEARCH_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.pro_search_reasoning = SEARCH_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            ProConfigRow::Persistence => {
-                                                app.model_dialog.pro_persist_permanent = !app.model_dialog.pro_persist_permanent;
-                                            }
-                                        }
-
-                                        let pro_settings = app.model_dialog.to_pro_settings();
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.pro_settings = pro_settings.clone();
-                                        if cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" {
-                                            cfg.reasoning_effort = pro_settings.reasoning_effort.clone();
-                                        }
-                                        if app.model_dialog.pro_persist_permanent {
-                                            let _ = Config::save_pro_settings(&pro_settings);
-                                        }
-                                        app.llm_client.update_config(cfg);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            ModelDialogView::HybridConfig => {
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        app.model_dialog.view = ModelDialogView::Main;
-                                    }
-                                    KeyCode::Up => {
-                                        app.model_dialog.hybrid_row = match app.model_dialog.hybrid_row {
-                                            HybridConfigRow::Mode => HybridConfigRow::Mode,
-                                            HybridConfigRow::PrimaryModel => HybridConfigRow::Mode,
-                                            HybridConfigRow::CommandReasoning => HybridConfigRow::PrimaryModel,
-                                            HybridConfigRow::CodeReasoning => HybridConfigRow::CommandReasoning,
-                                            HybridConfigRow::SecondaryLocalModel => HybridConfigRow::CodeReasoning,
-                                            HybridConfigRow::LocalUrl => HybridConfigRow::SecondaryLocalModel,
-                                            HybridConfigRow::AutoCompression => HybridConfigRow::LocalUrl,
-                                            HybridConfigRow::Persistence => HybridConfigRow::AutoCompression,
-                                        };
-                                    }
-                                    KeyCode::Down => {
-                                        app.model_dialog.hybrid_row = match app.model_dialog.hybrid_row {
-                                            HybridConfigRow::Mode => HybridConfigRow::PrimaryModel,
-                                            HybridConfigRow::PrimaryModel => HybridConfigRow::CommandReasoning,
-                                            HybridConfigRow::CommandReasoning => HybridConfigRow::CodeReasoning,
-                                            HybridConfigRow::CodeReasoning => HybridConfigRow::SecondaryLocalModel,
-                                            HybridConfigRow::SecondaryLocalModel => HybridConfigRow::LocalUrl,
-                                            HybridConfigRow::LocalUrl => HybridConfigRow::AutoCompression,
-                                            HybridConfigRow::AutoCompression => HybridConfigRow::Persistence,
-                                            HybridConfigRow::Persistence => HybridConfigRow::Persistence,
-                                        };
-                                    }
-                                    KeyCode::Enter => {
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.model = app.model_dialog.hybrid_primary_model.clone();
-                                        cfg.flash_settings.command_reasoning_effort = app.model_dialog.hybrid_command_reasoning.clone();
-                                        cfg.flash_settings.code_reasoning_effort = app.model_dialog.hybrid_code_reasoning.clone();
-                                        cfg.local_llm_enabled = true;
-                                        cfg.hybrid_compression = app.model_dialog.hybrid_auto_compression;
-                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                        cfg.hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                        if app.model_dialog.hybrid_persist_permanent {
-                                            let _ = cfg.save();
-                                            let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                            let _ = Config::save_flash_settings(&cfg.flash_settings);
-                                        }
-                                        app.llm_client.update_config(cfg.clone());
-                                        app.session.model = cfg.model.clone();
-                                        let _ = app.session.save();
-                                        app.session.add_message(Message::system(format!(
-                                            "Activated Hybrid Mode!\n- Strategy: {}\n- Primary Cloud Engine: {}\n- Command CoT: {} | Code CoT: {}\n- Secondary Local Assistant: {}\n- Local Server: {}",
-                                            cfg.hybrid_settings.mode.display_name(),
-                                            cfg.model,
-                                            cfg.flash_settings.command_reasoning_effort,
-                                            cfg.flash_settings.code_reasoning_effort,
-                                            cfg.local_llm_model,
-                                            cfg.local_llm_url
-                                        )));
-                                        app.model_dialog.close();
-                                    }
-                                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                                        let is_right = key.code == KeyCode::Right;
-                                        match app.model_dialog.hybrid_row {
-                                            HybridConfigRow::Mode => {
-                                                let curr_idx = crate::model_dialog::HYBRID_MODES
-                                                    .iter()
-                                                    .position(|&m| m == app.model_dialog.hybrid_mode)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1) % crate::model_dialog::HYBRID_MODES.len()
-                                                } else if curr_idx == 0 {
-                                                    crate::model_dialog::HYBRID_MODES.len() - 1
-                                                } else {
-                                                    curr_idx - 1
-                                                };
-                                                app.model_dialog.hybrid_mode = crate::model_dialog::HYBRID_MODES[next_idx];
-                                            }
-                                            HybridConfigRow::PrimaryModel => {
-                                                let curr_idx = HYBRID_PRIMARY_MODELS
-                                                    .iter()
-                                                    .position(|&m| m == app.model_dialog.hybrid_primary_model)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(HYBRID_PRIMARY_MODELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.hybrid_primary_model =
-                                                    HYBRID_PRIMARY_MODELS[next_idx].to_string();
-                                            }
-                                            HybridConfigRow::CommandReasoning => {
-                                                let curr_idx = crate::model_dialog::COMMAND_REASONING_LEVELS
-                                                    .iter()
-                                                    .position(|&r| r == app.model_dialog.hybrid_command_reasoning)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(crate::model_dialog::COMMAND_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.hybrid_command_reasoning =
-                                                    crate::model_dialog::COMMAND_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            HybridConfigRow::CodeReasoning => {
-                                                let curr_idx = crate::model_dialog::CODE_REASONING_LEVELS
-                                                    .iter()
-                                                    .position(|&r| r == app.model_dialog.hybrid_code_reasoning)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(crate::model_dialog::CODE_REASONING_LEVELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.hybrid_code_reasoning =
-                                                    crate::model_dialog::CODE_REASONING_LEVELS[next_idx].to_string();
-                                            }
-                                            HybridConfigRow::SecondaryLocalModel => {
-                                                let curr_idx = HYBRID_LOCAL_MODELS
-                                                    .iter()
-                                                    .position(|&m| m == app.model_dialog.hybrid_secondary_local_model)
-                                                    .unwrap_or(0);
-                                                let next_idx = if is_right {
-                                                    (curr_idx + 1).min(HYBRID_LOCAL_MODELS.len() - 1)
-                                                } else {
-                                                    curr_idx.saturating_sub(1)
-                                                };
-                                                app.model_dialog.hybrid_secondary_local_model =
-                                                    HYBRID_LOCAL_MODELS[next_idx].to_string();
-                                            }
-                                            HybridConfigRow::LocalUrl => {
-                                                if app.model_dialog.hybrid_local_url == "http://127.0.0.1:8080/v1" {
-                                                    app.model_dialog.hybrid_local_url = "http://localhost:11434/v1".to_string();
-                                                } else {
-                                                    app.model_dialog.hybrid_local_url = "http://127.0.0.1:8080/v1".to_string();
-                                                }
-                                            }
-                                            HybridConfigRow::AutoCompression => {
-                                                app.model_dialog.hybrid_auto_compression =
-                                                    !app.model_dialog.hybrid_auto_compression;
-                                            }
-                                            HybridConfigRow::Persistence => {
-                                                app.model_dialog.hybrid_persist_permanent =
-                                                    !app.model_dialog.hybrid_persist_permanent;
-                                            }
-                                        }
-
-                                        let hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                        let mut cfg = app.llm_client.get_config();
-                                        cfg.hybrid_settings = hybrid_settings.clone();
-                                        cfg.flash_settings.command_reasoning_effort = app.model_dialog.hybrid_command_reasoning.clone();
-                                        cfg.flash_settings.code_reasoning_effort = app.model_dialog.hybrid_code_reasoning.clone();
-                                        cfg.local_llm_url = hybrid_settings.local_url.clone();
-                                        cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
-                                        cfg.hybrid_compression = hybrid_settings.auto_compression;
-                                        if app.model_dialog.hybrid_persist_permanent {
-                                            let _ = Config::save_hybrid_settings(&hybrid_settings);
-                                            let _ = Config::save_flash_settings(&cfg.flash_settings);
-                                        }
-                                        app.llm_client.update_config(cfg);
-                                    }
-                                    _ => {}
                                 }
                             }
                         }
@@ -1589,6 +1893,25 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                             let pending_batch = app.pending_confirmation.take().unwrap();
                             let calls = pending_batch.calls;
+
+                            // Check if sudo password is required before running
+                            let sudo_needed = calls.iter().find_map(|c| {
+                                if c.function.name == "run_shell_command" {
+                                    let args_json: serde_json::Value = serde_json::from_str(&c.function.arguments).ok()?;
+                                    let cmd = args_json.get("command")?.as_str()?;
+                                    if command_requires_sudo(cmd) {
+                                        let extracted = extract_first_sudo_command(cmd).unwrap_or_else(|| cmd.to_string());
+                                        return Some(extracted);
+                                    }
+                                }
+                                None
+                            });
+
+                            if let Some(sudo_cmd) = sudo_needed {
+                                app.sudo_dialog.open_batch(calls, sudo_cmd);
+                                continue;
+                            }
+
                             let context = ToolContext {
                                 workspace_dir: app.workspace_dir.clone(),
                                 yolo_mode: app.always_allow_tools,
@@ -1598,6 +1921,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                             let tx = event_tx.clone();
                             let registry = app.tool_registry.clone();
+                            let gen = app.current_generation_id;
                             app.is_streaming = true;
 
                             tokio::spawn(async move {
@@ -1616,13 +1940,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             Ok(o) => o.output,
                                             Err(e) => format!("Execution error: {}", e),
                                         };
-                                        let _ = tx_call.send(StreamEvent::ToolExecutionDone { call_id, output }).await;
+                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
                                     }));
                                 }
                                 for h in handles {
                                     let _ = h.await;
                                 }
-                                let _ = tx.send(StreamEvent::AllToolsDone).await;
+                                let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
                             });
                             continue;
                         } else if should_deny {
@@ -1710,7 +2034,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.thinking_state.is_expanded = !app.thinking_state.is_expanded;
                             }
                             KeyCode::Char('l') => {
-                                app.session.messages.clear();
+                                terminal.clear()?;
+                                needs_redraw = true;
                             }
                             _ => {}
                         }
@@ -1727,19 +2052,160 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         .collect();
 
                     match key.code {
+                        KeyCode::Left => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                                let before = &app.input_buffer[..app.cursor_idx];
+                                let trimmed = before.trim_end();
+                                let non_space = match trimmed.rfind(' ') {
+                                    Some(pos) => pos + 1,
+                                    None => 0,
+                                };
+                                app.cursor_idx = non_space;
+                            } else if app.cursor_idx > 0 {
+                                let before = &app.input_buffer[..app.cursor_idx];
+                                if before.ends_with(']') {
+                                    if let Some(open_idx) = before.rfind("[Pasted text #") {
+                                        app.cursor_idx = open_idx;
+                                    } else {
+                                        let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                                        app.cursor_idx = prev;
+                                    }
+                                } else {
+                                    let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                                    app.cursor_idx = prev;
+                                }
+                            }
+                            app.clamp_cursor();
+                        }
+                        KeyCode::Right => {
+                            if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                                let after = &app.input_buffer[app.cursor_idx..];
+                                let trimmed = after.trim_start();
+                                let skip_spaces = after.len() - trimmed.len();
+                                let word_len = trimmed.find(' ').unwrap_or(trimmed.len());
+                                app.cursor_idx = (app.cursor_idx + skip_spaces + word_len).min(app.input_buffer.len());
+                            } else if app.cursor_idx < app.input_buffer.len() {
+                                let after = &app.input_buffer[app.cursor_idx..];
+                                if after.starts_with("[Pasted text #") {
+                                    if let Some(end_bracket) = after.find(']') {
+                                        app.cursor_idx = (app.cursor_idx + end_bracket + 1).min(app.input_buffer.len());
+                                    } else {
+                                        let next = after.chars().next().map(|c| app.cursor_idx + c.len_utf8()).unwrap_or(app.input_buffer.len());
+                                        app.cursor_idx = next;
+                                    }
+                                } else {
+                                    let next = after.chars().next().map(|c| app.cursor_idx + c.len_utf8()).unwrap_or(app.input_buffer.len());
+                                    app.cursor_idx = next;
+                                }
+                            }
+                            app.clamp_cursor();
+                        }
+                        KeyCode::Home => {
+                            app.cursor_idx = 0;
+                        }
+                        KeyCode::End => {
+                            app.cursor_idx = app.input_buffer.len();
+                        }
+                        KeyCode::Delete => {
+                            app.clamp_cursor();
+                            if app.cursor_idx < app.input_buffer.len() {
+                                let after = &app.input_buffer[app.cursor_idx..];
+                                if after.starts_with("[Pasted text #") {
+                                    if let Some(end_bracket) = after.find(']') {
+                                        let tag_slice = &after[..=end_bracket];
+                                        if let Some(num_str) = tag_slice.strip_prefix("[Pasted text #") {
+                                            if let Some(space_pos) = num_str.find(' ') {
+                                                if let Ok(id) = num_str[..space_pos].parse::<usize>() {
+                                                    app.pastes.remove(&id);
+                                                }
+                                            }
+                                        }
+                                        app.input_buffer.drain(app.cursor_idx..app.cursor_idx + end_bracket + 1);
+                                    } else {
+                                        let ch_len = after.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                                        app.input_buffer.drain(app.cursor_idx..app.cursor_idx + ch_len);
+                                    }
+                                } else {
+                                    let ch_len = after.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                                    app.input_buffer.drain(app.cursor_idx..app.cursor_idx + ch_len);
+                                }
+                                app.clamp_cursor();
+                            }
+                        }
                         KeyCode::Char(c) => {
-                            app.input_buffer.push(c);
-                            app.slash_selected_idx = 0;
-                            app.last_esc_press = None;
+                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                match c {
+                                    'a' => app.cursor_idx = 0,
+                                    'e' => app.cursor_idx = app.input_buffer.len(),
+                                    'u' => {
+                                        app.input_buffer.drain(..app.cursor_idx);
+                                        app.cursor_idx = 0;
+                                    }
+                                    'k' => {
+                                        app.input_buffer.truncate(app.cursor_idx);
+                                    }
+                                    'w' => {
+                                        let before = &app.input_buffer[..app.cursor_idx];
+                                        let trimmed = before.trim_end();
+                                        let non_space = match trimmed.rfind(' ') {
+                                            Some(pos) => pos + 1,
+                                            None => 0,
+                                        };
+                                        app.input_buffer.drain(non_space..app.cursor_idx);
+                                        app.cursor_idx = non_space;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                app.clamp_cursor();
+                                app.input_buffer.insert(app.cursor_idx, c);
+                                app.cursor_idx += c.len_utf8();
+                                app.slash_selected_idx = 0;
+                                app.last_esc_press = None;
+                            }
                         }
                         KeyCode::Backspace => {
-                            app.input_buffer.pop();
+                            app.clamp_cursor();
+                            if app.cursor_idx > 0 {
+                                let before = &app.input_buffer[..app.cursor_idx];
+                                if before.ends_with(']') {
+                                    if let Some(open_idx) = before.rfind("[Pasted text #") {
+                                        let tag_slice = &before[open_idx..];
+                                        if tag_slice.ends_with(']') {
+                                            if let Some(num_str) = tag_slice.strip_prefix("[Pasted text #") {
+                                                if let Some(space_pos) = num_str.find(' ') {
+                                                    if let Ok(id) = num_str[..space_pos].parse::<usize>() {
+                                                        app.pastes.remove(&id);
+                                                    }
+                                                }
+                                            }
+                                            app.input_buffer.drain(open_idx..app.cursor_idx);
+                                            app.cursor_idx = open_idx;
+                                        } else {
+                                            let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                                            app.input_buffer.drain(prev..app.cursor_idx);
+                                            app.cursor_idx = prev;
+                                        }
+                                    } else {
+                                        let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                                        app.input_buffer.drain(prev..app.cursor_idx);
+                                        app.cursor_idx = prev;
+                                    }
+                                } else {
+                                    let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
+                                    app.input_buffer.drain(prev..app.cursor_idx);
+                                    app.cursor_idx = prev;
+                                }
+                            }
+                            app.clamp_cursor();
                             app.slash_selected_idx = 0;
                             app.last_esc_press = None;
                         }
                         KeyCode::Esc => {
                             if is_slash_open && !matching_cmds.is_empty() {
                                 app.input_buffer.clear();
+                                app.cursor_idx = 0;
+                                app.pastes.clear();
                                 app.slash_selected_idx = 0;
                                 app.last_esc_press = None;
                             } else {
@@ -1750,9 +2216,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 if is_recent {
                                     // 2nd ESC within 500ms -> Clear prompt & reset history navigation!
                                     app.input_buffer.clear();
+                                    app.cursor_idx = 0;
+                                    app.pastes.clear();
                                     app.history_idx = None;
                                     app.saved_draft.clear();
                                     app.slash_selected_idx = 0;
+                                    app.slash_popup_height_current = 0.0;
                                     app.last_esc_press = None;
                                 } else {
                                     // 1st ESC -> Start 500ms window to show toast
@@ -1764,6 +2233,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             if is_slash_open && !matching_cmds.is_empty() {
                                 let selected = matching_cmds[app.slash_selected_idx % matching_cmds.len()];
                                 app.input_buffer = format!("{} ", selected);
+                                app.cursor_idx = app.input_buffer.len();
                             }
                         }
                         KeyCode::Up => {
@@ -1780,12 +2250,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         let last_idx = app.input_history.len() - 1;
                                         app.history_idx = Some(last_idx);
                                         app.input_buffer = app.input_history[last_idx].clone();
+                                        app.cursor_idx = app.input_buffer.len();
                                     }
                                     Some(i) => {
                                         if i > 0 {
                                             let next_i = i - 1;
                                             app.history_idx = Some(next_i);
                                             app.input_buffer = app.input_history[next_i].clone();
+                                            app.cursor_idx = app.input_buffer.len();
                                         }
                                     }
                                 }
@@ -1799,9 +2271,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let next_i = i + 1;
                                     app.history_idx = Some(next_i);
                                     app.input_buffer = app.input_history[next_i].clone();
+                                    app.cursor_idx = app.input_buffer.len();
                                 } else {
                                     app.history_idx = None;
                                     app.input_buffer = std::mem::take(&mut app.saved_draft);
+                                    app.cursor_idx = app.input_buffer.len();
                                 }
                             }
                         }
@@ -1832,29 +2306,25 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.history_idx = None;
                                 app.saved_draft.clear();
                                 app.input_buffer.clear();
+                                app.cursor_idx = 0;
                                 app.slash_selected_idx = 0;
+                                app.slash_popup_height_current = 0.0;
 
                                 if cmd_to_run == "/quit" || cmd_to_run == "/exit" {
                                     break;
                                 }
 
-                                if cmd_to_run.starts_with('/') {
-                                    if app.handle_slash_command(&cmd_to_run).await {
+                                if cmd_to_run.starts_with('/')
+                                    && app.handle_slash_command(&cmd_to_run).await {
                                         continue;
                                     }
-                                }
 
                                 let mut user_prompt_clean = cmd_to_run.clone();
 
-                                // Extract and strip $sudo:<password> securely into session RAM
+                                // Strip $sudo: if present
                                 if let Some(pos) = user_prompt_clean.find("$sudo:") {
                                     let after = &user_prompt_clean[pos + 6..];
                                     let end = after.find(' ').unwrap_or(after.len());
-                                    let pwd = &after[..end];
-                                    if !pwd.is_empty() {
-                                        set_sudo_password(Some(pwd.to_string()));
-                                        app.session.add_message(Message::system("Sudo password stored in session RAM (silent AskPass enabled)."));
-                                    }
                                     let before = &user_prompt_clean[..pos];
                                     let rest = &after[end..];
                                     user_prompt_clean = format!("{} {}", before.trim(), rest.trim()).trim().to_string();
@@ -1874,6 +2344,26 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     continue;
                                 }
 
+                                for (id, pasted_content) in &app.pastes {
+                                    let prefix = format!("[Pasted text #{}", id);
+                                    while let Some(start_idx) = user_prompt_clean.find(&prefix) {
+                                        let rest = &user_prompt_clean[start_idx..];
+                                        if let Some(end_bracket) = rest.find(']') {
+                                            user_prompt_clean.replace_range(start_idx..start_idx + end_bracket + 1, pasted_content);
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                app.pastes.clear();
+
+                                if app.is_streaming {
+                                    if let Some(token) = app.cancel_token.take() {
+                                        token.cancel();
+                                    }
+                                    app.is_streaming = false;
+                                }
+
                                 app.session.add_message(Message::user(user_prompt_clean));
 
                                 // ⚡ START TURN!
@@ -1885,6 +2375,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 _ => {}
             }
+        } else if is_animating {
+            needs_redraw = true;
         }
 
         if last_tick.elapsed() >= tick_rate {
@@ -1892,9 +2384,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
+    drop(_guard);
 
     println!("Session saved. Resume anytime with `uti --resume {}`", app.session.id);
     Ok(())
@@ -1903,9 +2393,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 /// Finishes the interactive ask_user dialog: executes the pending tool batch
 /// (feeding the user's answers to the `ask_user` call), then triggers the next
 /// agent turn via `AllToolsDone`.
-fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<StreamEvent>) {
+fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
     let tx = event_tx.clone();
     let registry = app.tool_registry.clone();
+    let gen = app.current_generation_id;
     let context = ToolContext {
         workspace_dir: app.workspace_dir.clone(),
         yolo_mode: app.always_allow_tools,
@@ -1923,18 +2414,18 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<StreamEvent>) {
         for call in calls {
             if call.id == ask_call_id {
                 let _ = tx
-                    .send(StreamEvent::ToolExecutionDone {
+                    .send((gen, StreamEvent::ToolExecutionDone {
                         call_id: call.id,
                         output: output.clone(),
-                    })
+                    }))
                     .await;
             } else if cancelled {
                 // Batch aborted: report every remaining call as skipped.
                 let _ = tx
-                    .send(StreamEvent::ToolExecutionDone {
+                    .send((gen, StreamEvent::ToolExecutionDone {
                         call_id: call.id,
                         output: "Skipped: user cancelled the pending questions.".to_string(),
-                    })
+                    }))
                     .await;
             } else {
                 let args_json = serde_json::from_str(&call.function.arguments)
@@ -1944,11 +2435,11 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<StreamEvent>) {
                     Err(e) => format!("Error executing {}: {}", call.function.name, e),
                 };
                 let _ = tx
-                    .send(StreamEvent::ToolExecutionDone { call_id: call.id, output: out })
+                    .send((gen, StreamEvent::ToolExecutionDone { call_id: call.id, output: out }))
                     .await;
             }
         }
-        let _ = tx.send(StreamEvent::AllToolsDone).await;
+        let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
     });
 }
 
@@ -1960,11 +2451,7 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()))
                 .unwrap_or(raw_args);
             let single_line_cmd = cmd.replace('\n', " ").replace("  ", " ");
-            let display_cmd = if single_line_cmd.len() > 80 {
-                format!("{}...", &single_line_cmd[..77])
-            } else {
-                single_line_cmd
-            };
+            let display_cmd = uti_core::truncate_ellipsis(&single_line_cmd, 80);
             vec![
                 Span::styled("  $ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(display_cmd, Style::default().fg(theme.accent_cyan)),
@@ -2015,12 +2502,26 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
                 Span::styled(path.to_string(), Style::default().fg(theme.accent_cyan)),
             ]
         }
+        "edit" | "replace" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            vec![
+                Span::styled("  [EDIT] edit ", Style::default().fg(theme.accent_yellow)),
+                Span::styled(path.to_string(), Style::default().fg(theme.accent_cyan)),
+            ]
+        }
+        "write_file" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            vec![
+                Span::styled("  [WRITE] write_file ", Style::default().fg(theme.accent_yellow)),
+                Span::styled(path.to_string(), Style::default().fg(theme.accent_cyan)),
+            ]
+        }
         _ => {
-            let display_args = if raw_args.len() > 60 {
-                format!("{}...", &raw_args[..57])
-            } else {
-                raw_args.to_string()
-            };
+            let display_args = uti_core::truncate_ellipsis(raw_args, 60);
             vec![
                 Span::styled("  [TOOL] ", Style::default().fg(theme.accent_yellow)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
@@ -2030,25 +2531,374 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
     }
 }
 
+fn format_input_spans<'a>(text: &'a str, theme: &'a Theme) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start_idx) = rest.find("[Pasted text #") {
+        if start_idx > 0 {
+            spans.push(Span::raw(&rest[..start_idx]));
+        }
+        let after_start = &rest[start_idx..];
+        if let Some(end_bracket) = after_start.find(']') {
+            let tag = &after_start[..=end_bracket];
+            spans.push(Span::styled(
+                tag,
+                Style::default()
+                    .fg(theme.accent_cyan)
+                    .bg(Color::Rgb(25, 45, 65))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            rest = &after_start[end_bracket + 1..];
+        } else {
+            spans.push(Span::raw(after_start));
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest));
+    }
+    spans
+}
+
+fn format_input_with_cursor<'a>(
+    text: &'a str,
+    cursor_idx: usize,
+    theme: &'a Theme,
+) -> (Vec<Span<'a>>, usize) {
+    let mut clamped = cursor_idx.min(text.len());
+    while !text.is_char_boundary(clamped) {
+        clamped = clamped.saturating_sub(1);
+    }
+    let mut spans = Vec::new();
+
+    if text.is_empty() {
+        spans.push(Span::styled("█", Style::default().fg(theme.accent_blue)));
+        return (spans, 0);
+    }
+
+    if clamped >= text.len() {
+        spans.extend(format_input_spans(text, theme));
+        let cursor_col: usize = spans.iter().map(|s| s.width()).sum();
+        spans.push(Span::styled("█", Style::default().fg(theme.accent_blue)));
+        return (spans, cursor_col);
+    }
+
+    let before = &text[..clamped];
+    let mut before_spans = format_input_spans(before, theme);
+    let cursor_col: usize = before_spans.iter().map(|s| s.width()).sum();
+
+    if text[clamped..].starts_with("[Pasted text #") {
+        if let Some(end_bracket) = text[clamped..].find(']') {
+            let tag = &text[clamped..=clamped + end_bracket];
+            let after = &text[clamped + end_bracket + 1..];
+            spans.append(&mut before_spans);
+            spans.push(Span::styled(
+                tag,
+                Style::default()
+                    .fg(Color::Rgb(20, 20, 20))
+                    .bg(theme.accent_blue)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.extend(format_input_spans(after, theme));
+            return (spans, cursor_col);
+        }
+    }
+
+    let c = text[clamped..].chars().next().unwrap_or(' ');
+    let c_len = c.len_utf8();
+    let char_str = &text[clamped..clamped + c_len];
+    let after = &text[clamped + c_len..];
+
+    spans.append(&mut before_spans);
+    spans.push(Span::styled(
+        char_str,
+        Style::default()
+            .fg(Color::Rgb(20, 20, 20))
+            .bg(theme.accent_blue)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.extend(format_input_spans(after, theme));
+
+    (spans, cursor_col)
+}
+
+fn format_system_message(text: &str, _theme: &Theme, content_max_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let raw_lines: Vec<&str> = text.lines().collect();
+
+    if raw_lines.is_empty() {
+        return lines;
+    }
+
+    let first_line = raw_lines[0].trim();
+
+    // Soft, muted color palette for discreet visual presence (opaco / disimulado)
+    let muted_dim = Color::Rgb(70, 82, 98);
+    let muted_label = Color::Rgb(105, 118, 135);
+    let muted_text = Color::Rgb(155, 168, 185);
+    let muted_tag = Color::Rgb(95, 115, 138);
+
+    // 1. Model Activation Message
+    if first_line.starts_with("Activated ") || first_line.starts_with("Switched ") {
+        let title = first_line.trim_start_matches("Activated ").trim_start_matches("Switched ");
+        let header_spans = vec![
+            Span::styled("  · ", Style::default().fg(muted_dim)),
+            Span::styled("[model] ", Style::default().fg(muted_tag)),
+            Span::styled(title.to_string(), Style::default().fg(muted_text)),
+        ];
+        lines.push(Line::from(header_spans));
+
+        for sub_line in &raw_lines[1..] {
+            let trimmed = sub_line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(param) = trimmed.strip_prefix("- ") {
+                let mut spans = vec![
+                    Span::styled("    · ", Style::default().fg(muted_dim)),
+                ];
+                if let Some((k, v)) = param.split_once(':') {
+                    spans.push(Span::styled(format!("{}: ", k.trim()), Style::default().fg(muted_label)));
+                    let val = v.trim();
+                    let val_color = match val.to_lowercase().as_str() {
+                        "dynamic" | "low" | "enabled" => Color::Rgb(115, 150, 135),
+                        "medium" => Color::Rgb(165, 150, 120),
+                        "high" | "max" => Color::Rgb(150, 130, 165),
+                        _ => Color::Rgb(140, 155, 175),
+                    };
+                    spans.push(Span::styled(val.to_string(), Style::default().fg(val_color)));
+                } else {
+                    spans.push(Span::styled(param.to_string(), Style::default().fg(muted_text)));
+                }
+                lines.push(Line::from(spans));
+            } else {
+                let spans = vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(trimmed.to_string(), Style::default().fg(muted_label)),
+                ];
+                lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    "));
+            }
+        }
+        return lines;
+    }
+
+    // 2. Error / Failure Message
+    if first_line.starts_with("Error") || first_line.starts_with("Failed") {
+        let err_spans = vec![
+            Span::styled("  ✕ ", Style::default().fg(Color::Rgb(190, 95, 95))),
+            Span::styled("[error] ", Style::default().fg(Color::Rgb(190, 95, 95))),
+            Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
+        ];
+        lines.extend(crate::markdown::wrap_spans(err_spans, content_max_width, "    "));
+        for sub_line in &raw_lines[1..] {
+            let spans = vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(sub_line.to_string(), Style::default().fg(muted_label)),
+            ];
+            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    "));
+        }
+        return lines;
+    }
+
+    // 3. Checkpoint / Saved Message
+    if first_line.contains("checkpoint saved") || first_line.contains("saved with tag") {
+        let save_spans = vec![
+            Span::styled("  ✓ ", Style::default().fg(Color::Rgb(105, 145, 125))),
+            Span::styled("[checkpoint] ", Style::default().fg(Color::Rgb(105, 145, 125))),
+            Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
+        ];
+        lines.extend(crate::markdown::wrap_spans(save_spans, content_max_width, "    "));
+        return lines;
+    }
+
+    // 4. Session Event
+    if first_line.starts_with("Resumed session") || first_line.starts_with("Started new chat") {
+        let session_spans = vec![
+            Span::styled("  · ", Style::default().fg(muted_dim)),
+            Span::styled("[session] ", Style::default().fg(muted_tag)),
+            Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
+        ];
+        lines.extend(crate::markdown::wrap_spans(session_spans, content_max_width, "    "));
+        return lines;
+    }
+
+    // 5. Default General Multi-line or Single-line System Message
+    let mut is_first = true;
+    for line in raw_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let prefix = if is_first { "  · " } else { "    " };
+        let sys_spans = vec![
+            Span::styled(prefix, Style::default().fg(muted_dim)),
+            Span::styled(trimmed.to_string(), Style::default().fg(muted_label)),
+        ];
+        lines.extend(crate::markdown::wrap_spans(sys_spans, content_max_width, "    "));
+        is_first = false;
+    }
+
+    lines
+}
+
+fn render_single_message_with_pending(
+    _msg_idx: usize,
+    msg: &Message,
+    next_msg: Option<&Message>,
+    theme: &Theme,
+    content_max_width: usize,
+    pending_conf: Option<&PendingToolBatch>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match msg.role.as_str() {
+        "user" => {
+            let content = msg.text_content().unwrap_or("");
+            let user_spans = vec![
+                Span::styled("❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                Span::styled(content.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            ];
+            let mut wrapped = crate::markdown::wrap_spans(user_spans, content_max_width, "  ");
+            wrapped.push(Line::from(""));
+            lines.extend(wrapped);
+        }
+        "assistant" => {
+            if let Some(text) = msg.text_content() {
+                let mut md_lines = render_markdown(text, theme, content_max_width);
+                md_lines.push(Line::from(""));
+                lines.extend(md_lines);
+            }
+
+            if let Some(ref calls) = msg.tool_calls {
+                for call in calls {
+                    if let Some(pending) = pending_conf {
+                        if pending.calls.iter().any(|c| c.id == call.id) {
+                            continue;
+                        }
+                    }
+
+                    let spans = format_tool_call_spans(&call.function.name, &call.function.arguments, theme);
+                    let wrapped = crate::markdown::wrap_spans(spans, content_max_width, "  ");
+                    lines.extend(wrapped);
+                }
+            }
+        }
+        "tool" => {
+            let content = msg.text_content().unwrap_or("");
+            let is_last_tool = next_msg.map(|m| m.role.as_str() != "tool").unwrap_or(true);
+
+            let check_slice = uti_core::safe_truncate_str(content, 2048);
+            if check_slice.contains("denied by user") || check_slice.contains("declined") {
+                let line_spans = vec![
+                    Span::styled("    ✕ ", Style::default().fg(Color::Red)),
+                    Span::styled("Execution declined by user", Style::default().fg(theme.gray)),
+                ];
+                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                lines.extend(wrapped);
+            } else if content.starts_with("Successfully edited") && content.contains('\n') {
+                let mut content_lines = content.lines();
+                let header = content_lines.next().unwrap_or("Successfully edited");
+                let header_spans = vec![
+                    Span::styled("    ✓ ", Style::default().fg(Color::Green)),
+                    Span::styled(header.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+                ];
+                let wrapped_header = crate::markdown::wrap_spans(header_spans, content_max_width, "    ");
+                lines.extend(wrapped_header);
+
+                for prev_line in content_lines {
+                    if prev_line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(body) = prev_line.strip_prefix('>') {
+                        let mut spans = vec![
+                            Span::styled("      > ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                        ];
+                        if let Some((num, code)) = body.split_once('|') {
+                            spans.push(Span::styled(num.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)));
+                            spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
+                            spans.push(Span::styled(code.to_string(), Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)));
+                        } else {
+                            spans.push(Span::styled(body.to_string(), Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)));
+                        }
+                        lines.push(Line::from(spans));
+                    } else {
+                        let clean_line = prev_line.strip_prefix(' ').unwrap_or(prev_line);
+                        let mut spans = vec![
+                            Span::styled("        ", Style::default()),
+                        ];
+                        if let Some((num, code)) = clean_line.split_once('|') {
+                            spans.push(Span::styled(num.to_string(), Style::default().fg(theme.dark_gray)));
+                            spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
+                            spans.push(Span::styled(code.to_string(), Style::default().fg(theme.gray)));
+                        } else {
+                            spans.push(Span::styled(clean_line.to_string(), Style::default().fg(theme.gray)));
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                }
+            } else {
+                let raw_line = content
+                    .lines()
+                    .take(50)
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("Done")
+                    .replace('\t', "    ");
+
+                let trimmed_banner = raw_line.trim_matches(|c| {
+                    c == '#' || c == '=' || c == '-' || c == '*' || c == ' '
+                        || c == '═' || c == '─' || c == '━' || c == '_' || c == '~'
+                });
+                let first_line_raw = if !trimmed_banner.is_empty() {
+                    trimmed_banner.to_string()
+                } else {
+                    raw_line
+                };
+
+                let is_err = first_line_raw.starts_with("Error") || first_line_raw.starts_with("Failed");
+                let icon = if is_err { "    ✕ " } else { "    ✓ " };
+                let icon_color = if is_err { Color::Red } else { Color::Green };
+
+                let display_first_line = if first_line_raw.len() > 140 {
+                    let mut end = 137;
+                    while end > 0 && !first_line_raw.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &first_line_raw[..end])
+                } else {
+                    first_line_raw
+                };
+
+                let line_spans = vec![
+                    Span::styled(icon, Style::default().fg(icon_color)),
+                    Span::styled(display_first_line, Style::default().fg(theme.gray)),
+                ];
+                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                lines.extend(wrapped);
+            }
+
+            if is_last_tool {
+                lines.push(Line::from(""));
+            }
+        }
+        "system" => {
+            if let Some(text) = msg.text_content() {
+                lines.extend(format_system_message(text, theme, content_max_width));
+                lines.push(Line::from(""));
+            }
+        }
+        _ => {}
+    }
+    lines
+}
+
 fn render_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
-    let show_popup = app.input_buffer.starts_with('/');
-    let target_height = if show_popup {
-        let filter = app.input_buffer.to_lowercase();
-        let matching_count = ALL_COMMANDS
-            .iter()
-            .filter(|c| c.name.starts_with(&filter))
-            .count();
-        if matching_count > 0 {
-            (matching_count as f32 + 2.0).min(10.0)
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    };
+    if app.input_buffer.starts_with('/') {
+        app.last_slash_filter = app.input_buffer.clone();
+    }
 
+    let target_height = app.slash_popup_target_height();
     let speed = 0.35;
     let diff = target_height - app.slash_popup_height_current;
     if diff.abs() > 0.05 {
@@ -2057,7 +2907,13 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         app.slash_popup_height_current = target_height;
     }
 
-    let popup_height = app.slash_popup_height_current.round() as u16;
+    // Bordered popup needs at least 3 lines (top border, 1 item, bottom border).
+    // When closing, any height < 2.5 snaps to 0 so the single top-border line is never rendered.
+    let popup_height = if app.slash_popup_height_current >= 2.5 {
+        app.slash_popup_height_current.round() as u16
+    } else {
+        0
+    };
 
     let chunks = if popup_height > 0 {
         Layout::default()
@@ -2091,85 +2947,64 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     let mut all_lines = Vec::new();
 
     // 1. Header Banner (First item in scrollable feed!)
-    let header_lines = render_gradient_logo("0.1.0");
+    let cfg = app.llm_client.get_config();
+    let is_auth = !cfg.api_key.trim().is_empty();
+    let is_local = cfg.local_llm_enabled;
+    let header_lines = render_gradient_logo("0.1.0", is_auth, is_local);
     all_lines.extend(header_lines);
 
-    // 2. Messages & Tool Executions List
-    for (msg_idx, msg) in app.session.messages.iter().enumerate() {
-        match msg.role.as_str() {
-            "user" => {
-                let content = msg.text_content().unwrap_or("");
-                let user_spans = vec![
-                    Span::styled("❯ ", Style::default().fg(app.theme.accent_blue).add_modifier(Modifier::BOLD)),
-                    Span::styled(content.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                ];
-                let mut lines = crate::markdown::wrap_spans(user_spans, content_max_width, "  ");
-                lines.push(Line::from(""));
-                all_lines.extend(lines);
-            }
-            "assistant" => {
-                if let Some(text) = msg.text_content() {
-                    let mut lines = render_markdown(text, &app.theme, content_max_width);
-                    lines.push(Line::from(""));
-                    all_lines.extend(lines);
-                }
+    // 2. Cached Messages & Tool Executions List
+    if app.cached_render_width != content_max_width || app.cached_session_id != app.session.id {
+        app.cached_message_lines.clear();
+        app.cached_message_count = 0;
+        app.cached_render_width = content_max_width;
+        app.cached_session_id = app.session.id.clone();
+    }
 
-                if let Some(ref calls) = msg.tool_calls {
-                    for call in calls {
-                        // If this tool call is currently pending confirmation, do not render duplicate raw JSON line!
-                        if let Some(ref pending) = app.pending_confirmation {
-                            if pending.calls.iter().any(|c| c.id == call.id) {
-                                continue;
-                            }
-                        }
+    let target_cache_count = if app.pending_confirmation.is_some() {
+        app.session.messages.len().saturating_sub(1)
+    } else {
+        app.session.messages.len()
+    };
 
-                        let spans = format_tool_call_spans(&call.function.name, &call.function.arguments, &app.theme);
-                        let wrapped = crate::markdown::wrap_spans(spans, content_max_width, "  ");
-                        all_lines.extend(wrapped);
-                    }
-                }
-            }
-            "tool" => {
-                let content = msg.text_content().unwrap_or("");
-                let is_last_tool = msg_idx + 1 >= app.session.messages.len()
-                    || app.session.messages[msg_idx + 1].role != "tool";
+    if app.cached_message_count > target_cache_count {
+        app.cached_message_lines.clear();
+        app.cached_message_count = 0;
+    }
 
-                let line_spans = if content.contains("denied by user") || content.contains("declined") {
-                    vec![
-                        Span::styled("    ✕ ", Style::default().fg(Color::Red)),
-                        Span::styled("Execution declined by user", Style::default().fg(app.theme.gray)),
-                    ]
-                } else {
-                    let first_line = content
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("Done")
-                        .replace('\t', "    ");
-                    vec![
-                        Span::styled("    ✓ ", Style::default().fg(Color::Green)),
-                        Span::styled(first_line, Style::default().fg(app.theme.gray)),
-                    ]
-                };
-
-                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
-                all_lines.extend(wrapped);
-                if is_last_tool {
-                    all_lines.push(Line::from(""));
-                }
-            }
-            "system" => {
-                if let Some(text) = msg.text_content() {
-                    let sys_spans = vec![
-                        Span::styled("  • ", Style::default().fg(app.theme.accent_cyan)),
-                        Span::styled(text.to_string(), Style::default().fg(app.theme.gray)),
-                    ];
-                    let wrapped = crate::markdown::wrap_spans(sys_spans, content_max_width, "    ");
-                    all_lines.extend(wrapped);
-                    all_lines.push(Line::from(""));
-                }
-            }
-            _ => {}
+    if app.cached_message_count != target_cache_count {
+        app.cached_message_lines.clear();
+        for msg_idx in 0..target_cache_count {
+            let msg = &app.session.messages[msg_idx];
+            let next_msg = app.session.messages[..target_cache_count].get(msg_idx + 1);
+            let rendered = render_single_message_with_pending(
+                msg_idx,
+                msg,
+                next_msg,
+                &app.theme,
+                content_max_width,
+                None,
+            );
+            app.cached_message_lines.extend(rendered);
         }
+        app.cached_message_count = target_cache_count;
+    }
+
+    all_lines.extend(app.cached_message_lines.iter().cloned());
+
+    if target_cache_count < app.session.messages.len() {
+        let msg_idx = target_cache_count;
+        let msg = &app.session.messages[msg_idx];
+        let next_msg = app.session.messages.get(msg_idx + 1);
+        let rendered = render_single_message_with_pending(
+            msg_idx,
+            msg,
+            next_msg,
+            &app.theme,
+            content_max_width,
+            app.pending_confirmation.as_ref(),
+        );
+        all_lines.extend(rendered);
     }
 
     // Render Tool Confirmation Dialog inline directly in the chat stream!
@@ -2242,51 +3077,56 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     } else {
         Span::styled("> ", Style::default().fg(app.theme.accent_blue).add_modifier(Modifier::BOLD))
     };
+    let prefix_width = prompt_prefix.width();
 
     let show_esc_hint = app.last_esc_press
         .map(|i| i.elapsed() <= Duration::from_millis(500))
         .unwrap_or(false);
 
-    let prompt_content = if app.pending_confirmation.is_some() {
-        Line::from(vec![
-            prompt_prefix,
-            Span::styled("(Press 1-3 or Enter to select, Esc to decline)", Style::default().fg(app.theme.dark_gray)),
-        ])
+    let (prompt_content, cursor_col) = if app.pending_confirmation.is_some() {
+        (
+            Line::from(vec![
+                prompt_prefix,
+                Span::styled("(Press 1-3 or Enter to select, Esc to decline)", Style::default().fg(app.theme.dark_gray)),
+            ]),
+            0,
+        )
     } else if show_esc_hint {
         let msg = if app.input_buffer.is_empty() {
             "Press Esc again to rewind."
         } else {
             "Press Esc again to clear prompt."
         };
-        Line::from(vec![
-            prompt_prefix,
-            Span::raw(&app.input_buffer),
-            Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
-            Span::styled(format!("({})", msg), Style::default().fg(app.theme.gray)),
-        ])
+        let (mut spans, col) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
+        spans.insert(0, prompt_prefix);
+        spans.push(Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray)));
+        (Line::from(spans), prefix_width + col)
     } else if app.input_buffer.is_empty() {
-        Line::from(vec![
-            prompt_prefix,
-            Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
-            Span::styled("Type your message or @path/to/file", Style::default().fg(app.theme.dark_gray)),
-        ])
+        (
+            Line::from(vec![
+                prompt_prefix,
+                Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
+                Span::styled("Type your message or @path/to/file", Style::default().fg(app.theme.dark_gray)),
+            ]),
+            prefix_width,
+        )
     } else {
-        Line::from(vec![
-            prompt_prefix,
-            Span::raw(&app.input_buffer),
-            Span::styled("█", Style::default().fg(app.theme.accent_blue)),
-        ])
+        let (mut spans, col) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
+        spans.insert(0, prompt_prefix);
+        (Line::from(spans), prefix_width + col)
     };
 
     let composer_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(app.theme.dark_gray));
 
-    // Horizontal scroll: keep the end of the input (and the █ cursor) visible
-    // once the text grows beyond the composer width.
-    let line_width = prompt_content.width() as u16;
-    let visible = composer_chunk.width.saturating_sub(1);
-    let scroll_x = line_width.saturating_sub(visible);
+    let visible = (composer_chunk.width as usize).saturating_sub(1).max(1);
+    let margin = if visible > 10 { 5 } else { 0 };
+    let scroll_x = if cursor_col < visible {
+        0
+    } else {
+        (cursor_col + margin).saturating_sub(visible) as u16
+    };
 
     frame.render_widget(
         Paragraph::new(prompt_content)
@@ -2297,7 +3137,12 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
 
     // Render slash command popup if active
     if let Some(p_chunk) = popup_chunk {
-        render_command_popup(frame, &app.input_buffer, app.slash_selected_idx, p_chunk, &app.theme);
+        let filter_text = if app.input_buffer.starts_with('/') {
+            &app.input_buffer
+        } else {
+            &app.last_slash_filter
+        };
+        render_command_popup(frame, filter_text, app.slash_selected_idx, p_chunk, &app.theme);
     }
 
     // 4. Status Footer Bar (Left: Workspace Path | Right: Model Info)
@@ -2324,7 +3169,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
 
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
-    let is_flash = cfg.model.contains("flash") || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4-Flash";
+    let is_flash = cfg.model.contains("flash") || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4-Flash";
     let is_pro = cfg.model.contains("pro") || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro";
 
     if is_flash {
@@ -2341,19 +3186,26 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             Color::Rgb(244, 67, 54)
         };
 
-        let r_color = match cfg.reasoning_effort.as_str() {
-            "low" => Color::Rgb(105, 240, 174),
-            "medium" => Color::Rgb(255, 152, 0),
-            "high" => Color::Rgb(244, 67, 54),
+        let effort = if (cfg.local_llm_enabled || cfg.reasoning_effort == "dynamic") && !cfg.flash_settings.code_reasoning_effort.is_empty() {
+            &cfg.flash_settings.code_reasoning_effort
+        } else {
+            &cfg.reasoning_effort
+        };
+
+        let r_color = match effort.as_str() {
+            "none" => Color::Rgb(158, 158, 158),
+            "low" => Color::Rgb(79, 195, 247),
+            "high" => Color::Rgb(255, 213, 79),
+            "xhigh" => Color::Rgb(255, 110, 64),
             "max" => Color::Rgb(224, 64, 251),
             _ => app.theme.accent_cyan,
         };
 
-        right_spans.push(Span::styled("DeepSeek-V4-Flash", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
+        right_spans.push(Span::styled("DeepSeek-V4.1-Flash", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
         right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
         right_spans.push(Span::styled(format!("{:.1}", temp), Style::default().fg(temp_color)));
         right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
-        right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(r_color)));
+        right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
     } else if is_pro {
         let effort = &cfg.pro_settings.reasoning_effort;
         let r_color = match effort.as_str() {
@@ -2378,16 +3230,60 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         right_spans.push(Span::styled("Hybrid ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
     }
 
+    // Center spans: Local LLM status indicator and Active Background Tasks badge
+    let mut center_spans = Vec::new();
+    if cfg.local_llm_enabled || cfg.model.starts_with("local") {
+        let is_local_online = app.local_llm_online.load(Ordering::Relaxed);
+        let dot_color = if is_local_online {
+            Color::Rgb(105, 240, 174) // Green (#69f0ae)
+        } else {
+            Color::Rgb(244, 67, 54)   // Red (#f44336)
+        };
+        center_spans.push(Span::styled("● ", Style::default().fg(dot_color)));
+        center_spans.push(Span::styled(
+            "Local LLM",
+            Style::default().fg(if is_local_online { app.theme.foreground } else { app.theme.gray })
+        ));
+    }
+
+    let active_tasks = if !app.active_background_pids.is_empty() {
+        app.active_background_pids.len()
+    } else {
+        uti_tools::background::get_task_manager()
+            .lock()
+            .map(|m| m.active_count())
+            .unwrap_or(0)
+    };
+
+    if active_tasks > 0 {
+        if !center_spans.is_empty() {
+            center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
+        }
+        let task_badge = if active_tasks == 1 {
+            "[1 Task Running]".to_string()
+        } else {
+            format!("[{} Tasks Running]", active_tasks)
+        };
+        center_spans.push(Span::styled(
+            task_badge,
+            Style::default()
+                .fg(Color::Rgb(255, 213, 79))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let footer_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(60),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
         ])
         .split(status_chunk);
 
     frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
-    frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[1]);
+    frame.render_widget(Paragraph::new(Line::from(center_spans)).alignment(Alignment::Center), footer_cols[1]);
+    frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[2]);
 
     // 5. Sudo Authentication Dialog Modal if open
     if app.sudo_dialog.is_open {
@@ -2414,3 +3310,174 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         render_user_dialog(frame, size, &app.user_dialog, &app.theme);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_large_output_is_truncated_in_render() {
+        let theme = Theme::default();
+        // Create huge 100KB output with a long first line
+        let huge_line = "A".repeat(50_000);
+        let huge_output = format!("{}\nSecond line\nThird line", huge_line);
+        let msg = Message::tool_response("call_1".to_string(), huge_output);
+
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None);
+        assert!(!lines.is_empty(), "expected at least one line rendered for tool");
+
+        // Verify the entire output spans contain "✓" and "..." and was bounded to ~140 chars
+        let all_text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(all_text.contains('✓'));
+        assert!(all_text.contains("..."));
+        assert!(all_text.len() < 300, "tool summary should be truncated: length was {}", all_text.len());
+        // Should only be ~2 wrapped lines at max_width=80, never hundreds
+        assert!(lines.len() <= 3, "expected at most 3 wrapped lines, got {}", lines.len());
+    }
+
+    #[tokio::test]
+    async fn test_app_cache_invalidation() {
+        let client = LlmClient::new(uti_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        app.cached_message_count = 10;
+        app.cached_render_width = 80;
+        app.cached_session_id = "test_sess".to_string();
+        app.cached_message_lines.push(Line::from("cached line"));
+
+        app.invalidate_message_cache();
+
+        assert_eq!(app.cached_message_count, 0);
+        assert_eq!(app.cached_render_width, 0);
+        assert!(app.cached_session_id.is_empty());
+        assert!(app.cached_message_lines.is_empty());
+    }
+
+    #[test]
+    fn test_format_input_spans_with_paste_tag() {
+        let theme = Theme::default();
+        let text = "Look at this: [Pasted text #1 +17 lines] and continue";
+        let spans = format_input_spans(text, &theme);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "Look at this: ");
+        assert_eq!(spans[1].content, "[Pasted text #1 +17 lines]");
+        assert_eq!(spans[2].content, " and continue");
+    }
+
+    #[test]
+    fn test_paste_expansion_logic() {
+        let mut user_prompt_clean = "Explain this: [Pasted text #1 +2 lines] and fix it.".to_string();
+        let mut pastes = std::collections::HashMap::new();
+        pastes.insert(1, "error line 1\nerror line 2\nerror line 3".to_string());
+
+        for (id, pasted_content) in &pastes {
+            let prefix = format!("[Pasted text #{}", id);
+            while let Some(start_idx) = user_prompt_clean.find(&prefix) {
+                let rest = &user_prompt_clean[start_idx..];
+                if let Some(end_bracket) = rest.find(']') {
+                    user_prompt_clean.replace_range(start_idx..start_idx + end_bracket + 1, pasted_content);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            user_prompt_clean,
+            "Explain this: error line 1\nerror line 2\nerror line 3 and fix it."
+        );
+    }
+
+    #[test]
+    fn test_format_input_with_cursor_empty() {
+        let theme = Theme::default();
+        let (spans, col) = format_input_with_cursor("", 0, &theme);
+        assert_eq!(col, 0);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "█");
+    }
+
+    #[test]
+    fn test_format_input_with_cursor_end() {
+        let theme = Theme::default();
+        let (spans, col) = format_input_with_cursor("cargo check", 11, &theme);
+        assert_eq!(col, 11);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "cargo check");
+        assert_eq!(spans[1].content, "█");
+    }
+
+    #[test]
+    fn test_format_input_with_cursor_middle() {
+        let theme = Theme::default();
+        let (spans, col) = format_input_with_cursor("cargo check", 5, &theme);
+        assert_eq!(col, 5);
+        // Spans: "cargo" (before), " " (cursor highlighted), "check" (after)
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "cargo");
+        assert_eq!(spans[1].content, " ");
+        assert_eq!(spans[2].content, "check");
+    }
+
+    #[test]
+    fn test_format_input_with_cursor_paste_tag() {
+        let theme = Theme::default();
+        let text = "run [Pasted text #1 +5 lines] now";
+        let (spans, col) = format_input_with_cursor(text, 4, &theme);
+        assert_eq!(col, 4);
+        assert_eq!(spans[0].content, "run ");
+        assert_eq!(spans[1].content, "[Pasted text #1 +5 lines]");
+        assert_eq!(spans[2].content, " now");
+    }
+
+    #[tokio::test]
+    async fn test_generation_id_increment() {
+        let mut app = App::new(
+            LlmClient::new(Config::default()),
+            PathBuf::from("/tmp"),
+            false,
+        );
+        assert_eq!(app.current_generation_id, 0);
+        app.current_generation_id = app.current_generation_id.wrapping_add(1);
+        assert_eq!(app.current_generation_id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_slash_popup_animation_targets() {
+        let mut app = App::new(
+            LlmClient::new(Config::default()),
+            PathBuf::from("/tmp"),
+            false,
+        );
+        app.auth_dialog.close();
+
+        // 1. Empty buffer -> target is 0.0, no animation
+        assert_eq!(app.slash_popup_target_height(), 0.0);
+        assert!(!app.is_slash_animating());
+
+        // 2. Buffer starts with '/' -> target is > 0, animation starts
+        app.input_buffer = "/".to_string();
+        assert!(app.slash_popup_target_height() >= 3.0);
+        assert!(app.is_slash_animating());
+
+        // 3. Buffer has /model -> target is 3.0 (1 item + 2 borders)
+        app.input_buffer = "/model".to_string();
+        assert_eq!(app.slash_popup_target_height(), 3.0);
+
+        // 4. Modal is open -> target must be 0.0 even if buffer has '/'
+        app.model_dialog.is_open = true;
+        assert_eq!(app.slash_popup_target_height(), 0.0);
+    }
+
+    #[test]
+    fn test_format_system_message_model_activation() {
+        let theme = Theme::default();
+        let msg = "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: max\n- Search CoT: low";
+        let lines = format_system_message(msg, &theme, 80);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("[model]")));
+        assert!(lines[1].spans.iter().any(|s| s.content.contains("Reasoning Depth:")));
+        assert!(lines[2].spans.iter().any(|s| s.content.contains("Search CoT:")));
+    }
+}
+

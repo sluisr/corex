@@ -302,6 +302,29 @@ Keep answers concise and practical with code snippets where helpful."#;
         self.complete(system_prompt, prompt).await
     }
 
+    /// Generates a dense, structured context summary of past conversation messages.
+    /// Run locally on llama-server / local SLM @ $0.00.
+    pub async fn compact_conversation(&self, formatted_history: &str) -> Result<String> {
+        let system_prompt = r#"You are the Context Compactor for UTI CLI.
+Your job is to condense older conversation messages into a dense, high-signal technical memory block.
+Extract and summarize:
+1. Primary User Objectives & Intent
+2. Key Architectural Decisions, Frameworks & Constraints
+3. Exact Files Examined, Created, or Modified
+4. Current Progress & Pending Next Steps
+
+Format the output strictly as:
+## [Conversation Summary]
+- **Goal:** <concise summary of user intent>
+- **Files Modified / Touched:** <exact paths>
+- **Key Technical Decisions:** <architectural rules or constraints>
+- **Current State & Next Steps:** <what is done and what remains>
+
+Be concise, technical, and omit conversational filler."#;
+
+        self.complete(system_prompt, formatted_history).await
+    }
+
     /// Evaluates user prompt intent using fast heuristics (0ms) and local LLM zero-shot classification:
     /// - `LocalChat` -> Greetings, theory, general Q&A ($0.00)
     /// - `LocalInspection` -> Hardware stats, reading files, directory navigation ($0.00)
@@ -403,17 +426,29 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
     // Clean leading/trailing punctuation (including Spanish inverted ¿, ¡)
     let clean = lower.trim_matches(|c: char| c.is_ascii_punctuation() || c == '¿' || c == '¡' || c == '…').trim();
 
-    // 1. Definite heavy coding indicators -> DeepSeek Cloud
+    // Strip common leading conversational filler/particles (e.g. "vale ", "ok ", "bueno ", "oye ")
+    let mut core_text = clean;
+    let fillers = ["vale ", "ok ", "bueno ", "oye ", "hey ", "hola ", "hello ", "por favor "];
+    for f in fillers {
+        if core_text.starts_with(f) {
+            core_text = core_text[f.len()..].trim();
+        }
+    }
+
+    // 1. Definite heavy coding & workspace modification/inspection indicators -> DeepSeek Cloud
     let code_keywords = [
         "refactor", "refactoriza", "corrige", "arregla", "fix ", "fix:", "bug",
         "patch", "aplica el parche", "apply_patch", "implementa", "implement ",
         "escribe una funcion", "escribe una función", "write a function", "write code",
         "crea un archivo", "create file", "modifica el archivo", "edit file",
         "crea una app", "haz una app", "build an app", "desarrolla",
+        "revisa mi config", "revisa la config", "revisa el archivo", "revisa los archivos",
+        "optimiza", "optimizar", "borrar", "elimina", "limpia", "clean up", "analiza",
+        "hyprland", "dotfiles", "config", "configuration",
         "fn ", "pub fn ", "def ", "class ", "impl ", "struct ", "enum ",
         "<!doctype html", "<html", "import react", "use std::",
     ];
-    if code_keywords.iter().any(|k| lower.contains(k) || clean.contains(k)) {
+    if code_keywords.iter().any(|k| lower.contains(k) || core_text.contains(k)) {
         return Some(IntentDecision::HeavyCoding);
     }
 
@@ -426,7 +461,7 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
         "lista los archivos", "muestra los archivos", "que archivos hay", "qué archivos hay",
         "ls", "tree", "pwd", "ip a", "ifconfig", "ping",
     ];
-    if inspect_exact.iter().any(|&k| clean == k || clean.starts_with(k) || clean.ends_with(k)) {
+    if inspect_exact.iter().any(|&k| core_text == k || core_text.starts_with(k) || core_text.ends_with(k)) {
         return Some(IntentDecision::LocalInspection);
     }
 
@@ -438,16 +473,17 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
         "como te llamas", "cómo te llamas", "ayuda", "help", "gracias", "muchas gracias",
         "thanks", "thx", "ok", "vale", "listo", "adios", "adiós", "bye", "chau", "hasta luego",
     ];
-    if chat_exact.iter().any(|&k| clean == k || clean.starts_with(k)) {
+    if chat_exact.iter().any(|&k| core_text == k || clean == k) {
         return Some(IntentDecision::LocalChat);
     }
 
     // Explanations of theoretical concepts without code modification
-    if (clean.starts_with("que es ") || clean.starts_with("qué es ") || clean.starts_with("what is ")
-        || clean.starts_with("explica ") || clean.starts_with("explicame ") || clean.starts_with("explícame ")
-        || clean.starts_with("explain ") || clean.starts_with("diferencia entre ") || clean.starts_with("como funciona ")
-        || clean.starts_with("cómo funciona "))
-        && !clean.contains("crea") && !clean.contains("haz") && !clean.contains("escribe") && !clean.contains("modifica")
+    if (core_text.starts_with("que es ") || core_text.starts_with("qué es ") || core_text.starts_with("what is ")
+        || core_text.starts_with("explica ") || core_text.starts_with("explicame ") || core_text.starts_with("explícame ")
+        || core_text.starts_with("explain ") || core_text.starts_with("diferencia entre ") || core_text.starts_with("como funciona ")
+        || core_text.starts_with("cómo funciona "))
+        && !core_text.contains("crea") && !core_text.contains("haz") && !core_text.contains("escribe") && !core_text.contains("modifica")
+        && !core_text.contains("revisa") && !core_text.contains("optimiza")
     {
         return Some(IntentDecision::LocalChat);
     }

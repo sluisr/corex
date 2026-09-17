@@ -57,7 +57,9 @@ impl Default for ProSettings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HybridMode {
+    #[default]
     AutoTriage,
     LocalScout,
     DraftAndReview,
@@ -76,10 +78,10 @@ impl HybridMode {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            HybridMode::AutoTriage => "Auto-Triage (Smart Route @ $0.00)",
-            HybridMode::LocalScout => "Local Scout (Read Local, Code Cloud)",
-            HybridMode::DraftAndReview => "Draft & Review (Local Draft, Cloud Audit)",
-            HybridMode::CompressionOnly => "Compression Only (Cloud + Local Summaries)",
+            HybridMode::AutoTriage => "Auto-Triage",
+            HybridMode::LocalScout => "Local Scout",
+            HybridMode::DraftAndReview => "Draft & Review",
+            HybridMode::CompressionOnly => "Compression Only",
         }
     }
 
@@ -104,14 +106,9 @@ impl HybridMode {
     }
 }
 
-impl Default for HybridMode {
-    fn default() -> Self {
-        HybridMode::AutoTriage
-    }
-}
 
 fn default_hybrid_mode() -> HybridMode {
-    HybridMode::AutoTriage
+    HybridMode::CompressionOnly
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,7 +126,7 @@ pub struct HybridSettings {
 }
 
 fn default_hybrid_primary_model() -> String {
-    "deepseek-v4-flash".to_string()
+    "deepseek-flash".to_string()
 }
 
 impl Default for HybridSettings {
@@ -139,7 +136,7 @@ impl Default for HybridSettings {
             local_url: default_local_llm_url(),
             secondary_local_model: default_local_llm_model(),
             auto_compression: true,
-            mode: HybridMode::AutoTriage,
+            mode: HybridMode::CompressionOnly,
         }
     }
 }
@@ -173,7 +170,7 @@ pub struct Config {
     pub hybrid_settings: HybridSettings,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
-    #[serde(default)]
+    #[serde(default, skip)]
     pub sudo_password: Option<String>,
     #[serde(default)]
     pub yolo_mode: bool,
@@ -187,10 +184,22 @@ pub struct Config {
     pub local_llm_model: String,
     #[serde(default = "default_hybrid_compression")]
     pub hybrid_compression: bool,
+    #[serde(default = "default_auto_compact")]
+    pub auto_compact: bool,
+    #[serde(default = "default_compact_threshold_tokens")]
+    pub compact_threshold_tokens: usize,
     /// Extra shell commands (binary names or `cmd subcommand` prefixes) that
     /// are treated as safe without requiring user confirmation.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+}
+
+fn default_auto_compact() -> bool {
+    true
+}
+
+fn default_compact_threshold_tokens() -> usize {
+    95_000
 }
 
 fn default_local_llm_enabled() -> bool {
@@ -227,7 +236,7 @@ fn default_base_url() -> String {
 fn default_model() -> String {
     std::env::var("UTI_MODEL")
         .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
-        .unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+        .unwrap_or_else(|_| "deepseek-flash".to_string())
 }
 
 fn default_reasoning_effort() -> String {
@@ -257,6 +266,8 @@ impl Default for Config {
             local_llm_url: default_local_llm_url(),
             local_llm_model: default_local_llm_model(),
             hybrid_compression: default_hybrid_compression(),
+            auto_compact: default_auto_compact(),
+            compact_threshold_tokens: default_compact_threshold_tokens(),
             allowed_commands: Vec::new(),
         }
     }
@@ -264,6 +275,20 @@ impl Default for Config {
 
 impl Config {
     pub fn load_flash_settings() -> FlashSettings {
+        Self::load_flash_settings_with_workspace(None)
+    }
+
+    pub fn load_flash_settings_with_workspace(workspace: Option<&Path>) -> FlashSettings {
+        if let Some(ws) = workspace {
+            let local_file = ws.join(".uti").join("flash_settings.json");
+            if local_file.exists() {
+                if let Ok(c) = fs::read_to_string(&local_file) {
+                    if let Ok(parsed) = serde_json::from_str::<FlashSettings>(&c) {
+                        return parsed;
+                    }
+                }
+            }
+        }
         if let Some(dirs) = BaseDirs::new() {
             let uti_file = dirs.home_dir().join(".uti").join("flash_settings.json");
             let legacy_file = dirs.home_dir().join(".deepseek").join("flash_settings.json");
@@ -285,17 +310,44 @@ impl Config {
     }
 
     pub fn save_flash_settings(settings: &FlashSettings) -> anyhow::Result<()> {
-        if let Some(dirs) = BaseDirs::new() {
-            let dir = dirs.home_dir().join(".uti");
-            fs::create_dir_all(&dir)?;
-            let file = dir.join("flash_settings.json");
-            let content = serde_json::to_string_pretty(settings)?;
-            fs::write(file, content)?;
+        Self::save_flash_settings_with_workspace(settings, None)
+    }
+
+    pub fn save_flash_settings_with_workspace(settings: &FlashSettings, workspace: Option<&Path>) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(settings)?;
+        let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
+        if let Some(ws) = workspace {
+            let dir = ws.join(".uti");
+            if dir.exists() {
+                let _ = fs::write(dir.join("flash_settings.json"), &content);
+            }
+        }
+        if !is_temp {
+            if let Some(dirs) = BaseDirs::new() {
+                let dir = dirs.home_dir().join(".uti");
+                fs::create_dir_all(&dir)?;
+                let file = dir.join("flash_settings.json");
+                fs::write(file, content)?;
+            }
         }
         Ok(())
     }
 
     pub fn load_pro_settings() -> ProSettings {
+        Self::load_pro_settings_with_workspace(None)
+    }
+
+    pub fn load_pro_settings_with_workspace(workspace: Option<&Path>) -> ProSettings {
+        if let Some(ws) = workspace {
+            let local_file = ws.join(".uti").join("pro_settings.json");
+            if local_file.exists() {
+                if let Ok(c) = fs::read_to_string(&local_file) {
+                    if let Ok(parsed) = serde_json::from_str::<ProSettings>(&c) {
+                        return parsed;
+                    }
+                }
+            }
+        }
         if let Some(dirs) = BaseDirs::new() {
             let uti_file = dirs.home_dir().join(".uti").join("pro_settings.json");
             let legacy_file = dirs.home_dir().join(".deepseek").join("pro_settings.json");
@@ -317,17 +369,44 @@ impl Config {
     }
 
     pub fn save_pro_settings(settings: &ProSettings) -> anyhow::Result<()> {
-        if let Some(dirs) = BaseDirs::new() {
-            let dir = dirs.home_dir().join(".uti");
-            fs::create_dir_all(&dir)?;
-            let file = dir.join("pro_settings.json");
-            let content = serde_json::to_string_pretty(settings)?;
-            fs::write(file, content)?;
+        Self::save_pro_settings_with_workspace(settings, None)
+    }
+
+    pub fn save_pro_settings_with_workspace(settings: &ProSettings, workspace: Option<&Path>) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(settings)?;
+        let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
+        if let Some(ws) = workspace {
+            let dir = ws.join(".uti");
+            if dir.exists() {
+                let _ = fs::write(dir.join("pro_settings.json"), &content);
+            }
+        }
+        if !is_temp {
+            if let Some(dirs) = BaseDirs::new() {
+                let dir = dirs.home_dir().join(".uti");
+                fs::create_dir_all(&dir)?;
+                let file = dir.join("pro_settings.json");
+                fs::write(file, content)?;
+            }
         }
         Ok(())
     }
 
     pub fn load_hybrid_settings() -> HybridSettings {
+        Self::load_hybrid_settings_with_workspace(None)
+    }
+
+    pub fn load_hybrid_settings_with_workspace(workspace: Option<&Path>) -> HybridSettings {
+        if let Some(ws) = workspace {
+            let local_file = ws.join(".uti").join("hybrid_settings.json");
+            if local_file.exists() {
+                if let Ok(c) = fs::read_to_string(&local_file) {
+                    if let Ok(parsed) = serde_json::from_str::<HybridSettings>(&c) {
+                        return parsed;
+                    }
+                }
+            }
+        }
         if let Some(dirs) = BaseDirs::new() {
             let uti_file = dirs.home_dir().join(".uti").join("hybrid_settings.json");
             if uti_file.exists() {
@@ -342,17 +421,34 @@ impl Config {
     }
 
     pub fn save_hybrid_settings(settings: &HybridSettings) -> anyhow::Result<()> {
-        if let Some(dirs) = BaseDirs::new() {
-            let dir = dirs.home_dir().join(".uti");
-            fs::create_dir_all(&dir)?;
-            let file = dir.join("hybrid_settings.json");
-            let content = serde_json::to_string_pretty(settings)?;
-            fs::write(file, content)?;
+        Self::save_hybrid_settings_with_workspace(settings, None)
+    }
+
+    pub fn save_hybrid_settings_with_workspace(settings: &HybridSettings, workspace: Option<&Path>) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(settings)?;
+        let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
+        if let Some(ws) = workspace {
+            let dir = ws.join(".uti");
+            if dir.exists() {
+                let _ = fs::write(dir.join("hybrid_settings.json"), &content);
+            }
+        }
+        if !is_temp {
+            if let Some(dirs) = BaseDirs::new() {
+                let dir = dirs.home_dir().join(".uti");
+                fs::create_dir_all(&dir)?;
+                let file = dir.join("hybrid_settings.json");
+                fs::write(file, content)?;
+            }
         }
         Ok(())
     }
 
     pub fn load() -> Self {
+        Self::load_with_workspace(None)
+    }
+
+    pub fn load_with_workspace(workspace: Option<&Path>) -> Self {
         let mut config = Config::default();
 
         let global_config_path = BaseDirs::new()
@@ -379,20 +475,37 @@ impl Config {
             }
         }
 
-        // Local project config ./.uti/settings.json override
-        let local_path = Path::new(".uti").join("settings.json");
+        // Local project config ./.uti/settings.json override (safe merge: protect sensitive credentials & security settings)
+        let local_path = workspace
+            .map(|ws| ws.join(".uti").join("settings.json"))
+            .unwrap_or_else(|| Path::new(".uti").join("settings.json"));
+
         if local_path.exists() {
             if let Ok(content) = fs::read_to_string(&local_path) {
                 if let Ok(parsed) = serde_json::from_str::<Config>(&content) {
-                    config = parsed;
+                    if !parsed.model.is_empty() {
+                        config.model = parsed.model;
+                    }
+                    config.temperature = parsed.temperature;
+                    config.reasoning_effort = parsed.reasoning_effort;
+                    config.yolo_mode = parsed.yolo_mode;
+                    config.auto_compact = parsed.auto_compact;
+                    config.compact_threshold_tokens = parsed.compact_threshold_tokens;
+                    config.local_llm_enabled = parsed.local_llm_enabled;
+
+                    // SECURITY: Do not let untrusted repository configs hijack endpoints,
+                    // inject malicious MCP commands, or bypass safe command lists.
+                    if config.api_key.is_empty() && !parsed.api_key.is_empty() {
+                        config.api_key = parsed.api_key;
+                    }
                 }
             }
         }
 
         // Load disk-persisted flash, pro and hybrid settings
-        config.flash_settings = Self::load_flash_settings();
-        config.pro_settings = Self::load_pro_settings();
-        config.hybrid_settings = Self::load_hybrid_settings();
+        config.flash_settings = Self::load_flash_settings_with_workspace(workspace);
+        config.pro_settings = Self::load_pro_settings_with_workspace(workspace);
+        config.hybrid_settings = Self::load_hybrid_settings_with_workspace(workspace);
 
         // Apply active model's reasoning/temp defaults from settings
         if config.model.contains("reasoner") || config.model.contains("pro") {
@@ -402,8 +515,10 @@ impl Config {
             config.reasoning_effort = config.flash_settings.reasoning_effort.clone();
         }
 
-        // Env vars override
-        if let Ok(k) = std::env::var("UTI_API_KEY").or_else(|_| std::env::var("DEEPSEEK_API_KEY")) {
+        if let Ok(k) = std::env::var("UTI_API_KEY")
+            .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        {
             if !k.is_empty() {
                 config.api_key = k;
             }
@@ -443,13 +558,72 @@ impl Config {
         config
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
+    fn load_existing_api_key(workspace: Option<&Path>) -> Option<String> {
+        if let Some(ws) = workspace {
+            let local_path = ws.join(".uti").join("settings.json");
+            if local_path.exists() {
+                if let Ok(c) = fs::read_to_string(&local_path) {
+                    if let Ok(parsed) = serde_json::from_str::<Config>(&c) {
+                        if !parsed.api_key.trim().is_empty() {
+                            return Some(parsed.api_key);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(dirs) = BaseDirs::new() {
-            let dir = dirs.home_dir().join(".uti");
-            fs::create_dir_all(&dir)?;
-            let file = dir.join("settings.json");
-            let content = serde_json::to_string_pretty(self)?;
-            fs::write(file, content)?;
+            let path = dirs.home_dir().join(".uti").join("settings.json");
+            if path.exists() {
+                if let Ok(c) = fs::read_to_string(&path) {
+                    if let Ok(parsed) = serde_json::from_str::<Config>(&c) {
+                        if !parsed.api_key.trim().is_empty() {
+                            return Some(parsed.api_key);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(k) = std::env::var("UTI_API_KEY")
+            .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
+            .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        {
+            if !k.trim().is_empty() {
+                return Some(k);
+            }
+        }
+        None
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_with_workspace(None)
+    }
+
+    pub fn save_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
+        let mut to_save = self.clone();
+        if to_save.api_key.trim().is_empty() {
+            if let Some(existing) = Self::load_existing_api_key(workspace) {
+                to_save.api_key = existing;
+            }
+        }
+
+        let content = serde_json::to_string_pretty(&to_save)?;
+        let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
+
+        if let Some(ws) = workspace {
+            let uti_dir = ws.join(".uti");
+            if uti_dir.exists() {
+                let file = uti_dir.join("settings.json");
+                let _ = fs::write(file, &content);
+            }
+        }
+
+        if !is_temp {
+            if let Some(dirs) = BaseDirs::new() {
+                let dir = dirs.home_dir().join(".uti");
+                fs::create_dir_all(&dir)?;
+                let file = dir.join("settings.json");
+                fs::write(file, content)?;
+            }
         }
         Ok(())
     }
@@ -473,7 +647,7 @@ mod tests {
     #[test]
     fn test_hybrid_settings_serialization() {
         let settings = HybridSettings {
-            primary_model: "deepseek-v4-flash".to_string(),
+            primary_model: "deepseek-flash".to_string(),
             local_url: "http://127.0.0.1:8080/v1".to_string(),
             secondary_local_model: "Llama-3.2-3B-Instruct".to_string(),
             auto_compression: true,
@@ -484,6 +658,25 @@ mod tests {
         let deserialized: HybridSettings = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.mode, HybridMode::LocalScout);
         assert_eq!(deserialized.auto_compression, true);
+    }
+
+    #[test]
+    fn test_workspace_config_override() {
+        let unique = format!("uti_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let temp_dir = std::env::temp_dir().join(unique);
+        let uti_dir = temp_dir.join(".uti");
+        fs::create_dir_all(&uti_dir).expect("create dir");
+
+        let mut config = Config::default();
+        config.model = "deepseek-v4-pro".to_string();
+        config.local_llm_enabled = false;
+        config.save_with_workspace(Some(&temp_dir)).expect("save");
+
+        let loaded = Config::load_with_workspace(Some(&temp_dir));
+        assert_eq!(loaded.model, "deepseek-v4-pro");
+        assert_eq!(loaded.local_llm_enabled, false);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 

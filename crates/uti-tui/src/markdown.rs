@@ -37,7 +37,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             if in_code_block {
                 in_code_block = false;
                 flush_code_block(
-                    &mut code_buffer,
+                    &code_buffer,
                     &code_block_lang,
                     theme,
                     effective_width,
@@ -46,7 +46,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             } else {
                 in_code_block = true;
                 code_buffer.clear();
-                let lang = trimmed.trim_start_matches(|c| c == '`' || c == '~').trim();
+                let lang = trimmed.trim_start_matches(['`', '~']).trim();
                 code_block_lang = lang.to_string();
             }
             continue;
@@ -78,37 +78,43 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
 
         // 3. Headers
         if let Some(h1) = line.strip_prefix("# ") {
+            if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
+                result_lines.push(Line::from(""));
+            }
             let mut spans = vec![
-                Span::styled("  # ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("◈ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(parse_inline_spans(h1, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans(spans, effective_width, "  "));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
             continue;
         }
         if let Some(h2) = line.strip_prefix("## ") {
+            if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
+                result_lines.push(Line::from(""));
+            }
             let mut spans = vec![
-                Span::styled("  ## ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                Span::styled("◆ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(parse_inline_spans(h2, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans(spans, effective_width, "  "));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
             continue;
         }
         if let Some(h3) = line.strip_prefix("### ") {
+            if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
+                result_lines.push(Line::from(""));
+            }
             let mut spans = vec![
-                Span::styled("  ### ", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
+                Span::styled("▸ ", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
             ];
             spans.extend(parse_inline_spans(h3, theme, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans(spans, effective_width, "  "));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
             continue;
         }
 
         // 4. Blockquotes
         if let Some(quote) = line.strip_prefix("> ") {
-            let mut spans = vec![
-                Span::styled("  ▎ ", Style::default().fg(theme.accent_cyan)),
-            ];
-            spans.extend(parse_inline_spans(quote, theme, Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC)));
-            result_lines.extend(wrap_spans(spans, effective_width, "  ▎ "));
+            let spans = parse_inline_spans(quote, theme, Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ▎ ", "  ▎ "));
             continue;
         }
 
@@ -116,15 +122,17 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
         let bullet_prefixes = ["- ", "* ", "+ "];
         let mut is_bullet = false;
         for prefix in bullet_prefixes {
-            let leading_spaces = line.len() - line.trim_start().len();
-            let indent = " ".repeat(leading_spaces);
             let trimmed_lead = line.trim_start();
             if let Some(item_text) = trimmed_lead.strip_prefix(prefix) {
+                let leading_spaces = line.len() - trimmed_lead.len();
+                let base_indent = " ".repeat(leading_spaces);
                 let mut spans = vec![
-                    Span::raw(format!("  {}• ", indent)),
+                    Span::styled("• ", Style::default().fg(theme.accent_cyan)),
                 ];
                 spans.extend(parse_inline_spans(item_text, theme, Style::default().fg(theme.foreground)));
-                result_lines.extend(wrap_spans(spans, effective_width, "    "));
+                let first_pfx = format!("  {}", base_indent);
+                let cont_pfx = format!("    {}", base_indent);
+                result_lines.extend(wrap_spans_with_indent(spans, effective_width, &first_pfx, &cont_pfx));
                 is_bullet = true;
                 break;
             }
@@ -137,22 +145,29 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
         let trimmed_lead = line.trim_start();
         if let Some(dot_idx) = trimmed_lead.find(". ") {
             if let Ok(num) = trimmed_lead[..dot_idx].parse::<usize>() {
-                let leading_spaces = line.len() - line.trim_start().len();
-                let indent = " ".repeat(leading_spaces);
+                let leading_spaces = line.len() - trimmed_lead.len();
+                let base_indent = " ".repeat(leading_spaces);
                 let item_text = &trimmed_lead[dot_idx + 2..];
+                let num_str = format!("{}. ", num);
+                let num_len = num_str.chars().count();
                 let mut spans = vec![
-                    Span::styled(format!("  {}{}. ", indent, num), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(num_str, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
                 ];
                 spans.extend(parse_inline_spans(item_text, theme, Style::default().fg(theme.foreground)));
-                result_lines.extend(wrap_spans(spans, effective_width, "    "));
+                let first_pfx = format!("  {}", base_indent);
+                let cont_pfx = format!("  {}{}", base_indent, " ".repeat(num_len));
+                result_lines.extend(wrap_spans_with_indent(spans, effective_width, &first_pfx, &cont_pfx));
                 continue;
             }
         }
 
         // 7. Regular Paragraph Text
-        let mut spans = Vec::new();
-        spans.extend(parse_inline_spans(line, theme, Style::default().fg(theme.foreground)));
-        result_lines.extend(wrap_spans(spans, effective_width, "  "));
+        if trimmed.is_empty() {
+            result_lines.push(Line::from(""));
+            continue;
+        }
+        let spans = parse_inline_spans(line, theme, Style::default().fg(theme.foreground));
+        result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
     }
 
     // Flush any remaining table at the end of text
@@ -161,7 +176,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
     // Flush an unclosed code block (missing closing fence)
     if in_code_block {
         flush_code_block(
-            &mut code_buffer,
+            &code_buffer,
             &code_block_lang,
             theme,
             effective_width,
@@ -176,7 +191,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
 /// widest content line (capped at `max_width`), so short snippets produce
 /// compact frames instead of stretching across the whole terminal.
 fn flush_code_block(
-    buf: &mut Vec<String>,
+    buf: &[String],
     lang: &str,
     theme: &Theme,
     max_width: usize,
@@ -242,25 +257,33 @@ fn flush_code_block(
     )));
 }
 
-/// Wraps a list of spans so that no line exceeds `max_width` visible characters,
-/// preserving indentation and span styling.
-pub fn wrap_spans(
+/// Wraps a list of spans with distinct first-line and continuation indents (hanging indent),
+/// ensuring wrapped bullet points, numbered lists, and quotes align cleanly.
+pub fn wrap_spans_with_indent(
     spans: Vec<Span<'static>>,
     max_width: usize,
-    indent: &str,
+    first_line_indent: &str,
+    continuation_indent: &str,
 ) -> Vec<Line<'static>> {
     if max_width < 10 {
-        return vec![Line::from(spans)];
+        let mut line = Vec::new();
+        if !first_line_indent.is_empty() {
+            line.push(Span::raw(first_line_indent.to_string()));
+        }
+        line.extend(spans);
+        return vec![Line::from(line)];
     }
 
     let mut lines = Vec::new();
     let mut current_line = Vec::new();
     let mut current_len = 0;
 
-    let indent_len = indent.chars().count();
-    if indent_len > 0 {
-        current_line.push(Span::raw(indent.to_string()));
-        current_len += indent_len;
+    let first_len = first_line_indent.chars().count();
+    let cont_len = continuation_indent.chars().count();
+
+    if first_len > 0 {
+        current_line.push(Span::raw(first_line_indent.to_string()));
+        current_len += first_len;
     }
 
     for span in spans {
@@ -274,12 +297,14 @@ pub fn wrap_spans(
             let need_space = !is_first;
             let added_len = word_len + if need_space { 1 } else { 0 };
 
-            if current_len + added_len > max_width && current_len > indent_len {
+            let current_indent_len = if lines.is_empty() { first_len } else { cont_len };
+
+            if current_len + added_len > max_width && current_len > current_indent_len {
                 lines.push(Line::from(std::mem::take(&mut current_line)));
                 current_len = 0;
-                if indent_len > 0 {
-                    current_line.push(Span::raw(indent.to_string()));
-                    current_len += indent_len;
+                if cont_len > 0 {
+                    current_line.push(Span::raw(continuation_indent.to_string()));
+                    current_len += cont_len;
                 }
                 if !word.is_empty() {
                     current_line.push(Span::styled(word.to_string(), style));
@@ -309,6 +334,16 @@ pub fn wrap_spans(
     lines
 }
 
+/// Wraps a list of spans so that no line exceeds `max_width` visible characters,
+/// preserving indentation and span styling.
+pub fn wrap_spans(
+    spans: Vec<Span<'static>>,
+    max_width: usize,
+    indent: &str,
+) -> Vec<Line<'static>> {
+    wrap_spans_with_indent(spans, max_width, indent, indent)
+}
+
 /// Truncates a slice of styled spans so the total visible width is at most
 /// `max_width`, appending an ellipsis when content had to be cut.
 fn truncate_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Span<'static>> {
@@ -336,7 +371,7 @@ fn truncate_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Spa
             }
             result.push(Span::styled(cut, span.style));
             used += cut_w;
-            if used + 1 <= max_width {
+            if used < max_width {
                 result.push(Span::styled("…".to_string(), span.style));
             }
             break;
@@ -407,7 +442,7 @@ fn parse_inline_spans(
             }
             let mut italic_text = String::new();
             let delim = ch;
-            while let Some(next_ch) = chars.next() {
+            for next_ch in chars.by_ref() {
                 if next_ch == delim {
                     break;
                 }
@@ -434,19 +469,34 @@ fn colorize_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static
     let mut spans = Vec::new();
     let trimmed = line.trim_start();
 
+    if lang == "diff" || lang == "patch" {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(theme.diff_added_fg)));
+            return spans;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(theme.diff_removed_fg)));
+            return spans;
+        } else if line.starts_with("@@") {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)));
+            return spans;
+        } else if line.starts_with("---") || line.starts_with("+++") {
+            spans.push(Span::styled(line.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)));
+            return spans;
+        }
+    }
+
     // Simple fast syntax highlighting heuristics
     if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") || trimmed.starts_with("--") {
         spans.push(Span::styled(line.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC)));
         return spans;
     }
 
-    if lang == "bash" || lang == "sh" || lang == "shell" {
-        if trimmed.starts_with('$') {
+    if (lang == "bash" || lang == "sh" || lang == "shell")
+        && trimmed.starts_with('$') {
             spans.push(Span::styled("$ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)));
             spans.push(Span::styled(trimmed[1..].to_string(), Style::default().fg(Color::White)));
             return spans;
         }
-    }
 
     spans.push(Span::styled(line.to_string(), Style::default().fg(Color::White)));
     spans
@@ -495,46 +545,51 @@ fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'s
         }
     }
 
-    // Shrink the last column if the total table width exceeds max_width
+    // Proportionally shrink columns if total table width exceeds max_width
     let border_padding_width = 3 + 3 * num_cols;
-    let total_col_width: usize = col_widths.iter().sum();
-    let total_table_width = total_col_width + border_padding_width;
+    let avail_content_width = max_width.saturating_sub(border_padding_width).max(num_cols * 6);
+    let mut total_col_width: usize = col_widths.iter().sum();
 
-    if total_table_width > max_width && num_cols > 1 {
-        let last_col_idx = num_cols - 1;
-        let other_cols_width: usize = col_widths.iter().take(last_col_idx).sum();
-        let avail_last_col_width = max_width
-            .saturating_sub(border_padding_width)
-            .saturating_sub(other_cols_width)
-            .max(10); // keep at least 10 chars for description
+    if total_col_width > avail_content_width {
+        let min_col_width = 8;
+        // Iteratively shrink the widest columns until total fits within avail_content_width
+        while total_col_width > avail_content_width {
+            let max_w = *col_widths.iter().max().unwrap_or(&0);
+            if max_w <= min_col_width {
+                break;
+            }
 
-        if col_widths[last_col_idx] > avail_last_col_width {
-            col_widths[last_col_idx] = avail_last_col_width;
-            
-            // Truncate cell values in the grid for the last column
-            for row in &mut grid {
-                let is_separator = row.iter().all(|cell| cell.chars().all(|c| c == '-' || c == ':' || c == ' '));
-                if is_separator {
-                    continue;
-                }
-                if let Some(cell) = row.get_mut(last_col_idx) {
-                    let cell_width = unicode_width::UnicodeWidthStr::width(cell.as_str());
-                    if cell_width > avail_last_col_width {
-                        let mut truncated = String::new();
-                        let mut current_width = 0;
-                        let target_width = avail_last_col_width.saturating_sub(3);
-                        for c in cell.chars() {
-                            let char_w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                            if current_width + char_w > target_width {
-                                break;
-                            }
-                            truncated.push(c);
-                            current_width += char_w;
-                        }
-                        truncated.push_str("...");
-                        *cell = truncated;
+            // Find the second widest column width (or min_col_width)
+            let second_max = col_widths
+                .iter()
+                .copied()
+                .filter(|&w| w < max_w)
+                .max()
+                .unwrap_or(min_col_width)
+                .max(min_col_width);
+
+            // How many columns share the maximum width?
+            let count_max = col_widths.iter().filter(|&&w| w == max_w).count();
+            let excess = total_col_width - avail_content_width;
+
+            let target_reduction_per_col = (max_w - second_max).max(1);
+            let needed_reduction_per_col = (excess + count_max - 1) / count_max;
+            let reduce_by = target_reduction_per_col.min(needed_reduction_per_col).max(1);
+
+            let mut reduced_any = false;
+            for w in col_widths.iter_mut() {
+                if *w == max_w && *w > min_col_width {
+                    let actual_dec = reduce_by.min(*w - min_col_width);
+                    if actual_dec > 0 {
+                        *w -= actual_dec;
+                        total_col_width -= actual_dec;
+                        reduced_any = true;
                     }
                 }
+            }
+
+            if !reduced_any {
+                break;
             }
         }
     }
@@ -573,13 +628,22 @@ fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'s
                 if i >= num_cols {
                     break;
                 }
-                // Parse inline markdown (bold, code, italic) within each table cell
+                let target_w = col_widths[i];
                 let cell_spans = parse_inline_spans(cell, theme, base_cell_style);
                 let visible_width: usize = cell_spans.iter().map(|s| s.width()).sum();
-                let pad = col_widths[i].saturating_sub(visible_width);
+
+                let (rendered_spans, actual_w) = if visible_width > target_w {
+                    let truncated = truncate_spans_to_width(&cell_spans, target_w);
+                    let tr_w: usize = truncated.iter().map(|s| s.width()).sum();
+                    (truncated, tr_w)
+                } else {
+                    (cell_spans, visible_width)
+                };
+
+                let pad = target_w.saturating_sub(actual_w);
                 
                 line_spans.push(Span::raw(" "));
-                line_spans.extend(cell_spans);
+                line_spans.extend(rendered_spans);
                 if pad > 0 {
                     line_spans.push(Span::raw(" ".repeat(pad)));
                 }
@@ -606,6 +670,29 @@ mod tests {
             let s: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
             println!("Line {}: {}", i, s);
         }
+    }
+
+    #[test]
+    fn test_markdown_table_wide_middle_column() {
+        let theme = Theme::default();
+        let text = "| Vector | Prueba | Resultado |\n|---|---|---|\n| LFI sobre scripts ocultos | ?file/page/inc/… = php://filter/…resource=fun.php en los 7 send/*.php | ❌ ignorado |\n| Fuzz de campos POST | 7 endpoints × 35 nombres ( page,file,include,tpl,view,load,path,url,func,callback… ) con php://filter | ❌ 0 resultados |\n";
+        let max_width = 100;
+        let lines = render_markdown(text, &theme, max_width);
+
+        // Verify table was rendered and no line exceeds max_width
+        assert!(!lines.is_empty());
+        for line in &lines {
+            let w = line.width();
+            assert!(w <= max_width, "table line width {} exceeds max_width {}", w, max_width);
+            let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+            // Verify right border is intact
+            assert!(s.ends_with('│') || s.ends_with('┤'), "table line missing right border: {}", s);
+        }
+
+        // Verify the Resultado column was NOT crushed to "Resul" or "❌ ig"
+        let table_str: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(table_str.contains("Resultado"), "Resultado header was crushed: {}", table_str);
+        assert!(table_str.contains("ignorado"), "ignorado was crushed: {}", table_str);
     }
 
     #[test]
@@ -657,6 +744,29 @@ mod tests {
         // Top, content and bottom must all have the same width.
         for line in &lines {
             assert_eq!(line.width(), w, "mismatched box width: {:?}", line.spans);
+        }
+    }
+
+    #[test]
+    fn test_hanging_indent_bullets_and_headers() {
+        let theme = Theme::default();
+        let text = "## Lo bueno ✅\n- CPU muy capaz: El procesador es eficiente y con buena potencia para su gama.\n";
+        let lines = render_markdown(text, &theme, 40);
+
+        // Header should not contain raw literal "## "
+        let header_str: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!header_str.contains("##"), "header contains raw hashes: {}", header_str);
+        assert!(header_str.contains("Lo bueno"), "header text missing: {}", header_str);
+
+        // First bullet line starts with "  • " (4 visible chars)
+        let bullet_line1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(bullet_line1.starts_with("  • "), "bullet line 1 missing prefix: {}", bullet_line1);
+
+        // Wrapped bullet line 2 MUST have hanging indent of 4 spaces ("    "), not 2 or 6
+        if lines.len() > 2 {
+            let bullet_line2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(bullet_line2.starts_with("    "), "hanging indent missing: {}", bullet_line2);
+            assert!(!bullet_line2.starts_with("     "), "over-indented: {}", bullet_line2);
         }
     }
 }

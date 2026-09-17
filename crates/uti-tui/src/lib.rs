@@ -12,7 +12,7 @@ pub mod theme;
 pub mod thinking_view;
 pub mod user_dialog;
 
-pub use app::{run_tui, App};
+pub use app::{restore_terminal, run_tui, App, TerminalGuard};
 pub use auth_dialog::AuthDialogState;
 pub use markdown::render_markdown;
 pub use model_dialog::ModelDialogState;

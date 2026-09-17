@@ -28,7 +28,7 @@ struct Cli {
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 
-    /// Model name override (e.g. deepseek-v4-flash, deepseek-v4-pro)
+    /// Model name override (e.g. deepseek-flash, deepseek-v4-pro)
     #[arg(short = 'm', long)]
     model: Option<String>,
 
@@ -92,12 +92,12 @@ async fn main() -> Result<()> {
             for (i, s) in sessions.iter().enumerate() {
                 let rel_time = Session::format_relative_time(s.updated_at);
                 let tag_str = s.tag.as_ref().map(|t| format!(" [tag: {}]", t)).unwrap_or_default();
-                let model_display = if s.model == "deepseek-v4-flash" || s.model == "deepseek-chat" {
-                    "DeepSeek-V4-Flash"
+                let model_display = if s.model == "deepseek-flash" || s.model == "deepseek-v4.1-flash" || s.model == "deepseek-v4-flash" || s.model == "deepseek-chat" {
+                    "DeepSeek-V4.1-Flash"
                 } else if s.model == "deepseek-v4-pro" || s.model == "deepseek-reasoner" {
                     "DeepSeek-V4-Pro"
                 } else if s.model == "deepseek-v4-flash-vision-exp" {
-                    "DeepSeek-V4-Flash-Vision"
+                    "DeepSeek-V4.1-Flash (Vision)"
                 } else {
                     &s.model
                 };
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let log_path = uti_core::ForensicLogger::init(Some(&workspace_dir));
     tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
 
-    let mut config = Config::load();
+    let mut config = Config::load_with_workspace(Some(&workspace_dir));
     if let Some(m) = cli.model {
         config.model = m;
     }
@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
 
     // Launch interactive TUI
     let mut app = App::new(llm_client, workspace_dir.clone(), cli.yolo);
+    let _ = app.reload_mcp_servers().await;
     if let Some(session_id) = cli.resume {
         match Session::load_by_id_or_tag(&session_id) {
             Ok(loaded) => {
@@ -180,7 +181,11 @@ async fn run_headless(
     user_prompt: String,
     yolo: bool,
 ) -> Result<()> {
-    let tool_registry = ToolRegistry::new();
+    let mut tool_registry = ToolRegistry::new();
+    let (mcp_tools, _) = uti_tools::load_mcp_servers(&client.get_config().mcp_servers).await;
+    for t in mcp_tools {
+        tool_registry.register(t);
+    }
     let prompt_builder = PromptBuilder::new(&workspace_dir)
         .with_sudo_password(get_sudo_password().is_some());
 
@@ -241,6 +246,12 @@ async fn run_headless(
                         current_tool_calls[index].function.arguments.push_str(&a);
                     }
                 }
+                StreamEvent::Notice(msg) => {
+                    println!("\n[INFO] {}\n", msg);
+                }
+                StreamEvent::ContextCompacted { notice, .. } => {
+                    println!("\n[INFO] {}\n", notice);
+                }
                 StreamEvent::Completed { .. } => {}
                 StreamEvent::Error(err) => {
                     eprintln!("\nError: {}", err);
@@ -265,6 +276,36 @@ async fn run_headless(
             for call in &current_tool_calls {
                 let args_json = serde_json::from_str(&call.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
+
+                // Prompt user for confirmation on potentially mutating/dangerous actions unless YOLO mode is enabled
+                if !context.yolo_mode {
+                    if let Some(tool) = tool_registry.get(&call.function.name) {
+                        if tool.needs_confirmation(&args_json, &context) {
+                            println!("\n[WARNING] Action requires confirmation: [{}]", call.function.name);
+                            if let Some(diff) = tool.format_diff(&args_json, &context.workspace_dir) {
+                                println!("{}", diff);
+                            } else if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
+                                println!("  Command: {}", cmd);
+                            } else {
+                                println!("  Arguments: {}", serde_json::to_string_pretty(&args_json).unwrap_or_default());
+                            }
+
+                            print!("Allow execution? [y/N]: ");
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+
+                            let mut input = String::new();
+                            let _ = std::io::stdin().read_line(&mut input);
+                            let trimmed = input.trim().to_lowercase();
+                            if trimmed != "y" && trimmed != "yes" {
+                                println!("Execution cancelled by user.");
+                                messages.push(Message::tool_response(call.id.clone(), "Execution denied by user."));
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let output = match tool_registry
                     .execute(&call.function.name, args_json, &context)
                     .await

@@ -1,6 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::symbols;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -28,6 +29,12 @@ pub struct UserDialogState {
     pub calls: Vec<ToolCall>,
     pub call_id: String,
     pub cancelled: bool,
+}
+
+impl Default for UserDialogState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UserDialogState {
@@ -162,7 +169,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     let height = (7 + max_opts as u16).min(area.height.saturating_sub(6)).max(8);
     // Compact box with generous side margins so the chat text doesn't touch
     // the frame edges.
-    let width = area.width.saturating_sub(24).min(76).max(40);
+    let width = area.width.saturating_sub(24).clamp(40, 76);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let dialog = Rect::new(x, y, width, height);
@@ -199,9 +206,24 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
         }
     } else {
         let input = &state.text_input[state.current];
+        let q_lower = q.question.to_lowercase();
+        let h_lower = q.header.as_deref().unwrap_or("").to_lowercase();
+        let is_secret = q_lower.contains("password")
+            || q_lower.contains("contraseñ")
+            || q_lower.contains("contra")
+            || q_lower.contains("secret")
+            || h_lower.contains("password")
+            || h_lower.contains("contra");
+
+        let display_text = if is_secret {
+            "*".repeat(input.len())
+        } else {
+            input.clone()
+        };
+
         lines.push(Line::from(vec![
             Span::styled("   ❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-            Span::styled(input.clone(), Style::default().fg(theme.foreground)),
+            Span::styled(display_text, Style::default().fg(theme.foreground)),
             Span::styled("█", Style::default().fg(theme.accent_blue)),
         ]));
     }
@@ -220,6 +242,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     let block = Block::default()
         .title(format!(" {} ", title))
         .borders(Borders::ALL)
+        .border_set(symbols::border::PLAIN)
         .border_style(Style::default().fg(theme.accent_blue));
 
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), dialog);

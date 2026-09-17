@@ -5,18 +5,35 @@ use async_trait::async_trait;
 use serde_json::json;
 use diffy::Patch;
 
+use crate::fs_tools::{atomic_write, resolve_path};
 use crate::types::{Tool, ToolContext, ToolOutput};
 
 pub struct ApplyPatchTool;
 
 impl ApplyPatchTool {
     fn extract_file_path(hunk_header: &str) -> Option<String> {
+        // Priority 1: +++ b/path (post-image target)
         for line in hunk_header.lines() {
-            if line.starts_with("+++ ") || line.starts_with("--- ") {
+            if line.starts_with("+++ ") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 2 {
                     let mut file = parts[1].trim();
                     if file.starts_with("b/") || file.starts_with("a/") {
+                        file = &file[2..];
+                    }
+                    if file != "/dev/null" && !file.is_empty() {
+                        return Some(file.to_string());
+                    }
+                }
+            }
+        }
+        // Priority 2: --- a/path (pre-image fallback)
+        for line in hunk_header.lines() {
+            if line.starts_with("--- ") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let mut file = parts[1].trim();
+                    if file.starts_with("a/") || file.starts_with("b/") {
                         file = &file[2..];
                     }
                     if file != "/dev/null" && !file.is_empty() {
@@ -46,6 +63,10 @@ impl Tool for ApplyPatchTool {
                 "patch": {
                     "type": "string",
                     "description": "The unified diff patch content to apply."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional: Path of the file to patch if not specified in diff headers (supports ~/)."
                 }
             },
             "required": ["patch"]
@@ -58,12 +79,20 @@ impl Tool for ApplyPatchTool {
 
     fn format_diff(&self, args: &serde_json::Value, _workspace: &Path) -> Option<String> {
         args.get("patch")
+            .or_else(|| args.get("input"))
+            .or_else(|| args.get("diff"))
             .and_then(|p| p.as_str())
+            .or_else(|| args.as_str())
             .map(|s| s.to_string())
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
-        let patch_str = match args.get("patch").and_then(|v| v.as_str()) {
+        let patch_str = match args.get("patch")
+            .or_else(|| args.get("input"))
+            .or_else(|| args.get("diff"))
+            .and_then(|v| v.as_str())
+            .or_else(|| args.as_str())
+        {
             Some(p) if !p.trim().is_empty() => p,
             _ => return Ok(ToolOutput::error("Error: 'patch' parameter cannot be empty.")),
         };
@@ -78,14 +107,23 @@ impl Tool for ApplyPatchTool {
             }
         };
 
-        let target_file_rel = Self::extract_file_path(patch_str)
-            .unwrap_or_else(|| "unknown".to_string());
+        let target_file = match Self::extract_file_path(patch_str) {
+            Some(f) => f,
+            None => match args.get("file_path")
+                .or_else(|| args.get("path"))
+                .or_else(|| args.get("file"))
+                .and_then(|v| v.as_str())
+            {
+                Some(f) => f.to_string(),
+                None => {
+                    return Ok(ToolOutput::error(
+                        "Error: Could not determine target file from diff headers (e.g. '+++ b/path/to/file') and 'file_path' was not provided."
+                    ));
+                }
+            },
+        };
 
-        if target_file_rel == "unknown" {
-            return Ok(ToolOutput::error("Could not determine target file from unified diff header. Ensure '--- a/file' and '+++ b/file' exist."));
-        }
-
-        let target_path = context.workspace_dir.join(&target_file_rel);
+        let target_path = resolve_path(&context.workspace_dir, &target_file);
 
         let original_content = if target_path.exists() {
             match fs::read_to_string(&target_path) {
@@ -101,25 +139,40 @@ impl Tool for ApplyPatchTool {
             Err(e) => {
                 return Ok(ToolOutput::error(format!(
                     "Patch application failed for {}: {}. Context line mismatch.",
-                    target_file_rel, e
+                    target_file, e
                 )));
             }
         };
 
-        if let Some(parent) = target_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                return Ok(ToolOutput::error(format!("Failed to create directories for {}: {}", target_path.display(), e)));
-            }
-        }
-
-        if let Err(e) = fs::write(&target_path, patched_content) {
+        if let Err(e) = atomic_write(&target_path, &patched_content) {
             return Ok(ToolOutput::error(format!("Failed to write patched content to {}: {}", target_path.display(), e)));
         }
 
         let action = if original_content.is_empty() { "Created" } else { "Patched" };
         Ok(ToolOutput::success_with_summary(
-            format!("{} {} successfully via apply_patch.", action, target_file_rel),
-            format!("{} {}", action, target_file_rel),
+            format!("{} {} successfully via apply_patch.", action, target_file),
+            format!("{} {}", action, target_file),
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_diff_flexible_keys() {
+        let tool = ApplyPatchTool;
+        let ws = Path::new("/tmp");
+
+        let args_patch = json!({"patch": "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-a\n+b\n"});
+        assert!(tool.format_diff(&args_patch, ws).is_some());
+
+        let args_input = json!({"input": "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-a\n+b\n"});
+        assert!(tool.format_diff(&args_input, ws).is_some());
+
+        let args_diff = json!({"diff": "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-a\n+b\n"});
+        assert!(tool.format_diff(&args_diff, ws).is_some());
+    }
+}
+

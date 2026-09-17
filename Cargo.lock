@@ -2227,6 +2227,7 @@ dependencies = [
  "directories",
  "glob",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "serde",

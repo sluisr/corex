@@ -69,7 +69,7 @@ pub fn build_tool_confirmation_lines(
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
 
     let border_color = Color::Rgb(70, 80, 100);
-    let box_width = max_width.min(105).max(30);
+    let box_width = max_width.clamp(30, 105);
     let inner_width = box_width.saturating_sub(6);
 
     let mut result = Vec::new();
@@ -86,7 +86,19 @@ pub fn build_tool_confirmation_lines(
     } else {
         all_diff_lines.into_iter().take(12).collect()
     };
-    for line in shown_diff_lines {
+    if shown_diff_lines.is_empty() {
+        result.push(format_boxed_row(
+            "$ ",
+            Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD),
+            "(no arguments provided)",
+            Style::default().fg(theme.gray),
+            None,
+            inner_width,
+            border_color,
+            border_color,
+        ));
+    } else {
+        for line in shown_diff_lines {
         if is_edit {
             if line.starts_with('+') && !line.starts_with("+++") {
                 result.push(format_boxed_row(
@@ -105,6 +117,28 @@ pub fn build_tool_confirmation_lines(
                     Style::default().fg(theme.diff_removed_fg).add_modifier(Modifier::BOLD),
                     &line[1..],
                     Style::default().fg(theme.diff_removed_fg),
+                    None,
+                    inner_width,
+                    border_color,
+                    border_color,
+                ));
+            } else if line.starts_with("@@") {
+                result.push(format_boxed_row(
+                    "",
+                    Style::default(),
+                    line,
+                    Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD),
+                    None,
+                    inner_width,
+                    border_color,
+                    border_color,
+                ));
+            } else if line.starts_with("---") || line.starts_with("+++") {
+                result.push(format_boxed_row(
+                    "",
+                    Style::default(),
+                    line,
+                    Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD),
                     None,
                     inner_width,
                     border_color,
@@ -140,6 +174,7 @@ pub fn build_tool_confirmation_lines(
                 border_color,
             ));
         }
+    }
     }
 
     // 3. Bottom border
@@ -226,7 +261,7 @@ pub fn build_streaming_tool_preview_lines(
 ) -> Vec<Line<'static>> {
     let dim_border = Color::Rgb(60, 70, 90);
     let beam_color = theme.accent_cyan;
-    let box_width = max_width.min(105).max(30);
+    let box_width = max_width.clamp(30, 105);
     let inner_width = box_width.saturating_sub(6);
     let bar_len = inner_width + 2;
     let num_rows = calls.len().max(1);
