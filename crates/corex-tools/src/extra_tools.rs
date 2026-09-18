@@ -372,7 +372,7 @@ impl Tool for GetInternalDocsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Accesses UTI CLI's own documentation for accurate answers about its capabilities."
+        "Accesses Corex's own documentation for accurate answers about its capabilities."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -390,7 +390,7 @@ impl Tool for GetInternalDocsTool {
 
     async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let docs = r#"
-UTI CLI (Universal Terminal Intelligence) Documentation:
+Corex Documentation:
 - Architecture: 100% Native Rust autonomous agent with hybrid Cloud (DeepSeek) & Local (llama.cpp/Ollama) routing.
 - Model Selection: Supports deepseek-flash, deepseek-v4-pro, deepseek-chat, deepseek-reasoner, and local SLM on :8080.
 - Operating Modes:
@@ -428,9 +428,18 @@ struct Task {
 }
 
 fn load_tasks(workspace_dir: &Path) -> Vec<Task> {
-    let path = workspace_dir.join(".uti").join("tasks.json");
-    if path.exists() {
-        if let Ok(content) = fs::read_to_string(path) {
+    let path = workspace_dir.join(".corex").join("tasks.json");
+    let fallback = workspace_dir.join(".uti").join("tasks.json");
+    let target = if path.exists() {
+        Some(path)
+    } else if fallback.exists() {
+        Some(fallback)
+    } else {
+        None
+    };
+
+    if let Some(p) = target {
+        if let Ok(content) = fs::read_to_string(p) {
             if let Ok(tasks) = serde_json::from_str(&content) {
                 return tasks;
             }
@@ -440,7 +449,7 @@ fn load_tasks(workspace_dir: &Path) -> Vec<Task> {
 }
 
 fn save_tasks(workspace_dir: &Path, tasks: &[Task]) -> Result<()> {
-    let dir = workspace_dir.join(".uti");
+    let dir = workspace_dir.join(".corex");
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("tasks.json");
     fs::write(path, serde_json::to_string_pretty(tasks)?)?;
@@ -858,7 +867,7 @@ impl Tool for UpdateTopicTool {
         let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
         let intent = args.get("strategic_intent").and_then(|v| v.as_str()).unwrap_or("");
 
-        let dir = context.workspace_dir.join(".uti");
+        let dir = context.workspace_dir.join(".corex");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("topic.json");
 

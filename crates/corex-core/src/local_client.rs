@@ -295,7 +295,7 @@ RULES:
 
     /// Fast answering for simple shell / terminal questions without contacting cloud API.
     pub async fn quick_chat(&self, prompt: &str) -> Result<String> {
-        let system_prompt = r#"You are UTI Local Assistant, a fast, knowledgeable Linux terminal & developer helper.
+        let system_prompt = r#"You are Corex Local Assistant, a fast, knowledgeable Linux terminal & developer helper.
 Give direct, accurate answers for shell commands, system utilities, git workflows, and quick explanations.
 Keep answers concise and practical with code snippets where helpful."#;
 
@@ -305,7 +305,7 @@ Keep answers concise and practical with code snippets where helpful."#;
     /// Generates a dense, structured context summary of past conversation messages.
     /// Run locally on llama-server / local SLM @ $0.00.
     pub async fn compact_conversation(&self, formatted_history: &str) -> Result<String> {
-        let system_prompt = r#"You are the Context Compactor for UTI CLI.
+        let system_prompt = r#"You are the Context Compactor for Corex.
 Your job is to condense older conversation messages into a dense, high-signal technical memory block.
 Extract and summarize:
 1. Primary User Objectives & Intent

@@ -111,7 +111,7 @@ impl McpClient {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {
-                    "name": "uti-cli",
+                    "name": "corex",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }

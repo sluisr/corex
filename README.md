@@ -39,7 +39,7 @@ While previous generation CLI tools were born as TypeScript adaptations of web/n
 
 ## ⚡ System Requirements & Resource Footprint
 
-Because **UTI CLI** is built 100% in native Rust with link-time optimization (LTO) and zero runtime overhead, its resource footprint is negligible compared to traditional Node.js or Python-based CLI assistants:
+Because **Corex** is built 100% in native Rust with link-time optimization (LTO) and zero runtime overhead, its resource footprint is negligible compared to traditional Node.js or Python-based CLI assistants:
 
 ### 💻 Hardware & OS Requirements
 
@@ -53,7 +53,7 @@ Because **UTI CLI** is built 100% in native Rust with link-time optimization (LT
 
 ### 📊 Real-World Performance & Memory Benchmarks
 
-| Metric | UTI CLI (Pure Native Rust) | Typical Node.js / TS CLIs | Electron / Webview CLIs |
+| Metric | Corex (Pure Native Rust) | Typical Node.js / TS CLIs | Electron / Webview CLIs |
 | :--- | :--- | :--- | :--- |
 | **Download Size** | **~3.8 – 4.2 MB** (`.tar.gz` / `.zip`) | ~80 – 150 MB (with `node_modules`) | ~180 – 350 MB |
 | **Executable Size** | **~13 MB** (single static binary) | Multi-file tree + Node.js runtime | Multi-file bundle + Chromium engine |
@@ -67,11 +67,11 @@ Because **UTI CLI** is built 100% in native Rust with link-time optimization (LT
 
 ## 🎯 3 Flexible Operating Modes
 
-UTI CLI offers 3 distinct execution modes switchable in real-time via `/model`:
+Corex offers 3 distinct execution modes switchable in real-time via `/model`:
 
 ```text
                                ┌─────────────────────────────┐
-                               │   UTI CLI OPERATING MODES   │
+                               │    COREX OPERATING MODES    │
                                └──────────────┬──────────────┘
                                               │
          ┌────────────────────────────────────┼────────────────────────────────────┐
@@ -234,7 +234,7 @@ Inside the interactive TUI, type `/` to access built-in commands:
 
 ## 🛠️ Built-in Agent Tools
 
-UTI CLI equips DeepSeek with native developer tools for autonomous development:
+Corex equips DeepSeek with native developer tools for autonomous development:
 
 * **⚡ `apply_patch`:** Unified diff atomic patching for safe, token-efficient code edits.
 * **📁 File Operations:** `read_file`, `write_file`, `smart_replace`, `list_directory`, `glob`, and `grep`.
@@ -242,13 +242,13 @@ UTI CLI equips DeepSeek with native developer tools for autonomous development:
 * **⚙️ Background Task Management (`manage_task`):** Unified task controller matching Antigravity architecture (`list`, `status`, `kill`, `send_input`).
 * **🌐 Web Fetch (`web_fetch`):** HTTP fetching and markdown extraction for online documentation and APIs.
 * **📋 Task Tracking (`write_todos`):** Dynamic multi-step task list tracking and progress monitoring.
-* **🧠 Persistent Memory:** Project-level (`./UTI.md`) and global (`~/.uti/UTI.md`) persistent context.
+* **🧠 Persistent Memory:** Project-level (`./COREX.md` / `./UTI.md`) and global (`~/.corex/COREX.md`) persistent context.
 
 ---
 
 ## 📊 Forensic Audit Logging
 
-UTI CLI logs complete telemetry to `~/.uti/logs/uti-forensic-YYYY-MM-DD.log`:
+Corex logs complete telemetry to `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`:
 
 ```text
 [2026-08-30 14:43:18.542][LLM_RESP    ] ─── INBOUND <- DeepSeek Cloud (deepseek-flash) [1613 ms] ───
@@ -274,12 +274,12 @@ Token & Cost Forensics:
 
 ## ⚙️ Configuration
 
-Settings are stored in `~/.uti/`:
+Settings are stored in `~/.corex/` (with automatic fallback to legacy `~/.uti/`):
 
-* `~/.uti/settings.json` — API credentials, base URL, default models.
-* `~/.uti/flash_settings.json` — CoT reasoning effort depths (`none` / `low` / `high` / `xhigh` / `max`).
-* `~/.uti/hybrid_settings.json` — Strategy, local server endpoint, scout settings.
-* `~/.uti/logs/` — Forensic audit logs.
+* `~/.corex/settings.json` — API credentials, base URL, default models.
+* `~/.corex/flash_settings.json` — CoT reasoning effort depths (`none` / `low` / `high` / `xhigh` / `max`).
+* `~/.corex/hybrid_settings.json` — Strategy, local server endpoint, scout settings.
+* `~/.corex/logs/` — Forensic audit logs.
 
 ---
 
@@ -289,7 +289,7 @@ Settings are stored in `~/.uti/`:
 * **Website:** [https://sluisr.com](https://sluisr.com/)
 * **GitHub:** [https://github.com/sluisr](https://github.com/sluisr)
 * **YouTube:** [https://www.youtube.com/@sluisr_](https://www.youtube.com/@sluisr_)
-* **Repository:** [https://github.com/sluisr/uti-cli](https://github.com/sluisr/uti-cli)
+* **Repository:** [https://github.com/sluisr/corex](https://github.com/sluisr/corex)
 
 ---
 
