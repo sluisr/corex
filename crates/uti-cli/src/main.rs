@@ -20,16 +20,16 @@ use uti_tui::{run_tui, App};
     about = "Corex — High-Performance Autonomous Coding Agent"
 )]
 struct Cli {
-    /// Non-interactive headless message/prompt to execute directly (e.g. -m "..." or -p "...")
-    #[arg(short = 'm', short_alias = 'p', long = "message", alias = "prompt")]
+    /// Non-interactive headless prompt to execute directly (e.g. -p "..." or --prompt "...")
+    #[arg(short = 'p', long = "prompt", alias = "message")]
     message: Option<String>,
 
-    /// Positional query (if provided without -m/-p, runs headlessly)
+    /// Positional query (if provided without -p, runs headlessly)
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 
-    /// Model name override (e.g. --model deepseek-flash, -M deepseek-v4-pro)
-    #[arg(short = 'M', long = "model")]
+    /// Model name override (e.g. -m deepseek-flash, --model deepseek-v4-pro)
+    #[arg(short = 'm', short_alias = 'M', long = "model")]
     model: Option<String>,
 
     /// Custom API base URL (e.g. https://api.deepseek.com)
