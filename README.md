@@ -1,15 +1,15 @@
-# 🦀 UTI CLI (Universal Terminal Intelligence)
+# ⚡ Corex (`cx`)
 
 <p align="center">
   <strong>The ultra-fast, native Rust autonomous AI terminal agent for DeepSeek API & Local LLMs with Hybrid Intelligence.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/sluisr/uti-cli/releases"><img src="https://img.shields.io/github/v/release/sluisr/uti-cli?color=blue&label=version" alt="Release"></a>
+  <a href="https://github.com/sluisr/corex/releases"><img src="https://img.shields.io/github/v/release/sluisr/corex?color=blue&label=version" alt="Release"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/language-Rust%202021-orange.svg" alt="Rust 2021"></a>
   <a href="https://platform.deepseek.com/"><img src="https://img.shields.io/badge/AI-DeepSeek%20V4.1%20Flash%20%7C%20Pro-blueviolet" alt="DeepSeek V4.1"></a>
   <a href="https://github.com/ggerganov/llama.cpp"><img src="https://img.shields.io/badge/Local%20LLM-llama.cpp%20%7C%20Ollama-green" alt="Local LLM"></a>
-  <a href="https://github.com/sluisr/uti-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
+  <a href="https://github.com/sluisr/corex/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
   <a href="https://sluisr.com/"><img src="https://img.shields.io/badge/author-sluisr.com-purple" alt="Author"></a>
 </p>
 
@@ -17,15 +17,15 @@
 
 ## 🚀 The Evolution: Beyond `deepseek-cli`
 
-**UTI CLI** is the official next-generation, high-performance successor to [`deepseek-cli`](https://github.com/sluisr/deepseek-cli), created and maintained 100% by [**sluisr**](https://sluisr.com/).
+**Corex** (invoked with the ultra-ergonomic command **`cx`**) is the official next-generation, high-performance autonomous terminal agent created and maintained 100% by [**sluisr**](https://sluisr.com/).
 
-While `deepseek-cli` was born as a TypeScript adaptation of Google's Gemini CLI, **UTI CLI** has been completely re-architected from scratch in **pure Rust**. It breaks free from all Google legacy upstream constraints, eliminates `node_modules` and Node.js runtime bloat, and delivers instant **5ms startup times**, **zero-cost Local LLM hybrid routing**, and **adaptive CoT reasoning**.
+While previous generation CLI tools were born as TypeScript adaptations of web/node CLIs, **Corex** has been completely re-architected from scratch in **pure Rust**. It breaks free from all runtime constraints, eliminates `node_modules` and Node.js runtime bloat, and delivers instant **5ms startup times**, **zero-cost Local LLM hybrid routing**, and **adaptive CoT reasoning**.
 
 ---
 
-## ⚡ Why UTI CLI?
+## ⚡ Why Corex?
 
-* 🦀 **100% Native Rust Architecture:** Single standalone static binary. Zero Node.js runtime, zero `npm` dependencies, instant terminal startup (< 10ms), and minimal RAM footprint.
+* 🦀 **100% Native Rust Architecture:** Single standalone static binary. Instant terminal startup (< 10ms), single-hand ergonomic typing (`cx`), and minimal RAM footprint.
 * 💰 **Hybrid Intelligence (@ $0.00 Local Routing):** Seamlessly pairs DeepSeek Cloud with your local SLM (`llama-server`, `llama.cpp`, or `Ollama`) on port 8080. Non-coding questions and greetings are handled locally at **$0.00**, saving up to 70% in API costs.
 * 🧠 **DeepSeek V4.1 Cloud Engine:** Full native support for `deepseek-flash` (DeepSeek-V4.1-Flash 522B vision-language MoE, native vision, 1M token context) and `deepseek-v4-pro` (Reasoning / Thinking CoT mode).
 * ⚡ **Dynamic Adaptive Reasoning CoT:** Automatically uses ultra-fast reasoning (~200ms TTFT) for shell commands and system inspection, reserving deep multi-stage CoT (`high` / `xhigh` / `max`) for complex code generation and refactoring.
@@ -130,37 +130,37 @@ Inside Hybrid Mode, you can choose between **4 specialized strategies**:
 
 ## 📦 Installation
 
-### Option 1: Cargo (Recommended)
+### Option 1: From Source / Cargo (Recommended)
 
 ```bash
-cargo install uti-cli
+cargo install --git https://github.com/sluisr/corex.git --force
 ```
 
 ### Option 2: Pre-compiled Binary (Linux / macOS / Windows)
 
-Download the latest release binary from the [Releases page](https://github.com/sluisr/uti-cli/releases) or install via `curl`:
+Download the latest release binary from the [Releases page](https://github.com/sluisr/corex/releases) or install via `curl`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sluisr/uti-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | sh
 ```
 
-### Option 3: Build from Source
+### Option 3: Local Clone & Build
 
 ```bash
-git clone https://github.com/sluisr/uti-cli.git
-cd uti-cli
+git clone https://github.com/sluisr/corex.git
+cd corex
 cargo build --release
-sudo cp target/release/uti /usr/local/bin/
+sudo cp target/release/cx /usr/local/bin/
 ```
 
 ### Option 4: Via npm / npx
 
 ```bash
 # Run instantly without installing:
-npx @sluisr/uti-cli
+npx corex-cli
 
 # Or install globally:
-npm install -g @sluisr/uti-cli
+npm install -g corex-cli
 ```
 
 ---
@@ -170,10 +170,12 @@ npm install -g @sluisr/uti-cli
 Get your DeepSeek API key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) and export it:
 
 ```bash
+export COREX_API_KEY="sk-your-deepseek-api-key"
+# or
 export DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
 ```
 
-Or configure it interactively inside UTI CLI by typing `/auth` on first launch.
+Or configure it interactively inside Corex by typing `/auth` or `/key` on first launch.
 
 ### Optional: Local LLM Server Setup (for Hybrid Mode)
 
@@ -189,11 +191,11 @@ llama-server -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080 -c 8192
 
 ### Interactive TUI Mode
 
-Launch the interactive terminal UI in any project directory:
+Launch the interactive terminal UI in any project directory with the lightning-fast command `cx` (or aliases `corex` / `uti`):
 
 ```bash
 cd my-project/
-uti
+cx
 ```
 
 ### Non-Interactive / Scripting Mode
@@ -201,7 +203,7 @@ uti
 Execute automated one-shot tasks directly from bash:
 
 ```bash
-uti -p "Analyze this Rust project and run all unit tests"
+cx -p "Analyze this Rust project and run all unit tests"
 ```
 
 ---

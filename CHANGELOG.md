@@ -1,9 +1,21 @@
 # Changelog
 
-All notable changes to **UTI CLI** will be documented in this file.
+All notable changes to **Corex** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [0.2.1] - 2026-09-18
+
+### Added
+- **Official Rebranding to Corex (`cx`)**: The autonomous coding agent is now **Corex**, launched via the ultra-ergonomic command **`cx`** (adjacent keys on QWERTY keyboards for instant single-hand typing).
+- **Backwards Compatibility Aliases**: Maintained full backward compatibility for `corex` and `uti` binary invocations.
+- **Prompt Queuing While Streaming**: Users can now type or paste follow-up prompts and press `Enter` while the model is generating responses. Queued prompts appear with a clean non-emoji status badge (`[queued] <prompt> (pending)`) and automatically execute sequentially when the active turn completes.
+- **Non-blocking `/balance` Lookup**: `/balance` (and `/wallet`) now queries account token credits and currency balances asynchronously in the background with a 10s timeout, showing an immediate status notification and live-updating once the server responds without blocking terminal interaction.
+- **Seamless Config & History Migration**: Unified settings resolution checking `~/.corex/` first with fallback to `~/.uti/` and `~/.deepseek/`.
+- **New Environment Variable**: Added support for `COREX_API_KEY` with fallback to `UTI_API_KEY`, `DEEPSEEK_API_KEY`, and `OPENAI_API_KEY`.
 
 ---
 

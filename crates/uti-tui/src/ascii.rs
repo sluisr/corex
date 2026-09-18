@@ -17,11 +17,11 @@ pub fn render_gradient_logo(
     let c3 = Color::Rgb(129, 140, 248); // Indigo (#818cf8)
     let c4 = Color::Rgb(168, 85, 247);  // Violet (#a855f7)
 
-    // Row 1: "  ▄██▀    UTI CLI v<version>"
+    // Row 1: "  ▄██▀    COREX CLI v<version>"
     lines.push(Line::from(vec![
         Span::styled("  \u{2584}\u{2588}\u{2588}\u{2580}", Style::default().fg(c1).add_modifier(Modifier::BOLD)),
         Span::raw("    "),
-        Span::styled("UTI CLI", Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)),
+        Span::styled("COREX CLI", Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" v{}", version), Style::default().fg(Color::DarkGray)),
     ]));
 
@@ -54,7 +54,7 @@ pub fn render_gradient_logo(
         row4_spans.push(Span::raw("   "));
         row4_spans.push(Span::styled("⚡ Update available: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
         row4_spans.push(Span::styled(format!("v{} → v{} ", version, newer), Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD)));
-        row4_spans.push(Span::styled("(run 'uti update' or update your terminal)", Style::default().fg(Color::DarkGray)));
+        row4_spans.push(Span::styled("(run 'cx update' or update your terminal)", Style::default().fg(Color::DarkGray)));
     }
     lines.push(Line::from(row4_spans));
 

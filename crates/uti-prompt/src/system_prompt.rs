@@ -104,9 +104,15 @@ impl PromptBuilder {
         let mut memory = String::new();
 
         if let Some(dirs) = BaseDirs::new() {
+            let corex_global = dirs.home_dir().join(".corex").join("COREX.md");
             let uti_global = dirs.home_dir().join(".uti").join("UTI.md");
             let legacy_global = dirs.home_dir().join(".deepseek").join("DEEPSEEK.md");
-            if uti_global.exists() {
+            if corex_global.exists() {
+                if let Ok(c) = fs::read_to_string(&corex_global) {
+                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    memory.push_str(&format!("\n--- User Global Memory (~/.corex/COREX.md) ---\n{}\n", bounded));
+                }
+            } else if uti_global.exists() {
                 if let Ok(c) = fs::read_to_string(&uti_global) {
                     let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                     memory.push_str(&format!("\n--- User Global Memory (~/.uti/UTI.md) ---\n{}\n", bounded));
@@ -119,9 +125,15 @@ impl PromptBuilder {
             }
         }
 
+        let corex_local = self.workspace_dir.join("COREX.md");
         let uti_local = self.workspace_dir.join("UTI.md");
         let legacy_local = self.workspace_dir.join("DEEPSEEK.md");
-        if uti_local.exists() {
+        if corex_local.exists() {
+            if let Ok(c) = fs::read_to_string(&corex_local) {
+                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                memory.push_str(&format!("\n--- Project Memory (./COREX.md) ---\n{}\n", bounded));
+            }
+        } else if uti_local.exists() {
             if let Ok(c) = fs::read_to_string(&uti_local) {
                 let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                 memory.push_str(&format!("\n--- Project Memory (./UTI.md) ---\n{}\n", bounded));
@@ -141,7 +153,7 @@ impl PromptBuilder {
 
         let mode_str = if self.is_plan_mode { "Plan" } else { "Default" };
         prompt.push_str(&format!(
-            "You are UTI CLI (created by sluisr), an autonomous, high-performance CLI agent specializing in software engineering tasks. You are currently operating in **{}** mode. Your primary goal is to help users safely and effectively.\n\n",
+            "You are Corex (cx, created by sluisr), an autonomous, high-performance CLI agent specializing in software engineering tasks. You are currently operating in **{}** mode. Your primary goal is to help users safely and effectively.\n\n",
             mode_str
         ));
 
@@ -164,6 +176,50 @@ impl PromptBuilder {
             prompt.push_str("\n\n# PLANNING MODE ACTIVE\n");
             prompt.push_str("- You are in architectural planning mode. Focus on reading and analyzing the codebase.\n");
             prompt.push_str("- Propose clear step-by-step plans before making any destructive edits.\n");
+        }
+
+        let memory = self.read_memory();
+        if !memory.is_empty() {
+            prompt.push_str(&memory);
+        }
+
+        prompt
+    }
+
+    /// Lite system prompt for small local models (Gemma 4 E2B, Llama 7B, etc.).
+    /// Simplified instructions that small models can reliably follow, but retains
+    /// the critical task management and result integrity rules.
+    pub fn build_lite(&self) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str(&format!(
+            "You are Corex, a local AI assistant for Linux terminal tasks. You run entirely on the user's hardware at $0.00 cost.\n\
+            OS: Linux. Date: {}. Workspace: {}.\n\n",
+            chrono::Utc::now().format("%Y-%m-%d"),
+            self.workspace_dir.display()
+        ));
+
+        prompt.push_str(
+            "## TOOL USAGE\n\
+            - To run a shell command: call run_shell_command immediately. Do NOT describe what you would do — just call the tool.\n\
+            - To read files or list directories: use read_file or list_directory tools.\n\
+            - NEVER make up, estimate, or guess command output. Only report what the tool actually returned.\n\
+            - NEVER fabricate speed test results, RAM numbers, or any system metrics. Run the command and report real output.\n\n\
+            ## BACKGROUND TASKS\n\
+            - When run_shell_command returns '[COMMAND SENT TO BACKGROUND]' with a Task ID, the command is still running.\n\
+            - NEVER assume the result or invent output for a background task. It is not done yet.\n\
+            - To check if a background task finished: call manage_task with action='status' and the task_id.\n\
+            - For multi-step tasks (e.g. install a tool THEN run it): wait for the install to complete before running the next command.\n\
+            - NEVER use sleep to wait. Use manage_task to check status.\n\n\
+            ## BEHAVIOR\n\
+            - Answer in the same language the user writes in.\n\
+            - Be concise and direct. No fluff.\n\
+            - For code questions, give short focused answers with snippets.\n\
+            - If you are unsure about something, say so. Do not invent information.\n\n"
+        );
+
+        if self.has_sudo_password {
+            prompt.push_str("sudo is pre-authenticated for this session. Use it freely when root is needed.\n\n");
         }
 
         let memory = self.read_memory();

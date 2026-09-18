@@ -410,7 +410,7 @@ impl LlmClient {
 
         // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
         if summary_opt.is_none() && !cfg.api_key.trim().is_empty() {
-            let summary_system = "You are the Context Compactor for UTI CLI. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
+            let summary_system = "You are the Context Compactor for Corex. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
             let digest = format!(
                 "User Requests:\n{}\n\nTool Actions:\n{}",
                 user_requests.join("\n"),
@@ -582,7 +582,7 @@ impl LlmClient {
         let api_key = &cfg.api_key;
         if api_key.is_empty() {
             crate::forensic::ForensicLogger::log_error("stream_chat", "Missing API key in Config");
-            bail!("API key is missing. Please set UTI_API_KEY / DEEPSEEK_API_KEY or configure ~/.uti/settings.json");
+            bail!("API key is missing. Please set COREX_API_KEY / DEEPSEEK_API_KEY or configure ~/.corex/settings.json");
         }
 
         // ⚡ ORDER OF INTEGRITY:
@@ -909,6 +909,7 @@ impl LlmClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(Duration::from_secs(10))
             .header("Authorization", format!("Bearer {}", api_key))
             .send()
             .await

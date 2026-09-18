@@ -285,7 +285,13 @@ impl Tool for WriteTodosTool {
             None => return Ok(ToolOutput::error("Missing 'todos' argument.")),
         };
 
-        let dir = context.workspace_dir.join(".uti");
+        let dir = if context.workspace_dir.join(".corex").exists() {
+            context.workspace_dir.join(".corex")
+        } else if context.workspace_dir.join(".uti").exists() {
+            context.workspace_dir.join(".uti")
+        } else {
+            context.workspace_dir.join(".corex")
+        };
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("todos.json");
         
@@ -293,7 +299,7 @@ impl Tool for WriteTodosTool {
             return Ok(ToolOutput::error(format!("Failed to write todos: {}", e)));
         }
 
-        Ok(ToolOutput::success("Todos successfully updated and saved in .uti/todos.json"))
+        Ok(ToolOutput::success("Todos successfully updated and saved in todos.json"))
     }
 }
 
@@ -309,7 +315,7 @@ impl Tool for ActivateSkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Loads specialized procedural expertise from .uti/skills or ~/.uti/skills directory."
+        "Loads specialized procedural expertise from .corex/skills, .uti/skills, or global skills directories."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -331,9 +337,13 @@ impl Tool for ActivateSkillTool {
             None => return Ok(ToolOutput::error("Missing 'name' argument.")),
         };
 
-        // Search precedence: 1. Workspace .uti/skills 2. Global ~/.uti/skills 3. Fallback .gemini/skills
+        // Search precedence: 1. Workspace .corex/skills 2. Workspace .uti/skills 3. Global ~/.corex/skills 4. Global ~/.uti/skills 5. Fallback .gemini/skills
         let candidates = [
+            context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
             context.workspace_dir.join(".uti").join("skills").join(name).join("SKILL.md"),
+            directories::BaseDirs::new()
+                .map(|b| b.home_dir().join(".corex").join("skills").join(name).join("SKILL.md"))
+                .unwrap_or_else(|| Path::new("").to_path_buf()),
             directories::BaseDirs::new()
                 .map(|b| b.home_dir().join(".uti").join("skills").join(name).join("SKILL.md"))
                 .unwrap_or_else(|| Path::new("").to_path_buf()),
@@ -349,7 +359,7 @@ impl Tool for ActivateSkillTool {
             }
         }
 
-        Ok(ToolOutput::error(format!("Skill '{}' not found in .uti/skills or ~/.uti/skills", name)))
+        Ok(ToolOutput::error(format!("Skill '{}' not found in .corex/skills or .uti/skills", name)))
     }
 }
 

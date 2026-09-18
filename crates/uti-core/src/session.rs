@@ -77,8 +77,12 @@ impl Session {
 
     pub fn sessions_dir() -> PathBuf {
         BaseDirs::new()
-            .map(|dirs| dirs.home_dir().join(".uti").join("sessions"))
-            .unwrap_or_else(|| PathBuf::from(".uti/sessions"))
+            .map(|dirs| dirs.home_dir().join(".corex").join("sessions"))
+            .unwrap_or_else(|| PathBuf::from(".corex/sessions"))
+    }
+
+    pub fn legacy_sessions_dir() -> Option<PathBuf> {
+        BaseDirs::new().map(|dirs| dirs.home_dir().join(".uti").join("sessions"))
     }
 
     pub fn add_message(&mut self, message: Message) {
@@ -126,6 +130,14 @@ impl Session {
             let session: Session = serde_json::from_str(&content)?;
             return Ok(session);
         }
+        if let Some(legacy_dir) = Self::legacy_sessions_dir() {
+            let legacy_file = legacy_dir.join(format!("{}.json", target));
+            if legacy_file.exists() {
+                let content = fs::read_to_string(&legacy_file)?;
+                let session: Session = serde_json::from_str(&content)?;
+                return Ok(session);
+            }
+        }
 
         // 2. Search by UUID prefix, tag, or 1-based index
         let all_summaries = Self::list_all(None);
@@ -133,9 +145,18 @@ impl Session {
             if idx > 0 && idx <= all_summaries.len() {
                 let target_id = &all_summaries[idx - 1].id;
                 let file = dir.join(format!("{}.json", target_id));
-                let content = fs::read_to_string(&file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
+                if file.exists() {
+                    let content = fs::read_to_string(&file)?;
+                    let session: Session = serde_json::from_str(&content)?;
+                    return Ok(session);
+                } else if let Some(legacy_dir) = Self::legacy_sessions_dir() {
+                    let legacy_file = legacy_dir.join(format!("{}.json", target_id));
+                    if legacy_file.exists() {
+                        let content = fs::read_to_string(&legacy_file)?;
+                        let session: Session = serde_json::from_str(&content)?;
+                        return Ok(session);
+                    }
+                }
             }
         }
 
@@ -145,49 +166,76 @@ impl Session {
                 || summary.tag.as_deref().map(|t| t.eq_ignore_ascii_case(target)).unwrap_or(false)
             {
                 let file = dir.join(format!("{}.json", summary.id));
-                let content = fs::read_to_string(&file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
+                if file.exists() {
+                    let content = fs::read_to_string(&file)?;
+                    let session: Session = serde_json::from_str(&content)?;
+                    return Ok(session);
+                } else if let Some(legacy_dir) = Self::legacy_sessions_dir() {
+                    let legacy_file = legacy_dir.join(format!("{}.json", summary.id));
+                    if legacy_file.exists() {
+                        let content = fs::read_to_string(&legacy_file)?;
+                        let session: Session = serde_json::from_str(&content)?;
+                        return Ok(session);
+                    }
+                }
             }
         }
 
-        bail!("No session found matching '{}'. Use `/chat list` or `uti --list-sessions` to view available sessions.", target);
+        bail!("No session found matching '{}'. Use `/chat list` or `cx --list-sessions` to view available sessions.", target);
     }
 
     pub fn delete_by_id_or_tag(id_or_tag: &str) -> Result<String> {
         let session = Self::load_by_id_or_tag(id_or_tag)?;
         let file = Self::sessions_dir().join(format!("{}.json", session.id));
         if file.exists() {
-            fs::remove_file(file)?;
+            fs::remove_file(&file)?;
+        }
+        if let Some(legacy_dir) = Self::legacy_sessions_dir() {
+            let legacy_file = legacy_dir.join(format!("{}.json", session.id));
+            if legacy_file.exists() {
+                fs::remove_file(&legacy_file)?;
+            }
         }
         Ok(session.id)
     }
 
     pub fn list_all(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
-        let dir = Self::sessions_dir();
+        let mut dirs = vec![Self::sessions_dir()];
+        if let Some(legacy) = Self::legacy_sessions_dir() {
+            if legacy.exists() {
+                dirs.push(legacy);
+            }
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
         let mut list = Vec::new();
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(sess) = serde_json::from_str::<Session>(&content) {
-                            if let Some(ws) = workspace_filter {
-                                if let Some(ref sess_ws) = sess.workspace_dir {
-                                    if sess_ws != ws {
-                                        continue;
+        for dir in dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            if let Ok(sess) = serde_json::from_str::<Session>(&content) {
+                                if !seen_ids.insert(sess.id.clone()) {
+                                    continue;
+                                }
+                                if let Some(ws) = workspace_filter {
+                                    if let Some(ref sess_ws) = sess.workspace_dir {
+                                        if sess_ws != ws {
+                                            continue;
+                                        }
                                     }
                                 }
+                                list.push(SessionSummary {
+                                    id: sess.id,
+                                    title: sess.title,
+                                    tag: sess.tag,
+                                    model: sess.model,
+                                    message_count: sess.messages.len(),
+                                    updated_at: sess.updated_at,
+                                    workspace_dir: sess.workspace_dir,
+                                });
                             }
-                            list.push(SessionSummary {
-                                id: sess.id,
-                                title: sess.title,
-                                tag: sess.tag,
-                                model: sess.model,
-                                message_count: sess.messages.len(),
-                                updated_at: sess.updated_at,
-                                workspace_dir: sess.workspace_dir,
-                            });
                         }
                     }
                 }

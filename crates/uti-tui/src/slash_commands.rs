@@ -62,6 +62,10 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "List and manage background tasks: /tasks, /tasks status <pid>, /tasks kill <pid>, /tasks send <pid> <input>",
     },
     CommandItem {
+        name: "/yolo",
+        description: "Toggle auto-approval of all tool executions: /yolo [on | off]",
+    },
+    CommandItem {
         name: "/rewind",
         description: "Rewind conversation history by 1 turn (undo last query and response)",
     },
@@ -79,11 +83,11 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/info",
-        description: "Display UTI CLI version, creator credits, official links, and session telemetry",
+        description: "Display Corex version, creator credits, official links, and session telemetry",
     },
     CommandItem {
         name: "/update",
-        description: "Check for new UTI CLI updates and display upgrade instructions",
+        description: "Check for new Corex updates and display upgrade instructions",
     },
     CommandItem {
         name: "/clear",
@@ -95,7 +99,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/quit",
-        description: "Exit the UTI session",
+        description: "Exit the Corex session",
     },
 ];
 

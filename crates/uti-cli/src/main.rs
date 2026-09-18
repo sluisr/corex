@@ -14,10 +14,10 @@ use uti_tui::{run_tui, App};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "uti",
+    name = "cx",
     version = env!("CARGO_PKG_VERSION"),
     author = "sluisr <contact@sluisr.com>",
-    about = "Universal Terminal Intelligence — High-Performance Autonomous Coding Agent"
+    about = "Corex — High-Performance Autonomous Coding Agent"
 )]
 struct Cli {
     /// Non-interactive headless message/prompt to execute directly (e.g. -m "..." or -p "...")
@@ -103,29 +103,29 @@ async fn main() -> Result<()> {
                 };
                 println!("  {}. {} ({}){} · {} [{}]", i + 1, s.title, rel_time, tag_str, model_display, s.id);
             }
-            println!("\nResume any session with: uti --resume <index | tag | id>\n");
+            println!("\nResume any session with: cx --resume <index | tag | id>\n");
         }
         return Ok(());
     }
 
-    // Handle "uti update" command directly
+    // Handle "cx update" command directly
     if cli.message.is_none() && cli.query.len() == 1 && (cli.query[0] == "update" || cli.query[0] == "--update") {
         let current = env!("CARGO_PKG_VERSION");
-        println!("Checking for UTI CLI updates...");
+        println!("Checking for Corex updates...");
         if let Some(newer) = uti_core::update::check_for_update_online(current).await {
             println!("\n⚡ Update available: v{} → v{}\n", current, newer);
-            println!("To update UTI CLI, run in your terminal:");
-            println!("  • Via npm:       npm install -g uti-cli");
-            println!("  • From source:   cargo install --git https://github.com/sluisr/uti-cli.git --force");
+            println!("To update Corex, run in your terminal:");
+            println!("  • Via npm:       npm install -g corex-cli");
+            println!("  • From source:   cargo install --git https://github.com/sluisr/corex.git --force");
             println!("  • Or download precompiled binaries from:");
-            println!("    https://github.com/sluisr/uti-cli/releases/latest\n");
+            println!("    https://github.com/sluisr/corex/releases/latest\n");
         } else {
-            println!("✓ UTI CLI is already on the latest version (v{}).", current);
+            println!("✓ Corex is already on the latest version (v{}).", current);
         }
         return Ok(());
     }
 
-    // Initialize forensic audit log system (~/.uti/logs/uti-forensic-YYYY-MM-DD.log)
+    // Initialize forensic audit log system (~/.corex/logs/corex-forensic-YYYY-MM-DD.log)
     let log_path = uti_core::ForensicLogger::init(Some(&workspace_dir));
     tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
 

@@ -1037,6 +1037,7 @@ impl Tool for ShellTool {
         });
 
         // Register with TaskManager
+        let is_background = Arc::new(Mutex::new(wait_ms == 0));
         let mgr = get_task_manager();
         if let Ok(mut m) = mgr.lock() {
             m.register(
@@ -1046,6 +1047,7 @@ impl Tool for ShellTool {
                 is_running.clone(),
                 finished_at.clone(),
                 exit_code.clone(),
+                is_background.clone(),
                 Some(stdin_tx),
             );
         }
@@ -1090,6 +1092,9 @@ impl Tool for ShellTool {
                 }
             }
             Err(_) => {
+                if let Ok(mut bg) = is_background.lock() {
+                    *bg = true;
+                }
                 let partial_output = output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
                 let snippet = if partial_output.trim().is_empty() {
                     "(No output produced yet)".to_string()

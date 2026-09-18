@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -221,6 +222,7 @@ pub struct App {
     pub total_rendered_items: usize,
     pub plan_mode: bool,
     pub always_allow_tools: bool,
+    pub logs_expanded: bool,
     pub git_branch: String,
     pub last_turn_start: Option<Instant>,
     pub last_esc_press: Option<Instant>,
@@ -233,6 +235,7 @@ pub struct App {
     pub cached_message_count: usize,
     pub cached_render_width: usize,
     pub cached_session_id: String,
+    pub cached_logs_expanded: bool,
     pub active_background_pids: std::collections::HashSet<u32>,
     pub current_generation_id: u64,
     pub update_available: Arc<std::sync::Mutex<Option<String>>>,
@@ -240,6 +243,11 @@ pub struct App {
     pub status_transition: StatusTransition,
     pub last_chat_rect: Option<Rect>,
     pub last_rendered_text_lines: Vec<String>,
+    pub balance_tx: mpsc::Sender<Result<uti_core::types::BalanceResponse, String>>,
+    pub balance_rx: mpsc::Receiver<Result<uti_core::types::BalanceResponse, String>>,
+    pub is_checking_balance: bool,
+    pub pending_balance_msg_index: Option<usize>,
+    pub message_queue: VecDeque<String>,
 }
 
 impl App {
@@ -254,6 +262,7 @@ impl App {
         }
 
         let is_online = Arc::new(AtomicBool::new(false));
+        let (balance_tx, balance_rx) = mpsc::channel(10);
         let app = Self {
             session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir)),
             llm_client: llm_client.clone(),
@@ -289,6 +298,7 @@ impl App {
             total_rendered_items: 0,
             plan_mode: false,
             always_allow_tools: yolo,
+            logs_expanded: false,
             git_branch: branch,
             last_turn_start: None,
             last_esc_press: None,
@@ -301,6 +311,7 @@ impl App {
             cached_message_count: 0,
             cached_render_width: 0,
             cached_session_id: String::new(),
+            cached_logs_expanded: false,
             active_background_pids: std::collections::HashSet::new(),
             current_generation_id: 0,
             update_available: Arc::new(std::sync::Mutex::new(uti_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
@@ -308,6 +319,11 @@ impl App {
             status_transition: StatusTransition::new(),
             last_chat_rect: None,
             last_rendered_text_lines: Vec::new(),
+            balance_tx,
+            balance_rx,
+            is_checking_balance: false,
+            pending_balance_msg_index: None,
+            message_queue: VecDeque::new(),
         };
         app.trigger_local_health_check();
         app.trigger_update_check();
@@ -368,6 +384,7 @@ impl App {
         self.cached_message_count = 0;
         self.cached_render_width = 0;
         self.cached_session_id.clear();
+        self.cached_logs_expanded = !self.logs_expanded;
     }
 
     pub fn trigger_local_health_check(&self) {
@@ -434,6 +451,36 @@ impl App {
         }
     }
 
+    pub fn handle_paste(&mut self, pasted: String) {
+        if self.sudo_dialog.is_open {
+            self.sudo_dialog.password_input.push_str(pasted.trim());
+        } else if self.auth_dialog.is_open {
+            self.auth_dialog.input_buffer.push_str(pasted.trim());
+        } else if self.user_dialog.is_open {
+            let cur = self.user_dialog.current;
+            if cur < self.user_dialog.questions.len() && !self.user_dialog.questions[cur].has_options {
+                self.user_dialog.text_input[cur].push_str(&pasted);
+            }
+        } else if self.pending_confirmation.is_none() {
+            self.clamp_cursor();
+            let line_count = pasted.lines().count();
+            if line_count > 1 || pasted.len() > 120 {
+                let id = self.next_paste_id;
+                self.next_paste_id += 1;
+                let extra_lines = line_count.saturating_sub(1);
+                let tag = format!("[Pasted text #{} +{} lines]", id, extra_lines);
+                self.pastes.insert(id, pasted);
+                self.input_buffer.insert_str(self.cursor_idx, &tag);
+                self.cursor_idx += tag.len();
+            } else {
+                self.input_buffer.insert_str(self.cursor_idx, &pasted);
+                self.cursor_idx += pasted.len();
+            }
+            self.slash_selected_idx = 0;
+            self.last_esc_press = None;
+        }
+    }
+
     pub fn start_stream_turn(&mut self, tx: mpsc::Sender<(u64, StreamEvent)>) {
         // Cancel any previous in-flight generation immediately
         if let Some(token) = self.cancel_token.take() {
@@ -456,7 +503,15 @@ impl App {
             .with_sudo_password(get_sudo_password().is_some())
             .with_plan_mode(self.plan_mode);
 
-        let mut messages = vec![Message::system(prompt_builder.build())];
+        let llm_cfg = self.llm_client.get_config();
+        let is_local = llm_cfg.local_llm_enabled || llm_cfg.model.starts_with("local");
+        let system_prompt = if is_local && llm_cfg.local_prompt_lite {
+            prompt_builder.build_lite()
+        } else {
+            prompt_builder.build()
+        };
+
+        let mut messages = vec![Message::system(system_prompt)];
         messages.extend(self.session.messages.clone());
 
         let tools = self.tool_registry.list_definitions();
@@ -627,23 +682,23 @@ impl App {
                 true
             }
             "/balance" | "/wallet" => {
-                match self.llm_client.check_balance().await {
-                    Ok(bal) => {
-                        let mut msg = format!("DeepSeek Account Balance (Available: {}):\n", bal.is_available);
-                        for info in bal.balance_infos {
-                            msg.push_str(&format!(
-                                "- Total: {} {}\n  (Topped up: {} {}, Granted: {} {})\n",
-                                info.total_balance, info.currency,
-                                info.topped_up_balance, info.currency,
-                                info.granted_balance, info.currency
-                            ));
-                        }
-                        self.session.add_message(Message::system(msg));
-                    }
-                    Err(e) => {
-                        self.session.add_message(Message::system(format!("Failed to retrieve balance: {}", e)));
-                    }
+                if self.is_checking_balance {
+                    self.set_status("Checking account balance...");
+                    return true;
                 }
+                let msg_idx = self.session.messages.len();
+                self.session.add_message(Message::system("Checking account balance..."));
+                self.pending_balance_msg_index = Some(msg_idx);
+                self.invalidate_message_cache();
+                self.set_status("Checking account balance...");
+                self.is_checking_balance = true;
+
+                let client = self.llm_client.clone();
+                let tx = self.balance_tx.clone();
+                tokio::spawn(async move {
+                    let res = client.check_balance().await.map_err(|e| e.to_string());
+                    let _ = tx.send(res).await;
+                });
                 true
             }
             "/chat" | "/sessions" => {
@@ -796,6 +851,7 @@ impl App {
                         &cfg.pro_settings,
                         &cfg.hybrid_settings,
                         cfg.local_llm_enabled && cfg.hybrid_compression,
+                        cfg.local_prompt_lite,
                     );
                 }
                 true
@@ -818,7 +874,7 @@ impl App {
                     cfg.api_key = key_str.clone();
                     let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg);
-                    self.session.add_message(Message::system("DeepSeek API key updated and saved to ~/.uti/settings.json."));
+                    self.session.add_message(Message::system("DeepSeek API key updated and saved to ~/.corex/settings.json."));
                 } else {
                     self.auth_dialog.open();
                 }
@@ -868,7 +924,7 @@ impl App {
             "/info" | "/author" | "/credits" | "/about" => {
                 let cfg = self.llm_client.get_config();
                 let info = format!(
-                    "UTI_INFO_CARD|{version}|{model}|{base_url}|{local_engine}|{local_enabled}|{session_id}|{workspace}|{branch}",
+                    "COREX_INFO_CARD|{version}|{model}|{base_url}|{local_engine}|{local_enabled}|{session_id}|{workspace}|{branch}",
                     version = env!("CARGO_PKG_VERSION"),
                     model = cfg.model,
                     base_url = cfg.base_url,
@@ -886,21 +942,21 @@ impl App {
                 let maybe_newer = self.update_available.lock().ok().and_then(|l| l.clone());
                 let msg = if let Some(newer) = maybe_newer {
                     format!(
-                        "⚡ A new version of UTI CLI is available: v{} → v{}\n\n\
+                        "⚡ A new version of Corex is available: v{} → v{}\n\n\
                         To update your installation, run in your terminal:\n\
-                        • Via npm:       npm install -g uti-cli\n\
-                        • From source:   cargo install --git https://github.com/sluisr/uti-cli.git --force\n\
+                        • Via npm:       npm install -g corex-cli\n\
+                        • From source:   cargo install --git https://github.com/sluisr/corex.git --force\n\
                         • Or download precompiled binaries from:\n\
-                          https://github.com/sluisr/uti-cli/releases/latest",
+                          https://github.com/sluisr/corex/releases/latest",
                         current, newer
                     )
                 } else {
                     format!(
-                        "✓ UTI CLI is up to date (v{}).\n\n\
+                        "✓ Corex is up to date (v{}).\n\n\
                         If you wish to reinstall or update manually:\n\
-                        • npm install -g uti-cli\n\
-                        • cargo install --git https://github.com/sluisr/uti-cli.git --force\n\
-                        • https://github.com/sluisr/uti-cli/releases",
+                        • npm install -g corex-cli\n\
+                        • cargo install --git https://github.com/sluisr/corex.git --force\n\
+                        • https://github.com/sluisr/corex/releases",
                         current
                     )
                 };
@@ -965,7 +1021,7 @@ impl App {
                         let statuses = self.reload_mcp_servers().await;
                         let mut msg = format!("Reloaded MCP Servers ({} configured):\n", statuses.len());
                         if statuses.is_empty() {
-                            msg.push_str("  No servers in config. Add them to ~/.uti/settings.json under 'mcp_servers'.\n");
+                            msg.push_str("  No servers in config. Add them to ~/.corex/settings.json under 'mcp_servers'.\n");
                         }
                         for s in &statuses {
                             let icon = if s.is_connected { "[OK]" } else { "[ERR]" };
@@ -980,7 +1036,7 @@ impl App {
                         let cfg = self.llm_client.get_config();
                         if cfg.mcp_servers.is_empty() {
                             let help = "No MCP (Model Context Protocol) servers configured.\n\
-                                To add MCP servers, configure ~/.uti/settings.json or .uti/settings.json:\n\
+                                To add MCP servers, configure ~/.corex/settings.json or .corex/settings.json:\n\
                                 {\n\
                                   \"mcp_servers\": {\n\
                                     \"github\": {\n\
@@ -1080,6 +1136,32 @@ impl App {
                 }
                 true
             }
+            "/yolo" => {
+                if parts.len() > 1 {
+                    let sub = parts[1].to_lowercase();
+                    match sub.as_str() {
+                        "on" | "enable" | "true" => {
+                            self.always_allow_tools = true;
+                            self.session.add_message(Message::system("YOLO mode enabled: all tool executions will be auto-approved without confirmation prompts."));
+                        }
+                        "off" | "disable" | "false" => {
+                            self.always_allow_tools = false;
+                            self.session.add_message(Message::system("YOLO mode disabled: confirmation prompts will appear for mutating or dangerous tools."));
+                        }
+                        _ => {
+                            self.session.add_message(Message::system("Usage: /yolo on | /yolo off"));
+                        }
+                    }
+                } else {
+                    self.always_allow_tools = !self.always_allow_tools;
+                    if self.always_allow_tools {
+                        self.session.add_message(Message::system("YOLO mode enabled: all tool executions will be auto-approved without confirmation prompts."));
+                    } else {
+                        self.session.add_message(Message::system("YOLO mode disabled: confirmation prompts will appear for mutating or dangerous tools."));
+                    }
+                }
+                true
+            }
             "/help" => {
                 let mut help = "Available Commands:\n".to_string();
                 for c in ALL_COMMANDS {
@@ -1142,25 +1224,27 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         app.poll_local_health_check();
 
         // Check for finished background tasks and notify the user/session
-        let newly_finished: Vec<(u32, Option<i32>)> = {
+        let newly_finished: Vec<(u32, Option<i32>, String, String)> = {
             if let Ok(mgr) = uti_tools::background::get_task_manager().lock() {
                 let mut finished = Vec::new();
                 let mut still_active = std::collections::HashSet::new();
 
                 for &pid in &app.active_background_pids {
                     if let Some(proc) = mgr.get_process(pid) {
-                        if proc.is_active() {
+                        if proc.is_active() && proc.is_backgrounded() {
                             still_active.insert(pid);
-                        } else {
-                            finished.push((pid, proc.get_exit_code()));
+                        } else if proc.is_backgrounded() {
+                            let dur = proc.duration_str();
+                            let output = proc.output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+                            finished.push((pid, proc.get_exit_code(), dur, output));
                         }
                     } else {
-                        finished.push((pid, None));
+                        finished.push((pid, None, String::new(), String::new()));
                     }
                 }
 
                 for (pid, proc) in mgr.all_processes() {
-                    if proc.is_active() {
+                    if proc.is_active() && proc.is_backgrounded() {
                         still_active.insert(*pid);
                     }
                 }
@@ -1172,24 +1256,71 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         };
 
-        for (pid, exit_code) in newly_finished {
+        for (pid, exit_code, dur, output) in newly_finished {
             let code_str = match exit_code {
-                Some(0) => "success (exit code: 0)".to_string(),
-                Some(c) => format!("exit code {}", c),
+                Some(c) => c.to_string(),
                 None => "stopped".to_string(),
             };
-            app.session.add_message(Message::system(format!(
-                "[TASK FINISHED] Background task {} finished with {}. Use '/tasks status {}' to inspect output.",
-                pid, code_str, pid
-            )));
+            let mut msg_text = format!("TASK_DONE|{}|{}|{}\n", pid, code_str, dur);
+            msg_text.push_str(output.trim_end());
+            app.session.add_message(Message::system(msg_text));
             app.invalidate_message_cache();
             needs_redraw = true;
+        }
+
+        while let Ok(res) = app.balance_rx.try_recv() {
+            app.clear_status();
+            app.is_checking_balance = false;
+
+            let msg = match res {
+                Ok(bal) => {
+                    let mut msg = format!("DeepSeek Account Balance (Available: {}):\n", bal.is_available);
+                    for info in bal.balance_infos {
+                        msg.push_str(&format!(
+                            "- Total: {} {}\n  (Topped up: {} {}, Granted: {} {})\n",
+                            info.total_balance, info.currency,
+                            info.topped_up_balance, info.currency,
+                            info.granted_balance, info.currency
+                        ));
+                    }
+                    msg
+                }
+                Err(e) => {
+                    format!("Failed to retrieve balance: {}", e)
+                }
+            };
+
+            if let Some(idx) = app.pending_balance_msg_index.take() {
+                if idx < app.session.messages.len() {
+                    app.session.messages[idx] = Message::system(msg);
+                } else {
+                    app.session.add_message(Message::system(msg));
+                }
+            } else {
+                app.session.add_message(Message::system(msg));
+            }
+            app.invalidate_message_cache();
+            needs_redraw = true;
+        }
+
+        if !app.is_streaming
+            && !app.message_queue.is_empty()
+            && app.pending_confirmation.is_none()
+            && !app.user_dialog.is_open
+            && !app.sudo_dialog.is_open
+            && !app.is_checking_balance
+        {
+            if let Some(next_prompt) = app.message_queue.pop_front() {
+                app.session.add_message(Message::user(next_prompt));
+                app.start_stream_turn(event_tx.clone());
+                needs_redraw = true;
+            }
         }
 
         let has_active_tasks = !app.active_background_pids.is_empty();
         let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
 
-        if needs_redraw || app.is_streaming || has_active_tasks || is_animating {
+        if needs_redraw || app.is_streaming || app.is_checking_balance || has_active_tasks || is_animating {
             terminal.draw(|f| {
                 render_ui(f, &mut app);
             })?;
@@ -1446,6 +1577,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.streaming_text.clear();
                         app.streaming_tool_calls.clear();
                         let _ = app.session.save();
+
+                        // ⚡ Automatically dequeue and run next queued user prompt!
+                        if let Some(next_prompt) = app.message_queue.pop_front() {
+                            app.session.add_message(Message::user(next_prompt));
+                            app.start_stream_turn(event_tx.clone());
+                        }
                     }
                 }
                 StreamEvent::ContextCompacted { compacted_messages, notice } => {
@@ -1465,6 +1602,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.session.add_message(Message::system(format!("Error: {}", err)));
                     app.streaming_text.clear();
                     app.streaming_tool_calls.clear();
+                    if let Some(next_prompt) = app.message_queue.pop_front() {
+                        if app.input_buffer.is_empty() {
+                            app.input_buffer = next_prompt;
+                            app.cursor_idx = app.input_buffer.len();
+                        }
+                    }
                 }
             }
         }
@@ -1485,33 +1628,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             needs_redraw = true;
             match event::read()? {
                 Event::Paste(pasted) => {
-                    if app.sudo_dialog.is_open {
-                        app.sudo_dialog.password_input.push_str(pasted.trim());
-                    } else if app.auth_dialog.is_open {
-                        app.auth_dialog.input_buffer.push_str(pasted.trim());
-                    } else if app.user_dialog.is_open {
-                        let cur = app.user_dialog.current;
-                        if cur < app.user_dialog.questions.len() && !app.user_dialog.questions[cur].has_options {
-                            app.user_dialog.text_input[cur].push_str(&pasted);
-                        }
-                    } else if !app.is_streaming {
-                        app.clamp_cursor();
-                        let line_count = pasted.lines().count();
-                        if line_count > 1 || pasted.len() > 120 {
-                            let id = app.next_paste_id;
-                            app.next_paste_id += 1;
-                            let extra_lines = line_count.saturating_sub(1);
-                            let tag = format!("[Pasted text #{} +{} lines]", id, extra_lines);
-                            app.pastes.insert(id, pasted);
-                            app.input_buffer.insert_str(app.cursor_idx, &tag);
-                            app.cursor_idx += tag.len();
-                        } else {
-                            app.input_buffer.insert_str(app.cursor_idx, &pasted);
-                            app.cursor_idx += pasted.len();
-                        }
-                        app.slash_selected_idx = 0;
-                        app.last_esc_press = None;
-                    }
+                    app.handle_paste(pasted);
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
@@ -1552,6 +1669,17 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         && (key.code == KeyCode::Esc
                             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
                         {
+                            if key.code == KeyCode::Esc && !app.message_queue.is_empty() {
+                                if let Some(queued) = app.message_queue.pop_back() {
+                                    if app.input_buffer.is_empty() {
+                                        app.input_buffer = queued;
+                                        app.cursor_idx = app.input_buffer.len();
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
+
                             if let Some(token) = app.cancel_token.take() {
                                 token.cancel();
                             }
@@ -1559,6 +1687,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.is_streaming = false;
                             app.thinking_state.is_streaming = false;
                             app.clear_status();
+                            app.message_queue.clear();
 
                             let partial_text = if app.streaming_text.is_empty() {
                                 None
@@ -1583,6 +1712,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let _ = app.session.save();
                             continue;
                         }
+
+                    if app.is_checking_balance && key.code == KeyCode::Esc {
+                        app.is_checking_balance = false;
+                        app.clear_status();
+                        if let Some(idx) = app.pending_balance_msg_index.take() {
+                            if idx < app.session.messages.len() {
+                                app.session.messages[idx] = Message::system("Balance check cancelled.");
+                                app.invalidate_message_cache();
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
 
                     // --- 1. Sudo Password Dialog Active ---
                     if app.sudo_dialog.is_open {
@@ -1719,7 +1861,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let _ = cfg.save_with_workspace(Some(&app.workspace_dir));
                                     app.llm_client.update_config(cfg);
                                     app.auth_dialog.close();
-                                    app.session.add_message(Message::system("API key saved successfully to ~/.uti/settings.json. Ready to assist!"));
+                                    app.session.add_message(Message::system("API key saved successfully to ~/.corex/settings.json. Ready to assist!"));
                                 }
                             }
                             _ => {}
@@ -2038,28 +2180,16 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                 app.model_dialog.hybrid_row_idx =
                                                     (app.model_dialog.hybrid_row_idx + 1).min(4);
                                             }
-                                            KeyCode::Left | KeyCode::Char('h') => {
-                                                app.model_dialog.cycle_hybrid_row(false);
+                                            KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                                                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
+                                                app.model_dialog.cycle_hybrid_row(forward);
                                                 let hybrid_settings = app.model_dialog.to_hybrid_settings();
                                                 let mut cfg = app.llm_client.get_config();
                                                 cfg.hybrid_settings = hybrid_settings.clone();
                                                 cfg.local_llm_url = hybrid_settings.local_url.clone();
                                                 cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
                                                 cfg.hybrid_compression = hybrid_settings.auto_compression;
-                                                if app.model_dialog.hybrid_persist_permanent {
-                                                    let _ = Config::save_hybrid_settings(&hybrid_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            KeyCode::Right | KeyCode::Char('l') => {
-                                                app.model_dialog.cycle_hybrid_row(true);
-                                                let hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.hybrid_settings = hybrid_settings.clone();
-                                                cfg.local_llm_url = hybrid_settings.local_url.clone();
-                                                cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
-                                                cfg.hybrid_compression = hybrid_settings.auto_compression;
+                                                cfg.local_prompt_lite = app.model_dialog.local_prompt_lite;
                                                 if app.model_dialog.hybrid_persist_permanent {
                                                     let _ = Config::save_hybrid_settings(&hybrid_settings);
                                                     let _ = cfg.save();
@@ -2081,27 +2211,27 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                 }
                                             }
                                             KeyCode::Enter => {
+                                                // Activate pure Local mode (no cloud hybrid)
                                                 let mut cfg = app.llm_client.get_config();
-                                                cfg.model = "deepseek-flash".to_string();
+                                                cfg.model = "local-assistant".to_string();
                                                 cfg.local_llm_enabled = true;
-                                                cfg.hybrid_compression = true;
-                                                cfg.hybrid_settings = app.model_dialog.to_hybrid_settings();
+                                                cfg.hybrid_compression = false;
                                                 cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
                                                 cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
+                                                cfg.local_prompt_lite = app.model_dialog.local_prompt_lite;
                                                 if app.model_dialog.hybrid_persist_permanent {
-                                                    let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
                                                     let _ = cfg.save();
                                                 }
-                                                app.model_dialog.active_engine = 3;
+                                                app.model_dialog.active_engine = 2;
                                                 app.llm_client.update_config(cfg.clone());
                                                 app.session.model = cfg.model.clone();
                                                 let _ = app.session.save();
+                                                let prompt_mode = if cfg.local_prompt_lite { "Lite (SLM-optimized)" } else { "Full (Corex standard)" };
                                                 app.session.add_message(Message::system(format!(
-                                                    "Activated Smart Hybrid Dual-Engine Mode\n- Strategy: {}\n- Local SLM: {}\n- Endpoint: {}\n- Auto Compression: {}",
-                                                    cfg.hybrid_settings.mode.display_name(),
+                                                    "Activated 100% Offline Local Mode\n- Model: {}\n- Endpoint: {}\n- Prompt Mode: {}\n- Cost: $0.00",
                                                     cfg.local_llm_model,
                                                     cfg.local_llm_url,
-                                                    if cfg.hybrid_settings.auto_compression { "Enabled (~70% token savings)" } else { "Disabled" }
+                                                    prompt_mode
                                                 )));
                                                 app.model_dialog.close();
                                             }
@@ -2320,6 +2450,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             }
                             KeyCode::Char('l') => {
                                 terminal.clear()?;
+                                needs_redraw = true;
+                            }
+                            KeyCode::Char('o') => {
+                                app.logs_expanded = !app.logs_expanded;
+                                app.invalidate_message_cache();
                                 needs_redraw = true;
                             }
                             _ => {}
@@ -2577,7 +2712,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }
                         KeyCode::Enter => {
                             let text = app.input_buffer.trim().to_string();
-                            if !text.is_empty() && !app.is_streaming {
+                            if !text.is_empty() {
                                 let cmd_to_run = if is_slash_open && !matching_cmds.is_empty() && !text.contains(' ') {
                                     matching_cmds[app.slash_selected_idx % matching_cmds.len()].to_string()
                                 } else {
@@ -2615,9 +2750,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     user_prompt_clean = format!("{} {}", before.trim(), rest.trim()).trim().to_string();
                                 }
 
-                                // Extract $auto / $yolo
+                                // Clean up $auto / $yolo prefix if present without mutating global session mode
                                 if user_prompt_clean.starts_with("$auto") || user_prompt_clean.starts_with("$yolo") {
-                                    app.always_allow_tools = true;
                                     user_prompt_clean = user_prompt_clean
                                         .trim_start_matches("$auto")
                                         .trim_start_matches("$yolo")
@@ -2643,11 +2777,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.pastes.clear();
 
                                 if app.is_streaming {
-                                    if let Some(token) = app.cancel_token.take() {
-                                        token.cancel();
-                                    }
-                                    app.is_streaming = false;
-                                    app.clear_status();
+                                    app.message_queue.push_back(user_prompt_clean);
+                                    needs_redraw = true;
+                                    continue;
                                 }
 
                                 app.session.add_message(Message::user(user_prompt_clean));
@@ -3124,8 +3256,8 @@ fn render_about_card(
         ])
     };
 
-    // Top line: ╭─ UTI CLI v0.2.0 ───────╮
-    let title = format!(" UTI CLI v{} ", version);
+    // Top line: ╭─ Corex v0.2.0 ───────╮
+    let title = format!(" Corex v{} ", version);
     let title_w = unicode_width::UnicodeWidthStr::width(title.as_str());
     let top_fill = inner_width.saturating_sub(1 + title_w);
     let top_line = Line::from(vec![
@@ -3163,16 +3295,16 @@ fn render_about_card(
             Span::styled(" (https://sluisr.com)", Style::default().fg(Color::Rgb(115, 160, 220))),
         ]),
         make_row("Official Website", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://uti.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(uti_core::truncate_ellipsis("https://corex.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("Changelog & Releases", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://uti.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(uti_core::truncate_ellipsis("https://corex.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("Report Issues & Bugs", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/uti-cli/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/corex/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("GitHub Repository", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/uti-cli", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/corex", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         empty_row(),
         div_line,
@@ -3201,7 +3333,7 @@ fn render_about_card(
     ]
 }
 
-fn format_system_message(text: &str, theme: &Theme, content_max_width: usize) -> Vec<Line<'static>> {
+fn format_system_message(text: &str, theme: &Theme, content_max_width: usize, logs_expanded: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let raw_lines: Vec<&str> = text.lines().collect();
 
@@ -3211,8 +3343,8 @@ fn format_system_message(text: &str, theme: &Theme, content_max_width: usize) ->
 
     let first_line = raw_lines[0].trim();
 
-    // 0. Dedicated UTI CLI Info Card
-    if first_line.starts_with("UTI_INFO_CARD|") {
+    // 0. Dedicated Corex Info Card
+    if first_line.starts_with("COREX_INFO_CARD|") || first_line.starts_with("UTI_INFO_CARD|") {
         let parts: Vec<&str> = first_line.split('|').collect();
         if parts.len() >= 9 {
             return render_about_card(
@@ -3236,7 +3368,83 @@ fn format_system_message(text: &str, theme: &Theme, content_max_width: usize) ->
     let muted_text = Color::Rgb(155, 168, 185);
     let muted_tag = Color::Rgb(95, 115, 138);
 
-    // 1. Model Activation Message
+    // 1. Task Finished / Background Task Done (One-Liner Badge + tail or full log)
+    if first_line.starts_with("TASK_DONE|") || first_line.starts_with("[TASK FINISHED]") {
+        let (pid, exit_code_str, duration) = if first_line.starts_with("TASK_DONE|") {
+            let parts: Vec<&str> = first_line.split('|').collect();
+            let pid = parts.get(1).copied().unwrap_or("?");
+            let code = parts.get(2).copied().unwrap_or("0");
+            let dur = parts.get(3).copied().unwrap_or("");
+            (pid, code, dur)
+        } else {
+            ("task", "0", "")
+        };
+
+        let is_ok = exit_code_str == "0";
+        let is_stopped = exit_code_str == "stopped";
+
+        let (icon, icon_color, status_text, status_color) = if is_stopped {
+            ("  ■ ", Color::Rgb(215, 175, 100), "stopped".to_string(), Color::Rgb(215, 175, 100))
+        } else if is_ok {
+            ("  ✓ ", Color::Rgb(105, 185, 135), "finished (exit 0)".to_string(), Color::Rgb(125, 160, 145))
+        } else {
+            let label = format!("finished (exit {})", exit_code_str);
+            ("  ✕ ", Color::Rgb(220, 100, 100), label, Color::Rgb(220, 110, 110))
+        };
+
+        let mut badge_spans = vec![
+            Span::styled(icon, Style::default().fg(icon_color)),
+            Span::styled(format!("[bg:{}] ", pid), Style::default().fg(muted_tag)),
+            Span::styled(status_text, Style::default().fg(status_color)),
+        ];
+        if !duration.trim().is_empty() {
+            badge_spans.push(Span::styled(format!(" ({})", duration.trim()), Style::default().fg(muted_dim)));
+        }
+        lines.push(Line::from(badge_spans));
+
+        // Output lines
+        let output_lines: Vec<&str> = raw_lines[1..]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+
+        if !output_lines.is_empty() {
+            let total = output_lines.len();
+            let max_lines = 5;
+            if logs_expanded {
+                for line_str in &output_lines {
+                    let clean = line_str.replace('\t', "    ");
+                    let spans = vec![
+                        Span::styled(clean, Style::default().fg(muted_text)),
+                    ];
+                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                }
+            } else {
+                if total > max_lines {
+                    let omitted = total - max_lines;
+                    let om_spans = vec![
+                        Span::styled("    │ ", Style::default().fg(muted_dim)),
+                        Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(muted_dim)),
+                    ];
+                    lines.push(Line::from(om_spans));
+                }
+
+                let start_idx = total.saturating_sub(max_lines);
+                for line_str in &output_lines[start_idx..] {
+                    let clean = line_str.replace('\t', "    ");
+                    let spans = vec![
+                        Span::styled(clean, Style::default().fg(muted_text)),
+                    ];
+                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                }
+            }
+        }
+
+        return lines;
+    }
+
+    // 2. Model Activation Message
     if first_line.starts_with("Activated ") || first_line.starts_with("Switched ") {
         let title = first_line.trim_start_matches("Activated ").trim_start_matches("Switched ");
         let header_spans = vec![
@@ -3351,6 +3559,7 @@ fn render_single_message_with_pending(
     theme: &Theme,
     content_max_width: usize,
     pending_conf: Option<&PendingToolBatch>,
+    logs_expanded: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match msg.role.as_str() {
@@ -3438,44 +3647,92 @@ fn render_single_message_with_pending(
                         lines.push(Line::from(spans));
                     }
                 }
-            } else {
-                let raw_line = content
-                    .lines()
-                    .take(50)
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("Done")
-                    .replace('\t', "    ");
-
-                let trimmed_banner = raw_line.trim_matches(|c| {
-                    c == '#' || c == '=' || c == '-' || c == '*' || c == ' '
-                        || c == '═' || c == '─' || c == '━' || c == '_' || c == '~'
-                });
-                let first_line_raw = if !trimmed_banner.is_empty() {
-                    trimmed_banner.to_string()
-                } else {
-                    raw_line
-                };
-
-                let is_err = first_line_raw.starts_with("Error") || first_line_raw.starts_with("Failed");
-                let icon = if is_err { "    ✕ " } else { "    ✓ " };
-                let icon_color = if is_err { Color::Red } else { Color::Green };
-
-                let display_first_line = if first_line_raw.len() > 140 {
-                    let mut end = 137;
-                    while end > 0 && !first_line_raw.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    format!("{}...", &first_line_raw[..end])
-                } else {
-                    first_line_raw
-                };
-
+            } else if content.starts_with("[COMMAND SENT TO BACKGROUND]") || content.starts_with("[BACKGROUND TASK LAUNCHED]") {
+                let pid_str = content.lines().find(|l| l.contains("Task ID (PID):")).and_then(|l| l.split(':').nth(1)).map(|p| p.trim()).unwrap_or("?");
                 let line_spans = vec![
-                    Span::styled(icon, Style::default().fg(icon_color)),
-                    Span::styled(display_first_line, Style::default().fg(theme.gray)),
+                    Span::styled("    · ", Style::default().fg(theme.accent_cyan)),
+                    Span::styled(format!("[bg:{}] ", pid_str), Style::default().fg(theme.accent_cyan)),
+                    Span::styled("running in background...", Style::default().fg(theme.gray)),
                 ];
                 let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
                 lines.extend(wrapped);
+            } else {
+                let raw_output_lines: Vec<&str> = content
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+
+                let is_err = content.starts_with("Error")
+                    || content.starts_with("Failed")
+                    || content.starts_with("Command exited with status code");
+
+                let icon = if is_err { "    ✕ " } else { "    ✓ " };
+                let icon_color = if is_err { Color::Red } else { Color::Green };
+
+                if raw_output_lines.len() <= 1 {
+                    let first_line_raw = raw_output_lines.first().copied().unwrap_or("Done").replace('\t', "    ");
+                    let display_first_line = if first_line_raw.len() > 140 {
+                        let mut end = 137;
+                        while end > 0 && !first_line_raw.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &first_line_raw[..end])
+                    } else {
+                        first_line_raw
+                    };
+
+                    let line_spans = vec![
+                        Span::styled(icon, Style::default().fg(icon_color)),
+                        Span::styled(display_first_line, Style::default().fg(theme.gray)),
+                    ];
+                    let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                    lines.extend(wrapped);
+                } else {
+                    let total = raw_output_lines.len();
+                    let header_label = if is_err {
+                        format!("Command failed ({} lines)", total)
+                    } else {
+                        format!("Output ({} lines)", total)
+                    };
+
+                    let mut header_spans = vec![
+                        Span::styled(icon, Style::default().fg(icon_color)),
+                        Span::styled(header_label, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+                    ];
+                    if !logs_expanded {
+                        header_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(theme.dark_gray)));
+                    }
+                    lines.push(Line::from(header_spans));
+
+                    let max_lines = 5;
+                    if logs_expanded {
+                        for line_str in &raw_output_lines {
+                            let clean = line_str.replace('\t', "    ");
+                            let spans = vec![
+                                Span::styled(clean, Style::default().fg(theme.gray)),
+                            ];
+                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
+                        }
+                    } else {
+                        if total > max_lines {
+                            let omitted = total - max_lines;
+                            let om_spans = vec![
+                                Span::styled("        │ ", Style::default().fg(theme.dark_gray)),
+                                Span::styled(format!("… (+{} lines above)", omitted), Style::default().fg(theme.dark_gray)),
+                            ];
+                            lines.push(Line::from(om_spans));
+                        }
+
+                        let start_idx = total.saturating_sub(max_lines);
+                        for line_str in &raw_output_lines[start_idx..] {
+                            let clean = line_str.replace('\t', "    ");
+                            let spans = vec![
+                                Span::styled(clean, Style::default().fg(theme.gray)),
+                            ];
+                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
+                        }
+                    }
+                }
             }
 
             if is_last_tool {
@@ -3484,8 +3741,16 @@ fn render_single_message_with_pending(
         }
         "system" => {
             if let Some(text) = msg.text_content() {
-                lines.extend(format_system_message(text, theme, content_max_width));
-                lines.push(Line::from(""));
+                lines.extend(format_system_message(text, theme, content_max_width, logs_expanded));
+                let is_task_done = text.starts_with("TASK_DONE|") || text.starts_with("[TASK FINISHED]");
+                let next_is_task_done = next_msg
+                    .and_then(|m| if m.role.as_str() == "system" { m.text_content() } else { None })
+                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("[TASK FINISHED]"))
+                    .unwrap_or(false);
+
+                if !is_task_done || !next_is_task_done {
+                    lines.push(Line::from(""));
+                }
             }
         }
         _ => {}
@@ -3570,11 +3835,15 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     all_lines.extend(header_lines);
 
     // 2. Cached Messages & Tool Executions List
-    if app.cached_render_width != content_max_width || app.cached_session_id != app.session.id {
+    if app.cached_render_width != content_max_width
+        || app.cached_session_id != app.session.id
+        || app.cached_logs_expanded != app.logs_expanded
+    {
         app.cached_message_lines.clear();
         app.cached_message_count = 0;
         app.cached_render_width = content_max_width;
         app.cached_session_id = app.session.id.clone();
+        app.cached_logs_expanded = app.logs_expanded;
     }
 
     let target_cache_count = if app.pending_confirmation.is_some() {
@@ -3600,6 +3869,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
                 &app.theme,
                 content_max_width,
                 None,
+                app.logs_expanded,
             );
             app.cached_message_lines.extend(rendered);
         }
@@ -3619,6 +3889,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             &app.theme,
             content_max_width,
             app.pending_confirmation.as_ref(),
+            app.logs_expanded,
         );
         all_lines.extend(rendered);
     }
@@ -3657,6 +3928,24 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             );
             all_lines.extend(preview_lines);
         }
+    }
+
+    if !app.message_queue.is_empty() {
+        all_lines.push(Line::from(""));
+        for (i, queued_msg) in app.message_queue.iter().enumerate() {
+            let label = if app.message_queue.len() == 1 {
+                "[queued] ".to_string()
+            } else {
+                format!("[queued #{}] ", i + 1)
+            };
+            all_lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(label, Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(queued_msg.clone(), Style::default().fg(app.theme.foreground)),
+                Span::styled(" (pending)", Style::default().fg(app.theme.dark_gray)),
+            ]));
+        }
+        all_lines.push(Line::from(""));
     }
 
     let total_lines = all_lines.len();
@@ -3708,7 +3997,19 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         ];
         left_spans.extend(text_spans);
 
-        let right_span = Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray));
+        let queue_count = app.message_queue.len();
+        if queue_count > 0 {
+            left_spans.push(Span::styled(
+                format!(" · [{} queued]", queue_count),
+                Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let right_span = if queue_count > 0 {
+            Span::styled("(Esc para descolar) ", Style::default().fg(app.theme.dark_gray))
+        } else {
+            Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray))
+        };
 
         let left_len: usize = left_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
         let right_len = unicode_width::UnicodeWidthStr::width(right_span.content.as_ref());
@@ -3927,6 +4228,18 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         ));
     }
 
+    if app.logs_expanded {
+        if !center_spans.is_empty() {
+            center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
+        }
+        center_spans.push(Span::styled(
+            "[Logs: Full (Ctrl+O)]",
+            Style::default()
+                .fg(app.theme.accent_cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let footer_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -3973,12 +4286,11 @@ mod tests {
     #[test]
     fn test_tool_large_output_is_truncated_in_render() {
         let theme = Theme::default();
-        // Create huge 100KB output with a long first line
+        // Create huge 100KB output on a single line
         let huge_line = "A".repeat(50_000);
-        let huge_output = format!("{}\nSecond line\nThird line", huge_line);
-        let msg = Message::tool_response("call_1".to_string(), huge_output);
+        let msg = Message::tool_response("call_1".to_string(), huge_line);
 
-        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None);
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
         assert!(!lines.is_empty(), "expected at least one line rendered for tool");
 
         // Verify the entire output spans contain "✓" and "..." and was bounded to ~140 chars
@@ -3986,8 +4298,29 @@ mod tests {
         assert!(all_text.contains('✓'));
         assert!(all_text.contains("..."));
         assert!(all_text.len() < 300, "tool summary should be truncated: length was {}", all_text.len());
-        // Should only be ~2 wrapped lines at max_width=80, never hundreds
         assert!(lines.len() <= 3, "expected at most 3 wrapped lines, got {}", lines.len());
+    }
+
+    #[test]
+    fn test_tool_multiline_output_expand() {
+        let theme = Theme::default();
+        let multiline_output = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
+        let msg = Message::tool_response("call_2".to_string(), multiline_output.to_string());
+
+        // 1. Compact mode (logs_expanded = false) -> header + omission line + last 5 lines
+        let lines_compact = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
+        let all_compact: String = lines_compact.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(all_compact.contains("Output (8 lines)"));
+        assert!(all_compact.contains("… (+3 lines above)"));
+        assert!(all_compact.contains("line 8"));
+
+        // 2. Expanded mode (logs_expanded = true) -> header + all 8 lines
+        let lines_expanded = render_single_message_with_pending(0, &msg, None, &theme, 80, None, true);
+        let all_expanded: String = lines_expanded.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        assert!(all_expanded.contains("Output (8 lines)"));
+        assert!(!all_expanded.contains("lines above"));
+        assert!(all_expanded.contains("line 1"));
+        assert!(all_expanded.contains("line 8"));
     }
 
     #[tokio::test]
@@ -4099,11 +4432,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_popup_animation_targets() {
-        let mut app = App::new(
-            LlmClient::new(Config::default()),
-            PathBuf::from("/tmp"),
-            false,
-        );
+        let client = LlmClient::new(uti_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.auth_dialog.close();
 
         // 1. Empty buffer -> target is 0.0, no animation
@@ -4128,7 +4458,7 @@ mod tests {
     fn test_format_system_message_model_activation() {
         let theme = Theme::default();
         let msg = "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: max\n- Search CoT: low";
-        let lines = format_system_message(msg, &theme, 80);
+        let lines = format_system_message(msg, &theme, 80, false);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].spans.iter().any(|s| s.content.contains("[model]")));
         assert!(lines[1].spans.iter().any(|s| s.content.contains("Reasoning Depth:")));
@@ -4154,5 +4484,94 @@ mod tests {
             None
         );
     }
-}
 
+    #[test]
+    fn test_format_system_message_task_done() {
+        let theme = Theme::default();
+        
+        // 1. Success task with empty output -> single badge line
+        let msg = "TASK_DONE|201653|0|0.2s\n";
+        let lines = format_system_message(msg, &theme, 80, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("[bg:201653]")));
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("finished (exit 0)")));
+
+        // 2. Failed task with > 5 output lines -> badge + omission line + last 5 lines (tail)
+        let msg_err = "TASK_DONE|201654|2|0.5s\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7";
+        let lines_err = format_system_message(msg_err, &theme, 80, false);
+        // Line 0: badge, Line 1: … (+2 lines above, Ctrl+O to expand), Lines 2..7: last 5 lines
+        assert_eq!(lines_err.len(), 7);
+        assert!(lines_err[0].spans.iter().any(|s| s.content.contains("[bg:201654]")));
+        assert!(lines_err[0].spans.iter().any(|s| s.content.contains("finished (exit 2)")));
+        assert!(lines_err[1].spans.iter().any(|s| s.content.contains("… (+2 lines above")));
+        let line2_text: String = lines_err[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(line2_text.contains("line 3"));
+        let line6_text: String = lines_err[6].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(line6_text.contains("line 7"));
+
+        // 3. Expanded logs -> shows all 7 lines (badge + 7 lines = 8 lines)
+        let lines_expanded = format_system_message(msg_err, &theme, 80, true);
+        assert_eq!(lines_expanded.len(), 8);
+        let exp_line1_text: String = lines_expanded[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(exp_line1_text.contains("line 1"));
+    }
+
+    #[tokio::test]
+    async fn test_balance_slash_command_non_blocking() {
+        let client = LlmClient::new(uti_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        assert!(!app.is_checking_balance);
+        let handled = app.handle_slash_command("/balance").await;
+        assert!(handled);
+        assert!(app.is_checking_balance);
+        assert_eq!(app.active_status.as_deref(), Some("Checking account balance..."));
+        assert_eq!(app.session.messages.len(), 1);
+        assert_eq!(app.session.messages[0].text_content(), Some("Checking account balance..."));
+    }
+
+    #[tokio::test]
+    async fn test_paste_while_streaming() {
+        let client = LlmClient::new(uti_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        app.is_streaming = true;
+
+        app.handle_paste("hello world".to_string());
+        assert_eq!(app.input_buffer, "hello world");
+        assert_eq!(app.cursor_idx, 11);
+
+        // Multiline paste while streaming creates paste tag
+        app.handle_paste("\nsecond line\nthird line".to_string());
+        assert!(app.input_buffer.contains("[Pasted text #1 +2 lines]"));
+        assert_eq!(app.pastes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_message_queuing_while_streaming() {
+        let client = LlmClient::new(uti_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        app.is_streaming = true;
+
+        // Queue two messages
+        app.message_queue.push_back("First queued task".to_string());
+        app.message_queue.push_back("Second queued task".to_string());
+        assert_eq!(app.message_queue.len(), 2);
+
+        // Dequeue first message
+        let first = app.message_queue.pop_front().unwrap();
+        assert_eq!(first, "First queued task");
+        app.session.add_message(Message::user(first));
+        assert_eq!(app.session.messages.len(), 1);
+        assert_eq!(app.session.messages[0].text_content(), Some("First queued task"));
+
+        // Dequeue second message
+        let second = app.message_queue.pop_front().unwrap();
+        assert_eq!(second, "Second queued task");
+        app.session.add_message(Message::user(second));
+        assert_eq!(app.session.messages.len(), 2);
+        assert_eq!(app.session.messages[1].text_content(), Some("Second queued task"));
+        assert!(app.message_queue.is_empty());
+    }
+}

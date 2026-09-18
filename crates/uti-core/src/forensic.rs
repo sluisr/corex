@@ -13,18 +13,18 @@ pub struct ForensicLogger {
 
 impl ForensicLogger {
     /// Initializes or retrieves the global forensic logger.
-    /// Creates log files under `~/.uti/logs/uti-forensic-YYYY-MM-DD.log`
-    /// and project-level `.uti/forensic.log` if workspace directory is supplied.
+    /// Creates log files under `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`
+    /// and project-level `.corex/forensic.log` if workspace directory is supplied.
     pub fn init(workspace_dir: Option<&Path>) -> PathBuf {
         let date_str = Local::now().format("%Y-%m-%d").to_string();
         let log_dir = if let Some(dirs) = BaseDirs::new() {
-            dirs.home_dir().join(".uti").join("logs")
+            dirs.home_dir().join(".corex").join("logs")
         } else {
-            PathBuf::from(".uti").join("logs")
+            PathBuf::from(".corex").join("logs")
         };
 
         let _ = fs::create_dir_all(&log_dir);
-        let log_file_path = log_dir.join(format!("uti-forensic-{}.log", date_str));
+        let log_file_path = log_dir.join(format!("corex-forensic-{}.log", date_str));
 
         let mut global = LOGGER.lock().unwrap();
         *global = Some(ForensicLogger {
@@ -34,7 +34,7 @@ impl ForensicLogger {
         // Write session start header
         Self::raw_append(&log_file_path, &format!(
             "\n╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗\n\
-             ║  UTI-CLI FORENSIC AUDIT SESSION STARTED: {}                                    ║\n\
+             ║  COREX FORENSIC AUDIT SESSION STARTED: {}                                      ║\n\
              ║  Workspace: {:<86} ║\n\
              ╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝\n",
             Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),

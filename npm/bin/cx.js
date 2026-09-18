@@ -11,7 +11,7 @@ async function main() {
   const targetBinPath = path.join(binDir, target.binName);
 
   if (!fs.existsSync(targetBinPath)) {
-    console.log('[uti-cli] Native binary not found, downloading...');
+    console.log('[corex] Native binary not found, downloading...');
     await install();
   }
 
@@ -22,7 +22,7 @@ async function main() {
   });
 
   if (result.error) {
-    console.error(`[uti-cli] Failed to execute binary: ${result.error.message}`);
+    console.error(`[corex] Failed to execute binary: ${result.error.message}`);
     process.exit(1);
   }
 
@@ -30,6 +30,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`[uti-cli] Error: ${err.message}`);
+  console.error(`[corex] Error: ${err.message}`);
   process.exit(1);
 });

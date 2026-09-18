@@ -1,10 +1,11 @@
 {
-  "name": "@sluisr/uti-cli",
+  "name": "corex-cli",
   "version": "0.2.1",
-  "description": "Universal Terminal Intelligence — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs",
+  "description": "Corex — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs",
   "bin": {
-    "uti": "bin/uti.js",
-    "uti-cli": "bin/uti.js"
+    "cx": "bin/cx.js",
+    "corex": "bin/cx.js",
+    "uti": "bin/cx.js"
   },
   "files": [
     "bin/",
@@ -18,8 +19,9 @@
     "access": "public"
   },
   "keywords": [
+    "corex",
+    "cx",
     "uti",
-    "uti-cli",
     "deepseek",
     "deepseek-v4",
     "ai",
@@ -31,13 +33,13 @@
     "sluisr"
   ],
   "author": "sluisr <contact@sluisr.com> (https://sluisr.com/)",
-  "homepage": "https://uti.sluisr.com",
+  "homepage": "https://corex.sluisr.com",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sluisr/uti-cli.git"
+    "url": "git+https://github.com/sluisr/corex.git"
   },
   "bugs": {
-    "url": "https://github.com/sluisr/uti-cli/issues"
+    "url": "https://github.com/sluisr/corex/issues"
   },
   "license": "Apache-2.0"
 }

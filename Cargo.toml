@@ -13,7 +13,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["sluisr <contact@sluisr.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/sluisr/uti-cli"
+repository = "https://github.com/sluisr/corex"
 
 [workspace.dependencies]
 tokio = { version = "1.43", features = ["full"] }

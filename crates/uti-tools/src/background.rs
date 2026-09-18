@@ -16,12 +16,23 @@ pub struct BackgroundProcess {
     pub exit_code: Arc<Mutex<Option<i32>>>,
     pub output_buffer: Arc<Mutex<String>>,
     pub is_running: Arc<Mutex<bool>>,
+    pub is_background: Arc<Mutex<bool>>,
     pub stdin_tx: Option<mpsc::Sender<String>>,
 }
 
 impl BackgroundProcess {
     pub fn is_active(&self) -> bool {
         self.is_running.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    pub fn is_backgrounded(&self) -> bool {
+        self.is_background.lock().map(|g| *g).unwrap_or(false)
+    }
+
+    pub fn set_backgrounded(&self, bg: bool) {
+        if let Ok(mut g) = self.is_background.lock() {
+            *g = bg;
+        }
     }
 
     pub fn get_exit_code(&self) -> Option<i32> {
@@ -72,6 +83,7 @@ impl TaskManager {
         is_running: Arc<Mutex<bool>>,
         finished_at: Arc<Mutex<Option<DateTime<Utc>>>>,
         exit_code: Arc<Mutex<Option<i32>>>,
+        is_background: Arc<Mutex<bool>>,
         stdin_tx: Option<mpsc::Sender<String>>,
     ) {
         if self.processes.len() > 50 {
@@ -95,6 +107,7 @@ impl TaskManager {
                 exit_code,
                 output_buffer,
                 is_running,
+                is_background,
                 stdin_tx,
             },
         );
@@ -556,6 +569,7 @@ mod tests {
         let running = Arc::new(Mutex::new(false));
         let finished = Arc::new(Mutex::new(Some(Utc::now())));
         let code = Arc::new(Mutex::new(Some(0)));
+        let is_bg = Arc::new(Mutex::new(true));
 
         mgr.register(
             99991,
@@ -564,6 +578,7 @@ mod tests {
             running,
             finished,
             code,
+            is_bg,
             None,
         );
 
@@ -580,6 +595,7 @@ mod tests {
         let running = Arc::new(Mutex::new(true));
         let finished = Arc::new(Mutex::new(None));
         let code = Arc::new(Mutex::new(None));
+        let is_bg = Arc::new(Mutex::new(true));
 
         mgr.register(
             99992,
@@ -588,6 +604,7 @@ mod tests {
             running,
             finished,
             code,
+            is_bg,
             None,
         );
 

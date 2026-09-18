@@ -112,8 +112,8 @@ pub struct ModelDialogState {
     pub pro_search_reasoning: String,
     pub pro_persist_permanent: bool,
 
-    // Hybrid settings
-    pub hybrid_mode: HybridMode,
+    // Local settings
+    pub local_prompt_lite: bool,
     pub hybrid_secondary_local_model: String,
     pub hybrid_local_url: String,
     pub hybrid_auto_compression: bool,
@@ -154,7 +154,7 @@ impl ModelDialogState {
             pro_search_reasoning: "low".to_string(),
             pro_persist_permanent: true,
 
-            hybrid_mode: HybridMode::AutoTriage,
+            local_prompt_lite: false,
             hybrid_secondary_local_model: "Llama-3.2-3B-Instruct".to_string(),
             hybrid_local_url: "http://127.0.0.1:8080/v1".to_string(),
             hybrid_auto_compression: true,
@@ -171,11 +171,13 @@ impl ModelDialogState {
         pro_settings: &ProSettings,
         hybrid_settings: &HybridSettings,
         hybrid_enabled: bool,
+        local_prompt_lite: bool,
     ) {
         self.is_open = true;
         self.current_tab = ModelTab::Models;
         self.active_model = current_model.to_string();
         self.server_status_msg = None;
+        self.local_prompt_lite = local_prompt_lite;
 
         if hybrid_enabled {
             self.active_engine = 3;
@@ -200,7 +202,6 @@ impl ModelDialogState {
         self.pro_reasoning = pro_settings.reasoning_effort.clone();
         self.pro_search_reasoning = pro_settings.search_reasoning_effort.clone();
 
-        self.hybrid_mode = hybrid_settings.mode;
         self.hybrid_secondary_local_model = hybrid_settings.secondary_local_model.clone();
         self.hybrid_local_url = hybrid_settings.local_url.clone();
         self.hybrid_auto_compression = hybrid_settings.auto_compression;
@@ -323,20 +324,11 @@ impl ModelDialogState {
     }
 
     pub fn cycle_hybrid_row(&mut self, forward: bool) {
+        let _ = forward;
         match self.hybrid_row_idx {
             0 => {
-                let curr_idx = HYBRID_MODES
-                    .iter()
-                    .position(|&m| m == self.hybrid_mode)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % HYBRID_MODES.len()
-                } else if curr_idx == 0 {
-                    HYBRID_MODES.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.hybrid_mode = HYBRID_MODES[next_idx];
+                // System Prompt toggle: Full <-> Lite
+                self.local_prompt_lite = !self.local_prompt_lite;
             }
             1 => {
                 let curr_idx = HYBRID_LOCAL_MODELS
@@ -399,7 +391,7 @@ impl ModelDialogState {
             local_url: self.hybrid_local_url.clone(),
             secondary_local_model: self.hybrid_secondary_local_model.clone(),
             auto_compression: self.hybrid_auto_compression,
-            mode: self.hybrid_mode,
+            mode: HybridMode::CompressionOnly,
         }
     }
 
@@ -456,7 +448,7 @@ pub fn render_model_dialog(
         (ModelTab::Models, "Models", "1"),
         (ModelTab::Flash, "Flash CoT", "2"),
         (ModelTab::Pro, "Pro CoT", "3"),
-        (ModelTab::Hybrid, "Local/Hybrid", "4"),
+        (ModelTab::Hybrid, "Local", "4"),
     ];
 
     let mut tab_spans = vec![Span::raw("  ")];
@@ -517,7 +509,7 @@ pub fn render_model_dialog(
             footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
         }
         ModelTab::Hybrid => {
-            footer.extend(key_badge("Enter", "Activate Hybrid", theme.accent_cyan, theme.gray));
+            footer.extend(key_badge("Enter", "Activate Local", theme.accent_cyan, theme.gray));
             footer.extend(key_badge("C", "Ping Server", theme.accent_green, theme.gray));
             footer.extend(key_badge("◄/►", "Adjust", theme.accent_yellow, theme.gray));
             footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
@@ -843,14 +835,14 @@ fn render_hybrid_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Th
     let rows = [
         (
             0,
-            "1. Hybrid Strategy: ",
-            state.hybrid_mode.display_name().to_string(),
-            Color::Rgb(105, 240, 174),
-            "Routes tools to local, code to cloud",
+            "1. System Prompt:   ",
+            if state.local_prompt_lite { "LITE".to_string() } else { "FULL".to_string() },
+            if state.local_prompt_lite { Color::Rgb(255, 213, 79) } else { Color::Rgb(105, 240, 174) },
+            if state.local_prompt_lite { "Simplified prompt for SLMs (2B-7B)" } else { "Full UTI prompt with tool enforcement" },
         ),
         (
             1,
-            "2. Local Secondary: ",
+            "2. Local Model:     ",
             state.hybrid_secondary_local_model.clone(),
             Color::Rgb(105, 240, 174),
             "Air-gapped offline SLM ($0.00 cost)",

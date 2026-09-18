@@ -8,15 +8,26 @@ pub struct HistoryStore;
 impl HistoryStore {
     fn history_file_path() -> PathBuf {
         let dir = BaseDirs::new()
-            .map(|d| d.home_dir().join(".uti"))
+            .map(|d| d.home_dir().join(".corex"))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         let _ = fs::create_dir_all(&dir);
         dir.join("history")
     }
 
-    /// Loads history from ~/.uti/history (oldest to newest)
+    fn legacy_history_file_path() -> Option<PathBuf> {
+        BaseDirs::new().map(|d| d.home_dir().join(".uti").join("history"))
+    }
+
+    /// Loads history from ~/.corex/history with fallback to ~/.uti/history (oldest to newest)
     pub fn load() -> Vec<String> {
-        let path = Self::history_file_path();
+        let mut path = Self::history_file_path();
+        if !path.exists() {
+            if let Some(legacy) = Self::legacy_history_file_path() {
+                if legacy.exists() {
+                    path = legacy;
+                }
+            }
+        }
         if !path.exists() {
             return Vec::new();
         }
@@ -46,7 +57,7 @@ impl HistoryStore {
         lines
     }
 
-    /// Appends a new prompt to ~/.uti/history
+    /// Appends a new prompt to ~/.corex/history
     pub fn append(entry: &str) {
         let trimmed = entry.trim();
         if trimmed.is_empty() {

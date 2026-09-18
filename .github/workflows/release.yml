@@ -19,25 +19,25 @@ jobs:
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin_name: uti
+            bin_name: cx
             archive_suffix: x86_64-unknown-linux-gnu.tar.gz
 
           # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin_name: uti.exe
+            bin_name: cx.exe
             archive_suffix: x86_64-pc-windows-msvc.zip
 
           # macOS Apple Silicon (M1/M2/M3/M4)
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin_name: uti
+            bin_name: cx
             archive_suffix: aarch64-apple-darwin.tar.gz
 
           # macOS Intel
           - os: macos-latest
             target: x86_64-apple-darwin
-            bin_name: uti
+            bin_name: cx
             archive_suffix: x86_64-apple-darwin.tar.gz
 
     steps:
@@ -49,26 +49,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release --bin uti --target ${{ matrix.target }}
+      - name: Build release binaries (cx, corex, uti)
+        run: cargo build --release --bin cx --bin corex --bin uti --target ${{ matrix.target }}
 
       - name: Set archive name
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME:-v0.2.0}"
-          echo "ARCHIVE_NAME=uti-${VERSION}-${{ matrix.archive_suffix }}" >> $GITHUB_ENV
+          echo "ARCHIVE_NAME=corex-${VERSION}-${{ matrix.archive_suffix }}" >> $GITHUB_ENV
 
       - name: Package release asset (Unix)
         if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czvf ../../../${{ env.ARCHIVE_NAME }} ${{ matrix.bin_name }}
+          tar -czvf ../../../${{ env.ARCHIVE_NAME }} cx corex uti
           cd ../../..
 
       - name: Package release asset (Windows)
         if: runner.os == 'Windows'
         run: |
-          Compress-Archive -Path target\${{ matrix.target }}\release\${{ matrix.bin_name }} -DestinationPath ${{ env.ARCHIVE_NAME }}
+          Compress-Archive -Path target\${{ matrix.target }}\release\cx.exe,target\${{ matrix.target }}\release\corex.exe,target\${{ matrix.target }}\release\uti.exe -DestinationPath ${{ env.ARCHIVE_NAME }}
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2

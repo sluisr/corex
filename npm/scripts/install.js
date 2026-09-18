@@ -7,36 +7,40 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 const VERSION = 'v0.2.0';
-const REPO = 'sluisr/uti-cli';
+const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
   linux: {
     x64: {
-      archive: `uti-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
-      binName: 'uti',
+      archive: `corex-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
+      legacyArchive: `uti-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
+      binName: 'cx',
       type: 'tar',
       sha256: '7b67e49b4bbc44eb5ac8f41fad69f9610b6c4486c77b8963c4affaadd307aac6'
     }
   },
   darwin: {
     arm64: {
-      archive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
-      binName: 'uti',
+      archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
+      legacyArchive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
+      binName: 'cx',
       type: 'tar',
       sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
     },
     x64: {
       // Fallback for Intel macs or Rosetta
-      archive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
-      binName: 'uti',
+      archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
+      legacyArchive: `uti-${VERSION}-aarch64-apple-darwin.tar.gz`,
+      binName: 'cx',
       type: 'tar',
       sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
     }
   },
   win32: {
     x64: {
-      archive: `uti-${VERSION}-x86_64-pc-windows-msvc.zip`,
-      binName: 'uti.exe',
+      archive: `corex-${VERSION}-x86_64-pc-windows-msvc.zip`,
+      legacyArchive: `uti-${VERSION}-x86_64-pc-windows-msvc.zip`,
+      binName: 'cx.exe',
       type: 'zip',
       sha256: 'e2bde564c8e59745b279fd9a9b060ae50ab2a1c5872d15666b323dfd18cf148a'
     }
@@ -108,12 +112,22 @@ async function install() {
   const url = `https://github.com/${REPO}/releases/download/${VERSION}/${target.archive}`;
   const archivePath = path.join(binDir, target.archive);
 
-  console.log(`[uti-cli] Downloading native binary for ${process.platform}-${process.arch} from GitHub...`);
-  await downloadFile(url, archivePath);
+  console.log(`[corex] Downloading native binary for ${process.platform}-${process.arch} from GitHub...`);
+  try {
+    await downloadFile(url, archivePath);
+  } catch (err) {
+    if (target.legacyArchive) {
+      const fallbackUrl = `https://github.com/${REPO}/releases/download/${VERSION}/${target.legacyArchive}`;
+      console.log(`[corex] Trying release asset fallback: ${target.legacyArchive}...`);
+      await downloadFile(fallbackUrl, archivePath);
+    } else {
+      throw err;
+    }
+  }
 
   // Corporate-grade cryptographic integrity verification
   if (target.sha256) {
-    console.log(`[uti-cli] Verifying SHA-256 checksum (${target.sha256.slice(0, 16)}...)...`);
+    console.log(`[corex] Verifying SHA-256 checksum (${target.sha256.slice(0, 16)}...)...`);
     const fileBuffer = fs.readFileSync(archivePath);
     const calculatedHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
     if (calculatedHash.toLowerCase() !== target.sha256.toLowerCase()) {
@@ -122,10 +136,10 @@ async function install() {
         `SHA-256 verification failed! Potential corrupted download or security tampering.\nExpected: ${target.sha256}\nReceived: ${calculatedHash}`
       );
     }
-    console.log('[uti-cli] SHA-256 checksum verified successfully.');
+    console.log('[corex] SHA-256 checksum verified successfully.');
   }
 
-  console.log('[uti-cli] Extracting binary...');
+  console.log('[corex] Extracting binary...');
   try {
     if (target.type === 'tar') {
       execSync(`tar -xzf "${archivePath}" -C "${binDir}"`, { stdio: 'inherit' });
@@ -150,12 +164,12 @@ async function install() {
     fs.chmodSync(targetBinPath, 0o755);
   }
 
-  console.log(`[uti-cli] UTI CLI ${VERSION} successfully verified and installed to ${targetBinPath}`);
+  console.log(`[corex] Corex ${VERSION} successfully verified and installed to ${targetBinPath}`);
 }
 
 if (require.main === module) {
   install().catch((err) => {
-    console.error(`[uti-cli] Installation error: ${err.message}`);
+    console.error(`[corex] Installation error: ${err.message}`);
     process.exit(1);
   });
 }

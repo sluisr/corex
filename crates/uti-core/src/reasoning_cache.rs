@@ -14,8 +14,8 @@ pub struct ReasoningCache {
 impl ReasoningCache {
     pub fn new() -> Self {
         let base_dir = BaseDirs::new()
-            .map(|dirs| dirs.home_dir().join(".uti"))
-            .unwrap_or_else(|| PathBuf::from(".uti"));
+            .map(|dirs| dirs.home_dir().join(".corex"))
+            .unwrap_or_else(|| PathBuf::from(".corex"));
 
         let _ = fs::create_dir_all(&base_dir);
         let cache_file = base_dir.join("reasoning_cache.json");
@@ -29,10 +29,18 @@ impl ReasoningCache {
                 }
             }
         } else {
-            // Check legacy DeepSeek path for seamless migration
+            // Check legacy UTI and DeepSeek paths for seamless migration
             if let Some(dirs) = BaseDirs::new() {
+                let uti_file = dirs.home_dir().join(".uti").join("reasoning_cache.json");
                 let legacy_file = dirs.home_dir().join(".deepseek").join("reasoning_cache.json");
-                if legacy_file.exists() {
+                if uti_file.exists() {
+                    if let Ok(data) = fs::read_to_string(&uti_file) {
+                        if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&data) {
+                            map = parsed;
+                            debug!("[CACHE] Migrated {} entries from UTI cache", map.len());
+                        }
+                    }
+                } else if legacy_file.exists() {
                     if let Ok(data) = fs::read_to_string(&legacy_file) {
                         if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&data) {
                             map = parsed;

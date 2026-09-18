@@ -12,6 +12,10 @@ pub struct UpdateCache {
 }
 
 fn get_cache_path() -> Option<PathBuf> {
+    BaseDirs::new().map(|d| d.home_dir().join(".corex").join("cache").join("update_check.json"))
+}
+
+fn get_legacy_cache_path() -> Option<PathBuf> {
     BaseDirs::new().map(|d| d.home_dir().join(".uti").join("cache").join("update_check.json"))
 }
 
@@ -38,10 +42,9 @@ pub fn is_newer_version(current: &str, candidate: &str) -> bool {
 
 /// Reads the local disk cache. If a cached version exists and is newer than current, returns Some(version).
 pub fn check_cached_update(current_version: &str) -> Option<String> {
-    let path = get_cache_path()?;
-    if !path.exists() {
-        return None;
-    }
+    let path = get_cache_path().and_then(|p| if p.exists() { Some(p) } else { None })
+        .or_else(|| get_legacy_cache_path().and_then(|p| if p.exists() { Some(p) } else { None }))?;
+
     let content = fs::read_to_string(path).ok()?;
     let cache: UpdateCache = serde_json::from_str(&content).ok()?;
     if is_newer_version(current_version, &cache.latest_version) {
@@ -67,45 +70,53 @@ fn save_cache(latest_version: &str) {
     }
 }
 
-/// Checks online (GitHub releases API, then GitHub tags fallback) for the latest UTI version in sluisr/uti-cli.
+/// Checks online (GitHub releases API, then GitHub tags fallback) for the latest Corex version in sluisr/corex.
 /// Sets a strict 3-second timeout so it never hangs or blocks the CLI/TUI.
 pub async fn check_for_update_online(current_version: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
-        .user_agent(format!("uti-cli/{}", current_version))
+        .user_agent(format!("corex/{}", current_version))
         .build()
         .ok()?;
 
-    // 1. Try GitHub Releases API
-    let github_url = "https://api.github.com/repos/sluisr/uti-cli/releases/latest";
-    if let Ok(resp) = client.get(github_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(val) = resp.json::<serde_json::Value>().await {
-                if let Some(tag) = val.get("tag_name").and_then(|t| t.as_str()) {
-                    let clean_tag = tag.trim_start_matches('v').to_string();
-                    save_cache(&clean_tag);
-                    if is_newer_version(current_version, &clean_tag) {
-                        return Some(clean_tag);
+    // Try primary sluisr/corex first, then fallback to sluisr/uti-cli
+    let repo_endpoints = [
+        "https://api.github.com/repos/sluisr/corex",
+        "https://api.github.com/repos/sluisr/uti-cli",
+    ];
+
+    for base in repo_endpoints {
+        // 1. Try GitHub Releases API
+        let github_url = format!("{}/releases/latest", base);
+        if let Ok(resp) = client.get(&github_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    if let Some(tag) = val.get("tag_name").and_then(|t| t.as_str()) {
+                        let clean_tag = tag.trim_start_matches('v').to_string();
+                        save_cache(&clean_tag);
+                        if is_newer_version(current_version, &clean_tag) {
+                            return Some(clean_tag);
+                        }
                     }
                 }
             }
         }
-    }
 
-    // 2. Try GitHub Tags API fallback
-    let tags_url = "https://api.github.com/repos/sluisr/uti-cli/tags";
-    if let Ok(resp) = client.get(tags_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(val) = resp.json::<serde_json::Value>().await {
-                if let Some(tags_array) = val.as_array() {
-                    for item in tags_array {
-                        if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                            let clean_tag = name.trim_start_matches('v').to_string();
-                            save_cache(&clean_tag);
-                            if is_newer_version(current_version, &clean_tag) {
-                                return Some(clean_tag);
+        // 2. Try GitHub Tags API fallback
+        let tags_url = format!("{}/tags", base);
+        if let Ok(resp) = client.get(&tags_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    if let Some(tags_array) = val.as_array() {
+                        for item in tags_array {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                let clean_tag = name.trim_start_matches('v').to_string();
+                                save_cache(&clean_tag);
+                                if is_newer_version(current_version, &clean_tag) {
+                                    return Some(clean_tag);
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
