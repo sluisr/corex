@@ -1,5 +1,5 @@
 [package]
-name = "uti-cli"
+name = "corex-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -18,10 +18,10 @@ name = "uti"
 path = "src/main.rs"
 
 [dependencies]
-uti-core = { workspace = true }
-uti-tools = { workspace = true }
-uti-prompt = { workspace = true }
-uti-tui = { workspace = true }
+corex-core = { workspace = true }
+corex-tools = { workspace = true }
+corex-prompt = { workspace = true }
+corex-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

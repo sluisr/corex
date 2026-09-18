@@ -148,7 +148,7 @@ impl TaskManager {
                 }
             };
             let dur = proc.duration_str();
-            let cmd_display = uti_core::truncate_ellipsis(&proc.command, 30);
+            let cmd_display = corex_core::truncate_ellipsis(&proc.command, 30);
             out.push(format!("{:<8} {:<14} {:<10} {:<30}", proc.pid, status, dur, cmd_display));
         }
 

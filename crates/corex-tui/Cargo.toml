@@ -1,14 +1,14 @@
 [package]
-name = "uti-tui"
+name = "corex-tui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-uti-core = { workspace = true }
-uti-tools = { workspace = true }
-uti-prompt = { workspace = true }
+corex-core = { workspace = true }
+corex-tools = { workspace = true }
+corex-prompt = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true }

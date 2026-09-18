@@ -284,6 +284,111 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corex-cli"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "corex-core",
+ "corex-prompt",
+ "corex-tools",
+ "corex-tui",
+ "crossterm",
+ "directories",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "corex-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "directories",
+ "futures-util",
+ "reqwest",
+ "reqwest-eventsource",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "corex-prompt"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "corex-core",
+ "corex-tools",
+ "directories",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "corex-tools"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "corex-core",
+ "diffy",
+ "directories",
+ "glob",
+ "ignore",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "similar",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "corex-tui"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "corex-core",
+ "corex-prompt",
+ "corex-tools",
+ "crossterm",
+ "directories",
+ "open",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "textwrap",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,111 +2266,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "uti-cli"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "crossterm",
- "directories",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uti-core",
- "uti-prompt",
- "uti-tools",
- "uti-tui",
-]
-
-[[package]]
-name = "uti-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "directories",
- "futures-util",
- "reqwest",
- "reqwest-eventsource",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "uti-prompt"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "directories",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "uti-core",
- "uti-tools",
-]
-
-[[package]]
-name = "uti-tools"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "diffy",
- "directories",
- "glob",
- "ignore",
- "libc",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "shell-words",
- "similar",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "uti-core",
- "walkdir",
-]
-
-[[package]]
-name = "uti-tui"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "directories",
- "open",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "serde_json",
- "textwrap",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util",
- "tracing",
- "unicode-width 0.2.0",
- "uti-core",
- "uti-prompt",
- "uti-tools",
-]
 
 [[package]]
 name = "uuid"

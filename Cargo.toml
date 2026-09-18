@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "crates/uti-core",
-    "crates/uti-tools",
-    "crates/uti-prompt",
-    "crates/uti-tui",
-    "crates/uti-cli",
+    "crates/corex-core",
+    "crates/corex-tools",
+    "crates/corex-prompt",
+    "crates/corex-tui",
+    "crates/corex-cli",
 ]
 resolver = "2"
 
@@ -48,7 +48,7 @@ async-trait = "0.1"
 base64 = "0.22"
 
 # Internal crates
-uti-core = { path = "crates/uti-core" }
-uti-tools = { path = "crates/uti-tools" }
-uti-prompt = { path = "crates/uti-prompt" }
-uti-tui = { path = "crates/uti-tui" }
+corex-core = { path = "crates/corex-core" }
+corex-tools = { path = "crates/corex-tools" }
+corex-prompt = { path = "crates/corex-prompt" }
+corex-tui = { path = "crates/corex-tui" }

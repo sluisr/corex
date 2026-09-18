@@ -1,12 +1,12 @@
 [package]
-name = "uti-tools"
+name = "corex-tools"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
 [dependencies]
-uti-core = { workspace = true }
+corex-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

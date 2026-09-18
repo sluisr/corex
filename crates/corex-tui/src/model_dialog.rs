@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use uti_core::config::{FlashSettings, HybridMode, HybridSettings, ProSettings};
+use corex_core::config::{FlashSettings, HybridMode, HybridSettings, ProSettings};
 
 use crate::overlay::render_scrim;
 use crate::theme::Theme;
@@ -617,7 +617,7 @@ fn render_models_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Th
         // Line 2: Indented description
         let indent = 10;
         let max_desc_w = inner_w.saturating_sub(indent + 2);
-        let truncated_desc = uti_core::truncate_ellipsis(desc, max_desc_w);
+        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
         let desc_len = truncated_desc.chars().count();
         let desc_style = if is_selected {
             Style::default().fg(Color::Rgb(180, 195, 215)).bg(row_bg)
@@ -728,7 +728,7 @@ fn render_flash_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &The
 
         let prefix_len = 3 + 22 + 2 + 9 + 2 + 3 + 9 + 2;
         let max_desc_w = inner_w.saturating_sub(prefix_len);
-        let truncated_desc = uti_core::truncate_ellipsis(desc, max_desc_w);
+        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
 
         let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
 
@@ -799,7 +799,7 @@ fn render_pro_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Theme
 
         let prefix_len = 3 + 20 + 2 + 9 + 2 + 3 + 9 + 2;
         let max_desc_w = inner_w.saturating_sub(prefix_len);
-        let truncated_desc = uti_core::truncate_ellipsis(desc, max_desc_w);
+        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
 
         let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
 
@@ -887,7 +887,7 @@ fn render_hybrid_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Th
 
         let prefix_len = 3 + 20 + 2 + 13 + 2 + 3;
         let max_desc_w = inner_w.saturating_sub(prefix_len);
-        let truncated_desc = uti_core::truncate_ellipsis(desc, max_desc_w);
+        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
 
         let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
 

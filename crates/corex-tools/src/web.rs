@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
-use uti_core::safe_truncate_str;
+use corex_core::safe_truncate_str;
 
 use crate::types::{Tool, ToolContext, ToolOutput};
 

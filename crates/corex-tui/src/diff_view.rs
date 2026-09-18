@@ -254,7 +254,7 @@ pub fn build_tool_confirmation_lines(
 }
 
 pub fn build_streaming_tool_preview_lines(
-    calls: &[uti_core::types::ToolCall],
+    calls: &[corex_core::types::ToolCall],
     elapsed_secs: f32,
     max_width: usize,
     theme: &Theme,

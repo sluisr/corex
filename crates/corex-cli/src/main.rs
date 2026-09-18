@@ -3,14 +3,14 @@ use anyhow::Result;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
-use uti_core::client::{get_sudo_password, LlmClient, StreamEvent};
-use uti_core::config::Config;
-use uti_core::session::Session;
-use uti_core::types::{Message, ToolCall};
-use uti_prompt::PromptBuilder;
-use uti_tools::registry::ToolRegistry;
-use uti_tools::types::ToolContext;
-use uti_tui::{run_tui, App};
+use corex_core::client::{get_sudo_password, LlmClient, StreamEvent};
+use corex_core::config::Config;
+use corex_core::session::Session;
+use corex_core::types::{Message, ToolCall};
+use corex_prompt::PromptBuilder;
+use corex_tools::registry::ToolRegistry;
+use corex_tools::types::ToolContext;
+use corex_tui::{run_tui, App};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     if cli.message.is_none() && cli.query.len() == 1 && (cli.query[0] == "update" || cli.query[0] == "--update") {
         let current = env!("CARGO_PKG_VERSION");
         println!("Checking for Corex updates...");
-        if let Some(newer) = uti_core::update::check_for_update_online(current).await {
+        if let Some(newer) = corex_core::update::check_for_update_online(current).await {
             println!("\n⚡ Update available: v{} → v{}\n", current, newer);
             println!("To update Corex, run in your terminal:");
             println!("  • Via npm:       npm install -g corex-cli");
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize forensic audit log system (~/.corex/logs/corex-forensic-YYYY-MM-DD.log)
-    let log_path = uti_core::ForensicLogger::init(Some(&workspace_dir));
+    let log_path = corex_core::ForensicLogger::init(Some(&workspace_dir));
     tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
 
     let mut config = Config::load_with_workspace(Some(&workspace_dir));
@@ -210,7 +210,7 @@ async fn run_headless(
     yolo: bool,
 ) -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
-    let (mcp_tools, _) = uti_tools::load_mcp_servers(&client.get_config().mcp_servers).await;
+    let (mcp_tools, _) = corex_tools::load_mcp_servers(&client.get_config().mcp_servers).await;
     for t in mcp_tools {
         tool_registry.register(t);
     }
@@ -327,7 +327,7 @@ async fn run_headless(
                         current_tool_calls.push(ToolCall {
                             id: String::new(),
                             call_type: "function".to_string(),
-                            function: uti_core::types::FunctionCall {
+                            function: corex_core::types::FunctionCall {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
@@ -373,8 +373,8 @@ async fn run_headless(
 
         if !assistant_text.trim().is_empty() {
             if is_tty {
-                let theme = uti_tui::Theme::default();
-                let rendered = uti_tui::render_markdown_to_ansi(&assistant_text, &theme, term_width);
+                let theme = corex_tui::Theme::default();
+                let rendered = corex_tui::render_markdown_to_ansi(&assistant_text, &theme, term_width);
                 println!("{}\n", rendered);
             } else {
                 println!("{}\n", assistant_text);
@@ -414,7 +414,7 @@ async fn run_headless(
                     ("Running tool", call.function.name.as_str())
                 };
 
-                let display_detail = uti_core::truncate_ellipsis(target_detail, 70);
+                let display_detail = corex_core::truncate_ellipsis(target_detail, 70);
 
                 // Prompt user for confirmation on potentially mutating/dangerous actions unless YOLO mode is enabled
                 if !context.yolo_mode {

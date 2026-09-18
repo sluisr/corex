@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph};
 use ratatui::Frame;
-use uti_core::session::{Session, SessionSummary};
+use corex_core::session::{Session, SessionSummary};
 
 use crate::overlay::render_scrim;
 use crate::theme::Theme;
@@ -133,7 +133,7 @@ pub fn render_session_dialog(
                 s.title.clone()
             };
 
-            let truncated_title = uti_core::truncate_ellipsis(&full_title, title_col_width);
+            let truncated_title = corex_core::truncate_ellipsis(&full_title, title_col_width);
             let title_len = truncated_title.chars().count();
             let padded_title = if title_len < title_col_width {
                 format!("{}{}", truncated_title, " ".repeat(title_col_width - title_len))

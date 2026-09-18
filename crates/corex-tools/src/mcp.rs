@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use uti_core::config::McpServerConfig;
+use corex_core::config::McpServerConfig;
 
 use crate::types::{Tool, ToolContext, ToolOutput};
 

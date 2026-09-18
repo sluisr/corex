@@ -22,14 +22,14 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use uti_core::client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
-use uti_core::config::Config;
-use uti_core::session::Session;
-use uti_core::types::{Message, ToolCall};
-use uti_prompt::PromptBuilder;
-use uti_tools::registry::ToolRegistry;
-use uti_tools::types::ToolContext;
-use uti_tools::{command_requires_sudo, extract_first_sudo_command};
+use corex_core::client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
+use corex_core::config::Config;
+use corex_core::session::Session;
+use corex_core::types::{Message, ToolCall};
+use corex_prompt::PromptBuilder;
+use corex_tools::registry::ToolRegistry;
+use corex_tools::types::ToolContext;
+use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
 use crate::ascii::render_gradient_logo;
 use crate::auth_dialog::{render_auth_dialog, AuthDialogState};
@@ -243,8 +243,8 @@ pub struct App {
     pub status_transition: StatusTransition,
     pub last_chat_rect: Option<Rect>,
     pub last_rendered_text_lines: Vec<String>,
-    pub balance_tx: mpsc::Sender<Result<uti_core::types::BalanceResponse, String>>,
-    pub balance_rx: mpsc::Receiver<Result<uti_core::types::BalanceResponse, String>>,
+    pub balance_tx: mpsc::Sender<Result<corex_core::types::BalanceResponse, String>>,
+    pub balance_rx: mpsc::Receiver<Result<corex_core::types::BalanceResponse, String>>,
     pub is_checking_balance: bool,
     pub pending_balance_msg_index: Option<usize>,
     pub message_queue: VecDeque<String>,
@@ -254,7 +254,7 @@ impl App {
     pub fn new(llm_client: LlmClient, workspace_dir: PathBuf, yolo: bool) -> Self {
         let branch = Self::detect_git_branch(&workspace_dir);
         let cfg = llm_client.get_config();
-        let persistent_history = uti_core::HistoryStore::load();
+        let persistent_history = corex_core::HistoryStore::load();
 
         let mut auth_dialog = AuthDialogState::new();
         if cfg.api_key.trim().is_empty() && !cfg.local_llm_enabled {
@@ -314,7 +314,7 @@ impl App {
             cached_logs_expanded: false,
             active_background_pids: std::collections::HashSet::new(),
             current_generation_id: 0,
-            update_available: Arc::new(std::sync::Mutex::new(uti_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
+            update_available: Arc::new(std::sync::Mutex::new(corex_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
             active_status: None,
             status_transition: StatusTransition::new(),
             last_chat_rect: None,
@@ -343,7 +343,7 @@ impl App {
     pub fn trigger_update_check(&self) {
         let update_arc = self.update_available.clone();
         tokio::spawn(async move {
-            if let Some(newer) = uti_core::update::check_for_update_online(env!("CARGO_PKG_VERSION")).await {
+            if let Some(newer) = corex_core::update::check_for_update_online(env!("CARGO_PKG_VERSION")).await {
                 if let Ok(mut lock) = update_arc.lock() {
                     *lock = Some(newer);
                 }
@@ -396,9 +396,9 @@ impl App {
         });
     }
 
-    pub async fn reload_mcp_servers(&mut self) -> Vec<uti_tools::McpServerStatus> {
+    pub async fn reload_mcp_servers(&mut self) -> Vec<corex_tools::McpServerStatus> {
         let cfg = self.llm_client.get_config();
-        let (tools, statuses) = uti_tools::load_mcp_servers(&cfg.mcp_servers).await;
+        let (tools, statuses) = corex_tools::load_mcp_servers(&cfg.mcp_servers).await;
         for t in tools {
             self.tool_registry.register(t);
         }
@@ -613,7 +613,7 @@ impl App {
                     match parts[1].to_lowercase().as_str() {
                         "mode" => {
                             if parts.len() > 2 {
-                                if let Some(m) = uti_core::config::HybridMode::from_str_loose(parts[2]) {
+                                if let Some(m) = corex_core::config::HybridMode::from_str_loose(parts[2]) {
                                     cfg.hybrid_settings.mode = m;
                                     cfg.local_llm_enabled = true;
                                     self.llm_client.update_config(cfg.clone());
@@ -1061,7 +1061,7 @@ impl App {
                 true
             }
             "/tasks" | "/background" => {
-                let mgr = uti_tools::background::get_task_manager();
+                let mgr = corex_tools::background::get_task_manager();
                 if parts.len() == 1 {
                     let guard = mgr.lock().unwrap();
                     let list = guard.list();
@@ -1225,7 +1225,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
         // Check for finished background tasks and notify the user/session
         let newly_finished: Vec<(u32, Option<i32>, String, String)> = {
-            if let Ok(mgr) = uti_tools::background::get_task_manager().lock() {
+            if let Ok(mgr) = corex_tools::background::get_task_manager().lock() {
                 let mut finished = Vec::new();
                 let mut still_active = std::collections::HashSet::new();
 
@@ -1347,7 +1347,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.streaming_tool_calls.push(ToolCall {
                             id: String::new(),
                             call_type: "function".to_string(),
-                            function: uti_core::types::FunctionCall {
+                            function: corex_core::types::FunctionCall {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
@@ -1396,7 +1396,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     };
 
                     if let (Some(ref txt), Some(ref cot)) = (&assistant_text, &reasoning) {
-                        let key = uti_core::reasoning_cache::ReasoningCache::compute_key(
+                        let key = corex_core::reasoning_cache::ReasoningCache::compute_key(
                             txt,
                             Some(&app.streaming_tool_calls),
                         );
@@ -1547,7 +1547,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             Ok(o) => (o.output, true),
                                             Err(e) => (format!("Error executing {}: {}", tool_name, e), false),
                                         };
-                                        uti_core::ForensicLogger::log_tool_call(
+                                        corex_core::ForensicLogger::log_tool_call(
                                             &tool_name,
                                             &call_id,
                                             &args_str,
@@ -2721,7 +2721,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                                 if app.input_history.last().map(|s| s.as_str()) != Some(&cmd_to_run) {
                                     app.input_history.push(cmd_to_run.clone());
-                                    uti_core::HistoryStore::append(&cmd_to_run);
+                                    corex_core::HistoryStore::append(&cmd_to_run);
                                 }
                                 app.history_idx = None;
                                 app.saved_draft.clear();
@@ -3005,7 +3005,7 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
             if cmd.is_empty() {
                 "Running command...".to_string()
             } else {
-                format!("Running command: {}", uti_core::truncate_ellipsis(cmd, 50))
+                format!("Running command: {}", corex_core::truncate_ellipsis(cmd, 50))
             }
         }
         "read_file" => {
@@ -3044,7 +3044,7 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()))
                 .unwrap_or(raw_args);
             let single_line_cmd = cmd.replace('\n', " ").replace("  ", " ");
-            let display_cmd = uti_core::truncate_ellipsis(&single_line_cmd, 80);
+            let display_cmd = corex_core::truncate_ellipsis(&single_line_cmd, 80);
             vec![
                 Span::styled("  $ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(display_cmd, Style::default().fg(theme.accent_cyan)),
@@ -3114,7 +3114,7 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
             ]
         }
         _ => {
-            let display_args = uti_core::truncate_ellipsis(raw_args, 60);
+            let display_args = corex_core::truncate_ellipsis(raw_args, 60);
             vec![
                 Span::styled("  [TOOL] ", Style::default().fg(theme.accent_yellow)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
@@ -3295,38 +3295,38 @@ fn render_about_card(
             Span::styled(" (https://sluisr.com)", Style::default().fg(Color::Rgb(115, 160, 220))),
         ]),
         make_row("Official Website", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://corex.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("Changelog & Releases", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://corex.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("Report Issues & Bugs", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/corex/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(corex_core::truncate_ellipsis("https://github.com/sluisr/corex/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         make_row("GitHub Repository", vec![
-            Span::styled(uti_core::truncate_ellipsis("https://github.com/sluisr/corex", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+            Span::styled(corex_core::truncate_ellipsis("https://github.com/sluisr/corex", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
         empty_row(),
         div_line,
         empty_row(),
         make_row("Active Model", vec![
-            Span::styled(uti_core::truncate_ellipsis(model, val_max), Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
+            Span::styled(corex_core::truncate_ellipsis(model, val_max), Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
         ]),
         make_row("API Base URL", vec![
-            Span::styled(uti_core::truncate_ellipsis(base_url, val_max), Style::default().fg(Color::Rgb(140, 150, 170))),
+            Span::styled(corex_core::truncate_ellipsis(base_url, val_max), Style::default().fg(Color::Rgb(140, 150, 170))),
         ]),
         make_row("Local SLM Engine", vec![
-            Span::styled(format!("{} ", uti_core::truncate_ellipsis(local_engine, val_max.saturating_sub(12))), Style::default().fg(Color::Rgb(140, 150, 170))),
+            Span::styled(format!("{} ", corex_core::truncate_ellipsis(local_engine, val_max.saturating_sub(12))), Style::default().fg(Color::Rgb(140, 150, 170))),
             Span::styled(local_status, Style::default().fg(local_color)),
         ]),
         make_row("Session ID", vec![
-            Span::styled(uti_core::truncate_ellipsis(session_id, val_max), Style::default().fg(Color::Rgb(125, 135, 150))),
+            Span::styled(corex_core::truncate_ellipsis(session_id, val_max), Style::default().fg(Color::Rgb(125, 135, 150))),
         ]),
         make_row("Workspace", vec![
-            Span::styled(uti_core::truncate_ellipsis(workspace, val_max), Style::default().fg(Color::Rgb(150, 180, 135))),
+            Span::styled(corex_core::truncate_ellipsis(workspace, val_max), Style::default().fg(Color::Rgb(150, 180, 135))),
         ]),
         make_row("Git Branch", vec![
-            Span::styled(uti_core::truncate_ellipsis(branch, val_max), Style::default().fg(Color::Rgb(210, 165, 105))),
+            Span::styled(corex_core::truncate_ellipsis(branch, val_max), Style::default().fg(Color::Rgb(210, 165, 105))),
         ]),
         empty_row(),
         bot_line,
@@ -3598,7 +3598,7 @@ fn render_single_message_with_pending(
             let content = msg.text_content().unwrap_or("");
             let is_last_tool = next_msg.map(|m| m.role.as_str() != "tool").unwrap_or(true);
 
-            let check_slice = uti_core::safe_truncate_str(content, 2048);
+            let check_slice = corex_core::safe_truncate_str(content, 2048);
             if check_slice.contains("denied by user") || check_slice.contains("declined") {
                 let line_spans = vec![
                     Span::styled("    ✕ ", Style::default().fg(Color::Red)),
@@ -4205,7 +4205,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     let active_tasks = if !app.active_background_pids.is_empty() {
         app.active_background_pids.len()
     } else {
-        uti_tools::background::get_task_manager()
+        corex_tools::background::get_task_manager()
             .lock()
             .map(|m| m.active_count())
             .unwrap_or(0)
@@ -4325,7 +4325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_app_cache_invalidation() {
-        let client = LlmClient::new(uti_core::config::Config::default());
+        let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
 
         app.cached_message_count = 10;
@@ -4432,7 +4432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_slash_popup_animation_targets() {
-        let client = LlmClient::new(uti_core::config::Config::default());
+        let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.auth_dialog.close();
 
@@ -4518,7 +4518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_balance_slash_command_non_blocking() {
-        let client = LlmClient::new(uti_core::config::Config::default());
+        let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
 
         assert!(!app.is_checking_balance);
@@ -4532,7 +4532,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_paste_while_streaming() {
-        let client = LlmClient::new(uti_core::config::Config::default());
+        let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.auth_dialog.close();
         app.is_streaming = true;
@@ -4549,7 +4549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_message_queuing_while_streaming() {
-        let client = LlmClient::new(uti_core::config::Config::default());
+        let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.auth_dialog.close();
         app.is_streaming = true;

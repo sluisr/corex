@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use uti_core::types::ToolCall;
+use corex_core::types::ToolCall;
 
 use crate::overlay::render_scrim;
 use crate::theme::Theme;
@@ -76,7 +76,7 @@ pub fn render_sudo_dialog(
     }
 
     let display_cmd = state.command.strip_prefix("sudo ").unwrap_or(&state.command).trim();
-    let title_cmd = uti_core::truncate_ellipsis(display_cmd, 35);
+    let title_cmd = corex_core::truncate_ellipsis(display_cmd, 35);
 
     let title_str = format!(" Sudo: {} ", title_cmd);
 
@@ -156,7 +156,7 @@ pub fn render_sudo_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uti_core::types::FunctionCall;
+    use corex_core::types::FunctionCall;
 
     #[test]
     fn test_sudo_dialog_open_and_close() {

@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::fs_tools::{is_binary_file, resolve_path};
 use crate::types::{Tool, ToolContext, ToolOutput};
-use uti_core::safe_truncate_str;
+use corex_core::safe_truncate_str;
 
 pub struct GrepTool;
 

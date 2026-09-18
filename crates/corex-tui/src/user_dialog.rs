@@ -5,7 +5,7 @@ use ratatui::symbols;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use uti_core::types::ToolCall;
+use corex_core::types::ToolCall;
 
 use crate::overlay::render_scrim;
 use crate::theme::Theme;

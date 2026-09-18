@@ -109,17 +109,17 @@ impl PromptBuilder {
             let legacy_global = dirs.home_dir().join(".deepseek").join("DEEPSEEK.md");
             if corex_global.exists() {
                 if let Ok(c) = fs::read_to_string(&corex_global) {
-                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                     memory.push_str(&format!("\n--- User Global Memory (~/.corex/COREX.md) ---\n{}\n", bounded));
                 }
             } else if uti_global.exists() {
                 if let Ok(c) = fs::read_to_string(&uti_global) {
-                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                     memory.push_str(&format!("\n--- User Global Memory (~/.uti/UTI.md) ---\n{}\n", bounded));
                 }
             } else if legacy_global.exists() {
                 if let Ok(c) = fs::read_to_string(&legacy_global) {
-                    let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                     memory.push_str(&format!("\n--- User Global Memory (~/.deepseek/DEEPSEEK.md) ---\n{}\n", bounded));
                 }
             }
@@ -130,17 +130,17 @@ impl PromptBuilder {
         let legacy_local = self.workspace_dir.join("DEEPSEEK.md");
         if corex_local.exists() {
             if let Ok(c) = fs::read_to_string(&corex_local) {
-                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                 memory.push_str(&format!("\n--- Project Memory (./COREX.md) ---\n{}\n", bounded));
             }
         } else if uti_local.exists() {
             if let Ok(c) = fs::read_to_string(&uti_local) {
-                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                 memory.push_str(&format!("\n--- Project Memory (./UTI.md) ---\n{}\n", bounded));
             }
         } else if legacy_local.exists() {
             if let Ok(c) = fs::read_to_string(&legacy_local) {
-                let bounded = uti_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
                 memory.push_str(&format!("\n--- Project Memory (./DEEPSEEK.md) ---\n{}\n", bounded));
             }
         }

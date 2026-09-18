@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Result;
-use uti_core::types::ToolDefinition;
+use corex_core::types::ToolDefinition;
 
 use crate::apply_patch::ApplyPatchTool;
 use crate::background::{

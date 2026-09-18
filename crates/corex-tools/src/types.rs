@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use uti_core::types::ToolDefinition;
+use corex_core::types::ToolDefinition;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
