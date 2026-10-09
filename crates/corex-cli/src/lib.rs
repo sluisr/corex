@@ -60,7 +60,7 @@ struct Cli {
     #[arg(short = 'C', long)]
     directory: Option<PathBuf>,
 
-    /// Enable or disable local LLM assistant / hybrid mode (--local, --no-local)
+    /// Enable or disable local LLM assistant (--local, --no-local)
     #[arg(long, default_missing_value = "true", num_args = 0..=1)]
     local: Option<bool>,
 

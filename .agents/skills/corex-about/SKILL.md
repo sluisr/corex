@@ -27,16 +27,16 @@ description: >-
 
 ## ⚡ What is Corex?
 
-**Corex** (invoked as **`cx`**) is the ultra-fast, native Rust autonomous AI terminal agent for the **DeepSeek API** and local LLMs with **Hybrid Intelligence**.
+**Corex** (invoked as **`cx`**) is the ultra-fast, native Rust autonomous AI terminal agent for the **DeepSeek API** and local LLMs.
 
 It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalone static binary with:
 
 - 🦀 **100% pure Rust** — single binary, <10ms startup, ~21MB RAM idle
-- 💰 **Hybrid routing** — DeepSeek Cloud + local LLM at $0.00 for chat/Q&A
+- 🔒 **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
 - 🧠 **DeepSeek V4.1** — Flash (1M context, native vision) + Pro (CoT reasoning)
 - ⚡ **Adaptive CoT** — automatic reasoning depth per task complexity
 - 🛡️ **96%+ KV cache hit rate** — up to 90% API cost reduction
-- 📝 **`apply_patch`** — atomic unified-diff patching
+- 📝 **`apply_patch`** — atomic unified-diff patching with fuzzy whitespace tolerance
 - 🔍 **Forensic telemetry** — TTFT, tokens/sec, USD cost per turn
 - 🔑 **Silent sudo / 0ms AskPass** — native non-blocking auth
 - 🔌 **MCP support** — connect external tools, databases, GitHub, Docker
@@ -45,7 +45,7 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 
 ## 📌 Current Status
 
-- **Version:** `0.2.1` (actively developed)
+- **Version:** `0.3.0` (actively developed)
 - **License:** Apache 2.0 — fully open source
 - **Platforms:** Linux, macOS, Windows
 
@@ -109,7 +109,7 @@ Corex stores all its configuration and data in **`~/.corex/`** (in your home dir
 | :--- | :--- |
 | `~/.corex/settings.json` | API key, base URL, default model |
 | `~/.corex/flash_settings.json` | CoT reasoning depth (`none` / `low` / `high` / `xhigh` / `max`) |
-| `~/.corex/hybrid_settings.json` | Hybrid mode strategy, local server endpoint, scout config |
+| `~/.corex/pro_settings.json` | Deep reasoning configuration for DeepSeek-V4-Pro |
 | `~/.corex/logs/` | Forensic audit logs (`corex-forensic-YYYY-MM-DD.log`) |
 | `~/.corex/COREX.md` | Global persistent memory (applies to all projects) |
 | `./COREX.md` | Project-level persistent memory (per working directory) |

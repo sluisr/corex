@@ -4757,7 +4757,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 
     if cfg.local_llm_enabled && !cfg.model.starts_with("local") {
-        right_spans.push(Span::styled("Hybrid ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
+        right_spans.push(Span::styled("+Local ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
     }
 
     // Center spans: Local LLM status indicator and Active Background Tasks badge

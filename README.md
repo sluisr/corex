@@ -1,7 +1,7 @@
 # ⚡ Corex (`cx`)
 
 <p align="center">
-  <strong>The ultra-fast, native Rust autonomous AI terminal agent for DeepSeek API & Local LLMs with Hybrid Intelligence.</strong>
+  <strong>The ultra-fast, native Rust autonomous AI terminal agent for DeepSeek API & Local LLMs.</strong>
 </p>
 
 <p align="center">
@@ -19,18 +19,21 @@
 
 **Corex** (invoked with the ultra-ergonomic command **`cx`**) is the official next-generation, high-performance autonomous terminal agent created and maintained 100% by [**sluisr**](https://sluisr.com/).
 
-While previous generation CLI tools were born as TypeScript adaptations of web/node CLIs, **Corex** has been completely re-architected from scratch in **pure Rust**. It breaks free from all runtime constraints, eliminates `node_modules` and Node.js runtime bloat, and delivers instant **5ms startup times**, **zero-cost Local LLM hybrid routing**, and **adaptive CoT reasoning**.
+While previous generation CLI tools were born as TypeScript adaptations of web/node CLIs, **Corex** has been completely re-architected from scratch in **pure Rust**. It breaks free from all runtime constraints, eliminates `node_modules` and Node.js runtime bloat, and delivers instant **5ms startup times**, **100% private offline Local LLM inference**, and **adaptive CoT reasoning**.
 
 ---
 
 ## ⚡ Why Corex?
 
 * 🦀 **100% Native Rust Architecture:** Single standalone static binary. Instant terminal startup (< 10ms), single-hand ergonomic typing (`cx`), and minimal RAM footprint.
-* 💰 **Hybrid Intelligence (@ $0.00 Local Routing):** Seamlessly pairs DeepSeek Cloud with your local SLM (`llama-server`, `llama.cpp`, or `Ollama`) on port 8080. Non-coding questions and greetings are handled locally at **$0.00**, saving up to 70% in API costs.
+* 🔒 **100% Offline Local Inference (@ $0.00 Cost):** Connect any local GGUF model via `llama-server`, `llama.cpp`, or `Ollama` on port 8080. 100% air-gapped, zero telemetry, zero data leaves your machine, and $0.00 API costs forever.
 * 🧠 **DeepSeek V4.1 Cloud Engine:** Full native support for `deepseek-flash` (DeepSeek-V4.1-Flash 522B vision-language MoE, native vision, 1M token context) and `deepseek-v4-pro` (Reasoning / Thinking CoT mode).
 * ⚡ **Dynamic Adaptive Reasoning CoT:** Automatically uses ultra-fast reasoning (~200ms TTFT) for shell commands and system inspection, reserving deep multi-stage CoT (`high` / `xhigh` / `max`) for complex code generation and refactoring.
 * 🛡️ **96%+ KV Cache Hit Rate:** Zero-invalidation architecture. Background tool-log compression keeps the KV cache intact, slashing DeepSeek API costs by up to ~90%.
-* 📝 **Atomic Code Patching (`apply_patch`):** Precise unified diff patching for token-efficient file modifications without rewrites.
+* 🧩 **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with fuzzy whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation without file rewrites.
+* ⏳ **Real-Time Prompt Queuing:** Compose or paste follow-up prompts while the model is streaming. Queued prompts execute automatically in sequence once the active generation completes.
+* 📋 **Native Clipboard Integration:** Integrated OSC 52 terminal copy sequences and platform clipboard support for seamless copying of code blocks and chat selections.
+* 🔒 **Enterprise Sandbox & Protected Paths:** Path-level mutex locks (`lock_path`) to serialize concurrent file writes and strict path guards that prevent touching sensitive credentials (SSH, git, GPG) even in YOLO mode.
 * 🔍 **Forensic Audit Telemetry:** Real-time tracking of Time-To-First-Token (TTFT), generation throughput (tokens/sec), exact financial costs ($USD), and KV cache savings.
 * 🔑 **Silent Sudo & 0ms AskPass:** Native non-blocking zero-lag system authentication for Linux `sudo`, `git`, and SSH.
 * 🔌 **Model Context Protocol (MCP):** Connect external database servers, GitHub tools, Docker controllers, and custom MCP integrations.
@@ -45,7 +48,7 @@ Because **Corex** is built 100% in native Rust with link-time optimization (LTO)
 
 | Component | Minimum Specification | Recommended |
 | :--- | :--- | :--- |
-| **RAM** | **64 MB** | **128 MB+** |
+| **RAM** | **64 MB** | **128 MB+** (with automatic Linux `malloc_trim` compaction) |
 | **CPU** | Any 64-bit x86_64 or ARM64 processor (1 core) | Multi-core processor |
 | **Disk Footprint** | **~4.2 MB** (download) / **~13 MB** (uncompressed binary) | 50 MB (with audit logs) |
 | **Operating System** | • Linux (glibc 2.17+ or musl)<br>• macOS 11+ (Apple Silicon M1-M4 & Intel)<br>• Windows 10 / 11 (64-bit) | Any modern OS |
@@ -65,66 +68,32 @@ Because **Corex** is built 100% in native Rust with link-time optimization (LTO)
 
 ---
 
-## 🎯 3 Flexible Operating Modes
+## 🎯 2 Flexible Operating Modes
 
-Corex offers 3 distinct execution modes switchable in real-time via `/model`:
+Corex offers 2 distinct execution paradigms switchable in real-time via `/model`:
 
 ```text
                                ┌─────────────────────────────┐
                                │    COREX OPERATING MODES    │
                                └──────────────┬──────────────┘
                                               │
-         ┌────────────────────────────────────┼────────────────────────────────────┐
-         ▼                                    ▼                                    ▼
-┌──────────────────┐               ┌──────────────────────┐               ┌──────────────────┐
-│   1. CLOUD API   │               │   2. OFFLINE LOCAL   │               │    3. HYBRID     │
-│  (DeepSeek API)  │               │ (llama-server / SLM) │               │  (Cloud + Local) │
-└──────────────────┘               └──────────────────────┘               └────────┬─────────┘
-                                                                                   │
-                                         ┌────────────────────┬────────────────────┼────────────────────┐
-                                         ▼                    ▼                    ▼                    ▼
-                                  [ Auto-Triage ]      [ Local Scout ]     [ Draft & Review ]  [ Compression Only ]
+                      ┌───────────────────────┴───────────────────────┐
+                      ▼                                               ▼
+           ┌──────────────────────┐                       ┌──────────────────────┐
+           │     1. CLOUD API     │                       │   2. OFFLINE LOCAL   │
+           │  (DeepSeek V4.1 API) │                       │ (llama-server / SLM) │
+           └──────────────────────┘                       └──────────────────────┘
 ```
 
-### 1. ☁️ Mode 1: 100% Cloud API Models (DeepSeek Cloud)
-* **Engines:** `deepseek-flash` (DeepSeek-V4.1-Flash multimodal with native vision & 1M context), `deepseek-v4-pro` (Reasoning / Thinking CoT), with backward-compatibility for `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`.
-* **Behavior:** All turns, reasoning, and tool calls run directly against the high-capacity DeepSeek Cloud API.
-* **Best For:** Heavy architectural redesigns, complex multi-file coding, and maximum AI capability.
+### 1. ☁️ Mode 1: Cloud API Models (DeepSeek Cloud)
+* **Engines:** `deepseek-flash` (DeepSeek-V4.1-Flash multimodal with native vision & 1M context) and `deepseek-v4-pro` (Reasoning / Thinking CoT architecture).
+* **Behavior:** High-throughput streaming, adaptive reasoning depth, and full tool autonomy powered by DeepSeek's cloud infrastructure.
+* **Best For:** Complex full-stack coding, deep architectural refactoring, and multi-file project implementation.
 
 ### 2. 🔒 Mode 2: 100% Offline Local LLM (Air-Gapped & Private)
 * **Engines:** Any local GGUF model via `llama-server` (e.g. `Llama-3.2-3B`, `Qwen-2.5-Coder`, `Mistral`) or `Ollama` on `http://127.0.0.1:8080/v1`.
-* **Behavior:** 100% air-gapped offline execution. Zero data leaves your machine, zero API calls, **$0.00 cost forever**.
-* **Best For:** Confidential codebases, offline travel/airplane coding, and private terminal exploration.
-
-### 3. ⚡ Mode 3: Hybrid Architecture (Cloud API + Local Assistant)
-Combines the raw coding intelligence of DeepSeek Cloud with the instant speed and zero-cost of your local SLM.
-
-Inside Hybrid Mode, you can choose between **4 specialized strategies**:
-
-```text
-                  ┌──────────────────────────────────────────────┐
-                  │               USER PROMPT                    │
-                  └──────────────────────┬───────────────────────┘
-                                         │
-                        [ 0ms Heuristic Intent Triage ]
-                                         │
-                 ┌───────────────────────┴───────────────────────┐
-                 ▼                                               ▼
-     [ Pure Chat / Theory / Q&A ]                    [ Coding / Patching / Tools ]
-                 │                                               │
-                 ▼                                               ▼
-    ┌─────────────────────────┐                     ┌─────────────────────────┐
-    │     LOCAL ASSISTANT     │                     │     DEEPSEEK CLOUD      │
-    │  (llama-server @ $0.00) │                     │    (deepseek-flash)     │
-    └─────────────────────────┘                     └─────────────────────────┘
-```
-
-| Hybrid Strategy | How It Works | Best For | Cost Impact |
-| :--- | :--- | :--- | :--- |
-| **1. Auto-Triage** *(Default & Recommended)* | Fast 0ms triage: routes chat, questions, and developer queries to Local LLM ($0.00); routes code generation, patches, and tools to DeepSeek Cloud. | Daily full-stack software development | **Maximum Savings ($0.00 chat)** |
-| **2. Local Scout** | Local SLM explores the repository using `grep`/`glob`, summarizes findings into dense context, and feeds it to DeepSeek Cloud for the final patch. | Large monolithic repositories & large codebases | **Saves up to 80% prompt tokens** |
-| **3. Draft & Review** | Local SLM writes the initial code draft, then DeepSeek Cloud reviews, optimizes, and executes atomic patches. | High-volume code generation | **Fast & Cost-balanced** |
-| **4. Compression Only** | DeepSeek handles all tasks, while the Local SLM compresses older tool outputs and conversation turns in background threads without blocking. | Multi-hour autonomous sessions | **Maintains 96%+ KV Cache hit** |
+* **Behavior:** 100% air-gapped offline execution. Zero telemetry, zero network calls, and **$0.00 API cost forever**.
+* **Best For:** Confidential codebases, air-gapped environments, offline work, and local experimentation.
 
 ---
 
@@ -136,13 +105,15 @@ Inside Hybrid Mode, you can choose between **4 specialized strategies**:
 cargo install --git https://github.com/sluisr/corex.git --force
 ```
 
-### Option 2: Pre-compiled Binary (Linux / macOS / Windows)
+### Option 2: Pre-compiled Binary (Linux / macOS)
 
-Download the latest release binary from the [Releases page](https://github.com/sluisr/corex/releases) or install via `curl`:
+Install instantly via `curl`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | sh
 ```
+
+Or download pre-built binaries directly for Linux, macOS, and Windows from the [GitHub Releases page](https://github.com/sluisr/corex/releases).
 
 ### Option 3: Local Clone & Build
 
@@ -175,9 +146,9 @@ export COREX_API_KEY="sk-your-deepseek-api-key"
 export DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
 ```
 
-Or configure it interactively inside Corex by typing `/auth` or `/key` on first launch.
+Or configure it interactively inside Corex by typing `/auth` on first launch.
 
-### Optional: Local LLM Server Setup (for Hybrid Mode)
+### Optional: Local LLM Server Setup (for Offline Mode)
 
 Run `llama-server` (from `llama.cpp`) or `Ollama` on port 8080:
 
@@ -203,7 +174,17 @@ cx
 Execute automated one-shot tasks directly from bash:
 
 ```bash
+# Run a direct prompt headlessly
 cx -p "Analyze this Rust project and run all unit tests"
+
+# Perform live web search
+cx -w "Latest DeepSeek API updates"
+
+# Run with auto-approval (YOLO mode)
+cx -y -p "Format all code and commit changes"
+
+# Target a specific model override
+cx -m deepseek-v4-pro -p "Solve this mathematical proof"
 ```
 
 ---
@@ -214,33 +195,39 @@ Inside the interactive TUI, type `/` to access built-in commands:
 
 | Command | Description |
 | :--- | :--- |
-| `/model` | Interactive TUI selector for Cloud Models, Local Assistant, and Hybrid Configuration. |
+| `/model` | Interactive TUI selector for Cloud Models (`Flash` / `Pro`) and Local Offline Assistant. |
 | `/auth` | Manage and update your DeepSeek API key securely. |
-| `/balance` | Live DeepSeek account balance lookup (`/wallet`, `/credits`). |
-| `/fim <file>` | Fill-in-the-Middle code autocompletion. |
+| `/balance` | Live DeepSeek account token credits and currency balance lookup (`/wallet`). |
+| `/fim <file>` | Fill-in-the-Middle code autocompletion at cursor position. |
+| `/local <prompt>` | Query the local offline LLM directly ($0.00 cost) or check local status (`/local status`). |
+| `/web <query>` | Search the live internet via DeepSeek's native search engine (`/search`). |
+| `/yolo` | Toggle auto-approval of all tool executions (`/yolo [on \| off]`). |
+| `/plan` | Enter interactive architectural planning mode (read-only safe discovery). |
 | `/prefix <text>` | Force exact output formatting with zero conversational filler. |
-| `/info` | Version, author credits, and system telemetry (`/author`, `/credits`). |
-| `/chat` / `/resume` | Search and resume previous conversation sessions. |
-| `/rewind` | Rewind conversation history to a previous turn. |
-| `/compress` | Manually compress conversation context to stay within token limits. |
-| `/mcp` | Manage Model Context Protocol (MCP) servers and tools. |
-| `/tasks` | Inspect and manage background tasks (`/tasks`, `/tasks status <pid>`, `/tasks kill <pid>`). |
-| `/plan` | Enter interactive planning mode for multi-file architectural changes. |
+| `/chat` / `/resume` | Search, save, and resume previous conversation sessions. |
+| `/save <tag>` | Save current conversation checkpoint with an optional tag. |
+| `/rewind` | Rewind conversation history by 1 turn (undo last query and response). |
+| `/compact` / `/compress` | Intelligently compress conversation context to stay within token limits. |
+| `/mcp` | Inspect and manage Model Context Protocol servers and connected tools. |
+| `/tasks` | Inspect and manage background tasks (`/tasks status <pid>`, `/tasks kill <pid>`). |
 | `/stats` | View session token metrics, cache hit rate, and financial costs. |
+| `/info` | Version, creator credits (`sluisr`), official links, and live telemetry. |
+| `/update` | Check for newer Corex releases on GitHub. |
 | `/clear` | Clear the terminal conversation view. |
+| `/help` | Display keyboard shortcuts and built-in commands. |
 | `/quit` / `/exit` | Exit the session and save state for resumption. |
 
 ---
 
 ## 🛠️ Built-in Agent Tools
 
-Corex equips DeepSeek with native developer tools for autonomous development:
+Corex equips the AI with native developer tools for autonomous development:
 
-* **⚡ `apply_patch`:** Unified diff atomic patching for safe, token-efficient code edits.
+* **⚡ `apply_patch`:** Intelligent unified diff atomic patching with fuzzy whitespace tolerance, CRLF/LF line ending preservation, and fence parsing.
 * **📁 File Operations:** `read_file`, `write_file`, `smart_replace`, `list_directory`, `glob`, and `grep`.
-* **💻 Shell Execution (`run_shell_command` / `run_command`):** Autonomous bash command execution with adaptive execution timeout (`wait_ms_before_async`, default 5000ms). Fast commands return immediately, while long commands automatically detach to background tasks with silent AskPass for `sudo`.
+* **💻 Shell Execution (`run_shell_command` / `run_command`):** Autonomous bash command execution with security sandboxing, adaptive timeout (`wait_ms_before_async`, default 5000ms), automatic detachment to background tasks, and silent AskPass for `sudo`.
 * **⚙️ Background Task Management (`manage_task`):** Unified task controller matching Antigravity architecture (`list`, `status`, `kill`, `send_input`).
-* **🌐 Web Fetch (`web_fetch`):** HTTP fetching and markdown extraction for online documentation and APIs.
+* **🌐 Web Search (`web_search`) & Fetch (`web_fetch`):** Real-time web search and HTTP fetching with clean markdown extraction for documentation and APIs.
 * **📋 Task Tracking (`write_todos`):** Dynamic multi-step task list tracking and progress monitoring.
 * **🧠 Persistent Memory:** Project-level (`./COREX.md`) and global (`~/.corex/COREX.md`) persistent context.
 
@@ -251,7 +238,7 @@ Corex equips DeepSeek with native developer tools for autonomous development:
 Corex logs complete telemetry to `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`:
 
 ```text
-[2026-08-30 14:43:18.542][LLM_RESP    ] ─── INBOUND <- DeepSeek Cloud (deepseek-flash) [1613 ms] ───
+[2026-10-09 14:43:18.542][LLM_RESP    ] ─── INBOUND <- DeepSeek Cloud (deepseek-flash) [1613 ms] ───
 Telemetry:
   • Engine:              DeepSeek Cloud
   • Model:               deepseek-flash (DeepSeek-V4.1-Flash)
@@ -278,7 +265,7 @@ Settings are stored in `~/.corex/`:
 
 * `~/.corex/settings.json` — API credentials, base URL, default models.
 * `~/.corex/flash_settings.json` — CoT reasoning effort depths (`none` / `low` / `high` / `xhigh` / `max`).
-* `~/.corex/hybrid_settings.json` — Strategy, local server endpoint, scout settings.
+* `~/.corex/pro_settings.json` — Deep reasoning configuration for DeepSeek-V4-Pro.
 * `~/.corex/logs/` — Forensic audit logs.
 
 ---

@@ -4,7 +4,7 @@ description: >-
   Use this skill when the user asks about Corex slash commands, what commands
   are available inside the TUI, how to use a specific command like /model,
   /chat, /resume, /stats, /yolo, /fim, /web, /local, /plan, /compress,
-  /compact, /rewind, /prefix, /tasks, /mcp, /hybrid, /balance, /wallet,
+  /compact, /rewind, /prefix, /tasks, /mcp, /balance, /wallet,
   /save, /update, /info, /clear, /help, /quit. Also activate for questions
   like 'what can I type with /', 'list commands', 'how do I switch model',
   'how do I check balance', 'how do I resume a session', 'how to compress context'.
@@ -41,7 +41,7 @@ cx -l                          # Short alias for --list-sessions
 
 | Command | Description |
 | :--- | :--- |
-| `/model` | Open the interactive model selector (Cloud / Local / Hybrid) |
+| `/model` | Open the interactive model selector (Cloud / Local) |
 
 Available models inside `/model`:
 - **`deepseek-flash`** — DeepSeek V4.1 Flash (522B MoE, 1M context, native vision, default)

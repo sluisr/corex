@@ -381,22 +381,26 @@ impl Tool for GetInternalDocsTool {
     async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let docs = r#"
 Corex Documentation:
-- Architecture: 100% Native Rust autonomous agent with hybrid Cloud (DeepSeek) & Local (llama.cpp/Ollama) routing.
+- Architecture: 100% Native Rust autonomous agent with DeepSeek Cloud & Local (llama.cpp/Ollama) inference.
 - Model Selection: Supports deepseek-flash, deepseek-v4-pro, deepseek-chat, deepseek-reasoner, and local SLM on :8080.
 - Operating Modes:
   * Pure Cloud (DeepSeek Cloud API)
   * Offline Local ($0.00 air-gapped llama-server)
-  * Hybrid (Auto-Triage, Local Scout, Draft & Review, Compression Only)
 - Built-in Slash Commands:
   * /chat, /resume, /save, /new : Session lifecycle management
-  * /model : Model switcher and hybrid settings
+  * /model : Model switcher (DeepSeek-V4.1-Flash, DeepSeek-V4-Pro, Local Offline)
+  * /local : Query local LLM directly ($0.00)
+  * /web : Search live internet via DeepSeek
+  * /yolo : Toggle auto-approval
   * /plan : Architectural planning mode (read-only safe exploration)
   * /balance : DeepSeek account balance lookup
   * /fim : Fill-in-the-Middle code autocompletion
   * /rewind : Step back turns in the current session
-  * /compress : Context compaction
+  * /compress, /compact : Context compaction
   * /mcp : Model Context Protocol server inspector
+  * /tasks : Background task manager
   * /sudo : Session RAM AskPass authentication
+  * /update : Check for newer Corex releases
   * /clear, /help, /info, /stats, /quit
 - Primary Tools: apply_patch, edit, read_file, write_file, grep, glob, list_directory, run_shell_command, web_search, web_fetch.
 "#;

@@ -72,7 +72,7 @@ cx --base-url https://api.deepseek.com -p "test"
 - DeepSeek free tier has rate limits — wait a few seconds and retry
 - Check your account balance: `/balance` inside TUI or [platform.deepseek.com](https://platform.deepseek.com)
 - Switch to `deepseek-flash` (cheaper, higher rate limits) via `/model`
-- Enable Hybrid mode to route simple queries to your local LLM: `/model` → Hybrid → Auto-Triage
+- Use local offline LLM ($0.00 cost): `/model` → Local Offline Assistant, or ask directly via `/local <prompt>`
 
 ---
 
@@ -98,7 +98,7 @@ llama-server -m /path/to/model.gguf --port 8080 -c 8192
 
 ### Wrong URL configured
 ```bash
-cat ~/.corex/hybrid_settings.json | grep local_url
+cat ~/.corex/settings.json | grep local_url
 # Default: http://127.0.0.1:8080/v1
 # Ollama uses: http://127.0.0.1:11434/v1
 ```
@@ -110,7 +110,7 @@ cat ~/.corex/hybrid_settings.json | grep local_url
 1. **Check TTFT** — type `/stats` to see Time-To-First-Token per turn
 2. **Use Flash model** — `deepseek-flash` is much faster than `deepseek-v4-pro`
 3. **Check KV cache hit rate** — should be >90%. Low hit rate = slow & expensive. Fix: don't change the system prompt between turns.
-4. **Enable hybrid mode** — simple Q&A goes to local LLM at 0ms cost
+4. **Use local model for quick queries** — ask `/local <prompt>` at 0ms latency and $0.00 cost
 5. **Compress context** — long conversations slow down. Run `/compress` or `/compact`
 
 ---

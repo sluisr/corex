@@ -38,7 +38,7 @@ cx -p "Analyze this project and run all unit tests"
 * 🦀 **100% Pure Native Rust:** Single standalone machine binary with sub-10ms startup time and ~21 MB memory footprint.
 * ⌨️ **Ergonomic Command (`cx`):** Single-hand, zero-friction launch from your terminal.
 * 🧠 **DeepSeek V4.1 Engine:** Native support for `deepseek-flash` (vision-language MoE, 1M context) and `deepseek-v4-pro` (Reasoning CoT).
-* 💰 **Hybrid Intelligence (@ $0.00):** Local SLM routing (`llama-server`, `llama.cpp`, or `Ollama`) on port 8080 for free offline chat and code triage.
+* 🔒 **100% Offline Local LLM (@ $0.00):** Private inference with `llama-server`, `llama.cpp`, or `Ollama` on port 8080.
 * 🛡️ **96%+ KV Cache Hit Rate:** Background tool compression preserving KV cache to slash API costs.
 * 📥 **Prompt Queuing:** Type or paste next instructions while the model streams, auto-dequeuing upon completion.
 * ⚡ **Non-blocking Balance:** Instant account credit lookups without freezing the terminal.
