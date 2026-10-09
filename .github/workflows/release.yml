@@ -73,7 +73,11 @@ jobs:
       - name: Set archive name
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-v0.3.0}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
           echo "ARCHIVE_NAME=corex-${VERSION}-${{ matrix.archive_suffix }}" >> "$GITHUB_ENV"
 
       - name: Package release asset (Unix)
