@@ -64,6 +64,8 @@ jobs:
 
       - name: Build release binaries (cross)
         if: matrix.use_cross
+        env:
+          RUSTFLAGS: "-C relocation-model=pie -C link-arg=-pie"
         run: cross build --release --locked --bin cx --bin corex --target ${{ matrix.target }}
 
       - name: Build release binaries (native cargo)
