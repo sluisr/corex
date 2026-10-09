@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.3.0';
+const VERSION = 'v0.4.0';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
@@ -16,7 +16,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '5a9117b823c5b438d8f8aa58683806b0d100ea39644bc5501bbb125c37d0d955'
+      sha256: '0477b7c052d56a5d1f615d78bbf677663430e2efac30dcf5159dea0006b5f98d'
     }
   },
   darwin: {
@@ -24,14 +24,14 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: 'e71159e417f8179f7fdf5a5101c03945c19b8abc23698995fec5f13e5dedbd59'
+      sha256: '3bdf3a46f2997b4e1beca971e8d6b9b066521648bc5b6ba94c4ec578fda2e246'
     },
     x64: {
       // Fallback for Intel macs or Rosetta
       archive: `corex-${VERSION}-x86_64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: 'd82c0e3a8aa3318c88bc3389ed36c56dff932688b00c4af9d6a6bf16c7d44659'
+      sha256: '3bdf3a46f2997b4e1beca971e8d6b9b066521648bc5b6ba94c4ec578fda2e246'
     }
   },
   win32: {
@@ -39,7 +39,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-pc-windows-msvc.zip`,
       binName: 'cx.exe',
       type: 'zip',
-      sha256: '17233b981b568de646d8a6265d378e9b76e49fb4503f19e212aabb1100756090'
+      sha256: '1b1c4c866c4a4592e4060b4e35b3fa805670783da5185735079cfb66acc7a64e'
     }
   }
 };
