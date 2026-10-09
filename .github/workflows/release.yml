@@ -36,6 +36,13 @@ jobs:
             bin_name: cx
             archive_suffix: aarch64-apple-darwin.tar.gz
 
+          # Linux ARM64 (Raspberry Pi, Termux, Android Linux)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin_name: cx
+            archive_suffix: aarch64-unknown-linux-musl.tar.gz
+            use_cross: true
+
           # macOS Intel
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -51,7 +58,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binaries (cx, corex)
+      - name: Install cross (for cross-compilation)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binaries (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --bin cx --bin corex --target ${{ matrix.target }}
+
+      - name: Build release binaries (native cargo)
+        if: "!matrix.use_cross"
         run: cargo build --release --locked --bin cx --bin corex --target ${{ matrix.target }}
 
       - name: Set archive name
