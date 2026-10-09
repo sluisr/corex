@@ -2,7 +2,11 @@
 set -e
 
 REPO="sluisr/corex"
-INSTALL_DIR="/usr/local/bin"
+if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
+  INSTALL_DIR="$PREFIX/bin"
+else
+  INSTALL_DIR="/usr/local/bin"
+fi
 
 # Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
