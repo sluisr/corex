@@ -117,7 +117,8 @@ impl LlmClient {
     /// Heals accidental Chinese drift by asking the LLM to re-express the text in the user's conversation language dynamically.
     pub async fn heal_cjk_drift(&self, text: &str) -> anyhow::Result<String> {
         let cfg = self.get_config();
-        if cfg.api_key.trim().is_empty() {
+        let (base_url, api_key) = cfg.endpoint();
+        if api_key.trim().is_empty() {
             anyhow::bail!("No API key configured for translation");
         }
         let prompt = format!(
@@ -128,17 +129,17 @@ impl LlmClient {
             text
         );
         let request_body = serde_json::json!({
-            "model": "deepseek-flash",
+            "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
             "messages": [
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
             "max_tokens": 2048
         });
-        let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let resp = self.http
             .post(&url)
-            .header("Authorization", format!("Bearer {}", cfg.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request_body)
             .timeout(Duration::from_secs(20))
@@ -380,7 +381,8 @@ impl LlmClient {
 
 
         // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
-        if summary_opt.is_none() && !cfg.api_key.trim().is_empty() {
+        let (ep_base_url, ep_api_key) = cfg.endpoint();
+        if summary_opt.is_none() && !ep_api_key.trim().is_empty() {
             let summary_system = "You are the Context Compactor for Corex. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
             let digest = format!(
                 "User Requests:\n{}\n\nTool Actions:\n{}",
@@ -388,7 +390,7 @@ impl LlmClient {
                 tool_actions.join("\n")
             );
             let request_body = serde_json::json!({
-                "model": "deepseek-flash",
+                "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
                 "messages": [
                     {"role": "system", "content": summary_system},
                     {"role": "user", "content": digest}
@@ -397,10 +399,10 @@ impl LlmClient {
                 "temperature": 0.3
             });
 
-            let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+            let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
             if let Ok(resp) = self.http
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", cfg.api_key))
+                .header("Authorization", format!("Bearer {}", ep_api_key))
                 .header("Content-Type", "application/json")
                 .json(&request_body)
                 .send()
@@ -520,10 +522,19 @@ impl LlmClient {
             }
         }
 
-        let api_key = &cfg.api_key;
+        let (endpoint_url, api_key_owned) = cfg.endpoint();
+        let api_key = &api_key_owned;
+        let is_deepseek = cfg.is_deepseek_endpoint();
         if api_key.is_empty() {
             crate::forensic::ForensicLogger::log_error("stream_chat", "Missing API key in Config");
-            bail!("API key is missing. Please set COREX_API_KEY / DEEPSEEK_API_KEY or configure ~/.corex/settings.json");
+            if is_deepseek {
+                bail!("API key is missing. Please set COREX_API_KEY / DEEPSEEK_API_KEY or configure ~/.corex/settings.json");
+            } else {
+                bail!(
+                    "API key for provider '{}' is missing. Export its API key environment variable (see /model) or switch provider.",
+                    cfg.active_provider.as_deref().unwrap_or("?")
+                );
+            }
         }
 
         // ⚡ ORDER OF INTEGRITY:
@@ -576,7 +587,7 @@ impl LlmClient {
                     msg.content = Some(MessageContent::Text(String::new()));
                 }
 
-                if has_tools {
+                if has_tools && is_deepseek {
                     if msg.reasoning_content.is_none() {
                         if let Some(text) = msg.text_content() {
                             let key = ReasoningCache::compute_key(text, msg.tool_calls.as_deref());
@@ -594,7 +605,9 @@ impl LlmClient {
             }
         }
 
-        let api_model = if cfg.model == "deepseek-v4-pro"
+        let api_model = if !is_deepseek {
+            cfg.model.clone()
+        } else if cfg.model == "deepseek-v4-pro"
             || cfg.model == "deepseek-reasoner"
             || cfg.model.contains("pro")
             || cfg.model.contains("reasoner")
@@ -616,7 +629,7 @@ impl LlmClient {
             cfg.model.clone()
         };
 
-        let base_url = cfg.base_url.trim_end_matches('/');
+        let base_url = endpoint_url.trim_end_matches('/');
         let url = format!("{}/chat/completions", base_url);
 
         let tools_count = tools.as_ref().map(|t| t.len()).unwrap_or(0);
@@ -649,7 +662,11 @@ impl LlmClient {
             || normalized_reasoning_effort == "off"
             || normalized_reasoning_effort == "false";
 
-        let thinking_config = if is_thinking_disabled {
+        // `thinking` / `reasoning_effort` are DeepSeek extensions: other OpenAI-compatible
+        // providers may reject unknown fields, so they get a plain chat-completions request.
+        let thinking_config = if !is_deepseek {
+            None
+        } else if is_thinking_disabled {
             Some(ThinkingConfig {
                 thinking_type: "disabled".to_string(),
             })
@@ -659,13 +676,17 @@ impl LlmClient {
             })
         };
 
-        let effective_reasoning_effort = if is_thinking_disabled {
+        let effective_reasoning_effort = if !is_deepseek {
+            None
+        } else if is_thinking_disabled {
             Some("none".to_string())
         } else {
             Some(normalized_reasoning_effort)
         };
 
-        let effective_temperature = if is_thinking_disabled {
+        let effective_temperature = if !is_deepseek {
+            Some(cfg.temperature)
+        } else if is_thinking_disabled {
             if api_model.contains("flash") {
                 Some(cfg.flash_settings.temperature)
             } else {
@@ -850,6 +871,9 @@ impl LlmClient {
 
     pub async fn check_balance(&self) -> Result<BalanceResponse> {
         let cfg = self.get_config();
+        if !cfg.is_deepseek_endpoint() {
+            bail!("Balance lookup is only available for the DeepSeek provider.");
+        }
         let api_key = &cfg.api_key;
         if api_key.is_empty() {
             bail!("API key is missing.");

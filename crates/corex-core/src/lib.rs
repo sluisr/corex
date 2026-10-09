@@ -5,6 +5,7 @@ pub mod forensic;
 pub mod history;
 pub mod language;
 pub mod local_client;
+pub mod providers;
 pub mod reasoning_cache;
 pub mod secure_fs;
 pub mod session;

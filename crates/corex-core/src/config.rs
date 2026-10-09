@@ -122,6 +122,13 @@ pub struct Config {
     /// are treated as safe without requiring user confirmation.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    /// User-defined providers (merged over the built-in catalog, see `providers.rs`).
+    #[serde(default)]
+    pub providers: Vec<crate::providers::ProviderConfig>,
+    /// Name of the provider currently in use. `None` keeps the legacy single-endpoint
+    /// behavior (`base_url` / `api_key`, i.e. DeepSeek by default).
+    #[serde(default)]
+    pub active_provider: Option<String>,
 }
 
 fn default_auto_compact() -> bool {
@@ -251,7 +258,43 @@ impl Default for Config {
             compact_threshold_tokens: default_compact_threshold_tokens(),
             local_prompt_lite: false,
             allowed_commands: Vec::new(),
+            providers: Vec::new(),
+            active_provider: None,
         }
+    }
+}
+
+impl Config {
+    /// All providers: built-ins merged with user-defined ones.
+    pub fn all_providers(&self) -> Vec<crate::providers::ProviderConfig> {
+        crate::providers::merge_providers(&self.providers)
+    }
+
+    /// The remote (non-DeepSeek, non-local) provider currently selected, if any.
+    fn external_provider(&self) -> Option<crate::providers::ProviderConfig> {
+        let name = self.active_provider.as_deref()?;
+        self.all_providers()
+            .into_iter()
+            .find(|p| {
+                p.name == name
+                    && !p.is_deepseek()
+                    && !p.is_local()
+                    && validate_base_url(&p.base_url).is_ok()
+            })
+    }
+
+    /// `(base_url, api_key)` that requests must use. Switching provider never overwrites the
+    /// stored DeepSeek `base_url` / `api_key`; the other provider's key comes from its env var.
+    pub fn endpoint(&self) -> (String, String) {
+        match self.external_provider() {
+            Some(p) => (p.base_url.clone(), p.api_key()),
+            None => (self.base_url.clone(), self.api_key.clone()),
+        }
+    }
+
+    /// True when requests go to DeepSeek (enables DeepSeek-only request fields and model aliases).
+    pub fn is_deepseek_endpoint(&self) -> bool {
+        self.external_provider().is_none()
     }
 }
 
@@ -429,12 +472,15 @@ impl Config {
         config.flash_settings = Self::load_flash_settings_with_workspace(workspace);
         config.pro_settings = Self::load_pro_settings_with_workspace(workspace);
 
-        // Apply active model's reasoning/temp defaults from settings
-        if is_pro_model(&config.model) {
-            config.reasoning_effort = config.pro_settings.reasoning_effort.clone();
-        } else {
-            config.temperature = config.flash_settings.temperature;
-            config.reasoning_effort = config.flash_settings.reasoning_effort.clone();
+        // Apply active model's reasoning/temp defaults from settings (DeepSeek models only:
+        // other providers keep the temperature / reasoning saved in settings.json).
+        if config.is_deepseek_endpoint() && !config.local_llm_enabled {
+            if is_pro_model(&config.model) {
+                config.reasoning_effort = config.pro_settings.reasoning_effort.clone();
+            } else {
+                config.temperature = config.flash_settings.temperature;
+                config.reasoning_effort = config.flash_settings.reasoning_effort.clone();
+            }
         }
 
         if let Ok(k) = std::env::var("COREX_API_KEY")

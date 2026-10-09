@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-10-09
+
+### Added
+- **Master-Detail Model Switcher (`/model`)**: Modular provider catalog replacing hardcoded tabs. Two-column layout with status indicators (`● active`, `○ ready`, `◌ needs key`), dynamic per-model setting sliders (Temperature, General CoT, Tool CoT, Coding CoT, Web Search CoT), and secret key masking.
+- **Interactive Split-View Session Explorer (`/resume`)**: Revamped session picker featuring live realtime fuzzy filtering (`Filter: ...`), dual-pane layout with compact session list on the left and full contextual preview on the right (turn counts, token consumption, and latest user/assistant dialogue snippet).
+- **Categorized Slash Command Menu (`/`)**: Grouped command drawer partitioned into logical categories (Session, Model, Context, Tools, App) with substring & fuzzy matching, argument placeholders, and integrated alias support (`/wallet` -> `/balance`, `/compress` -> `/compact`, `/search` -> `/web`).
+- **Unified Modal Overlay Engine (`begin_modal`)**: Centralized modal isolation across all dialogs (`/model`, `/resume`, auth, `/sudo`, user prompts) with background terminal dimming and anti-collision perimeter halos.
+
+---
+
 ## [0.3.0] - 2026-10-09
 
 ### Breaking Changes

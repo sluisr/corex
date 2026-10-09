@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, Event, KeyCode,
     KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
@@ -37,7 +38,7 @@ use crate::auth_dialog::{render_auth_dialog, AuthDialogState};
 use crate::clipboard;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::markdown::render_markdown;
-use crate::model_dialog::{render_model_dialog, ModelDialogState, ModelTab};
+use crate::model_dialog::{render_model_dialog, DialogAction, ModelDialogState};
 use crate::session_dialog::{render_session_dialog, SessionDialogState};
 use crate::slash_commands::{render_command_popup, ALL_COMMANDS};
 use crate::sudo_dialog::{render_sudo_dialog, SudoDialogState};
@@ -617,10 +618,8 @@ impl App {
             return Vec::new();
         }
 
-        let filter = self.input_buffer.to_lowercase();
-        ALL_COMMANDS
-            .iter()
-            .filter(|c| c.name.starts_with(&filter))
+        crate::slash_commands::match_commands(&self.input_buffer)
+            .into_iter()
             .map(|c| c.name)
             .collect()
     }
@@ -1090,12 +1089,7 @@ impl App {
                 } else {
                     let cfg = self.llm_client.get_config();
                     self.slash_popup_height_current = 0.0;
-                    self.model_dialog.open(
-                        &cfg.model,
-                        &cfg.flash_settings,
-                        &cfg.pro_settings,
-                        cfg.local_prompt_lite,
-                    );
+                    self.model_dialog.open(&cfg);
                 }
                 true
             }
@@ -1425,8 +1419,23 @@ impl App {
             }
             "/help" => {
                 let mut help = "Available Commands:\n".to_string();
+                let mut last_group = "";
                 for c in ALL_COMMANDS {
-                    help.push_str(&format!("  {:<12} {}\n", c.name, c.description));
+                    if c.group != last_group {
+                        last_group = c.group;
+                        help.push_str(&format!("\n {}\n", c.group));
+                    }
+                    let usage = if c.args.is_empty() {
+                        c.name.to_string()
+                    } else {
+                        format!("{} {}", c.name, c.args)
+                    };
+                    let alias = if c.aliases.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (alias {})", c.aliases.join(", "))
+                    };
+                    help.push_str(&format!("  {:<30} {}{}\n", usage, c.description, alias));
                 }
                 help.push_str("  /key <sk..>  Set or update your DeepSeek API key\n");
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
@@ -1446,13 +1455,19 @@ impl App {
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = stdout();
+    // Explicitly switch every mouse mode off (also the ones enabled by hand in the TUI loop)
+    // and reset attributes so a dead session never leaves escape junk in the shell.
+    let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let _ = stdout.write_all(b"\x1b[?1003l\x1b[0m");
     let _ = execute!(
         stdout,
+        DisableFocusChange,
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableMouseCapture,
         crossterm::cursor::Show
     );
+    let _ = stdout.flush();
 }
 
 /// Mouse tracking modes the TUI actually consumes: `1000` (wheel and buttons), `1002` (drags,
@@ -1493,10 +1508,31 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Clear any stale mouse mode left by a previously killed session before starting.
+    let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
     let _guard = TerminalGuard;
+
+    // Closing the terminal window (SIGHUP) or `kill` (SIGTERM) skips Drop; restore explicitly.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (Ok(mut hup), Ok(mut term)) =
+            (signal(SignalKind::hangup()), signal(SignalKind::terminate()))
+        else {
+            return;
+        };
+        tokio::select! {
+            _ = hup.recv() => {}
+            _ = term.recv() => {}
+        }
+        restore_terminal();
+        std::process::exit(130);
+    });
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     // Mouse reporting is applied by the loop below (reconcile step) so that startup
     // and F2 share a single code path.
@@ -1965,12 +2001,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     );
                     app.handle_paste(pasted);
                 }
+                // A resize or regaining focus can leave ghost cells the diff renderer believes
+                // are correct; wipe the backing buffer so the next draw repaints everything.
+                Event::Resize(..) | Event::FocusGained => {
+                    let _ = terminal.clear();
+                }
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                    // Security: Never log raw keystrokes, input buffer, or passwords to forensic logs
-                    tracing::trace!(code = ?key.code, modifiers = ?key.modifiers, "TUI key pressed");
+                    // --- Force Quit: Ctrl+Z ---
+                    if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
+                        break;
+                    }
 
                     // --- Mouse reporting toggle: F2 ---
                     // Reclaims native click-drag selection/copy on demand without giving up
@@ -2191,9 +2234,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                     // --- 1.5. Session Dialog Active ---
                     if app.session_dialog.is_open {
+                        let filtered_count = app.session_dialog.filtered_sessions().len();
                         match key.code {
                             KeyCode::Esc => {
-                                app.session_dialog.close();
+                                if !app.session_dialog.search_query.is_empty() {
+                                    app.session_dialog.search_query.clear();
+                                    app.session_dialog.selected_idx = 0;
+                                } else {
+                                    app.session_dialog.close();
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                app.session_dialog.search_query.pop();
+                                app.session_dialog.selected_idx = 0;
                             }
                             KeyCode::Up => {
                                 if app.session_dialog.selected_idx > 0 {
@@ -2201,21 +2254,25 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
                             }
                             KeyCode::Down => {
-                                if app.session_dialog.selected_idx + 1 < app.session_dialog.sessions.len() {
+                                if filtered_count > 0 && app.session_dialog.selected_idx + 1 < filtered_count {
                                     app.session_dialog.selected_idx += 1;
                                 }
                             }
-                            KeyCode::Char('x') => {
-                                if !app.session_dialog.sessions.is_empty() {
-                                    let session_id = app.session_dialog.sessions[app.session_dialog.selected_idx].id.clone();
+                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) || app.session_dialog.search_query.is_empty() => {
+                                if let Some(selected_session) = app.session_dialog.selected_session().cloned() {
+                                    let session_id = selected_session.id.clone();
                                     let _ = Session::delete_by_id_or_tag(&session_id);
                                     // Refresh list
                                     app.session_dialog.open(&app.workspace_dir.display().to_string());
                                 }
                             }
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
+                                app.session_dialog.search_query.push(c);
+                                app.session_dialog.selected_idx = 0;
+                            }
                             KeyCode::Enter => {
-                                if !app.session_dialog.sessions.is_empty() {
-                                    let session_id = app.session_dialog.sessions[app.session_dialog.selected_idx].id.clone();
+                                if let Some(selected_session) = app.session_dialog.selected_session().cloned() {
+                                    let session_id = selected_session.id.clone();
                                     match Session::load_by_id_or_tag(&session_id) {
                                         Ok(loaded) => {
                                             let mut cfg = app.llm_client.get_config();
@@ -2248,210 +2305,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                     // --- 2. Model Dialog Active ---
                     if app.model_dialog.is_open {
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.model_dialog.close();
-                            }
-                            KeyCode::Tab => {
-                                app.model_dialog.next_tab();
-                            }
-                            KeyCode::BackTab => {
-                                app.model_dialog.prev_tab();
-                            }
-                            KeyCode::Char('1') => {
-                                app.model_dialog.current_tab = ModelTab::Models;
-                            }
-                            KeyCode::Char('2') => {
-                                app.model_dialog.current_tab = ModelTab::Flash;
-                            }
-                            KeyCode::Char('3') => {
-                                app.model_dialog.current_tab = ModelTab::Pro;
-                            }
-                            KeyCode::Char('t') | KeyCode::Char('T') => {
-                                match app.model_dialog.current_tab {
-                                    ModelTab::Models => {
-                                        app.model_dialog.persist_model = !app.model_dialog.persist_model;
-                                    }
-                                    ModelTab::Flash => {
-                                        app.model_dialog.flash_persist_permanent =
-                                            !app.model_dialog.flash_persist_permanent;
-                                        if app.model_dialog.flash_persist_permanent {
-                                            let flash_settings = app.model_dialog.to_flash_settings();
-                                            let _ = Config::save_flash_settings(&flash_settings);
-                                        }
-                                    }
-                                    ModelTab::Pro => {
-                                        app.model_dialog.pro_persist_permanent =
-                                            !app.model_dialog.pro_persist_permanent;
-                                        if app.model_dialog.pro_persist_permanent {
-                                            let pro_settings = app.model_dialog.to_pro_settings();
-                                            let _ = Config::save_pro_settings(&pro_settings);
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {
-                                match app.model_dialog.current_tab {
-                                    ModelTab::Models => {
-                                        match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => {
-                                                app.model_dialog.selected_model_idx =
-                                                    app.model_dialog.selected_model_idx.saturating_sub(1);
-                                            }
-                                            KeyCode::Down | KeyCode::Char('j') => {
-                                                app.model_dialog.selected_model_idx =
-                                                    (app.model_dialog.selected_model_idx + 1).min(2);
-                                            }
-                                            KeyCode::Enter => {
-                                                match app.model_dialog.selected_model_idx {
-                                                    0 => {
-                                                        app.model_dialog.active_engine = 0;
-                                                        let mut cfg = app.llm_client.get_config();
-                                                        cfg.model = "deepseek-flash".to_string();
-                                                        cfg.local_llm_enabled = false;
-                                                        cfg.flash_settings = app.model_dialog.to_flash_settings();
-                                                        cfg.temperature = cfg.flash_settings.temperature;
-                                                        cfg.reasoning_effort = cfg.flash_settings.reasoning_effort.clone();
-                                                        if app.model_dialog.persist_model {
-                                                            let _ = cfg.save();
-                                                        }
-                                                        app.llm_client.update_config(cfg.clone());
-                                                        app.session.model = cfg.model.clone();
-                                                        app.session.temperature = Some(cfg.temperature);
-                                                        app.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
-                                                        let _ = app.session.save();
-                                                        app.session.add_message(Message::system(format!(
-                                                            "Activated DeepSeek-V4.1-Flash (Fast MoE Engine)\n- Temperature: {:.1}\n- General Reasoning: {}\n- Command CoT: {}\n- Code CoT: {}",
-                                                            cfg.temperature,
-                                                            cfg.reasoning_effort,
-                                                            cfg.flash_settings.command_reasoning_effort,
-                                                            cfg.flash_settings.code_reasoning_effort
-                                                        )));
-                                                        app.model_dialog.close();
-                                                    }
-                                                    1 => {
-                                                        app.model_dialog.active_engine = 1;
-                                                        let mut cfg = app.llm_client.get_config();
-                                                        cfg.model = "deepseek-pro".to_string();
-                                                        cfg.local_llm_enabled = false;
-                                                        cfg.pro_settings = app.model_dialog.to_pro_settings();
-                                                        cfg.reasoning_effort = cfg.pro_settings.reasoning_effort.clone();
-                                                        if app.model_dialog.persist_model {
-                                                            let _ = cfg.save();
-                                                        }
-                                                        app.llm_client.update_config(cfg.clone());
-                                                        app.session.model = cfg.model.clone();
-                                                        app.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
-                                                        let _ = app.session.save();
-                                                        app.session.add_message(Message::system(format!(
-                                                            "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: {}\n- Search CoT: {}",
-                                                            cfg.pro_settings.reasoning_effort,
-                                                            cfg.pro_settings.search_reasoning_effort
-                                                        )));
-                                                        app.model_dialog.close();
-                                                    }
-                                                    2 => {
-                                                        app.model_dialog.active_engine = 2;
-                                                        let mut cfg = app.llm_client.get_config();
-                                                        cfg.model = "local-assistant".to_string();
-                                                        cfg.local_llm_enabled = true;
-                                                        if app.model_dialog.persist_model {
-                                                            let _ = cfg.save();
-                                                        }
-                                                        app.llm_client.update_config(cfg.clone());
-                                                        app.session.model = cfg.model.clone();
-                                                        let _ = app.session.save();
-                                                        app.session.add_message(Message::system(format!(
-                                                            "Activated 100% Standalone Offline Local Assistant\n- Engine: {}\n- Endpoint: {}\n- Cost: $0.00 (Zero cloud telemetry)",
-                                                            cfg.local_llm_model, cfg.local_llm_url
-                                                        )));
-                                                        app.model_dialog.close();
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    ModelTab::Flash => {
-                                        match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => {
-                                                app.model_dialog.flash_row_idx =
-                                                    app.model_dialog.flash_row_idx.saturating_sub(1);
-                                            }
-                                            KeyCode::Down | KeyCode::Char('j') => {
-                                                app.model_dialog.flash_row_idx =
-                                                    (app.model_dialog.flash_row_idx + 1).min(5);
-                                            }
-                                            KeyCode::Left | KeyCode::Char('h') => {
-                                                app.model_dialog.cycle_flash_row(false);
-                                                let flash_settings = app.model_dialog.to_flash_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.flash_settings = flash_settings.clone();
-                                                cfg.temperature = flash_settings.temperature;
-                                                cfg.reasoning_effort = flash_settings.reasoning_effort.clone();
-                                                if app.model_dialog.flash_persist_permanent {
-                                                    let _ = Config::save_flash_settings(&flash_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            KeyCode::Right | KeyCode::Char('l') => {
-                                                app.model_dialog.cycle_flash_row(true);
-                                                let flash_settings = app.model_dialog.to_flash_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.flash_settings = flash_settings.clone();
-                                                cfg.temperature = flash_settings.temperature;
-                                                cfg.reasoning_effort = flash_settings.reasoning_effort.clone();
-                                                if app.model_dialog.flash_persist_permanent {
-                                                    let _ = Config::save_flash_settings(&flash_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    ModelTab::Pro => {
-                                        match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => {
-                                                app.model_dialog.pro_row_idx =
-                                                    app.model_dialog.pro_row_idx.saturating_sub(1);
-                                            }
-                                            KeyCode::Down | KeyCode::Char('j') => {
-                                                app.model_dialog.pro_row_idx =
-                                                    (app.model_dialog.pro_row_idx + 1).min(2);
-                                            }
-                                            KeyCode::Left | KeyCode::Char('h') => {
-                                                app.model_dialog.cycle_pro_row(false);
-                                                let pro_settings = app.model_dialog.to_pro_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.pro_settings = pro_settings.clone();
-                                                cfg.reasoning_effort = pro_settings.reasoning_effort.clone();
-                                                if app.model_dialog.pro_persist_permanent {
-                                                    let _ = Config::save_pro_settings(&pro_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            KeyCode::Right | KeyCode::Char('l') => {
-                                                app.model_dialog.cycle_pro_row(true);
-                                                let pro_settings = app.model_dialog.to_pro_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.pro_settings = pro_settings.clone();
-                                                cfg.reasoning_effort = pro_settings.reasoning_effort.clone();
-                                                if app.model_dialog.pro_persist_permanent {
-                                                    let _ = Config::save_pro_settings(&pro_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let action = app.model_dialog.handle_key(key.code);
+                        app.apply_model_dialog_action(action);
                         continue;
                     }
 
@@ -4842,7 +4697,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
 
     // 8. Session Dialog Modal if open
     if app.session_dialog.is_open {
-        render_session_dialog(frame, size, &app.session_dialog, &app.theme);
+        render_session_dialog(frame, size, &mut app.session_dialog, &app.theme);
     }
 
     // 9. Interactive Ask-User Dialog Modal if open (rendered on top)
@@ -4950,6 +4805,140 @@ fn paint_selection(
                 cell.set_style(style);
             }
         }
+    }
+}
+
+impl App {
+    /// Applies what the model dialog asked for after a key press.
+    pub fn apply_model_dialog_action(&mut self, action: DialogAction) {
+        match action {
+            DialogAction::None => {}
+            DialogAction::Close => self.model_dialog.close(),
+            DialogAction::SettingsChanged => self.apply_dialog_settings(),
+            DialogAction::Activate { provider, model } => self.activate_model(provider, model),
+        }
+    }
+
+    /// Pushes the dialog's tunables into the running config (and disk when persistent).
+    fn apply_dialog_settings(&mut self) {
+        let d = &self.model_dialog;
+        let flash = d.to_flash_settings();
+        let pro = d.to_pro_settings();
+        let persist = d.persist;
+        let is_active = d.selection_is_active();
+        let family = d.selected_model().map(|m| m.family);
+        let (temp, reasoning) = d.effective_params();
+
+        let mut cfg = self.llm_client.get_config();
+        cfg.flash_settings = flash.clone();
+        cfg.pro_settings = pro.clone();
+        if is_active {
+            match family {
+                Some(corex_core::providers::ModelFamily::Flash) => {
+                    cfg.temperature = flash.temperature;
+                    cfg.reasoning_effort = flash.reasoning_effort.clone();
+                }
+                Some(corex_core::providers::ModelFamily::Pro) => {
+                    cfg.reasoning_effort = pro.reasoning_effort.clone();
+                }
+                _ => {
+                    cfg.temperature = temp;
+                    if !reasoning.is_empty() {
+                        cfg.reasoning_effort = reasoning;
+                    }
+                }
+            }
+        }
+        if persist {
+            let _ = Config::save_flash_settings(&flash);
+            let _ = Config::save_pro_settings(&pro);
+            let _ = cfg.save();
+        }
+        self.llm_client.update_config(cfg);
+    }
+
+    /// Makes `provider`/`model` (dialog indices) the active model.
+    fn activate_model(&mut self, provider_idx: usize, model_idx: usize) {
+        let Some((provider, profile)) = self
+            .model_dialog
+            .providers
+            .get(provider_idx)
+            .and_then(|p| p.models.get(model_idx).map(|m| (p.clone(), m.clone())))
+        else {
+            return;
+        };
+
+        if !self.model_dialog.ready.get(provider_idx).copied().unwrap_or(false) {
+            self.session.add_message(Message::system(format!(
+                "Provider '{}' has no API key. Export {} and reopen /model.",
+                provider.display_name(),
+                provider.api_key_env
+            )));
+            return;
+        }
+
+        let d = &self.model_dialog;
+        let flash = d.to_flash_settings();
+        let pro = d.to_pro_settings();
+        let generic_temp = d.generic_temperature;
+        let generic_reasoning = d.generic_reasoning.clone();
+        let persist = d.persist;
+
+        use corex_core::providers::ModelFamily;
+        let mut cfg = self.llm_client.get_config();
+        cfg.model = profile.id.clone();
+        cfg.active_provider = Some(provider.name.clone());
+        cfg.local_llm_enabled = provider.is_local();
+        let detail = if provider.is_local() {
+            format!("- Endpoint: {}\n- Cost: $0.00 (Zero cloud telemetry)", cfg.local_llm_url)
+        } else {
+            match profile.family {
+                ModelFamily::Flash => {
+                    cfg.flash_settings = flash.clone();
+                    cfg.temperature = flash.temperature;
+                    cfg.reasoning_effort = flash.reasoning_effort.clone();
+                    format!(
+                        "- Temperature: {:.1}\n- General Reasoning: {}\n- Command CoT: {}\n- Code CoT: {}",
+                        cfg.temperature,
+                        cfg.reasoning_effort,
+                        flash.command_reasoning_effort,
+                        flash.code_reasoning_effort
+                    )
+                }
+                ModelFamily::Pro => {
+                    cfg.pro_settings = pro.clone();
+                    cfg.reasoning_effort = pro.reasoning_effort.clone();
+                    format!(
+                        "- Reasoning Depth: {}\n- Search CoT: {}",
+                        pro.reasoning_effort, pro.search_reasoning_effort
+                    )
+                }
+                ModelFamily::Generic => {
+                    cfg.temperature = generic_temp;
+                    if !generic_reasoning.is_empty() {
+                        cfg.reasoning_effort = generic_reasoning.clone();
+                    }
+                    format!("- Temperature: {:.1}\n- Endpoint: {}", generic_temp, provider.base_url)
+                }
+            }
+        };
+
+        if persist {
+            let _ = cfg.save();
+        }
+        self.llm_client.update_config(cfg.clone());
+        self.session.model = cfg.model.clone();
+        self.session.temperature = Some(cfg.temperature);
+        self.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
+        let _ = self.session.save();
+        self.session.add_message(Message::system(format!(
+            "Activated {} · {}\n{}",
+            provider.display_name(),
+            profile.display_name(),
+            detail
+        )));
+        self.model_dialog.mark_active(provider_idx, model_idx);
+        self.model_dialog.close();
     }
 }
 

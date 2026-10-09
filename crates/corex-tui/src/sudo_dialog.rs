@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use corex_core::types::ToolCall;
 
-use crate::overlay::render_scrim;
+use crate::overlay::begin_modal;
 use crate::theme::Theme;
 
 pub struct SudoDialogState {
@@ -89,9 +89,9 @@ pub fn render_sudo_dialog(
     let y = area.height.saturating_sub(7);
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
 
-    // Dim the chat behind the modal so it does not visually collide.
-    render_scrim(frame, area);
-    frame.render_widget(Clear, dialog_area);
+    // Dim the chat behind the modal so it does not visually collide. No vertical halo: this
+    // bar sits right above the composer.
+    begin_modal(frame, area, dialog_area, 2, 0);
 
     let block = Block::default()
         .borders(Borders::ALL)

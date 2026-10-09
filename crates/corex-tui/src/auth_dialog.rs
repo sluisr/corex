@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::overlay::render_scrim;
+use crate::overlay::begin_modal;
 use crate::theme::Theme;
 
 pub struct AuthDialogState {
@@ -59,8 +59,7 @@ pub fn render_auth_dialog(
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
 
     // Dim the chat behind the modal so it does not visually collide.
-    render_scrim(frame, area);
-    frame.render_widget(Clear, dialog_area);
+    begin_modal(frame, area, dialog_area, 2, 1);
 
     let mut lines = vec![
         Line::from(""),

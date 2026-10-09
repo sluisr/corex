@@ -1,37 +1,14 @@
-use ratatui::layout::Rect;
+use corex_core::config::{Config, FlashSettings, ProSettings};
+use corex_core::providers::{locate_active, ModelFamily, ModelProfile, ProviderConfig};
+use crossterm::event::KeyCode;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use corex_core::config::{FlashSettings, ProSettings};
 
-use crate::overlay::render_scrim;
+use crate::overlay::begin_modal;
 use crate::theme::Theme;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelTab {
-    Models = 0,
-    Flash = 1,
-    Pro = 2,
-}
-
-impl ModelTab {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Models => Self::Flash,
-            Self::Flash => Self::Pro,
-            Self::Pro => Self::Models,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Models => Self::Pro,
-            Self::Flash => Self::Models,
-            Self::Pro => Self::Flash,
-        }
-    }
-}
 
 pub const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0];
 pub const REASONING_LEVELS: &[&str] = &["dynamic", "low", "medium", "high"];
@@ -39,6 +16,9 @@ pub const COMMAND_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
 pub const CODE_REASONING_LEVELS: &[&str] = &["high", "max", "medium", "low"];
 pub const SEARCH_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "max"];
 pub const PRO_REASONING_LEVELS: &[&str] = &["max", "high", "medium", "low"];
+
+const SELECTED_BG: Color = Color::Rgb(26, 38, 58);
+const RULE: Color = Color::Rgb(35, 45, 60);
 
 pub fn get_temp_info(temp: f32) -> (&'static str, &'static str, Color) {
     if temp <= 0.25 {
@@ -63,33 +43,87 @@ pub fn get_reasoning_color(r: &str) -> Color {
     }
 }
 
+/// Which of the three panes has keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Providers,
+    Models,
+    Settings,
+}
+
+impl Pane {
+    fn next(self) -> Self {
+        match self {
+            Self::Providers => Self::Models,
+            Self::Models => Self::Settings,
+            Self::Settings => Self::Providers,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Providers => Self::Settings,
+            Self::Models => Self::Providers,
+            Self::Settings => Self::Models,
+        }
+    }
+}
+
+/// A tunable row in the settings pane. Which rows exist depends on the model's family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingRow {
+    Temperature,
+    Reasoning,
+    CommandCot,
+    CodeCot,
+    SearchCot,
+    Persist,
+}
+
+/// What the app must do after a key press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogAction {
+    None,
+    Close,
+    /// Make `provider`/`model` (indices into the dialog's provider list) the active model.
+    Activate { provider: usize, model: usize },
+    /// A setting value changed; the app should apply (and optionally persist) it.
+    SettingsChanged,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelDialogState {
     pub is_open: bool,
-    pub current_tab: ModelTab,
-    pub selected_model_idx: usize, // 0..2
-    pub active_engine: usize,      // 0..2 strictly which engine is currently running
-    pub flash_row_idx: usize,      // 0..5
-    pub pro_row_idx: usize,        // 0..2
+    pub pane: Pane,
+    pub providers: Vec<ProviderConfig>,
+    /// Per provider: can it be used right now (key present / local)?
+    pub ready: Vec<bool>,
+    /// Per provider: short human hint about credentials / endpoint.
+    pub hints: Vec<String>,
+    pub prov_idx: usize,
+    pub model_idx: usize,
+    pub row_idx: usize,
+    pub active_provider: usize,
+    pub active_model: usize,
 
-    // Model tab
-    pub active_model: String,
-    pub persist_model: bool,
+    /// Persist activation and setting changes to disk (vs. this session only).
+    pub persist: bool,
 
-    // Flash settings
+    // Flash family
     pub temperature: f32,
     pub flash_reasoning: String,
     pub flash_command_reasoning: String,
     pub flash_code_reasoning: String,
     pub flash_search_reasoning: String,
-    pub flash_persist_permanent: bool,
 
-    // Pro settings
+    // Pro family
     pub pro_reasoning: String,
     pub pro_search_reasoning: String,
-    pub pro_persist_permanent: bool,
 
-    // Local settings
+    // Generic family (OpenAI-compatible providers, local)
+    pub generic_temperature: f32,
+    pub generic_reasoning: String,
+
     pub local_prompt_lite: bool,
 }
 
@@ -99,183 +133,236 @@ impl Default for ModelDialogState {
     }
 }
 
+fn mask_key(key: &str) -> String {
+    let n = key.chars().count();
+    if n == 0 {
+        return String::new();
+    }
+    let tail: String = key.chars().skip(n.saturating_sub(4)).collect();
+    format!("••••{}", tail)
+}
+
+fn cycle_str(levels: &[String], current: &str, forward: bool) -> String {
+    if levels.is_empty() {
+        return current.to_string();
+    }
+    let cur = levels.iter().position(|l| l == current).unwrap_or(0);
+    let next = if forward {
+        (cur + 1) % levels.len()
+    } else if cur == 0 {
+        levels.len() - 1
+    } else {
+        cur - 1
+    };
+    levels[next].clone()
+}
+
+fn cycle_static(levels: &[&str], current: &str, forward: bool) -> String {
+    let owned: Vec<String> = levels.iter().map(|s| s.to_string()).collect();
+    cycle_str(&owned, current, forward)
+}
+
+fn cycle_temperature(current: f32, forward: bool) -> f32 {
+    let cur = TEMPERATURE_PRESETS
+        .iter()
+        .position(|&t| (t - current).abs() < 0.01)
+        .unwrap_or(6);
+    let next = if forward {
+        (cur + 1) % TEMPERATURE_PRESETS.len()
+    } else if cur == 0 {
+        TEMPERATURE_PRESETS.len() - 1
+    } else {
+        cur - 1
+    };
+    TEMPERATURE_PRESETS[next]
+}
+
 impl ModelDialogState {
     pub fn new() -> Self {
         Self {
             is_open: false,
-            current_tab: ModelTab::Models,
-            selected_model_idx: 0,
-            active_engine: 0,
-            flash_row_idx: 0,
-            pro_row_idx: 0,
-
-            active_model: "deepseek-flash".to_string(),
-            persist_model: true,
+            pane: Pane::Models,
+            providers: Vec::new(),
+            ready: Vec::new(),
+            hints: Vec::new(),
+            prov_idx: 0,
+            model_idx: 0,
+            row_idx: 0,
+            active_provider: 0,
+            active_model: 0,
+            persist: true,
 
             temperature: 1.0,
             flash_reasoning: "dynamic".to_string(),
             flash_command_reasoning: "low".to_string(),
             flash_code_reasoning: "high".to_string(),
             flash_search_reasoning: "low".to_string(),
-            flash_persist_permanent: true,
 
             pro_reasoning: "max".to_string(),
             pro_search_reasoning: "low".to_string(),
-            pro_persist_permanent: true,
+
+            generic_temperature: 1.0,
+            generic_reasoning: String::new(),
 
             local_prompt_lite: false,
         }
     }
 
-    pub fn open(
-        &mut self,
-        current_model: &str,
-        flash_settings: &FlashSettings,
-        pro_settings: &ProSettings,
-        local_prompt_lite: bool,
-    ) {
+    pub fn open(&mut self, cfg: &Config) {
         self.is_open = true;
-        self.current_tab = ModelTab::Models;
-        self.active_model = current_model.to_string();
-        self.local_prompt_lite = local_prompt_lite;
+        self.pane = Pane::Models;
+        self.local_prompt_lite = cfg.local_prompt_lite;
 
-        if current_model.starts_with("local") {
-            self.active_engine = 2;
-            self.selected_model_idx = 2;
-        } else if current_model.contains("pro") || current_model.contains("reasoner") {
-            self.active_engine = 1;
-            self.selected_model_idx = 1;
+        self.providers = cfg.all_providers();
+        self.ready = Vec::with_capacity(self.providers.len());
+        self.hints = Vec::with_capacity(self.providers.len());
+        for p in &self.providers {
+            if p.is_local() {
+                self.ready.push(true);
+                self.hints.push(format!("endpoint: {}", cfg.local_llm_url));
+            } else if p.is_deepseek() {
+                let key = if cfg.api_key.is_empty() { p.api_key() } else { cfg.api_key.clone() };
+                self.ready.push(!key.trim().is_empty());
+                self.hints.push(if key.is_empty() {
+                    format!("export {}=…", p.api_key_env)
+                } else {
+                    format!("key: {}", mask_key(&key))
+                });
+            } else {
+                let key = p.api_key();
+                self.ready.push(!key.trim().is_empty());
+                self.hints.push(if key.is_empty() {
+                    format!("export {}=…  to enable", p.api_key_env)
+                } else {
+                    format!("key: {} (env {})", mask_key(&key), p.api_key_env)
+                });
+            }
+        }
+
+        let (pi, mi) = locate_active(
+            &self.providers,
+            cfg.active_provider.as_deref(),
+            &cfg.model,
+            cfg.local_llm_enabled,
+        );
+        self.active_provider = pi;
+        self.active_model = mi;
+        self.prov_idx = pi;
+        self.model_idx = mi;
+        self.row_idx = 0;
+
+        self.temperature = cfg.flash_settings.temperature;
+        self.flash_reasoning = cfg.flash_settings.reasoning_effort.clone();
+        self.flash_command_reasoning = cfg.flash_settings.command_reasoning_effort.clone();
+        self.flash_code_reasoning = cfg.flash_settings.code_reasoning_effort.clone();
+        self.flash_search_reasoning = cfg.flash_settings.search_reasoning_effort.clone();
+
+        self.pro_reasoning = cfg.pro_settings.reasoning_effort.clone();
+        self.pro_search_reasoning = cfg.pro_settings.search_reasoning_effort.clone();
+
+        self.generic_temperature = cfg.temperature;
+        self.generic_reasoning = if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled {
+            String::new()
         } else {
-            self.active_engine = 0;
-            self.selected_model_idx = 0;
-        }
-
-        self.temperature = flash_settings.temperature;
-        self.flash_reasoning = flash_settings.reasoning_effort.clone();
-        self.flash_command_reasoning = flash_settings.command_reasoning_effort.clone();
-        self.flash_code_reasoning = flash_settings.code_reasoning_effort.clone();
-        self.flash_search_reasoning = flash_settings.search_reasoning_effort.clone();
-
-        self.pro_reasoning = pro_settings.reasoning_effort.clone();
-        self.pro_search_reasoning = pro_settings.search_reasoning_effort.clone();
+            cfg.reasoning_effort.clone()
+        };
     }
 
-    pub fn cycle_flash_row(&mut self, forward: bool) {
-        match self.flash_row_idx {
-            0 => {
-                let curr_idx = TEMPERATURE_PRESETS
-                    .iter()
-                    .position(|&t| (t - self.temperature).abs() < 0.01)
-                    .unwrap_or(6);
-                let next_idx = if forward {
-                    (curr_idx + 1) % TEMPERATURE_PRESETS.len()
-                } else if curr_idx == 0 {
-                    TEMPERATURE_PRESETS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.temperature = TEMPERATURE_PRESETS[next_idx];
+    pub fn selected_provider(&self) -> Option<&ProviderConfig> {
+        self.providers.get(self.prov_idx)
+    }
+
+    pub fn selected_model(&self) -> Option<&ModelProfile> {
+        self.selected_provider().and_then(|p| p.models.get(self.model_idx))
+    }
+
+    /// True when the highlighted model is the one currently running.
+    pub fn selection_is_active(&self) -> bool {
+        self.prov_idx == self.active_provider && self.model_idx == self.active_model
+    }
+
+    pub fn settings_rows(&self) -> Vec<SettingRow> {
+        let Some(m) = self.selected_model() else { return vec![SettingRow::Persist] };
+        match m.family {
+            ModelFamily::Flash => vec![
+                SettingRow::Temperature,
+                SettingRow::Reasoning,
+                SettingRow::CommandCot,
+                SettingRow::CodeCot,
+                SettingRow::SearchCot,
+                SettingRow::Persist,
+            ],
+            ModelFamily::Pro => vec![SettingRow::Reasoning, SettingRow::SearchCot, SettingRow::Persist],
+            ModelFamily::Generic => {
+                let mut rows = vec![SettingRow::Temperature];
+                if !m.reasoning.is_empty() {
+                    rows.push(SettingRow::Reasoning);
+                }
+                rows.push(SettingRow::Persist);
+                rows
             }
-            1 => {
-                let curr_idx = REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.flash_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.flash_reasoning = REASONING_LEVELS[next_idx].to_string();
-            }
-            2 => {
-                let curr_idx = COMMAND_REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.flash_command_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % COMMAND_REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    COMMAND_REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.flash_command_reasoning = COMMAND_REASONING_LEVELS[next_idx].to_string();
-            }
-            3 => {
-                let curr_idx = CODE_REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.flash_code_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % CODE_REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    CODE_REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.flash_code_reasoning = CODE_REASONING_LEVELS[next_idx].to_string();
-            }
-            4 => {
-                let curr_idx = SEARCH_REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.flash_search_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % SEARCH_REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    SEARCH_REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.flash_search_reasoning = SEARCH_REASONING_LEVELS[next_idx].to_string();
-            }
-            5 => {
-                self.flash_persist_permanent = !self.flash_persist_permanent;
-            }
-            _ => {}
         }
     }
 
-    pub fn cycle_pro_row(&mut self, forward: bool) {
-        match self.pro_row_idx {
-            0 => {
-                let curr_idx = PRO_REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.pro_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % PRO_REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    PRO_REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.pro_reasoning = PRO_REASONING_LEVELS[next_idx].to_string();
-            }
-            1 => {
-                let curr_idx = SEARCH_REASONING_LEVELS
-                    .iter()
-                    .position(|&r| r == self.pro_search_reasoning)
-                    .unwrap_or(0);
-                let next_idx = if forward {
-                    (curr_idx + 1) % SEARCH_REASONING_LEVELS.len()
-                } else if curr_idx == 0 {
-                    SEARCH_REASONING_LEVELS.len() - 1
-                } else {
-                    curr_idx - 1
-                };
-                self.pro_search_reasoning = SEARCH_REASONING_LEVELS[next_idx].to_string();
-            }
-            2 => {
-                self.pro_persist_permanent = !self.pro_persist_permanent;
-            }
-            _ => {}
+    fn current_temperature(&self) -> f32 {
+        match self.selected_model().map(|m| m.family) {
+            Some(ModelFamily::Flash) => self.temperature,
+            _ => self.generic_temperature,
         }
     }
 
+    fn current_reasoning(&self) -> String {
+        match self.selected_model().map(|m| m.family) {
+            Some(ModelFamily::Flash) => self.flash_reasoning.clone(),
+            Some(ModelFamily::Pro) => self.pro_reasoning.clone(),
+            _ => self.generic_reasoning.clone(),
+        }
+    }
+
+    pub fn adjust_row(&mut self, forward: bool) {
+        let rows = self.settings_rows();
+        let Some(row) = rows.get(self.row_idx).copied() else { return };
+        let family = self.selected_model().map(|m| m.family).unwrap_or_default();
+        match row {
+            SettingRow::Temperature => {
+                if family == ModelFamily::Flash {
+                    self.temperature = cycle_temperature(self.temperature, forward);
+                } else {
+                    self.generic_temperature = cycle_temperature(self.generic_temperature, forward);
+                }
+            }
+            SettingRow::Reasoning => match family {
+                ModelFamily::Flash => {
+                    self.flash_reasoning = cycle_static(REASONING_LEVELS, &self.flash_reasoning, forward)
+                }
+                ModelFamily::Pro => {
+                    self.pro_reasoning = cycle_static(PRO_REASONING_LEVELS, &self.pro_reasoning, forward)
+                }
+                ModelFamily::Generic => {
+                    let levels = self.selected_model().map(|m| m.reasoning.clone()).unwrap_or_default();
+                    self.generic_reasoning = cycle_str(&levels, &self.generic_reasoning, forward);
+                }
+            },
+            SettingRow::CommandCot => {
+                self.flash_command_reasoning =
+                    cycle_static(COMMAND_REASONING_LEVELS, &self.flash_command_reasoning, forward)
+            }
+            SettingRow::CodeCot => {
+                self.flash_code_reasoning =
+                    cycle_static(CODE_REASONING_LEVELS, &self.flash_code_reasoning, forward)
+            }
+            SettingRow::SearchCot => {
+                if family == ModelFamily::Pro {
+                    self.pro_search_reasoning =
+                        cycle_static(SEARCH_REASONING_LEVELS, &self.pro_search_reasoning, forward)
+                } else {
+                    self.flash_search_reasoning =
+                        cycle_static(SEARCH_REASONING_LEVELS, &self.flash_search_reasoning, forward)
+                }
+            }
+            SettingRow::Persist => self.persist = !self.persist,
+        }
+    }
 
     pub fn to_flash_settings(&self) -> FlashSettings {
         FlashSettings {
@@ -294,13 +381,95 @@ impl ModelDialogState {
         }
     }
 
-
-    pub fn next_tab(&mut self) {
-        self.current_tab = self.current_tab.next();
+    /// `(temperature, reasoning_effort)` the highlighted model would run with.
+    pub fn effective_params(&self) -> (f32, String) {
+        (self.current_temperature(), self.current_reasoning())
     }
 
-    pub fn prev_tab(&mut self) {
-        self.current_tab = self.current_tab.prev();
+    fn select_provider(&mut self, idx: usize) {
+        self.prov_idx = idx;
+        self.model_idx = if idx == self.active_provider { self.active_model } else { 0 };
+        self.row_idx = 0;
+    }
+
+    pub fn handle_key(&mut self, code: KeyCode) -> DialogAction {
+        match code {
+            KeyCode::Esc => return DialogAction::Close,
+            KeyCode::Tab => self.pane = self.pane.next(),
+            KeyCode::BackTab => self.pane = self.pane.prev(),
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                self.persist = !self.persist;
+                return DialogAction::SettingsChanged;
+            }
+            KeyCode::Up | KeyCode::Char('k') => match self.pane {
+                Pane::Providers => {
+                    if self.prov_idx > 0 {
+                        self.select_provider(self.prov_idx - 1);
+                    }
+                }
+                Pane::Models => {
+                    self.model_idx = self.model_idx.saturating_sub(1);
+                    self.row_idx = 0;
+                }
+                Pane::Settings => self.row_idx = self.row_idx.saturating_sub(1),
+            },
+            KeyCode::Down | KeyCode::Char('j') => match self.pane {
+                Pane::Providers => {
+                    if self.prov_idx + 1 < self.providers.len() {
+                        self.select_provider(self.prov_idx + 1);
+                    }
+                }
+                Pane::Models => {
+                    let n = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
+                    if self.model_idx + 1 < n {
+                        self.model_idx += 1;
+                        self.row_idx = 0;
+                    }
+                }
+                Pane::Settings => {
+                    let n = self.settings_rows().len();
+                    if self.row_idx + 1 < n {
+                        self.row_idx += 1;
+                    }
+                }
+            },
+            KeyCode::Left | KeyCode::Char('h') => match self.pane {
+                Pane::Providers => {}
+                Pane::Models => self.pane = Pane::Providers,
+                Pane::Settings => {
+                    self.adjust_row(false);
+                    return DialogAction::SettingsChanged;
+                }
+            },
+            KeyCode::Right | KeyCode::Char('l') => match self.pane {
+                Pane::Providers => self.pane = Pane::Models,
+                Pane::Models => self.pane = Pane::Settings,
+                Pane::Settings => {
+                    self.adjust_row(true);
+                    return DialogAction::SettingsChanged;
+                }
+            },
+            KeyCode::Enter => match self.pane {
+                Pane::Providers => self.pane = Pane::Models,
+                Pane::Models => {
+                    if self.selected_model().is_some() {
+                        return DialogAction::Activate { provider: self.prov_idx, model: self.model_idx };
+                    }
+                }
+                Pane::Settings => {
+                    self.adjust_row(true);
+                    return DialogAction::SettingsChanged;
+                }
+            },
+            _ => {}
+        }
+        DialogAction::None
+    }
+
+    /// Marks `provider`/`model` as the running one (after the app applied it).
+    pub fn mark_active(&mut self, provider: usize, model: usize) {
+        self.active_provider = provider;
+        self.active_model = model;
     }
 
     pub fn close(&mut self) {
@@ -314,405 +483,362 @@ fn key_badge(key: &'static str, desc: &'static str, color: Color, gray: Color) -
         Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled("] ", Style::default().fg(Color::Rgb(70, 85, 110))),
         Span::styled(desc, Style::default().fg(gray)),
-        Span::raw("   "),
+        Span::raw("  "),
     ]
 }
 
-pub fn render_model_dialog(
-    frame: &mut Frame,
-    area: Rect,
-    state: &ModelDialogState,
-    theme: &Theme,
-) {
+fn pad_right(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.chars().take(w).collect()
+    } else {
+        format!("{}{}", s, " ".repeat(w - n))
+    }
+}
+
+fn pane_title(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
+    let style = if focused {
+        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![Span::styled(format!(" {}", label), style)])
+}
+
+pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
     if !state.is_open {
         return;
     }
 
-    let dialog_width = 80.min(area.width.saturating_sub(4)).max(54);
-    let dialog_height = 18.min(area.height.saturating_sub(2));
-
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
+    let dialog_width = 100.min(area.width.saturating_sub(4)).max(60.min(area.width));
+    let dialog_height = 22.min(area.height.saturating_sub(2));
+    let x = area.width.saturating_sub(dialog_width) / 2;
+    let y = area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
 
-    render_scrim(frame, area);
-    frame.render_widget(Clear, dialog_area);
-
-    let inner_w = dialog_width.saturating_sub(2) as usize;
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(""));
-
-    // 1. Pill Tabs Header
-    let tabs = [
-        (ModelTab::Models, "Models", "1"),
-        (ModelTab::Flash, "Flash CoT", "2"),
-        (ModelTab::Pro, "Pro CoT", "3"),
-    ];
-
-    let mut tab_spans = vec![Span::raw("  ")];
-    for (tab_type, title, key) in tabs.iter() {
-        let is_active = state.current_tab == *tab_type;
-        if is_active {
-            tab_spans.push(Span::styled(
-                format!(" [{} {}] ", key, title),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(38, 54, 82))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            tab_spans.push(Span::raw(" "));
-        } else {
-            tab_spans.push(Span::styled(
-                format!("  {} {}  ", key, title),
-                Style::default().fg(Color::Rgb(110, 125, 150)),
-            ));
-            tab_spans.push(Span::raw(" "));
-        }
-    }
-    lines.push(Line::from(tab_spans));
-
-    // Divider below tabs
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("─".repeat(inner_w.saturating_sub(4)), Style::default().fg(Color::Rgb(35, 45, 60))),
-    ]));
-
-    // 2. Tab Content Body
-    match state.current_tab {
-        ModelTab::Models => render_models_tab(&mut lines, state, theme, inner_w),
-        ModelTab::Flash => render_flash_tab(&mut lines, state, theme, inner_w),
-        ModelTab::Pro => render_pro_tab(&mut lines, state, theme, inner_w),
-    }
-
-    // Divider above footer
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("─".repeat(inner_w.saturating_sub(4)), Style::default().fg(Color::Rgb(35, 45, 60))),
-    ]));
-
-    // 3. Contextual Footer
-    let mut footer = vec![Span::raw("   ")];
-    match state.current_tab {
-        ModelTab::Models => {
-            footer.extend(key_badge("Enter", "Select Engine", theme.accent_blue, theme.gray));
-            footer.extend(key_badge("Tab", "Next Tab", theme.accent_cyan, theme.gray));
-            footer.extend(key_badge("T", "Persist", theme.accent_green, theme.gray));
-            footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
-        }
-        ModelTab::Flash | ModelTab::Pro => {
-            footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme.gray));
-            footer.extend(key_badge("◄/►", "Adjust Value", theme.accent_cyan, theme.gray));
-            footer.extend(key_badge("Tab", "Next Tab", theme.accent_yellow, theme.gray));
-            footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
-        }
-    }
-    lines.push(Line::from(footer));
+    begin_modal(frame, area, dialog_area, 2, 1);
 
     let block = Block::default()
-        .title("  AI Model & Architecture Control Center  ")
+        .title("  Models  ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.accent_blue));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
 
-    frame.render_widget(Paragraph::new(lines).block(block), dialog_area);
+    let vertical = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
+    let (body, footer_area) = (vertical[0], vertical[1]);
+    let horizontal = Layout::horizontal([
+        Constraint::Length(26),
+        Constraint::Length(1),
+        Constraint::Min(20),
+    ])
+    .split(body);
+
+    render_providers_pane(frame, horizontal[0], state, theme);
+    let sep: Vec<Line> = (0..horizontal[1].height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(RULE))))
+        .collect();
+    frame.render_widget(Paragraph::new(sep), horizontal[1]);
+    render_detail_pane(frame, horizontal[2], state, theme);
+
+    let mut footer = vec![Span::raw(" ")];
+    footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme.gray));
+    footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme.gray));
+    match state.pane {
+        Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme.gray)),
+        Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme.gray)),
+        Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme.gray)),
+    }
+    footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme.gray));
+    footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
+    let footer_lines = vec![
+        Line::from(Span::styled("─".repeat(footer_area.width as usize), Style::default().fg(RULE))),
+        Line::from(footer),
+    ];
+    frame.render_widget(Paragraph::new(footer_lines), footer_area);
 }
 
-fn render_models_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Theme, inner_w: usize) {
-    let selected_bg = Color::Rgb(26, 38, 58);
+fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
+    let focused = state.pane == Pane::Providers;
+    let w = area.width as usize;
+    let mut lines = vec![pane_title("PROVIDERS", focused, theme), Line::from("")];
 
-    let models = [
-        (
-            "DeepSeek-V4.1-Flash",
-            "Primary coding engine · Sub-second tool execution & dynamic CoT",
-            "[Recommended]",
-            theme.accent_green,
-        ),
-        (
-            "DeepSeek-V4-Pro",
-            "Deep reasoning architecture · Hard debugging & complex mathematics",
-            "[Thinking]",
-            theme.accent_purple,
-        ),
-        (
-            "Local Offline Assistant",
-            "100% Private local inference · llama.cpp / Ollama ($0.00 cost)",
-            "[Air-gapped]",
-            theme.accent_yellow,
-        ),
-    ];
+    for (i, p) in state.providers.iter().enumerate() {
+        let selected = i == state.prov_idx;
+        let is_active = i == state.active_provider;
+        let ready = state.ready.get(i).copied().unwrap_or(false);
 
-    for (i, (name, desc, badge, badge_col)) in models.iter().enumerate() {
-        let is_selected = i == state.selected_model_idx;
-        let is_active = i == state.active_engine;
-        let row_bg = if is_selected { selected_bg } else { Color::Reset };
-
-        let cursor = if is_selected { " ❯ " } else { "   " };
-        let cursor_style = if is_selected {
-            Style::default().fg(theme.accent_blue).bg(row_bg).add_modifier(Modifier::BOLD)
+        let (dot, dot_col) = if is_active {
+            ("●", theme.accent_green)
+        } else if ready {
+            ("○", theme.gray)
         } else {
-            Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
+            ("◌", theme.accent_yellow)
         };
+        let bg = if selected && focused { SELECTED_BG } else { Color::Reset };
+        let name_fg = if selected { Color::White } else { theme.foreground };
+        let count = format!("{}", p.models.len());
+        let name_w = w.saturating_sub(5 + count.chars().count() + 1);
 
-        let num_style = if is_selected {
-            Style::default().fg(theme.accent_blue).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)
-        };
-
-        let radio_symbol = if is_active { "[●] " } else { "[ ] " };
-        let radio_style = if is_selected {
-            Style::default().fg(if is_active { theme.accent_green } else { theme.dark_gray }).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(if is_active { theme.accent_green } else { theme.dark_gray }).add_modifier(Modifier::BOLD)
-        };
-
-        let name_style = if is_selected {
-            Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)
-        };
-
-        let badge_style = if is_selected {
-            Style::default().fg(*badge_col).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(*badge_col).add_modifier(Modifier::BOLD)
-        };
-
-        // Line 1: Cursor + Num + Radio + Name + Spacing + Badge + Trailing
-        let left_len = 3 + 3 + 4 + name.chars().count();
-        let badge_len = badge.chars().count();
-        let space_len = inner_w.saturating_sub(left_len + badge_len + 2).max(2);
-
-        let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
-
-        let mut line1_spans = vec![
-            Span::styled(cursor, cursor_style),
-            Span::styled(format!("{}. ", i + 1), num_style),
-            Span::styled(radio_symbol, radio_style),
-            Span::styled(*name, name_style),
-            Span::styled(" ".repeat(space_len), space_style),
-            Span::styled(*badge, badge_style),
-        ];
-        let used_line1 = left_len + space_len + badge_len;
-        if inner_w > used_line1 {
-            line1_spans.push(Span::styled(" ".repeat(inner_w - used_line1), space_style));
+        let mut name_style = Style::default().fg(name_fg).bg(bg);
+        if selected {
+            name_style = name_style.add_modifier(Modifier::BOLD);
         }
-        lines.push(Line::from(line1_spans));
-
-        // Line 2: Indented description
-        let indent = 10;
-        let max_desc_w = inner_w.saturating_sub(indent + 2);
-        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
-        let desc_len = truncated_desc.chars().count();
-        let desc_style = if is_selected {
-            Style::default().fg(Color::Rgb(180, 195, 215)).bg(row_bg)
-        } else {
-            Style::default().fg(theme.dark_gray)
-        };
-
-        let mut line2_spans = vec![
-            Span::styled(" ".repeat(indent), space_style),
-            Span::styled(truncated_desc, desc_style),
-        ];
-        let used_line2 = indent + desc_len;
-        if inner_w > used_line2 {
-            line2_spans.push(Span::styled(" ".repeat(inner_w - used_line2), space_style));
-        }
-        lines.push(Line::from(line2_spans));
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ❯ " } else { "   " },
+                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{} ", dot), Style::default().fg(dot_col).bg(bg)),
+            Span::styled(pad_right(p.display_name(), name_w), name_style),
+            Span::styled(count, Style::default().fg(theme.dark_gray).bg(bg)),
+            Span::styled(" ", Style::default().bg(bg)),
+        ]));
     }
 
-    // Persistence row
+    lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("─".repeat(inner_w.saturating_sub(4)), Style::default().fg(Color::Rgb(35, 45, 60))),
+        Span::styled(" ● ", Style::default().fg(theme.accent_green)),
+        Span::styled("active ", Style::default().fg(theme.dark_gray)),
+        Span::styled("○ ", Style::default().fg(theme.gray)),
+        Span::styled("ready", Style::default().fg(theme.dark_gray)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" ◌ ", Style::default().fg(theme.accent_yellow)),
+        Span::styled("needs API key", Style::default().fg(theme.dark_gray)),
     ]));
 
-    let (p_label, p_col, p_desc) = if state.persist_model {
-        ("[PERMANENT]", theme.accent_green, "Saved in ~/.config/corex/config.toml")
-    } else {
-        ("[SESSION ONLY]", theme.accent_yellow, "Active for current process only")
-    };
-
-    lines.push(Line::from(vec![
-        Span::raw("   "),
-        Span::styled("Persistence: ", Style::default().fg(theme.foreground)),
-        Span::styled(p_label, Style::default().fg(p_col).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  ·  {} (Press T to toggle)", p_desc), Style::default().fg(theme.dark_gray)),
-    ]));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_flash_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Theme, inner_w: usize) {
-    let selected_bg = Color::Rgb(26, 38, 58);
-    let (temp_tag, temp_desc, temp_col) = get_temp_info(state.temperature);
+fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
+    let Some(provider) = state.selected_provider() else { return };
+    let w = area.width as usize;
+    let ready = state.ready.get(state.prov_idx).copied().unwrap_or(false);
+    let is_active_provider = state.prov_idx == state.active_provider;
+    let mut lines: Vec<Line> = Vec::new();
 
-    let rows = [
-        (
-            0,
-            "1. Temperature:       ",
-            format!("{:.1}", state.temperature),
-            temp_col,
-            temp_tag,
-            temp_desc,
+    // Header: provider + status + endpoint
+    let (status, status_col) = if is_active_provider {
+        ("● active", theme.accent_green)
+    } else if ready {
+        ("○ ready", theme.gray)
+    } else {
+        ("◌ needs API key", theme.accent_yellow)
+    };
+    let endpoint = if provider.base_url.is_empty() { String::new() } else { provider.base_url.clone() };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {}", provider.display_name()),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
-        (
-            1,
-            "2. General Reasoning: ",
-            state.flash_reasoning.to_uppercase(),
-            get_reasoning_color(&state.flash_reasoning),
-            "Adaptive",
-            "~200ms tools, deep CoT for complex code",
+        Span::styled("  ", Style::default()),
+        Span::styled(status, Style::default().fg(status_col).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}", endpoint), Style::default().fg(theme.dark_gray)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(w.saturating_sub(1)),
+        Style::default().fg(RULE),
+    )));
+
+    // Models
+    let models_focused = state.pane == Pane::Models;
+    lines.push(pane_title("MODELS", models_focused, theme));
+    for (i, m) in provider.models.iter().enumerate() {
+        let selected = i == state.model_idx;
+        let is_active = is_active_provider && i == state.active_model;
+        let bg = if selected && models_focused { SELECTED_BG } else { Color::Reset };
+
+        let radio = if is_active { "(●) " } else { "( ) " };
+        let radio_col = if is_active { theme.accent_green } else { theme.dark_gray };
+        let tags = m.tags.join(" · ");
+        let name_w = 26usize;
+        let tags_w = w.saturating_sub(3 + 4 + name_w + 1);
+
+        let mut name_style = Style::default().fg(if selected { Color::White } else { theme.foreground }).bg(bg);
+        if selected {
+            name_style = name_style.add_modifier(Modifier::BOLD);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ❯ " } else { "   " },
+                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(radio, Style::default().fg(radio_col).bg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled(pad_right(m.display_name(), name_w), name_style),
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(
+                pad_right(&corex_core::truncate_ellipsis(&tags, tags_w), tags_w),
+                Style::default().fg(theme.dark_gray).bg(bg),
+            ),
+        ]));
+    }
+    if provider.models.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no models defined — add them under `providers` in settings.json)",
+            Style::default().fg(theme.dark_gray),
+        )));
+    }
+
+    // Settings
+    lines.push(Line::from(""));
+    let settings_focused = state.pane == Pane::Settings;
+    let model_name = state.selected_model().map(|m| m.display_name().to_string()).unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            " SETTINGS",
+            if settings_focused {
+                Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)
+            },
         ),
-        (
-            2,
-            "3. Command & Tool CoT:",
+        Span::styled(format!(" · {}", model_name), Style::default().fg(theme.dark_gray)),
+    ]));
+
+    let family = state.selected_model().map(|m| m.family).unwrap_or_default();
+    for (i, row) in state.settings_rows().iter().enumerate() {
+        let selected = i == state.row_idx;
+        let bg = if selected && settings_focused { SELECTED_BG } else { Color::Reset };
+        let (label, value, val_col, desc) = setting_display(*row, family, state);
+
+        let arrow_col = if selected && settings_focused { theme.accent_cyan } else { theme.dark_gray };
+        let label_style = if selected {
+            Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.gray)
+        };
+        let desc_w = w.saturating_sub(3 + 20 + 2 + 11 + 2 + 2);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { " ❯ " } else { "   " },
+                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(pad_right(label, 20), label_style),
+            Span::styled("◄ ", Style::default().fg(arrow_col).bg(bg)),
+            Span::styled(
+                format!("{:^9}", value),
+                Style::default().fg(val_col).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ►", Style::default().fg(arrow_col).bg(bg)),
+            Span::styled("  ", Style::default().bg(bg)),
+            Span::styled(
+                pad_right(&corex_core::truncate_ellipsis(&desc, desc_w), desc_w),
+                Style::default().fg(if selected { theme.foreground } else { theme.dark_gray }).bg(bg),
+            ),
+        ]));
+    }
+
+    // Credentials / endpoint hint
+    lines.push(Line::from(""));
+    let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
+    lines.push(Line::from(Span::styled(
+        format!(" {}", corex_core::truncate_ellipsis(&hint, w.saturating_sub(2))),
+        Style::default().fg(if ready { theme.dark_gray } else { theme.accent_yellow }),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn setting_display(
+    row: SettingRow,
+    family: ModelFamily,
+    state: &ModelDialogState,
+) -> (&'static str, String, Color, String) {
+    match row {
+        SettingRow::Temperature => {
+            let t = if family == ModelFamily::Flash { state.temperature } else { state.generic_temperature };
+            let (tag, desc, col) = get_temp_info(t);
+            ("Temperature", format!("{:.1}", t), col, format!("{} · {}", tag, desc))
+        }
+        SettingRow::Reasoning => {
+            let r = match family {
+                ModelFamily::Flash => &state.flash_reasoning,
+                ModelFamily::Pro => &state.pro_reasoning,
+                ModelFamily::Generic => &state.generic_reasoning,
+            };
+            let desc = match family {
+                ModelFamily::Flash => "Adaptive · ~200ms tools, deep CoT for complex code",
+                ModelFamily::Pro => "Exhaustive reasoning for novel architecture",
+                ModelFamily::Generic => "Model reasoning level",
+            };
+            let shown = if r.is_empty() { "default".to_string() } else { r.to_uppercase() };
+            ("Reasoning", shown, get_reasoning_color(r), desc.to_string())
+        }
+        SettingRow::CommandCot => (
+            "Command & Tool CoT",
             state.flash_command_reasoning.to_uppercase(),
             get_reasoning_color(&state.flash_command_reasoning),
-            "Fast",
-            "~200ms quick checks for shell tools",
+            "Quick checks for shell tools".to_string(),
         ),
-        (
-            3,
-            "4. Coding & Dev CoT:  ",
+        SettingRow::CodeCot => (
+            "Coding & Dev CoT",
             state.flash_code_reasoning.to_uppercase(),
             get_reasoning_color(&state.flash_code_reasoning),
-            "Deep CoT",
-            "High verification for architecture & code",
+            "Verification for architecture & code".to_string(),
         ),
-        (
-            4,
-            "5. Web Search CoT:    ",
-            state.flash_search_reasoning.to_uppercase(),
-            get_reasoning_color(&state.flash_search_reasoning),
-            "Fast",
-            "Quick snippets & direct links (~2-4s)",
-        ),
-        (
-            5,
-            "6. Save Overrides:    ",
-            if state.flash_persist_permanent { "PERMANENT".to_string() } else { "SESSION".to_string() },
-            if state.flash_persist_permanent { Color::Rgb(105, 240, 174) } else { Color::Rgb(255, 152, 0) },
-            "Storage",
-            if state.flash_persist_permanent { "Saves to ~/.config/corex/config.toml" } else { "Active in this session only" },
-        ),
-    ];
-
-    for (row_idx, label, val_str, val_col, tag, desc) in rows.iter() {
-        let is_selected = state.flash_row_idx == *row_idx;
-        let row_bg = if is_selected { selected_bg } else { Color::Reset };
-
-        let cursor = if is_selected { " ❯ " } else { "   " };
-        let cursor_col = if is_selected { theme.accent_blue } else { theme.dark_gray };
-        let label_style = if is_selected {
-            Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.gray)
-        };
-
-        let padded_val = format!("{:^9}", val_str);
-        let arrow_col = if is_selected { theme.accent_cyan } else { theme.dark_gray };
-
-        let prefix_len = 3 + 22 + 2 + 9 + 2 + 3 + 9 + 2;
-        let max_desc_w = inner_w.saturating_sub(prefix_len);
-        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
-
-        let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
-
-        let mut row_spans = vec![
-            Span::styled(cursor, if is_selected { Style::default().fg(cursor_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(cursor_col) }),
-            Span::styled(*label, label_style),
-            Span::styled("◄ ", if is_selected { Style::default().fg(arrow_col).bg(row_bg) } else { Style::default().fg(arrow_col) }),
-            Span::styled(padded_val, if is_selected { Style::default().fg(*val_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(*val_col).add_modifier(Modifier::BOLD) }),
-            Span::styled(" ►", if is_selected { Style::default().fg(arrow_col).bg(row_bg) } else { Style::default().fg(arrow_col) }),
-            Span::styled(" · ", if is_selected { Style::default().fg(Color::Rgb(70, 85, 105)).bg(row_bg) } else { Style::default().fg(Color::Rgb(70, 85, 105)) }),
-            Span::styled(format!("{:<9}", tag), if is_selected { Style::default().fg(*val_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme.gray).add_modifier(Modifier::BOLD) }),
-            Span::styled("  ", space_style),
-            Span::styled(truncated_desc.clone(), if is_selected { Style::default().fg(theme.foreground).bg(row_bg) } else { Style::default().fg(theme.dark_gray) }),
-        ];
-
-        let used_w = prefix_len + truncated_desc.chars().count();
-        if inner_w > used_w {
-            row_spans.push(Span::styled(" ".repeat(inner_w - used_w), space_style));
+        SettingRow::SearchCot => {
+            let r = if family == ModelFamily::Pro { &state.pro_search_reasoning } else { &state.flash_search_reasoning };
+            (
+                "Web Search CoT",
+                r.to_uppercase(),
+                get_reasoning_color(r),
+                "Quick snippets & direct links".to_string(),
+            )
         }
-        lines.push(Line::from(row_spans));
+        SettingRow::Persist => (
+            "Save changes",
+            if state.persist { "PERMANENT".to_string() } else { "SESSION".to_string() },
+            if state.persist { Color::Rgb(105, 240, 174) } else { Color::Rgb(255, 152, 0) },
+            if state.persist { "Saved to ~/.corex/settings.json".to_string() } else { "Active in this session only".to_string() },
+        ),
     }
 }
 
-fn render_pro_tab(lines: &mut Vec<Line>, state: &ModelDialogState, theme: &Theme, inner_w: usize) {
-    let selected_bg = Color::Rgb(26, 38, 58);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let rows = [
-        (
-            0,
-            "1. Model Reasoning: ",
-            state.pro_reasoning.to_uppercase(),
-            get_reasoning_color(&state.pro_reasoning),
-            "Max Depth",
-            "Exhaustive reasoning for novel architecture",
-        ),
-        (
-            1,
-            "2. Web Search CoT:  ",
-            state.pro_search_reasoning.to_uppercase(),
-            get_reasoning_color(&state.pro_search_reasoning),
-            "Fast",
-            "Quick snippets & direct links (~2-4s)",
-        ),
-        (
-            2,
-            "3. Save Overrides:  ",
-            if state.pro_persist_permanent { "PERMANENT".to_string() } else { "SESSION".to_string() },
-            if state.pro_persist_permanent { Color::Rgb(105, 240, 174) } else { Color::Rgb(255, 152, 0) },
-            "Storage",
-            if state.pro_persist_permanent { "Saves to ~/.config/corex/config.toml" } else { "Active in this session only" },
-        ),
-    ];
-
-    for (row_idx, label, val_str, val_col, tag, desc) in rows.iter() {
-        let is_selected = state.pro_row_idx == *row_idx;
-        let row_bg = if is_selected { selected_bg } else { Color::Reset };
-
-        let cursor = if is_selected { " ❯ " } else { "   " };
-        let cursor_col = if is_selected { theme.accent_blue } else { theme.dark_gray };
-        let label_style = if is_selected {
-            Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.gray)
-        };
-
-        let padded_val = format!("{:^9}", val_str);
-        let arrow_col = if is_selected { theme.accent_cyan } else { theme.dark_gray };
-
-        let prefix_len = 3 + 20 + 2 + 9 + 2 + 3 + 9 + 2;
-        let max_desc_w = inner_w.saturating_sub(prefix_len);
-        let truncated_desc = corex_core::truncate_ellipsis(desc, max_desc_w);
-
-        let space_style = if is_selected { Style::default().bg(row_bg) } else { Style::default() };
-
-        let mut row_spans = vec![
-            Span::styled(cursor, if is_selected { Style::default().fg(cursor_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(cursor_col) }),
-            Span::styled(*label, label_style),
-            Span::styled("◄ ", if is_selected { Style::default().fg(arrow_col).bg(row_bg) } else { Style::default().fg(arrow_col) }),
-            Span::styled(padded_val, if is_selected { Style::default().fg(*val_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(*val_col).add_modifier(Modifier::BOLD) }),
-            Span::styled(" ►", if is_selected { Style::default().fg(arrow_col).bg(row_bg) } else { Style::default().fg(arrow_col) }),
-            Span::styled(" · ", if is_selected { Style::default().fg(Color::Rgb(70, 85, 105)).bg(row_bg) } else { Style::default().fg(Color::Rgb(70, 85, 105)) }),
-            Span::styled(format!("{:<9}", tag), if is_selected { Style::default().fg(*val_col).bg(row_bg).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme.gray).add_modifier(Modifier::BOLD) }),
-            Span::styled("  ", space_style),
-            Span::styled(truncated_desc.clone(), if is_selected { Style::default().fg(theme.foreground).bg(row_bg) } else { Style::default().fg(theme.dark_gray) }),
-        ];
-
-        let used_w = prefix_len + truncated_desc.chars().count();
-        if inner_w > used_w {
-            row_spans.push(Span::styled(" ".repeat(inner_w - used_w), space_style));
-        }
-        lines.push(Line::from(row_spans));
-        lines.push(Line::from(""));
+    fn open_default() -> ModelDialogState {
+        let mut s = ModelDialogState::new();
+        s.open(&Config::default());
+        s
     }
 
-    lines.push(Line::from(vec![
-        Span::raw("   "),
-        Span::styled("DeepSeek Pro uses extensive thinking tokens for hard architecture & complex bugs.", Style::default().fg(theme.dark_gray)),
-    ]));
+    #[test]
+    fn opens_on_active_deepseek_model() {
+        let s = open_default();
+        assert!(s.providers[s.active_provider].is_deepseek());
+        assert!(s.selection_is_active());
+    }
+
+    #[test]
+    fn enter_in_models_pane_activates_selection() {
+        let mut s = open_default();
+        s.pane = Pane::Models;
+        s.handle_key(KeyCode::Down);
+        let action = s.handle_key(KeyCode::Enter);
+        assert_eq!(action, DialogAction::Activate { provider: s.prov_idx, model: 1 });
+    }
+
+    #[test]
+    fn settings_rows_follow_model_family() {
+        let mut s = open_default();
+        assert_eq!(s.settings_rows().len(), 6); // flash
+        s.model_idx = 1; // pro
+        assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::SearchCot, SettingRow::Persist]);
+        let local = s.providers.iter().position(|p| p.is_local()).unwrap();
+        s.select_provider(local);
+        assert_eq!(s.settings_rows(), vec![SettingRow::Temperature, SettingRow::Persist]);
+    }
+
+    #[test]
+    fn right_in_settings_pane_adjusts_value() {
+        let mut s = open_default();
+        s.pane = Pane::Settings;
+        let before = s.temperature;
+        assert_eq!(s.handle_key(KeyCode::Right), DialogAction::SettingsChanged);
+        assert_ne!(s.temperature, before);
+    }
 }
-
-

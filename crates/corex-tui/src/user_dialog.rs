@@ -7,7 +7,7 @@ use ratatui::Frame;
 
 use corex_core::types::ToolCall;
 
-use crate::overlay::render_scrim;
+use crate::overlay::begin_modal;
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -175,8 +175,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     let dialog = Rect::new(x, y, width, height);
 
     // Dim the chat behind the modal so it does not visually collide.
-    render_scrim(frame, area);
-    frame.render_widget(Clear, dialog);
+    begin_modal(frame, area, dialog, 2, 1);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.extend(wrap_question(&q.question, width as usize - 4));
