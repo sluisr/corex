@@ -128,10 +128,10 @@ sudo cp target/release/cx /usr/local/bin/
 
 ```bash
 # Run instantly without installing:
-npx corex-cli
+npx corex
 
 # Or install globally:
-npm install -g corex-cli
+npm install -g corex
 ```
 
 ---

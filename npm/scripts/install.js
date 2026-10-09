@@ -15,7 +15,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '7b67e49b4bbc44eb5ac8f41fad69f9610b6c4486c77b8963c4affaadd307aac6'
+      sha256: '5a9117b823c5b438d8f8aa58683806b0d100ea39644bc5501bbb125c37d0d955'
     }
   },
   darwin: {
@@ -23,14 +23,14 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
+      sha256: 'e71159e417f8179f7fdf5a5101c03945c19b8abc23698995fec5f13e5dedbd59'
     },
     x64: {
       // Fallback for Intel macs or Rosetta
-      archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
+      archive: `corex-${VERSION}-x86_64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '1d97f877286447245d25ebda2c06fcc935ecd5eddd5396df2539212b1fb6af57'
+      sha256: 'd82c0e3a8aa3318c88bc3389ed36c56dff932688b00c4af9d6a6bf16c7d44659'
     }
   },
   win32: {
@@ -38,7 +38,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-pc-windows-msvc.zip`,
       binName: 'cx.exe',
       type: 'zip',
-      sha256: 'e2bde564c8e59745b279fd9a9b060ae50ab2a1c5872d15666b323dfd18cf148a'
+      sha256: '17233b981b568de646d8a6265d378e9b76e49fb4503f19e212aabb1100756090'
     }
   }
 };

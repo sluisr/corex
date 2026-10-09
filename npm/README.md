@@ -1,8 +1,8 @@
-# ⚡ corex-cli (`cx`)
+# ⚡ corex (`cx`)
 
 > **Corex** — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs.
 
-[![npm version](https://img.shields.io/npm/v/corex-cli?color=blue)](https://www.npmjs.com/package/corex-cli)
+[![npm version](https://img.shields.io/npm/v/corex?color=blue)](https://www.npmjs.com/package/corex)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/sluisr/corex/blob/main/LICENSE)
 
 ## 📦 Installation
@@ -10,13 +10,13 @@
 Install globally via npm:
 
 ```bash
-npm install -g corex-cli
+npm install -g corex
 ```
 
 Or run directly without installing using `npx`:
 
 ```bash
-npx corex-cli
+npx corex
 ```
 
 ## 🚀 Usage
