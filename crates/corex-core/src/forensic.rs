@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -23,10 +23,32 @@ impl ForensicLogger {
             PathBuf::from(".corex").join("logs")
         };
 
-        let _ = fs::create_dir_all(&log_dir);
+        let _ = crate::secure_fs::ensure_private_dir(&log_dir);
         let log_file_path = log_dir.join(format!("corex-forensic-{}.log", date_str));
 
-        let mut global = LOGGER.lock().unwrap();
+        // Retention policy: Clean up log files older than 7 days to prevent unbounded disk usage
+        if let Ok(entries) = fs::read_dir(&log_dir) {
+            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400);
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("corex-forensic-") && name.ends_with(".log") {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if modified < cutoff {
+                                    let _ = fs::remove_file(&p);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut global = match LOGGER.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         *global = Some(ForensicLogger {
             log_file_path: log_file_path.clone(),
         });
@@ -45,7 +67,7 @@ impl ForensicLogger {
     }
 
     fn raw_append(path: &Path, content: &str) {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut file) = crate::secure_fs::open_private(path, true) {
             let _ = file.write_all(content.as_bytes());
             let _ = file.flush();
         }
@@ -83,6 +105,7 @@ impl ForensicLogger {
     /// - Total round-trip duration & Generation speed (Tokens/sec)
     /// - Exact token usage breakdown (Prompt, Cache Hit %, Completion, Reasoning)
     /// - Real-time estimated financial cost ($USD) & cache savings
+    #[allow(clippy::too_many_arguments)]
     pub fn log_llm_response(
         engine: &str,
         model: &str,
@@ -184,14 +207,6 @@ impl ForensicLogger {
         Self::log_event("TOOL_EXEC", &format!("TOOL: {} [{}]", tool_name, status_str), &details);
     }
 
-    /// Logs Hybrid Decision Router evaluation (e.g. why a turn went to Local vs Cloud)
-    pub fn log_hybrid_decision(user_prompt: &str, is_coding_intent: bool, chosen_engine: &str, reason: &str) {
-        let details = format!(
-            "User Prompt:   {:?}\nIs Coding:     {}\nEngine Chosen: {}\nRationale:     {}",
-            user_prompt, is_coding_intent, chosen_engine, reason
-        );
-        Self::log_event("HYBRID_ROUTE", &format!("DECISION -> {}", chosen_engine), &details);
-    }
 
     /// Logs Any System / Network / Parse Errors
     pub fn log_error(context: &str, error_msg: &str) {

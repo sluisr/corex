@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use directories::BaseDirs;
@@ -9,25 +9,14 @@ impl HistoryStore {
     fn history_file_path() -> PathBuf {
         let dir = BaseDirs::new()
             .map(|d| d.home_dir().join(".corex"))
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let _ = fs::create_dir_all(&dir);
+            .unwrap_or_else(|| PathBuf::from(".corex"));
+        let _ = crate::secure_fs::ensure_private_dir(&dir);
         dir.join("history")
     }
 
-    fn legacy_history_file_path() -> Option<PathBuf> {
-        BaseDirs::new().map(|d| d.home_dir().join(".uti").join("history"))
-    }
-
-    /// Loads history from ~/.corex/history with fallback to ~/.uti/history (oldest to newest)
+    /// Loads history from ~/.corex/history (oldest to newest)
     pub fn load() -> Vec<String> {
-        let mut path = Self::history_file_path();
-        if !path.exists() {
-            if let Some(legacy) = Self::legacy_history_file_path() {
-                if legacy.exists() {
-                    path = legacy;
-                }
-            }
-        }
+        let path = Self::history_file_path();
         if !path.exists() {
             return Vec::new();
         }
@@ -65,7 +54,7 @@ impl HistoryStore {
         }
 
         let path = Self::history_file_path();
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut file) = crate::secure_fs::open_private(&path, true) {
             let _ = writeln!(file, "{}", trimmed);
         }
     }

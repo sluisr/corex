@@ -24,4 +24,5 @@ chrono = { workspace = true }
 directories = { workspace = true }
 open = { workspace = true }
 unicode-width = "0.2"
+base64 = { workspace = true }
 

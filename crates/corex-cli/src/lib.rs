@@ -28,6 +28,10 @@ struct Cli {
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 
+    /// Perform live web search using DeepSeek native search engine (e.g. -w "query" or --web "query")
+    #[arg(short = 'w', long = "web")]
+    web: Option<String>,
+
     /// Model name override (e.g. -m deepseek-flash, --model deepseek-v4-pro)
     #[arg(short = 'm', short_alias = 'M', long = "model")]
     model: Option<String>,
@@ -68,13 +72,9 @@ struct Cli {
     #[arg(long)]
     local_model: Option<String>,
 
-    /// Disable hybrid compression of large tool outputs
-    #[arg(long)]
-    no_hybrid_compression: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     let workspace_dir = cli
@@ -113,14 +113,14 @@ async fn main() -> Result<()> {
         let current = env!("CARGO_PKG_VERSION");
         println!("Checking for Corex updates...");
         if let Some(newer) = corex_core::update::check_for_update_online(current).await {
-            println!("\n⚡ Update available: v{} → v{}\n", current, newer);
+            println!("\nUpdate available: v{} → v{}\n", current, newer);
             println!("To update Corex, run in your terminal:");
             println!("  • Via npm:       npm install -g corex-cli");
             println!("  • From source:   cargo install --git https://github.com/sluisr/corex.git --force");
             println!("  • Or download precompiled binaries from:");
             println!("    https://github.com/sluisr/corex/releases/latest\n");
         } else {
-            println!("✓ Corex is already on the latest version (v{}).", current);
+            println!("Corex is already on the latest version (v{}).", current);
         }
         return Ok(());
     }
@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
     tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
 
     let mut config = Config::load_with_workspace(Some(&workspace_dir));
-    let mut headless_prompt = cli.message;
+    let mut headless_prompt = cli.message.clone();
 
     if let Some(m) = cli.model {
         // Smart fallback: If a sentence with spaces or question mark was passed to --model, treat as headless prompt!
@@ -157,14 +157,35 @@ async fn main() -> Result<()> {
     if let Some(loc_m) = cli.local_model {
         config.local_llm_model = loc_m;
     }
-    if cli.no_hybrid_compression {
-        config.hybrid_compression = false;
-    }
     if cli.yolo {
         config.yolo_mode = true;
     }
 
     let llm_client = LlmClient::new(config.clone());
+
+    // Handle standalone --web / -w or `cx web <query>` search query
+    let web_search_query = cli.web.or_else(|| {
+        if cli.message.is_none() && !cli.query.is_empty() && (cli.query[0] == "web" || cli.query[0] == "/web" || cli.query[0] == "search" || cli.query[0] == "/search") {
+            let q = cli.query[1..].join(" ");
+            if !q.is_empty() {
+                Some(q)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some(query) = web_search_query {
+        let prompt = format!(
+            "Por favor busca en internet usando la herramienta web_search y responde de manera clara, directa y sintetizada con fuentes a: {}",
+            query
+        );
+        let display = format!("/web {}", query);
+        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode).await?;
+        return Ok(());
+    }
 
     // Check if headless mode requested via -m, -p, or positional args
     if headless_prompt.is_none() && !cli.query.is_empty() {
@@ -172,7 +193,7 @@ async fn main() -> Result<()> {
     }
 
     if let Some(prompt_text) = headless_prompt {
-        run_headless(llm_client, workspace_dir, prompt_text, config.yolo_mode).await?;
+        run_headless(llm_client, workspace_dir, prompt_text, None, config.yolo_mode).await?;
         return Ok(());
     }
 
@@ -207,6 +228,7 @@ async fn run_headless(
     client: LlmClient,
     workspace_dir: PathBuf,
     user_prompt: String,
+    display_prompt: Option<String>,
     yolo: bool,
 ) -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
@@ -222,7 +244,7 @@ async fn run_headless(
         Message::user(user_prompt.clone()),
     ];
 
-    println!("❯ {}", user_prompt);
+    println!("You: {}", display_prompt.as_deref().unwrap_or(&user_prompt));
 
     let tools = tool_registry.list_definitions();
     let context = ToolContext {
@@ -277,10 +299,22 @@ async fn run_headless(
             if let Some(handle) = self.handle.take() {
                 let _ = handle.await;
             }
+            print!("\r\x1b[2K");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
         }
     }
 
+    const MAX_HEADLESS_TURNS: usize = 35;
+    let mut turn_count = 0;
+
     loop {
+        turn_count += 1;
+        if turn_count > MAX_HEADLESS_TURNS {
+            eprintln!("\n[WARNING] Maximum headless tool iteration limit ({}) reached. Terminating loop to protect budget.", MAX_HEADLESS_TURNS);
+            break;
+        }
+
         let cancel_token = CancellationToken::new();
         let mut rx = client
             .stream_chat(messages.clone(), Some(tools.clone()), cancel_token.clone())
@@ -410,23 +444,34 @@ async fn run_headless(
                 } else if call.function.name == "glob" || call.function.name == "ls" || call.function.name == "list_directory" {
                     let p = args_json.get("path").or_else(|| args_json.get("dir")).and_then(|c| c.as_str()).unwrap_or(".");
                     ("Exploring directory", p)
+                } else if call.function.name == "web_search" || call.function.name == "google_web_search" {
+                    let q = args_json.get("query").and_then(|c| c.as_str()).unwrap_or("");
+                    ("Searching web", q)
+                } else if call.function.name == "web_fetch" {
+                    let u = args_json.get("url").and_then(|c| c.as_str()).unwrap_or("");
+                    ("Fetching web page", u)
                 } else {
                     ("Running tool", call.function.name.as_str())
                 };
 
-                let display_detail = corex_core::truncate_ellipsis(target_detail, 70);
+                let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(target_detail), 70);
 
                 // Prompt user for confirmation on potentially mutating/dangerous actions unless YOLO mode is enabled
                 if !context.yolo_mode {
                     if let Some(tool) = tool_registry.get(&call.function.name) {
                         if tool.needs_confirmation(&args_json, &context) {
+                            if is_tty {
+                                print!("\r\x1b[2K");
+                                use std::io::Write;
+                                let _ = std::io::stdout().flush();
+                            }
                             println!("\n[WARNING] Action requires confirmation: [{}]", call.function.name);
                             if let Some(diff) = tool.format_diff(&args_json, &context.workspace_dir) {
                                 println!("{}", diff);
                             } else if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
-                                println!("  Command: {}", cmd);
+                                println!("  Command: {}", corex_core::sanitize_for_terminal(cmd));
                             } else {
-                                println!("  Arguments: {}", serde_json::to_string_pretty(&args_json).unwrap_or_default());
+                                println!("  Arguments: {}", corex_core::sanitize_for_terminal(&serde_json::to_string_pretty(&args_json).unwrap_or_default()));
                             }
 
                             print!("Allow execution? [y/N]: ");

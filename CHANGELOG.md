@@ -7,15 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.2.1] - 2026-09-18
+## [0.3.0] - 2026-10-09
+
+### Breaking Changes
+- **Legacy `uti` Deprecated & Removed**: Fully removed legacy `uti` binary target, `UTI_API_KEY`, and automatic migration fallbacks from `~/.uti/`. Invocations are now exclusively **`cx`** and **`corex`**.
+- **CLI Crate Modular Architecture**: Refactored `corex-cli` from monolithic `main.rs` into a reusable library (`corex_cli`) with dedicated binary entrypoints (`src/bin/cx.rs`, `src/bin/corex.rs`).
 
 ### Added
-- **Official Rebranding to Corex (`cx`)**: The autonomous coding agent is now **Corex**, launched via the ultra-ergonomic command **`cx`** (adjacent keys on QWERTY keyboards for instant single-hand typing).
-- **Backwards Compatibility Aliases**: Maintained full backward compatibility for `corex` and `uti` binary invocations.
-- **Prompt Queuing While Streaming**: Users can now type or paste follow-up prompts and press `Enter` while the model is generating responses. Queued prompts appear with a clean non-emoji status badge (`[queued] <prompt> (pending)`) and automatically execute sequentially when the active turn completes.
-- **Non-blocking `/balance` Lookup**: `/balance` (and `/wallet`) now queries account token credits and currency balances asynchronously in the background with a 10s timeout, showing an immediate status notification and live-updating once the server responds without blocking terminal interaction.
-- **Seamless Config & History Migration**: Unified settings resolution checking `~/.corex/` first with fallback to `~/.uti/` and `~/.deepseek/`.
-- **New Environment Variable**: Added support for `COREX_API_KEY` with fallback to `UTI_API_KEY`, `DEEPSEEK_API_KEY`, and `OPENAI_API_KEY`.
+- **Native Clipboard Integration**: Terminal clipboard copy support via OSC 52 escape sequences and system clipboard integration.
+- **Prompt Queuing While Streaming**: Support for composing and pasting follow-up prompts while the model is streaming responses, with visual `[queued]` badges and sequential execution.
+- **Mouse Selection & Drag Scrolling**: Bidirectional mouse text selection in the chat viewport with copy support and edge drag scrolling.
+- **Fuzzy Patch Engine**: Enhanced `apply_patch` tool with fuzzy whitespace matching, accurate hunk offsets, fence stripping, and LF/CRLF preservation.
+- **Concurrency Locking & Secure Filesystem**: Path-based mutex locking (`lock_path`) to prevent file corruption during parallel operations, atomic private writes, and terminal escape sequence sanitization.
+- **Protected Paths Enforcement**: Path guard blocking modification or deletion of sensitive credentials (SSH, GPG, git configs, system paths) even in YOLO mode.
+- **Hardened Shell Sandbox**: Expanded safe command whitelist (`git`, `tar`, `unzip`, `systemctl`), malicious redirection prevention, and POSIX signal exit status tracking (`128 + signal`).
+- **Memory Compaction**: Automatic OS memory page reclamation on Linux via glibc `malloc_trim(0)` after large reasoning turns.
+- **Non-blocking Balance Queries**: `/balance` and `/wallet` run asynchronously in the background without freezing the TUI.
+- **Agent Skills Suite**: 8 specialized skills in `.agents/skills/` for local LLMs, FIM autocompletion, MCP setup, session management, and troubleshooting.
+- **CI & Security Auditing**: Added automated GitHub Actions workflow for clippy, cargo tests, and RustSec vulnerability audits.
+- **NPM Cryptographic Verification**: Corporate-grade SHA-256 binary checksum verification and redirect-safe download pipeline in the npm installer.
 
 ---
 
@@ -41,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-09-01
 
 ### Added
-- Initial release of **UTI CLI (Universal Terminal Intelligence)**.
+- Initial release of **Corex CLI**.
 - Pure native Rust architecture (Tokio, Ratatui, Crossterm).
 - DeepSeek V3 / V4 integration with native KV Cache discount tracking.
 - Local SLM engine support ($0.00 cost hybrid reasoning).

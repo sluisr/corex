@@ -55,91 +55,6 @@ impl Default for ProSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
-pub enum HybridMode {
-    #[default]
-    AutoTriage,
-    LocalScout,
-    DraftAndReview,
-    CompressionOnly,
-}
-
-impl HybridMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HybridMode::AutoTriage => "auto_triage",
-            HybridMode::LocalScout => "local_scout",
-            HybridMode::DraftAndReview => "draft_and_review",
-            HybridMode::CompressionOnly => "compression_only",
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            HybridMode::AutoTriage => "Auto-Triage",
-            HybridMode::LocalScout => "Local Scout",
-            HybridMode::DraftAndReview => "Draft & Review",
-            HybridMode::CompressionOnly => "Compression Only",
-        }
-    }
-
-    pub fn description(&self) -> &'static str {
-        match self {
-            HybridMode::AutoTriage => "Chat & quick local queries routed locally; heavy coding to DeepSeek.",
-            HybridMode::LocalScout => "Local model explores files & greps at $0.00; DeepSeek writes final patch.",
-            HybridMode::DraftAndReview => "Local model drafts solutions/tests; DeepSeek audits & refines.",
-            HybridMode::CompressionOnly => "All queries to Cloud; Local model compresses bulky tool outputs.",
-        }
-    }
-
-    pub fn from_str_loose(s: &str) -> Option<Self> {
-        let clean = s.trim().to_lowercase().replace('-', "_");
-        match clean.as_str() {
-            "auto_triage" | "triage" | "auto" | "1" => Some(HybridMode::AutoTriage),
-            "local_scout" | "scout" | "read_local" | "2" => Some(HybridMode::LocalScout),
-            "draft_and_review" | "draft" | "review" | "speculative" | "3" => Some(HybridMode::DraftAndReview),
-            "compression_only" | "compression" | "compress" | "4" => Some(HybridMode::CompressionOnly),
-            _ => None,
-        }
-    }
-}
-
-
-fn default_hybrid_mode() -> HybridMode {
-    HybridMode::CompressionOnly
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HybridSettings {
-    #[serde(default = "default_hybrid_primary_model")]
-    pub primary_model: String,
-    #[serde(default = "default_local_llm_url")]
-    pub local_url: String,
-    #[serde(default = "default_local_llm_model")]
-    pub secondary_local_model: String,
-    #[serde(default = "default_hybrid_compression")]
-    pub auto_compression: bool,
-    #[serde(default = "default_hybrid_mode")]
-    pub mode: HybridMode,
-}
-
-fn default_hybrid_primary_model() -> String {
-    "deepseek-flash".to_string()
-}
-
-impl Default for HybridSettings {
-    fn default() -> Self {
-        Self {
-            primary_model: default_hybrid_primary_model(),
-            local_url: default_local_llm_url(),
-            secondary_local_model: default_local_llm_model(),
-            auto_compression: true,
-            mode: HybridMode::CompressionOnly,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -148,6 +63,21 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+/// Subset of settings a workspace (`<repo>/.corex/settings.json`) may override.
+/// Every field is optional so that absent keys keep the user's global values.
+/// Security-sensitive keys are parsed only to warn that they are ignored.
+#[derive(Debug, Default, Deserialize)]
+struct LocalOverrides {
+    model: Option<String>,
+    temperature: Option<f32>,
+    reasoning_effort: Option<String>,
+    auto_compact: Option<bool>,
+    compact_threshold_tokens: Option<usize>,
+    local_prompt_lite: Option<bool>,
+    yolo_mode: Option<bool>,
+    local_llm_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,8 +97,6 @@ pub struct Config {
     #[serde(default)]
     pub pro_settings: ProSettings,
     #[serde(default)]
-    pub hybrid_settings: HybridSettings,
-    #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
     #[serde(default, skip)]
     pub sudo_password: Option<String>,
@@ -182,8 +110,6 @@ pub struct Config {
     pub local_llm_url: String,
     #[serde(default = "default_local_llm_model")]
     pub local_llm_model: String,
-    #[serde(default = "default_hybrid_compression")]
-    pub hybrid_compression: bool,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
     #[serde(default = "default_compact_threshold_tokens")]
@@ -211,34 +137,87 @@ fn default_local_llm_enabled() -> bool {
 }
 
 fn default_local_llm_url() -> String {
-    std::env::var("UTI_LOCAL_LLM_URL")
+    std::env::var("COREX_LOCAL_LLM_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string())
 }
 
 fn default_local_llm_model() -> String {
-    std::env::var("UTI_LOCAL_LLM_MODEL")
+    std::env::var("COREX_LOCAL_LLM_MODEL")
         .unwrap_or_else(|_| "local-model".to_string())
 }
 
-fn default_hybrid_compression() -> bool {
-    false
-}
 
+/// Default API key: only keys issued for the default provider (DeepSeek) or Corex itself.
+/// `OPENAI_API_KEY` is deliberately NOT used here: sending an OpenAI key to the DeepSeek endpoint
+/// leaks a credential to a third party. It is only honoured when `base_url` points to OpenAI
+/// (see [`Config::load_with_workspace`]).
 fn default_api_key() -> String {
-    std::env::var("UTI_API_KEY")
+    std::env::var("COREX_API_KEY")
         .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
         .unwrap_or_default()
 }
 
+/// Returns the host of `url`, lowercased, if it parses.
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+}
+
+fn host_is_or_sub(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{}", domain))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with("127.")
+}
+
+/// A remote `base_url` receives the API key in every request, so it must use TLS.
+/// Plain HTTP is only accepted for loopback (local LLM servers).
+pub fn validate_base_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid base_url '{}': {}", url, e))?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&host) => Ok(()),
+        other => Err(format!(
+            "base_url '{}' uses '{}': remote endpoints must use https (the API key is sent with every request)",
+            url, other
+        )),
+    }
+}
+
+/// True when `base_url` points to DeepSeek's official API.
+pub fn is_deepseek_base_url(url: &str) -> bool {
+    url_host(url).map(|h| host_is_or_sub(&h, "deepseek.com")).unwrap_or(false)
+}
+
+/// True when `base_url` points to OpenAI's official API.
+pub fn is_openai_base_url(url: &str) -> bool {
+    url_host(url).map(|h| host_is_or_sub(&h, "openai.com")).unwrap_or(false)
+}
+
+/// True for "pro"/reasoner model profiles. Matches whole name segments so that names such as
+/// `improved-coder` or `approx-7b` are not mistaken for the pro profile.
+pub fn is_pro_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("reasoner")
+        || m.split(|c: char| c == '-' || c == '_' || c == ':' || c == '/' || c == '.')
+            .any(|seg| seg == "pro")
+}
+
+fn default_base_url_static() -> &'static str {
+    "https://api.deepseek.com"
+}
+
 fn default_base_url() -> String {
-    std::env::var("UTI_BASE_URL")
+    std::env::var("COREX_BASE_URL")
         .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.deepseek.com".to_string())
+        .unwrap_or_else(|_| default_base_url_static().to_string())
 }
 
 fn default_model() -> String {
-    std::env::var("UTI_MODEL")
+    std::env::var("COREX_MODEL")
         .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
         .unwrap_or_else(|_| "deepseek-flash".to_string())
 }
@@ -261,7 +240,6 @@ impl Default for Config {
             temperature: default_temperature(),
             flash_settings: FlashSettings::default(),
             pro_settings: ProSettings::default(),
-            hybrid_settings: HybridSettings::default(),
             mcp_servers: HashMap::new(),
             sudo_password: None,
             yolo_mode: false,
@@ -269,7 +247,6 @@ impl Default for Config {
             local_llm_enabled: default_local_llm_enabled(),
             local_llm_url: default_local_llm_url(),
             local_llm_model: default_local_llm_model(),
-            hybrid_compression: default_hybrid_compression(),
             auto_compact: default_auto_compact(),
             compact_threshold_tokens: default_compact_threshold_tokens(),
             local_prompt_lite: false,
@@ -285,19 +262,11 @@ impl Config {
             if corex_local.exists() {
                 return Some(corex_local);
             }
-            let uti_local = ws.join(".uti").join(filename);
-            if uti_local.exists() {
-                return Some(uti_local);
-            }
         }
         if let Some(dirs) = BaseDirs::new() {
             let corex_global = dirs.home_dir().join(".corex").join(filename);
             if corex_global.exists() {
                 return Some(corex_global);
-            }
-            let uti_global = dirs.home_dir().join(".uti").join(filename);
-            if uti_global.exists() {
-                return Some(uti_global);
             }
             let legacy = dirs.home_dir().join(".deepseek").join(filename);
             if legacy.exists() {
@@ -310,26 +279,40 @@ impl Config {
     fn save_to_destinations(content: &str, filename: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
         let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
         if let Some(ws) = workspace {
-            let dir = if ws.join(".corex").exists() {
-                Some(ws.join(".corex"))
-            } else if ws.join(".uti").exists() {
-                Some(ws.join(".uti"))
-            } else {
-                None
-            };
-            if let Some(d) = dir {
-                let _ = fs::write(d.join(filename), content);
+            let dir = ws.join(".corex");
+            if dir.exists() {
+                // Workspace copies must never carry credentials: they live inside a repository
+                // that may be committed or shared.
+                let sanitized = Self::strip_secrets(content);
+                if let Err(e) = crate::secure_fs::write_private_atomic(&dir.join(filename), sanitized) {
+                    tracing::warn!("Failed to save workspace settings {}: {}", dir.join(filename).display(), e);
+                    if is_temp {
+                        return Err(e.into());
+                    }
+                }
             }
         }
         if !is_temp {
             if let Some(dirs) = BaseDirs::new() {
                 let dir = dirs.home_dir().join(".corex");
-                fs::create_dir_all(&dir)?;
-                let file = dir.join(filename);
-                fs::write(file, content)?;
+                crate::secure_fs::ensure_private_dir(&dir)?;
+                crate::secure_fs::write_private_atomic(&dir.join(filename), content)?;
             }
         }
         Ok(())
+    }
+
+    /// Removes `api_key` from a serialized settings document.
+    fn strip_secrets(content: &str) -> String {
+        match serde_json::from_str::<serde_json::Value>(content) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("api_key");
+                }
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| content.to_string())
+            }
+            Err(_) => content.to_string(),
+        }
     }
 
     pub fn load_flash_settings() -> FlashSettings {
@@ -380,29 +363,6 @@ impl Config {
         Self::save_to_destinations(&content, "pro_settings.json", workspace)
     }
 
-    pub fn load_hybrid_settings() -> HybridSettings {
-        Self::load_hybrid_settings_with_workspace(None)
-    }
-
-    pub fn load_hybrid_settings_with_workspace(workspace: Option<&Path>) -> HybridSettings {
-        if let Some(path) = Self::resolve_settings_path(workspace, "hybrid_settings.json") {
-            if let Ok(c) = fs::read_to_string(&path) {
-                if let Ok(parsed) = serde_json::from_str::<HybridSettings>(&c) {
-                    return parsed;
-                }
-            }
-        }
-        HybridSettings::default()
-    }
-
-    pub fn save_hybrid_settings(settings: &HybridSettings) -> anyhow::Result<()> {
-        Self::save_hybrid_settings_with_workspace(settings, None)
-    }
-
-    pub fn save_hybrid_settings_with_workspace(settings: &HybridSettings, workspace: Option<&Path>) -> anyhow::Result<()> {
-        let content = serde_json::to_string_pretty(settings)?;
-        Self::save_to_destinations(&content, "hybrid_settings.json", workspace)
-    }
 
     pub fn load() -> Self {
         Self::load_with_workspace(None)
@@ -411,7 +371,7 @@ impl Config {
     pub fn load_with_workspace(workspace: Option<&Path>) -> Self {
         let mut config = Config::default();
 
-        // 1. Global config (~/.corex/settings.json, fallback ~/.uti/settings.json, fallback ~/.deepseek/settings.json)
+        // 1. Global config (~/.corex/settings.json, fallback ~/.deepseek/settings.json)
         if let Some(path) = Self::resolve_settings_path(None, "settings.json") {
             if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(parsed) = serde_json::from_str::<Config>(&content) {
@@ -420,44 +380,57 @@ impl Config {
             }
         }
 
-        // 2. Local project config (.corex/settings.json or .uti/settings.json) override (safe merge)
+        // 2. Local project config (.corex/settings.json) override (safe merge).
+        //
+        // SECURITY: the workspace is untrusted input (a cloned repository). Its config may only
+        // tune cosmetic/performance knobs. It can NEVER relax security or touch credentials and
+        // endpoints: `yolo_mode`, `local_llm_enabled`, `api_key`, `base_url`, `allowed_commands`
+        // and `mcp_servers` are ignored here. Fields are `Option` so that a key absent from the
+        // file does not silently reset the user's global value to a serde default.
         if let Some(ws) = workspace {
-            let local_candidates = [
-                ws.join(".corex").join("settings.json"),
-                ws.join(".uti").join("settings.json"),
-            ];
-            for local_path in &local_candidates {
-                if local_path.exists() {
-                    if let Ok(content) = fs::read_to_string(local_path) {
-                        if let Ok(parsed) = serde_json::from_str::<Config>(&content) {
-                            if !parsed.model.is_empty() {
-                                config.model = parsed.model;
-                            }
-                            config.temperature = parsed.temperature;
-                            config.reasoning_effort = parsed.reasoning_effort;
-                            config.yolo_mode = parsed.yolo_mode;
-                            config.auto_compact = parsed.auto_compact;
-                            config.compact_threshold_tokens = parsed.compact_threshold_tokens;
-                            config.local_llm_enabled = parsed.local_llm_enabled;
-
-                            // SECURITY: Do not let untrusted repository configs hijack credentials
-                            if config.api_key.is_empty() && !parsed.api_key.is_empty() {
-                                config.api_key = parsed.api_key;
-                            }
-                            break;
+            let local_path = ws.join(".corex").join("settings.json");
+            if local_path.exists() {
+                match fs::read_to_string(&local_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| serde_json::from_str::<LocalOverrides>(&c).map_err(|e| e.to_string()))
+                {
+                    Ok(o) => {
+                        if let Some(m) = o.model.filter(|m| !m.trim().is_empty()) {
+                            config.model = m;
+                        }
+                        if let Some(t) = o.temperature {
+                            config.temperature = t;
+                        }
+                        if let Some(r) = o.reasoning_effort.filter(|r| !r.trim().is_empty()) {
+                            config.reasoning_effort = r;
+                        }
+                        if let Some(a) = o.auto_compact {
+                            config.auto_compact = a;
+                        }
+                        if let Some(t) = o.compact_threshold_tokens {
+                            config.compact_threshold_tokens = t;
+                        }
+                        if let Some(l) = o.local_prompt_lite {
+                            config.local_prompt_lite = l;
+                        }
+                        if o.yolo_mode == Some(true) || o.local_llm_enabled.is_some() {
+                            tracing::warn!(
+                                "Ignoring security-sensitive keys (yolo_mode/local_llm_enabled) in {}",
+                                local_path.display()
+                            );
                         }
                     }
+                    Err(e) => tracing::warn!("Ignoring invalid {}: {}", local_path.display(), e),
                 }
             }
         }
 
-        // Load disk-persisted flash, pro and hybrid settings
+        // Load disk-persisted flash and pro settings
         config.flash_settings = Self::load_flash_settings_with_workspace(workspace);
         config.pro_settings = Self::load_pro_settings_with_workspace(workspace);
-        config.hybrid_settings = Self::load_hybrid_settings_with_workspace(workspace);
 
         // Apply active model's reasoning/temp defaults from settings
-        if config.model.contains("reasoner") || config.model.contains("pro") {
+        if is_pro_model(&config.model) {
             config.reasoning_effort = config.pro_settings.reasoning_effort.clone();
         } else {
             config.temperature = config.flash_settings.temperature;
@@ -465,57 +438,58 @@ impl Config {
         }
 
         if let Ok(k) = std::env::var("COREX_API_KEY")
-            .or_else(|_| std::env::var("UTI_API_KEY"))
             .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
         {
             if !k.is_empty() {
                 config.api_key = k;
             }
         }
         if let Ok(u) = std::env::var("COREX_BASE_URL")
-            .or_else(|_| std::env::var("UTI_BASE_URL"))
             .or_else(|_| std::env::var("DEEPSEEK_BASE_URL"))
         {
             if !u.is_empty() {
                 config.base_url = u;
             }
         }
+        if let Err(e) = validate_base_url(&config.base_url) {
+            tracing::warn!("{}; falling back to {}", e, default_base_url_static());
+            eprintln!("[corex] warning: {}; falling back to {}", e, default_base_url_static());
+            config.base_url = default_base_url_static().to_string();
+        }
+        // OpenAI keys are only ever sent to OpenAI.
+        if config.api_key.trim().is_empty() && is_openai_base_url(&config.base_url) {
+            if let Ok(k) = std::env::var("OPENAI_API_KEY") {
+                config.api_key = k;
+            }
+        }
         if let Ok(m) = std::env::var("COREX_MODEL")
-            .or_else(|_| std::env::var("UTI_MODEL"))
             .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
         {
             if !m.is_empty() {
                 config.model = m;
             }
         }
-        if let Ok(l_url) = std::env::var("COREX_LOCAL_LLM_URL").or_else(|_| std::env::var("UTI_LOCAL_LLM_URL")) {
+        if let Ok(l_url) = std::env::var("COREX_LOCAL_LLM_URL") {
             if !l_url.is_empty() {
                 config.local_llm_url = l_url;
             }
         }
-        if let Ok(l_model) = std::env::var("COREX_LOCAL_LLM_MODEL").or_else(|_| std::env::var("UTI_LOCAL_LLM_MODEL")) {
+        if let Ok(l_model) = std::env::var("COREX_LOCAL_LLM_MODEL") {
             if !l_model.is_empty() {
                 config.local_llm_model = l_model;
             }
         }
-        if let Ok(l_en) = std::env::var("COREX_LOCAL_LLM_ENABLED").or_else(|_| std::env::var("UTI_LOCAL_LLM_ENABLED")) {
+        if let Ok(l_en) = std::env::var("COREX_LOCAL_LLM_ENABLED") {
             config.local_llm_enabled = l_en != "0" && l_en.to_lowercase() != "false";
-        }
-        if let Ok(h_comp) = std::env::var("COREX_HYBRID_COMPRESSION").or_else(|_| std::env::var("UTI_HYBRID_COMPRESSION")) {
-            config.hybrid_compression = h_comp != "0" && h_comp.to_lowercase() != "false";
-        }
-        if let Ok(h_mode) = std::env::var("COREX_HYBRID_MODE").or_else(|_| std::env::var("UTI_HYBRID_MODE")) {
-            if let Some(m) = HybridMode::from_str_loose(&h_mode) {
-                config.hybrid_settings.mode = m;
-            }
         }
 
         config
     }
 
     fn load_existing_api_key(workspace: Option<&Path>) -> Option<String> {
-        if let Some(path) = Self::resolve_settings_path(workspace, "settings.json") {
+        // Credentials are only ever read from the user's global config, never from a workspace.
+        let _ = workspace;
+        if let Some(path) = Self::resolve_settings_path(None, "settings.json") {
             if let Ok(c) = fs::read_to_string(&path) {
                 if let Ok(parsed) = serde_json::from_str::<Config>(&c) {
                     if !parsed.api_key.trim().is_empty() {
@@ -525,9 +499,7 @@ impl Config {
             }
         }
         if let Ok(k) = std::env::var("COREX_API_KEY")
-            .or_else(|_| std::env::var("UTI_API_KEY"))
             .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-            .or_else(|_| std::env::var("OPENAI_API_KEY"))
         {
             if !k.trim().is_empty() {
                 return Some(k);
@@ -557,48 +529,24 @@ impl Config {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_hybrid_mode_parsing() {
-        assert_eq!(HybridMode::from_str_loose("triage"), Some(HybridMode::AutoTriage));
-        assert_eq!(HybridMode::from_str_loose("auto_triage"), Some(HybridMode::AutoTriage));
-        assert_eq!(HybridMode::from_str_loose("scout"), Some(HybridMode::LocalScout));
-        assert_eq!(HybridMode::from_str_loose("local-scout"), Some(HybridMode::LocalScout));
-        assert_eq!(HybridMode::from_str_loose("review"), Some(HybridMode::DraftAndReview));
-        assert_eq!(HybridMode::from_str_loose("compression"), Some(HybridMode::CompressionOnly));
-        assert_eq!(HybridMode::from_str_loose("invalid"), None);
-    }
-
-    #[test]
-    fn test_hybrid_settings_serialization() {
-        let settings = HybridSettings {
-            primary_model: "deepseek-flash".to_string(),
-            local_url: "http://127.0.0.1:8080/v1".to_string(),
-            secondary_local_model: "Llama-3.2-3B-Instruct".to_string(),
-            auto_compression: true,
-            mode: HybridMode::LocalScout,
-        };
-
-        let json = serde_json::to_string(&settings).expect("serialize");
-        let deserialized: HybridSettings = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(deserialized.mode, HybridMode::LocalScout);
-        assert_eq!(deserialized.auto_compression, true);
-    }
 
     #[test]
     fn test_workspace_config_override() {
-        let unique = format!("uti_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let unique = format!("corex_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         let temp_dir = std::env::temp_dir().join(unique);
-        let uti_dir = temp_dir.join(".uti");
-        fs::create_dir_all(&uti_dir).expect("create dir");
+        let corex_dir = temp_dir.join(".corex");
+        fs::create_dir_all(&corex_dir).expect("create dir");
 
-        let mut config = Config::default();
-        config.model = "deepseek-v4-pro".to_string();
-        config.local_llm_enabled = false;
+        let config = Config {
+            model: "deepseek-v4-pro".to_string(),
+            local_llm_enabled: false,
+            ..Default::default()
+        };
         config.save_with_workspace(Some(&temp_dir)).expect("save");
 
         let loaded = Config::load_with_workspace(Some(&temp_dir));
         assert_eq!(loaded.model, "deepseek-v4-pro");
-        assert_eq!(loaded.local_llm_enabled, false);
+        assert!(!loaded.local_llm_enabled);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

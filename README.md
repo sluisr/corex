@@ -191,7 +191,7 @@ llama-server -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080 -c 8192
 
 ### Interactive TUI Mode
 
-Launch the interactive terminal UI in any project directory with the lightning-fast command `cx` (or aliases `corex` / `uti`):
+Launch the interactive terminal UI in any project directory with the lightning-fast command `cx` (or alias `corex`):
 
 ```bash
 cd my-project/
@@ -242,7 +242,7 @@ Corex equips DeepSeek with native developer tools for autonomous development:
 * **⚙️ Background Task Management (`manage_task`):** Unified task controller matching Antigravity architecture (`list`, `status`, `kill`, `send_input`).
 * **🌐 Web Fetch (`web_fetch`):** HTTP fetching and markdown extraction for online documentation and APIs.
 * **📋 Task Tracking (`write_todos`):** Dynamic multi-step task list tracking and progress monitoring.
-* **🧠 Persistent Memory:** Project-level (`./COREX.md` / `./UTI.md`) and global (`~/.corex/COREX.md`) persistent context.
+* **🧠 Persistent Memory:** Project-level (`./COREX.md`) and global (`~/.corex/COREX.md`) persistent context.
 
 ---
 
@@ -274,7 +274,7 @@ Token & Cost Forensics:
 
 ## ⚙️ Configuration
 
-Settings are stored in `~/.corex/` (with automatic fallback to legacy `~/.uti/`):
+Settings are stored in `~/.corex/`:
 
 * `~/.corex/settings.json` — API credentials, base URL, default models.
 * `~/.corex/flash_settings.json` — CoT reasoning effort depths (`none` / `low` / `high` / `xhigh` / `max`).

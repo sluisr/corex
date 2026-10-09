@@ -1,6 +1,7 @@
 pub mod app;
 pub mod ascii;
 pub mod auth_dialog;
+pub mod clipboard;
 pub mod diff_view;
 pub mod markdown;
 pub mod model_dialog;

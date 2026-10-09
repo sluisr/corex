@@ -285,7 +285,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corex-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "corex-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "corex-prompt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "corex-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -366,9 +366,10 @@ dependencies = [
 
 [[package]]
 name = "corex-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "corex-core",
  "corex-prompt",

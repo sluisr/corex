@@ -5,18 +5,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "cx"
-path = "src/main.rs"
-
-[[bin]]
-name = "corex"
-path = "src/main.rs"
-
-[[bin]]
-name = "uti"
-path = "src/main.rs"
-
 [dependencies]
 corex-core = { workspace = true }
 corex-tools = { workspace = true }

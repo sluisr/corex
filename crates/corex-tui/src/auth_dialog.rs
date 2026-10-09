@@ -62,17 +62,18 @@ pub fn render_auth_dialog(
     render_scrim(frame, area);
     frame.render_widget(Clear, dialog_area);
 
-    let mut lines = Vec::new();
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Enter your DeepSeek API key for Cloud AI models:",
-        Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("  Saved securely in ", Style::default().fg(theme.gray)),
-        Span::styled("~/.uti/settings.json", Style::default().fg(theme.accent_cyan)),
-    ]));
-    lines.push(Line::from(""));
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter your DeepSeek API key for Cloud AI models:",
+            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("  Saved securely in ", Style::default().fg(theme.gray)),
+            Span::styled("~/.corex/settings.json", Style::default().fg(theme.accent_cyan)),
+        ]),
+        Line::from(""),
+    ];
 
     // Masked input box with stylish formatting
     let (input_span, cursor) = if state.input_buffer.is_empty() {
@@ -81,14 +82,15 @@ pub fn render_auth_dialog(
             Span::styled("█", Style::default().fg(theme.accent_blue)),
         )
     } else {
-        let buf = &state.input_buffer;
-        let masked = if buf.len() > 8 {
-            let prefix = &buf[..buf.len().min(4)];
-            let suffix = &buf[buf.len() - 4..];
-            let stars = "*".repeat(buf.len().saturating_sub(8));
+        let chars: Vec<char> = state.input_buffer.chars().collect();
+        let total_chars = chars.len();
+        let masked = if total_chars > 8 {
+            let prefix: String = chars[..4].iter().collect();
+            let suffix: String = chars[total_chars - 4..].iter().collect();
+            let stars = "*".repeat(total_chars - 8);
             format!("{}{}{}", prefix, stars, suffix)
         } else {
-            "*".repeat(buf.len())
+            "*".repeat(total_chars)
         };
         (
             Span::styled(masked, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -105,7 +107,7 @@ pub fn render_auth_dialog(
 
     if let Some(ref err) = state.error_msg {
         lines.push(Line::from(Span::styled(
-            format!("  ❌ {}", err),
+            format!("  ✕ {}", err),
             Style::default().fg(Color::LightRed),
         )));
     } else {
@@ -131,7 +133,7 @@ pub fn render_auth_dialog(
         .borders(Borders::ALL)
         .border_set(ratatui::symbols::border::PLAIN)
         .border_style(Style::default().fg(theme.accent_blue))
-        .title(" 🔑 DeepSeek API Key ")
+        .title(" DeepSeek API Key ")
         .title_alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(Paragraph::new(lines).block(block), dialog_area);

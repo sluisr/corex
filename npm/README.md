@@ -21,7 +21,7 @@ npx corex-cli
 
 ## 🚀 Usage
 
-Once installed, simply run the ultra-ergonomic command `cx` (or aliases `corex` / `uti`):
+Once installed, simply run the ultra-ergonomic command `cx` (or alias `corex`):
 
 ```bash
 cx

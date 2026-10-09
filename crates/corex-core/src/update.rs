@@ -15,10 +15,6 @@ fn get_cache_path() -> Option<PathBuf> {
     BaseDirs::new().map(|d| d.home_dir().join(".corex").join("cache").join("update_check.json"))
 }
 
-fn get_legacy_cache_path() -> Option<PathBuf> {
-    BaseDirs::new().map(|d| d.home_dir().join(".uti").join("cache").join("update_check.json"))
-}
-
 /// Parses semver string like "v0.2.1" or "0.2.0" into (major, minor, patch).
 pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     let clean = v.trim().trim_start_matches('v');
@@ -42,8 +38,7 @@ pub fn is_newer_version(current: &str, candidate: &str) -> bool {
 
 /// Reads the local disk cache. If a cached version exists and is newer than current, returns Some(version).
 pub fn check_cached_update(current_version: &str) -> Option<String> {
-    let path = get_cache_path().and_then(|p| if p.exists() { Some(p) } else { None })
-        .or_else(|| get_legacy_cache_path().and_then(|p| if p.exists() { Some(p) } else { None }))?;
+    let path = get_cache_path().filter(|p| p.exists())?;
 
     let content = fs::read_to_string(path).ok()?;
     let cache: UpdateCache = serde_json::from_str(&content).ok()?;
@@ -79,10 +74,8 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         .build()
         .ok()?;
 
-    // Try primary sluisr/corex first, then fallback to sluisr/uti-cli
     let repo_endpoints = [
         "https://api.github.com/repos/sluisr/corex",
-        "https://api.github.com/repos/sluisr/uti-cli",
     ];
 
     for base in repo_endpoints {
@@ -93,8 +86,8 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     if let Some(tag) = val.get("tag_name").and_then(|t| t.as_str()) {
                         let clean_tag = tag.trim_start_matches('v').to_string();
-                        save_cache(&clean_tag);
                         if is_newer_version(current_version, &clean_tag) {
+                            save_cache(&clean_tag);
                             return Some(clean_tag);
                         }
                     }
@@ -111,8 +104,8 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
                         for item in tags_array {
                             if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                                 let clean_tag = name.trim_start_matches('v').to_string();
-                                save_cache(&clean_tag);
                                 if is_newer_version(current_version, &clean_tag) {
+                                    save_cache(&clean_tag);
                                     return Some(clean_tag);
                                 }
                                 break;

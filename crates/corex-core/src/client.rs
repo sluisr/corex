@@ -70,7 +70,7 @@ impl LlmClient {
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
-            .expect("Failed to build HTTP client");
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         let local_client = crate::local_client::LocalLlmClient::new(
             &config.local_llm_url,
@@ -86,7 +86,9 @@ impl LlmClient {
     }
 
     pub fn get_config(&self) -> Config {
-        self.config.lock().unwrap().clone()
+        self.config.lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     pub fn update_config(&self, new_config: Config) {
@@ -103,11 +105,56 @@ impl LlmClient {
     }
 
     pub fn local_client(&self) -> crate::local_client::LocalLlmClient {
-        self.local_client.lock().unwrap().clone()
+        self.local_client.lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
     }
 
     pub fn reasoning_cache(&self) -> &ReasoningCache {
         &self.reasoning_cache
+    }
+
+    /// Heals accidental Chinese drift by asking the LLM to re-express the text in the user's conversation language dynamically.
+    pub async fn heal_cjk_drift(&self, text: &str) -> anyhow::Result<String> {
+        let cfg = self.get_config();
+        if cfg.api_key.trim().is_empty() {
+            anyhow::bail!("No API key configured for translation");
+        }
+        let prompt = format!(
+            "The following response unintentionally drifted into Chinese. \
+            Re-express and translate it accurately into the exact language of the user's conversation. \
+            Preserve all markdown formatting, tables, bullet points, source links, and code blocks exactly. \
+            Output ONLY the translation with no preamble or commentary:\n\n{}",
+            text
+        );
+        let request_body = serde_json::json!({
+            "model": "deepseek-flash",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048
+        });
+        let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+        let resp = self.http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", cfg.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+
+        let val: serde_json::Value = resp.json().await?;
+        let translated = val.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| anyhow::anyhow!("Empty translation response"))?;
+
+        Ok(translated)
     }
 
     /// Sanitizes message sequences to satisfy DeepSeek/OpenAI schema requirements:
@@ -213,75 +260,13 @@ impl LlmClient {
     /// result, but not enough to break the bank.
     const TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
 
-    pub async fn compress_or_truncate_tool_outputs(&self, messages: &mut [Message]) {
-        let cfg = self.get_config();
-        let local_available = cfg.local_llm_enabled && (cfg.hybrid_compression || cfg.hybrid_settings.auto_compression);
-
-        let local_client = if local_available {
-            let client = self.local_client();
-            if client.health_check().await {
-                Some(client)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // ⚡ KV CACHE IMMUTABILITY GUARANTEE:
-        // Find the boundary of the current turn's tool outputs (trailing block of tool messages).
-        // Historical messages prior to the latest assistant message MUST remain strictly immutable
-        // to guarantee a 100% KV Cache hit rate on DeepSeek / OpenAI prefix caching.
+    pub fn truncate_tool_outputs(messages: &mut [Message]) {
         let first_active_tool_idx = match messages.iter().rposition(|m| m.role == "assistant") {
             Some(pos) => pos + 1,
             None => 0,
         };
 
-        // Collect indices of active tool messages that need local compression
-        let mut compression_candidates = Vec::new();
-        for (idx, msg) in messages.iter().enumerate().skip(first_active_tool_idx) {
-            if msg.role == "tool" {
-                if let Some(content) = msg.text_content() {
-                    // Only compress if not already compressed (preserves Prefix KV Cache for past turns!)
-                    if content.len() > 1_500
-                        && !content.contains("[⚡ Synthesized & compressed")
-                        && !content.contains("chars truncated to save tokens")
-                    {
-                        compression_candidates.push((idx, content.to_string()));
-                    }
-                }
-            }
-        }
-
-        if let Some(ref local) = local_client {
-            if !compression_candidates.is_empty() {
-                let mut futures = Vec::new();
-                for (idx, content) in compression_candidates {
-                    let local = local.clone();
-                    futures.push(tokio::spawn(async move {
-                        let tool_name = "tool_output";
-                        let summary = local.summarize_tool_output(tool_name, &content).await;
-                        (idx, content, summary)
-                    }));
-                }
-
-                let results = futures_util::future::join_all(futures).await;
-                for res in results {
-                    if let Ok((idx, orig_content, Ok(summary))) = res {
-                        if !summary.trim().is_empty() && summary.len() < orig_content.len() {
-                            debug!("[HYBRID] Compressed tool output at index {} from {} to {} chars", idx, orig_content.len(), summary.len());
-                            messages[idx].content = Some(format!(
-                                "{}\n\n[⚡ Synthesized & compressed by Local LLM (saved ~{} tokens)]",
-                                summary.trim(),
-                                (orig_content.len().saturating_sub(summary.len())) / 4
-                            ).into());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Final safety truncation for any newly generated active tool output still exceeding TOOL_OUTPUT_MAX_CHARS
+        // Safety truncation for active tool output exceeding TOOL_OUTPUT_MAX_CHARS
         for msg in messages[first_active_tool_idx..].iter_mut() {
             if msg.role == "tool" {
                 if let Some(content) = msg.text_content().map(|s| s.to_string()) {
@@ -393,20 +378,6 @@ impl LlmClient {
 
         let mut summary_opt: Option<String> = None;
 
-        // 1. Try local SLM first (100% free @ $0.00)
-        let local_client = self.local_client();
-        if local_client.health_check().await {
-            let digest = format!(
-                "User Requests in Compacted Turns:\n{}\n\nTool Actions:\n{}",
-                user_requests.join("\n"),
-                tool_actions.join("\n")
-            );
-            if let Ok(local_sum) = local_client.compact_conversation(&digest).await {
-                if !local_sum.trim().is_empty() {
-                    summary_opt = Some(local_sum.trim().to_string());
-                }
-            }
-        }
 
         // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
         if summary_opt.is_none() && !cfg.api_key.trim().is_empty() {
@@ -417,7 +388,7 @@ impl LlmClient {
                 tool_actions.join("\n")
             );
             let request_body = serde_json::json!({
-                "model": if cfg.base_url.contains("deepseek.com") { "deepseek-chat" } else { "deepseek-flash" },
+                "model": "deepseek-flash",
                 "messages": [
                     {"role": "system", "content": summary_system},
                     {"role": "user", "content": digest}
@@ -533,10 +504,9 @@ impl LlmClient {
         if cfg.model.starts_with("local") {
             let local_client = self.local_client();
             if local_client.health_check().await {
-                crate::forensic::ForensicLogger::log_hybrid_decision(
-                    messages.last().and_then(|m| m.text_content()).unwrap_or(""),
-                    false,
-                    "LOCAL_LLM (STANDALONE_OFFLINE)",
+                crate::forensic::ForensicLogger::log_event(
+                    "LOCAL_LLM",
+                    "STANDALONE_OFFLINE",
                     "Running 100% offline on Local LLM (zero Cloud dependency, $0.00)."
                 );
                 return local_client.stream_chat(messages, tools, cancel_token).await;
@@ -547,35 +517,6 @@ impl LlmClient {
                     let _ = tx.send(StreamEvent::Error(err_msg)).await;
                 });
                 return Ok(rx);
-            }
-        }
-
-        let mut offline_fallback_notice: Option<String> = None;
-
-        // ⚡ MULTI-MODE DYNAMIC HYBRID ROUTING:
-        if cfg.local_llm_enabled {
-            let local_client = self.local_client();
-            let is_local_online = local_client.health_check().await;
-
-            if !is_local_online {
-                let is_tool_call_in_progress = messages.last().map(|m| m.role == "tool").unwrap_or(false);
-                if !is_tool_call_in_progress {
-                    offline_fallback_notice = Some(format!(
-                        "Local LLM is offline at {}. Using Cloud API.",
-                        cfg.local_llm_url
-                    ));
-                }
-                // Graceful fallback to DeepSeek Cloud without crashing or blocking the session!
-                crate::forensic::ForensicLogger::log_event(
-                    "HYBRID_FALLBACK",
-                    "LOCAL_OFFLINE -> CLOUD_FALLBACK",
-                    &format!("Local server unreachable at {}. Seamlessly falling back to DeepSeek Cloud.", cfg.local_llm_url)
-                );
-                debug!("[HYBRID_ROUTER] Local server offline at {}; fallback to DeepSeek Cloud", cfg.local_llm_url);
-            } else {
-                // Hybrid Mode: All agent turns run on DeepSeek Cloud with full tools,
-                // while the Local LLM handles parallel output compression & token reduction.
-                debug!("[HYBRID_ROUTER] Hybrid active; delegating agent turn to DeepSeek Cloud");
             }
         }
 
@@ -602,8 +543,25 @@ impl LlmClient {
         Self::cap_history_if_needed(&mut messages);
         // 3. Sanitize tool call sequences so no orphaned messages exist
         Self::sanitize_tool_call_sequences(&mut messages);
-        // 4. Compress tool outputs in parallel (preserving past turns for KV Cache hit)
-        self.compress_or_truncate_tool_outputs(&mut messages).await;
+        // 4. Truncate active tool outputs exceeding safety limits
+        Self::truncate_tool_outputs(&mut messages);
+
+        // 5. Sanitize any past CJK drift from history if user didn't request Chinese
+        crate::language::sanitize_messages_cjk_drift(&mut messages);
+
+        // 5b. Heal history written by older builds, which spliced the recency anchor onto the
+        // trailing tool output and persisted it into the session file on disk. Must run before
+        // step 6 applies a fresh anchor, so we strip the stale splice rather than dedupe on it.
+        crate::language::sanitize_messages_recency_anchor(&mut messages);
+
+        // 6. ⚡ DYNAMIC RECENCY LANGUAGE ANCHOR:
+        // When synthesizing tool outputs (especially long web search or command dumps),
+        // DeepSeek's attention to the system prompt degrades, causing it to fall back to base
+        // multilingual training (Chinese drift). We re-anchor the dynamic language constraint at
+        // the tail of the context window as a standalone message, never inside a tool payload:
+        // tool results are untrusted data, so splicing an instruction there would be read as
+        // file contents and would contradict the instruction to ignore directives in tool output.
+        crate::language::apply_recency_anchor(&mut messages);
 
         if let Some(ref mut t_list) = tools {
             Self::sort_tools(t_list);
@@ -636,31 +594,24 @@ impl LlmClient {
             }
         }
 
-        let is_official_deepseek = cfg.base_url.contains("deepseek.com");
-        let api_model = if cfg.model == "deepseek-chat" {
-            "deepseek-chat".to_string()
-        } else if cfg.model == "deepseek-reasoner" {
-            "deepseek-reasoner".to_string()
-        } else if cfg.model.contains("pro") || cfg.model.contains("reasoner") || cfg.model.contains("Pro") {
-            if is_official_deepseek {
-                "deepseek-reasoner".to_string()
-            } else {
-                "deepseek-v4-pro".to_string()
-            }
+        let api_model = if cfg.model == "deepseek-v4-pro"
+            || cfg.model == "deepseek-reasoner"
+            || cfg.model.contains("pro")
+            || cfg.model.contains("reasoner")
+            || cfg.model.contains("Pro")
+        {
+            "deepseek-v4-pro".to_string()
         } else if cfg.model == "deepseek-flash"
             || cfg.model == "deepseek-v4.1-flash"
             || cfg.model == "deepseek-v4-flash"
             || cfg.model == "deepseek-v4-flash-vision-exp"
+            || cfg.model == "deepseek-chat"
             || cfg.model.contains("flash")
             || cfg.model.contains("Flash")
             || cfg.model.contains("vision")
             || cfg.model.contains("Vision")
         {
-            if is_official_deepseek {
-                "deepseek-chat".to_string()
-            } else {
-                "deepseek-flash".to_string()
-            }
+            "deepseek-flash".to_string()
         } else {
             cfg.model.clone()
         };
@@ -714,8 +665,12 @@ impl LlmClient {
             Some(normalized_reasoning_effort)
         };
 
-        let effective_temperature = if api_model.contains("flash") {
-            Some(cfg.flash_settings.temperature)
+        let effective_temperature = if is_thinking_disabled {
+            if api_model.contains("flash") {
+                Some(cfg.flash_settings.temperature)
+            } else {
+                Some(cfg.temperature)
+            }
         } else {
             None
         };
@@ -761,9 +716,6 @@ impl LlmClient {
         tokio::spawn(async move {
             if let Some((compacted_messages, notice)) = auto_compact_event {
                 let _ = tx.send(StreamEvent::ContextCompacted { compacted_messages, notice }).await;
-            }
-            if let Some(notice) = offline_fallback_notice {
-                let _ = tx.send(StreamEvent::Notice(notice)).await;
             }
             let start_time = std::time::Instant::now();
             let mut first_token_time = None;

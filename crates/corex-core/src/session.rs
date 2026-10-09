@@ -43,6 +43,21 @@ pub struct SessionSummary {
     pub workspace_dir: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SessionSummaryDeserializer {
+    id: String,
+    title: String,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default = "default_session_model")]
+    model: String,
+    #[serde(default)]
+    messages: Vec<serde::de::IgnoredAny>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    workspace_dir: Option<String>,
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -81,10 +96,6 @@ impl Session {
             .unwrap_or_else(|| PathBuf::from(".corex/sessions"))
     }
 
-    pub fn legacy_sessions_dir() -> Option<PathBuf> {
-        BaseDirs::new().map(|dirs| dirs.home_dir().join(".uti").join("sessions"))
-    }
-
     pub fn add_message(&mut self, message: Message) {
         if self.messages.is_empty() && message.role == "user" {
             if let Some(text) = message.text_content() {
@@ -107,10 +118,10 @@ impl Session {
 
     pub fn save(&self) -> Result<()> {
         let dir = Self::sessions_dir();
-        fs::create_dir_all(&dir)?;
+        crate::secure_fs::ensure_private_dir(&dir)?;
         let file = dir.join(format!("{}.json", self.id));
         let serialized = serde_json::to_string_pretty(self)?;
-        fs::write(file, serialized)?;
+        crate::secure_fs::write_private_atomic(&file, serialized.as_bytes())?;
         Ok(())
     }
 
@@ -123,6 +134,10 @@ impl Session {
         let dir = Self::sessions_dir();
         let target = id_or_tag.trim();
 
+        if target.is_empty() {
+            bail!("Session identifier cannot be empty.");
+        }
+
         // 1. Direct file check with id.json
         let direct_file = dir.join(format!("{}.json", target));
         if direct_file.exists() {
@@ -130,17 +145,10 @@ impl Session {
             let session: Session = serde_json::from_str(&content)?;
             return Ok(session);
         }
-        if let Some(legacy_dir) = Self::legacy_sessions_dir() {
-            let legacy_file = legacy_dir.join(format!("{}.json", target));
-            if legacy_file.exists() {
-                let content = fs::read_to_string(&legacy_file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
-            }
-        }
 
-        // 2. Search by UUID prefix, tag, or 1-based index
         let all_summaries = Self::list_all(None);
+
+        // 2. Exact 1-based index
         if let Ok(idx) = target.parse::<usize>() {
             if idx > 0 && idx <= all_summaries.len() {
                 let target_id = &all_summaries[idx - 1].id;
@@ -149,39 +157,70 @@ impl Session {
                     let content = fs::read_to_string(&file)?;
                     let session: Session = serde_json::from_str(&content)?;
                     return Ok(session);
-                } else if let Some(legacy_dir) = Self::legacy_sessions_dir() {
-                    let legacy_file = legacy_dir.join(format!("{}.json", target_id));
-                    if legacy_file.exists() {
-                        let content = fs::read_to_string(&legacy_file)?;
-                        let session: Session = serde_json::from_str(&content)?;
-                        return Ok(session);
-                    }
                 }
             }
         }
 
-        // Search matching tag or prefix
-        for summary in all_summaries {
-            if summary.id.starts_with(target)
-                || summary.tag.as_deref().map(|t| t.eq_ignore_ascii_case(target)).unwrap_or(false)
-            {
-                let file = dir.join(format!("{}.json", summary.id));
-                if file.exists() {
-                    let content = fs::read_to_string(&file)?;
-                    let session: Session = serde_json::from_str(&content)?;
-                    return Ok(session);
-                } else if let Some(legacy_dir) = Self::legacy_sessions_dir() {
-                    let legacy_file = legacy_dir.join(format!("{}.json", summary.id));
-                    if legacy_file.exists() {
-                        let content = fs::read_to_string(&legacy_file)?;
-                        let session: Session = serde_json::from_str(&content)?;
-                        return Ok(session);
-                    }
-                }
+        // 3. Search matching tag or prefix
+        let mut matches = Vec::new();
+        for summary in &all_summaries {
+            let is_exact_tag = summary
+                .tag
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case(target))
+                .unwrap_or(false);
+            let is_prefix = summary.id.starts_with(target);
+            if is_exact_tag || is_prefix {
+                matches.push((summary.clone(), is_exact_tag));
             }
         }
 
-        bail!("No session found matching '{}'. Use `/chat list` or `cx --list-sessions` to view available sessions.", target);
+        if matches.is_empty() {
+            bail!(
+                "No session found matching '{}'. Use `/chat list` or `cx --list-sessions` to view available sessions.",
+                target
+            );
+        }
+
+        // If there is an exact tag match, prioritize it if it's unique
+        let exact_tag_matches: Vec<_> = matches.iter().filter(|(_, exact)| *exact).collect();
+        if exact_tag_matches.len() == 1 {
+            let file = dir.join(format!("{}.json", exact_tag_matches[0].0.id));
+            if file.exists() {
+                let content = fs::read_to_string(&file)?;
+                let session: Session = serde_json::from_str(&content)?;
+                return Ok(session);
+            }
+        }
+
+        // Single unique match (either tag or prefix)
+        if matches.len() == 1 {
+            let file = dir.join(format!("{}.json", matches[0].0.id));
+            if file.exists() {
+                let content = fs::read_to_string(&file)?;
+                let session: Session = serde_json::from_str(&content)?;
+                return Ok(session);
+            }
+        }
+
+        // If multiple sessions matched, fail safely instead of guessing or deleting wrong session
+        let samples: Vec<String> = matches
+            .iter()
+            .take(3)
+            .map(|(s, _)| {
+                format!(
+                    "{} (tag: {})",
+                    &s.id[..s.id.len().min(8)],
+                    s.tag.as_deref().unwrap_or("none")
+                )
+            })
+            .collect();
+        bail!(
+            "Ambiguous session identifier '{}' matches {} sessions (e.g. {}). Please specify more characters or the full ID.",
+            target,
+            matches.len(),
+            samples.join(", ")
+        );
     }
 
     pub fn delete_by_id_or_tag(id_or_tag: &str) -> Result<String> {
@@ -190,22 +229,11 @@ impl Session {
         if file.exists() {
             fs::remove_file(&file)?;
         }
-        if let Some(legacy_dir) = Self::legacy_sessions_dir() {
-            let legacy_file = legacy_dir.join(format!("{}.json", session.id));
-            if legacy_file.exists() {
-                fs::remove_file(&legacy_file)?;
-            }
-        }
         Ok(session.id)
     }
 
     pub fn list_all(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
-        let mut dirs = vec![Self::sessions_dir()];
-        if let Some(legacy) = Self::legacy_sessions_dir() {
-            if legacy.exists() {
-                dirs.push(legacy);
-            }
-        }
+        let dirs = vec![Self::sessions_dir()];
 
         let mut seen_ids = std::collections::HashSet::new();
         let mut list = Vec::new();
@@ -215,7 +243,7 @@ impl Session {
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("json") {
                         if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(sess) = serde_json::from_str::<Session>(&content) {
+                            if let Ok(sess) = serde_json::from_str::<SessionSummaryDeserializer>(&content) {
                                 if !seen_ids.insert(sess.id.clone()) {
                                     continue;
                                 }
@@ -264,3 +292,25 @@ impl Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_relative_time_renders_correctly() {
+        let now = Utc::now();
+        assert_eq!(Session::format_relative_time(now), "just now");
+        assert_eq!(Session::format_relative_time(now - chrono::Duration::seconds(120)), "2m ago");
+        assert_eq!(Session::format_relative_time(now - chrono::Duration::hours(5)), "5h ago");
+        assert_eq!(Session::format_relative_time(now - chrono::Duration::days(3)), "3d ago");
+    }
+
+    #[test]
+    fn load_by_empty_id_or_tag_bails() {
+        let res = Session::load_by_id_or_tag("   ");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("cannot be empty"));
+    }
+}
+

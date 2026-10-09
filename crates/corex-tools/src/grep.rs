@@ -121,6 +121,12 @@ impl Tool for GrepTool {
                 }
             }
 
+            // Skip files larger than 10 MB to prevent memory exhaustion / OOM crashes
+            let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if file_size > 10 * 1024 * 1024 {
+                continue;
+            }
+
             let content = match fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(_) => continue,

@@ -9,6 +9,10 @@
 *~
 .idea/
 .vscode/
+.corex/
 .uti/
-npm/bin/uti
-npm/bin/uti.exe
+uti-web/
+npm/bin/cx
+npm/bin/cx.exe
+npm/bin/corex
+npm/bin/corex.exe

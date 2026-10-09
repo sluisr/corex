@@ -58,6 +58,23 @@ impl BackgroundProcess {
     }
 }
 
+/// True if `pid` still exists. Uses signal 0, which performs error checking without delivering
+/// any signal. A zombie counts as alive, which is what we want while reaping is still pending.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    if pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 delivers nothing; libc::kill only validates the pid/group and permission.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// How long to give a task to exit on SIGTERM before escalating to SIGKILL.
+#[cfg(unix)]
+const GRACE_POLLS: u32 = 10;
+#[cfg(unix)]
+const GRACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub struct TaskManager {
     processes: HashMap<u32, BackgroundProcess>,
 }
@@ -75,6 +92,7 @@ impl TaskManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         pid: u32,
@@ -223,46 +241,41 @@ impl TaskManager {
 
     pub fn kill(&mut self, pid: u32) -> bool {
         if let Some(proc) = self.processes.get(&pid) {
-            if let Ok(mut g) = proc.is_running.lock() {
-                *g = false;
+            // Never signal a task that already finished. Its pid may have been recycled by the OS,
+            // in which case `kill(-p)` would tear down an unrelated process group.
+            if !proc.is_active() {
+                return false;
             }
-            if let Ok(mut ec) = proc.exit_code.lock() {
-                if ec.is_none() {
-                    *ec = Some(137);
-                }
-            }
-            if let Ok(mut fa) = proc.finished_at.lock() {
-                if fa.is_none() {
-                    *fa = Some(Utc::now());
-                }
-            }
+            // Deliberately *no* state updates here. `kill` only asks the process to die; the exit
+            // code, the finished timestamp and the running flag are owned by the reaper that waits
+            // on the child. Fabricating them here would (a) race the reaper and (b) report a
+            // hardcoded 137 for a task that in fact exited cleanly on SIGTERM.
             #[cfg(unix)]
             {
-                if pid > 1 {
+                if pid > 1 && pid != std::process::id() {
                     let p = pid as i32;
-                    // First try direct POSIX syscalls: kill process group (-p) and process (p).
-                    // These never output text to stdout/stderr and don't spawn child processes.
+                    // Ask the whole process group to exit first (-p) so children of the shell die too.
+                    // SAFETY: libc::kill is safe for any pid > 1; the pid was validated above and is
+                    // not our own. It never writes to stdout/stderr, so it cannot corrupt the TUI.
                     unsafe {
                         libc::kill(-p, libc::SIGTERM);
                         libc::kill(p, libc::SIGTERM);
-                        libc::kill(-p, libc::SIGKILL);
-                        libc::kill(p, libc::SIGKILL);
                     }
-                    // Fallback to /bin/kill with stdio suppressed so no stderr leak can ever corrupt the TUI
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg(format!("-{}", pid))
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg(pid.to_string())
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
+                    // Escalate on a detached thread: sleeping here would block a Tokio worker (and
+                    // with it the TUI repaint) for the whole grace period.
+                    std::thread::spawn(move || {
+                        for _ in 0..GRACE_POLLS {
+                            std::thread::sleep(GRACE_INTERVAL);
+                            if !process_alive(p as u32) {
+                                return;
+                            }
+                        }
+                        // SAFETY: same contract as above; the pid was validated and is not our own.
+                        unsafe {
+                            libc::kill(-p, libc::SIGKILL);
+                            libc::kill(p, libc::SIGKILL);
+                        }
+                    });
                 }
             }
             #[cfg(windows)]
@@ -285,11 +298,14 @@ impl TaskManager {
 pub static GLOBAL_TASK_MANAGER: Mutex<Option<Arc<Mutex<TaskManager>>>> = Mutex::new(None);
 
 pub fn get_task_manager() -> Arc<Mutex<TaskManager>> {
-    let mut guard = GLOBAL_TASK_MANAGER.lock().unwrap();
+    let mut guard = match GLOBAL_TASK_MANAGER.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
     if guard.is_none() {
         *guard = Some(Arc::new(Mutex::new(TaskManager::new())));
     }
-    guard.as_ref().unwrap().clone()
+    guard.as_ref().expect("TaskManager was just initialized").clone()
 }
 
 // --- ListBackgroundProcessesTool ---
@@ -314,7 +330,10 @@ impl Tool for ListBackgroundProcessesTool {
 
     async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let mgr = get_task_manager();
-        let guard = mgr.lock().unwrap();
+        let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         Ok(ToolOutput::success(guard.list()))
     }
 }
@@ -352,7 +371,10 @@ impl Tool for ReadBackgroundOutputTool {
         };
 
         let mgr = get_task_manager();
-        let guard = mgr.lock().unwrap();
+        let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         match guard.get_output(pid) {
             Some(output) if !output.is_empty() => Ok(ToolOutput::success(output)),
             Some(_) => Ok(ToolOutput::success("Process has produced no output yet.")),
@@ -394,7 +416,10 @@ impl Tool for KillBackgroundProcessTool {
         };
 
         let mgr = get_task_manager();
-        let mut guard = mgr.lock().unwrap();
+        let mut guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         if guard.kill(pid) {
             Ok(ToolOutput::success(format!("Successfully terminated background process {}.", pid)))
         } else {
@@ -444,7 +469,10 @@ impl Tool for WriteBackgroundInputTool {
         };
 
         let mgr = get_task_manager();
-        let guard = mgr.lock().unwrap();
+        let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
         match guard.send_input(pid, input) {
             Ok(true) => Ok(ToolOutput::success(format!("Input sent to process {}.", pid))),
             _ => Ok(ToolOutput::error(format!("Failed to send input to process {}", pid))),
@@ -506,7 +534,10 @@ impl Tool for ManageTaskTool {
 
         match action.as_str() {
             "list" => {
-                let guard = mgr.lock().unwrap();
+                let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
                 Ok(ToolOutput::success(guard.list()))
             }
             "status" => {
@@ -514,7 +545,10 @@ impl Tool for ManageTaskTool {
                     Some(p) => p,
                     None => return Ok(ToolOutput::error("Missing 'task_id' parameter for action 'status'.")),
                 };
-                let guard = mgr.lock().unwrap();
+                let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
                 match guard.get_status(pid) {
                     Some(st) => Ok(ToolOutput::success(st)),
                     None => Ok(ToolOutput::error(format!("No task found with ID {}.", pid))),
@@ -525,7 +559,10 @@ impl Tool for ManageTaskTool {
                     Some(p) => p,
                     None => return Ok(ToolOutput::error("Missing 'task_id' parameter for action 'kill'.")),
                 };
-                let mut guard = mgr.lock().unwrap();
+                let mut guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
                 if guard.kill(pid) {
                     Ok(ToolOutput::success(format!("Successfully terminated task {}.", pid)))
                 } else {
@@ -544,7 +581,10 @@ impl Tool for ManageTaskTool {
                 if input.is_empty() {
                     return Ok(ToolOutput::error("Missing 'input' parameter for action 'send_input'."));
                 }
-                let guard = mgr.lock().unwrap();
+                let guard = match mgr.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
                 match guard.send_input(pid, input.to_string()) {
                     Ok(true) => Ok(ToolOutput::success(format!("Input successfully sent to task {}.", pid))),
                     _ => Ok(ToolOutput::error(format!("Task {} is not active or stdin is unavailable.", pid))),

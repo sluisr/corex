@@ -50,9 +50,10 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Ask local LLM directly ($0.00 cost): /local <prompt> or /local status",
     },
     CommandItem {
-        name: "/hybrid",
-        description: "Toggle hybrid output compression mode: /hybrid on | off",
+        name: "/web",
+        description: "Search live internet via DeepSeek native search: /web <query> (/search)",
     },
+
     CommandItem {
         name: "/mcp",
         description: "List and manage Model Context Protocol servers: /mcp, /mcp status, /mcp reload",

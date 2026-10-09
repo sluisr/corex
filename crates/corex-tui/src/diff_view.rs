@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use crate::theme::Theme;
 
 /// Formats a single content row enclosed within rounded box borders with 100% width precision.
+#[allow(clippy::too_many_arguments)]
 fn format_boxed_row(
     prefix: &str,
     prefix_style: Style,
@@ -56,6 +57,7 @@ fn format_boxed_row(
     Line::from(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_tool_confirmation_lines(
     tool_name: &str,
     diff_or_cmd: &str,
@@ -64,6 +66,8 @@ pub fn build_tool_confirmation_lines(
     max_width: usize,
     theme: &Theme,
     expanded: bool,
+    input_mode: bool,
+    feedback_text: &str,
 ) -> Vec<Line<'static>> {
     let is_shell = tool_name == "run_shell_command" || tool_name == "shell";
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
@@ -225,27 +229,65 @@ pub fn build_tool_confirmation_lines(
     };
     result.push(question_line);
 
-    // 5. Options
-    let options = [
-        "Allow once",
-        "Allow for this session",
-        "No, suggest changes (esc)",
+    // 5. Options (Modern CLI style without emojis)
+    let options: [(&str, &str); 5] = [
+        ("Allow once", "[y]"),
+        ("Allow for this session", "[s]"),
+        ("Deny execution", "[n / esc]"),
+        ("Always allow & save to config", "[p]"),
+        ("Deny and provide instructions...", "[w]"),
     ];
 
-    for (i, opt) in options.iter().enumerate() {
+    for (i, (opt, shortcut)) in options.iter().enumerate() {
         let is_selected = i == selected_option;
         let bullet = if is_selected { "●" } else { "○" };
         let num = i + 1;
 
-        let style = if is_selected {
+        let num_style = if is_selected {
             Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.gray)
         };
 
+        let text_style = if is_selected {
+            Style::default().fg(Color::Rgb(240, 245, 255)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.foreground)
+        };
+
+        let shortcut_style = if is_selected {
+            Style::default().fg(theme.accent_cyan)
+        } else {
+            Style::default().fg(theme.dark_gray)
+        };
+
         result.push(Line::from(vec![
-            Span::styled(format!("    {} {}. ", bullet, num), style),
-            Span::styled(*opt, style),
+            Span::styled(format!("    {} {}. ", bullet, num), num_style),
+            Span::styled(format!("{:<36}", opt), text_style),
+            Span::styled(*shortcut, shortcut_style),
+        ]));
+    }
+
+    // 6. Interactive Instructions Input for Option 5
+    if input_mode {
+        result.push(Line::from(""));
+        result.push(Line::from(vec![
+            Span::styled("    Instructions for Corex:", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let cursor_char = "█";
+        result.push(Line::from(vec![
+            Span::styled("    ❯ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(feedback_text.to_string(), Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(cursor_char, Style::default().fg(theme.accent_cyan)),
+        ]));
+
+        result.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled("[Enter]", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" Send instructions to Corex    ", Style::default().fg(theme.gray)),
+            Span::styled("[Esc]", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" Cancel", Style::default().fg(theme.gray)),
         ]));
     }
 

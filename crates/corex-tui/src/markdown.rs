@@ -502,30 +502,100 @@ fn colorize_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static
     spans
 }
 
-fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
-    let mut grid: Vec<Vec<String>> = Vec::new();
-    for row in rows {
-        let trimmed = row.trim();
-        let mut parts: Vec<String> = trimmed
-            .split('|')
-            .map(|s| s.trim().to_string())
-            .collect();
-        if parts.first().map(|s| s.is_empty()).unwrap_or(false) {
-            parts.remove(0);
-        }
-        if parts.last().map(|s| s.is_empty()).unwrap_or(false) {
-            parts.pop();
-        }
-        grid.push(parts);
+fn split_markdown_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let mut cells = Vec::new();
+    let mut current_cell = String::new();
+    let mut chars = trimmed.chars().peekable();
+
+    if chars.peek() == Some(&'|') {
+        chars.next();
     }
+
+    let mut is_escaped = false;
+    let mut in_inline_code = false;
+
+    for c in chars {
+        if is_escaped {
+            if c == '|' {
+                current_cell.push('|');
+            } else {
+                current_cell.push('\\');
+                current_cell.push(c);
+            }
+            is_escaped = false;
+        } else if c == '\\' {
+            is_escaped = true;
+        } else if c == '`' {
+            in_inline_code = !in_inline_code;
+            current_cell.push(c);
+        } else if c == '|' && !in_inline_code {
+            cells.push(current_cell.trim().to_string());
+            current_cell.clear();
+        } else {
+            current_cell.push(c);
+        }
+    }
+
+    if is_escaped {
+        current_cell.push('\\');
+    }
+
+    let trailing = current_cell.trim();
+    if !trailing.is_empty() {
+        cells.push(trailing.to_string());
+    }
+
+    cells
+}
+
+fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
+    let mut grid: Vec<Vec<String>> = rows.iter().map(|r| split_markdown_row(r)).collect();
 
     if grid.is_empty() {
         return Vec::new();
     }
 
-    let num_cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    // Determine canonical column count from header or delimiter row
+    let num_cols = if let Some(sep_idx) = grid.iter().position(|r| {
+        !r.is_empty()
+            && r.iter().any(|cell| cell.contains('-'))
+            && r.iter().all(|cell| cell.chars().all(|c| c == '-' || c == ':' || c == ' '))
+    }) {
+        if sep_idx > 0 && !grid[0].is_empty() {
+            grid[0].len()
+        } else {
+            grid[sep_idx].len()
+        }
+    } else {
+        grid.first().map(|r| r.len()).unwrap_or(0)
+    };
+
     if num_cols == 0 {
         return Vec::new();
+    }
+
+    // Normalize each row to have EXACTLY num_cols so rows never deform borders
+    for row in grid.iter_mut() {
+        let is_sep = !row.is_empty()
+            && row.iter().any(|cell| cell.contains('-'))
+            && row.iter().all(|cell| cell.chars().all(|c| c == '-' || c == ':' || c == ' '));
+        if is_sep {
+            if row.len() > num_cols {
+                row.truncate(num_cols);
+            } else {
+                while row.len() < num_cols {
+                    row.push("---".to_string());
+                }
+            }
+        } else if row.len() > num_cols {
+            let tail = row.split_off(num_cols - 1);
+            row.push(tail.join(" | "));
+        } else {
+            while row.len() < num_cols {
+                row.push(String::new());
+            }
+        }
     }
 
     let mut col_widths = vec![0; num_cols];
@@ -573,7 +643,7 @@ fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'s
             let excess = total_col_width - avail_content_width;
 
             let target_reduction_per_col = (max_w - second_max).max(1);
-            let needed_reduction_per_col = (excess + count_max - 1) / count_max;
+            let needed_reduction_per_col = excess.div_ceil(count_max);
             let reduce_by = target_reduction_per_col.min(needed_reduction_per_col).max(1);
 
             let mut reduced_any = false;
@@ -746,12 +816,29 @@ mod tests {
 
     #[test]
     fn test_markdown_table() {
-        let text = "## 📊 Desglose de los 53 GB\n\n| Directorio | Tamaño | Qué es |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Log verbose de tmux (creciendo) |\n| `Projects/` | 13 GB | triade-app (7.9G: node_modules 3.6G + build android 4G), uti-cli/target 2.5G |\n";
+        let text = "## 📊 Desglose de los 53 GB\n\n| Directorio | Tamaño | Qué es |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Log verbose de tmux (creciendo) |\n| `Projects/` | 13 GB | triade-app (7.9G: node_modules 3.6G + build android 4G), corex/target 2.5G |\n";
         let theme = Theme::default();
         let lines = render_markdown(text, &theme, 100);
         for (i, line) in lines.iter().enumerate() {
             let s: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
             println!("Line {}: {}", i, s);
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_escaped_pipes() {
+        let text = "| Dato | Valor |\n|---|---|\n| Handle | sluisr |\n| Bio de GitHub | sluisr 🌌 \\| kernel enthusiast \\| 🛡️ cyber-sec \\| 🎧 jumpstyle & monster vibes \\| > stay arch |\n";
+        let theme = Theme::default();
+        let lines = render_markdown(text, &theme, 120);
+        assert!(!lines.is_empty());
+        // Verify separator line has only 1 cross '┼' (meaning 2 columns)
+        let sep: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let cross_count = sep.chars().filter(|&c| c == '┼').count();
+        assert_eq!(cross_count, 1, "Expected 2 columns (1 cross ┼), but got: {}", sep);
+        // Verify all lines end with right border
+        for line in &lines {
+            let s: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(s.ends_with('│') || s.ends_with('┤'), "Line missing right border: {}", s);
         }
     }
 
@@ -809,7 +896,7 @@ mod tests {
     #[test]
     fn test_markdown_code_block_autosizes() {
         let theme = Theme::default();
-        let text = "```bash\n~/.cargo/bin/uti\n```\n";
+        let text = "```bash\n~/.cargo/bin/cx\n```\n";
         let max_width: usize = 120;
         let lines = render_markdown(text, &theme, max_width);
 

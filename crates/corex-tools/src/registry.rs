@@ -46,7 +46,7 @@ impl ToolRegistry {
         let read_background_output = Arc::new(ReadBackgroundOutputTool);
         let kill_background_process = Arc::new(KillBackgroundProcessTool);
         let write_background_input = Arc::new(WriteBackgroundInputTool);
-        let google_web_search = Arc::new(WebSearchTool);
+        let web_search = Arc::new(WebSearchTool);
         let web_fetch = Arc::new(WebFetchTool);
 
         let read_many_files = Arc::new(ReadManyFilesTool);
@@ -76,7 +76,7 @@ impl ToolRegistry {
         registry.register_primary(read_background_output.clone());
         registry.register_primary(kill_background_process.clone());
         registry.register_primary(write_background_input.clone());
-        registry.register_primary(google_web_search.clone());
+        registry.register_primary(web_search.clone());
         registry.register_primary(web_fetch.clone());
 
         registry.register_primary(read_many_files);
@@ -97,7 +97,8 @@ impl ToolRegistry {
         registry.tools.insert("edit_file".to_string(), edit);
         registry.tools.insert("grep".to_string(), grep_search.clone());
         registry.tools.insert("search_files".to_string(), grep_search);
-        registry.tools.insert("web_search".to_string(), google_web_search);
+        registry.tools.insert("google_web_search".to_string(), web_search.clone());
+        registry.tools.insert("web_search".to_string(), web_search);
         registry.tools.insert("ls".to_string(), list_directory.clone());
         registry.tools.insert("read_dir".to_string(), list_directory);
         registry.tools.insert("run_command".to_string(), run_shell_command.clone());

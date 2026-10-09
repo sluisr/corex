@@ -285,13 +285,7 @@ impl Tool for WriteTodosTool {
             None => return Ok(ToolOutput::error("Missing 'todos' argument.")),
         };
 
-        let dir = if context.workspace_dir.join(".corex").exists() {
-            context.workspace_dir.join(".corex")
-        } else if context.workspace_dir.join(".uti").exists() {
-            context.workspace_dir.join(".uti")
-        } else {
-            context.workspace_dir.join(".corex")
-        };
+        let dir = context.workspace_dir.join(".corex");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("todos.json");
         
@@ -315,7 +309,7 @@ impl Tool for ActivateSkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Loads specialized procedural expertise from .corex/skills, .uti/skills, or global skills directories."
+        "Loads specialized procedural expertise from .corex/skills or global skills directories."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -337,15 +331,11 @@ impl Tool for ActivateSkillTool {
             None => return Ok(ToolOutput::error("Missing 'name' argument.")),
         };
 
-        // Search precedence: 1. Workspace .corex/skills 2. Workspace .uti/skills 3. Global ~/.corex/skills 4. Global ~/.uti/skills 5. Fallback .gemini/skills
+        // Search precedence: 1. Workspace .corex/skills 2. Global ~/.corex/skills 3. Fallback .gemini/skills
         let candidates = [
             context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
-            context.workspace_dir.join(".uti").join("skills").join(name).join("SKILL.md"),
             directories::BaseDirs::new()
                 .map(|b| b.home_dir().join(".corex").join("skills").join(name).join("SKILL.md"))
-                .unwrap_or_else(|| Path::new("").to_path_buf()),
-            directories::BaseDirs::new()
-                .map(|b| b.home_dir().join(".uti").join("skills").join(name).join("SKILL.md"))
                 .unwrap_or_else(|| Path::new("").to_path_buf()),
             context.workspace_dir.join(".gemini").join("skills").join(name).join("SKILL.md"),
         ];
@@ -359,7 +349,7 @@ impl Tool for ActivateSkillTool {
             }
         }
 
-        Ok(ToolOutput::error(format!("Skill '{}' not found in .corex/skills or .uti/skills", name)))
+        Ok(ToolOutput::error(format!("Skill '{}' not found in .corex/skills", name)))
     }
 }
 
@@ -429,17 +419,8 @@ struct Task {
 
 fn load_tasks(workspace_dir: &Path) -> Vec<Task> {
     let path = workspace_dir.join(".corex").join("tasks.json");
-    let fallback = workspace_dir.join(".uti").join("tasks.json");
-    let target = if path.exists() {
-        Some(path)
-    } else if fallback.exists() {
-        Some(fallback)
-    } else {
-        None
-    };
-
-    if let Some(p) = target {
-        if let Ok(content) = fs::read_to_string(p) {
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(path) {
             if let Ok(tasks) = serde_json::from_str(&content) {
                 return tasks;
             }
@@ -738,9 +719,9 @@ fn print_task_tree(
     if let Some(t) = tasks.iter().find(|x| x.id == task_id) {
         let status_symbol = match t.status.as_str() {
             "completed" => "✔",
-            "in_progress" => "⚡",
+            "in_progress" => "●",
             "failed" => "✘",
-            _ => "☐",
+            _ => "○",
         };
         let connector = if prefix.is_empty() { "" } else if is_last { "└── " } else { "├── " };
         out.push_str(&format!("{}{}[{}] {} ({})\n", prefix, connector, status_symbol, t.title, t.id));

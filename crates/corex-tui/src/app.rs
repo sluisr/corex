@@ -1,19 +1,20 @@
 use std::collections::VecDeque;
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -33,6 +34,7 @@ use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
 use crate::ascii::render_gradient_logo;
 use crate::auth_dialog::{render_auth_dialog, AuthDialogState};
+use crate::clipboard;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::markdown::render_markdown;
 use crate::model_dialog::{render_model_dialog, ModelDialogState, ModelTab};
@@ -180,11 +182,49 @@ impl StatusTransition {
     }
 }
 
+impl Default for StatusTransition {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct PendingToolBatch {
     pub calls: Vec<ToolCall>,
     pub diff_preview: Option<String>,
     pub selected_option: usize,
     pub diff_expanded: bool,
+    pub input_mode: bool,
+    pub feedback_text: String,
+}
+
+/// A mouse text selection over the rendered chat feed.
+///
+/// Positions are `(rendered line index, display column)`. The line index is absolute, so the
+/// highlight survives scrolling, and display columns (rather than char indices) map 1:1 onto
+/// screen cells, which keeps both the highlight and the extracted text correct for wide glyphs
+/// where a single char occupies two cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// Where the drag started.
+    pub anchor: (usize, u16),
+    /// Where the pointer currently is.
+    pub cursor: (usize, u16),
+}
+
+impl Selection {
+    /// Anchor and cursor in reading order, so `start` is never after `end`.
+    pub fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+
+    /// True when the drag covered no cells at all (i.e. a plain click).
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
 }
 
 pub struct App {
@@ -222,6 +262,12 @@ pub struct App {
     pub total_rendered_items: usize,
     pub plan_mode: bool,
     pub always_allow_tools: bool,
+    pub mouse_capture: bool,
+    pub selection: Option<Selection>,
+    pub selection_lines: Vec<String>,
+    /// Last cell the pointer was seen at while the left button is down.
+    pub drag_point: Option<(u16, u16)>,
+    pub session_allowed_commands: Vec<String>,
     pub logs_expanded: bool,
     pub git_branch: String,
     pub last_turn_start: Option<Instant>,
@@ -242,12 +288,13 @@ pub struct App {
     pub active_status: Option<String>,
     pub status_transition: StatusTransition,
     pub last_chat_rect: Option<Rect>,
-    pub last_rendered_text_lines: Vec<String>,
     pub balance_tx: mpsc::Sender<Result<corex_core::types::BalanceResponse, String>>,
     pub balance_rx: mpsc::Receiver<Result<corex_core::types::BalanceResponse, String>>,
     pub is_checking_balance: bool,
     pub pending_balance_msg_index: Option<usize>,
     pub message_queue: VecDeque<String>,
+    pub start_time: Instant,
+    pub last_interaction: Instant,
 }
 
 impl App {
@@ -298,6 +345,11 @@ impl App {
             total_rendered_items: 0,
             plan_mode: false,
             always_allow_tools: yolo,
+            mouse_capture: mouse_capture_enabled(),
+            selection: None,
+            selection_lines: Vec::new(),
+            drag_point: None,
+            session_allowed_commands: Vec::new(),
             logs_expanded: false,
             git_branch: branch,
             last_turn_start: None,
@@ -318,12 +370,13 @@ impl App {
             active_status: None,
             status_transition: StatusTransition::new(),
             last_chat_rect: None,
-            last_rendered_text_lines: Vec::new(),
             balance_tx,
             balance_rx,
             is_checking_balance: false,
             pending_balance_msg_index: None,
             message_queue: VecDeque::new(),
+            start_time: Instant::now(),
+            last_interaction: Instant::now(),
         };
         app.trigger_local_health_check();
         app.trigger_update_check();
@@ -333,6 +386,207 @@ impl App {
     pub fn set_status(&mut self, text: &str) {
         self.status_transition.set_target(text);
         self.active_status = Some(text.to_string());
+    }
+
+    /// Enables or disables terminal mouse reporting at runtime.
+    ///
+    /// The escape sequence itself is emitted by the main event loop, which reconciles
+    /// `mouse_capture` against the real terminal state, so F2 and `COREX_MOUSE`
+    /// all funnel through one code path.
+    pub fn set_mouse_capture(&mut self, enabled: bool) {
+        self.mouse_capture = enabled;
+        let msg = if enabled {
+            "Mouse reporting ENABLED: the wheel scrolls the feed, and dragging over it selects text, which is copied to the clipboard on release. F2 gives the mouse back to the terminal."
+        } else {
+            "Mouse reporting DISABLED: the terminal owns the mouse again and its native selection is back. Scroll with PageUp/PageDown or Shift+Up/Shift+Down."
+        };
+        self.session.add_message(Message::system(msg));
+    }
+
+    /// Flips mouse reporting on/off (bound to F2).
+    pub fn toggle_mouse_capture(&mut self) {
+        self.set_mouse_capture(!self.mouse_capture);
+    }
+
+    // --- Chat text selection (driven by mouse drags, see `Selection`) ---
+
+    /// Routes a mouse event: the wheel scrolls the feed, the left button selects text.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_selection(-3),
+            MouseEventKind::ScrollDown => self.scroll_selection(3),
+            MouseEventKind::Down(MouseButton::Left) => self.begin_selection(mouse.column, mouse.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.extend_selection(mouse.column, mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => self.commit_selection(),
+            _ => {}
+        }
+    }
+
+    /// Scrolls the feed, taking a live selection endpoint along with the view.
+    ///
+    /// With the button held the pointer stays on the same screen row, so scrolling swaps the line
+    /// underneath it. Moving the endpoint by the applied delta keeps the selection anchored to the
+    /// text rather than to the screen, which is how a terminal behaves.
+    fn scroll_selection(&mut self, delta: i32) {
+        let before = self.scroll_offset;
+        self.scroll_chat(delta);
+        let applied = self.scroll_offset as i32 - before as i32;
+        if applied == 0 {
+            return;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            selection.cursor.0 = (selection.cursor.0 as i32 + applied).max(0) as usize;
+        }
+    }
+
+    /// Keeps the feed scrolling while a drag is held at the edge of the viewport.
+    ///
+    /// Drag events stop the moment the pointer stops moving, so on its own a selection could only
+    /// ever reach one line past the edge. This is called on every tick, which is what lets a drag
+    /// held at the top row climb the whole conversation. Returns true when the view moved.
+    pub fn autoscroll_selection(&mut self) -> bool {
+        let Some((column, row)) = self.drag_point else { return false };
+        if self.selection.is_none() {
+            return false;
+        }
+        let Some(direction) = self.selection_scroll_delta(row) else { return false };
+        // Three lines a tick: fast enough to climb a long conversation, slow enough to aim.
+        let delta = direction * 3;
+
+        let before = self.scroll_offset;
+        self.scroll_chat(delta);
+        if self.scroll_offset == before {
+            return false;
+        }
+        // The pointer has not moved, so the line under it has: keep the endpoint under it.
+        if let Some(point) = self.chat_point(column, row) {
+            if let Some(selection) = self.selection.as_mut() {
+                selection.cursor = point;
+            }
+        }
+        true
+    }
+
+    /// Starts a selection on a press inside the chat viewport; a press elsewhere clears it.
+    pub fn begin_selection(&mut self, column: u16, row: u16) {
+        if !self.is_over_chat(column, row) {
+            self.clear_selection();
+            return;
+        }
+        if let Some(point) = self.chat_point(column, row) {
+            self.selection = Some(Selection { anchor: point, cursor: point });
+            self.drag_point = Some((column, row));
+        }
+    }
+
+    /// Extends the active selection, scrolling the feed when the drag reaches its edge.
+    pub fn extend_selection(&mut self, column: u16, row: u16) {
+        if self.selection.is_none() {
+            return;
+        }
+        self.drag_point = Some((column, row));
+        if let Some(delta) = self.selection_scroll_delta(row) {
+            self.scroll_chat(delta);
+        }
+        if let Some(point) = self.chat_point(column, row) {
+            if let Some(selection) = self.selection.as_mut() {
+                selection.cursor = point;
+            }
+        }
+    }
+
+    /// Copies the active selection to the system clipboard and drops the highlight.
+    ///
+    /// Releasing the button ends the drag the way a terminal ends its own selection. The app has
+    /// to do it because it is the one consuming the drag: with mouse reporting on, nothing above
+    /// it ever sees the gesture, so nothing above it can clear a highlight it did not paint. The
+    /// copy itself stays silent.
+    pub fn commit_selection(&mut self) {
+        let Some(selection) = self.selection else { return };
+
+        // Read the text before clearing: it is derived from the live selection.
+        let text = self.selection_text();
+        self.clear_selection();
+
+        if selection.is_empty() || text.trim().is_empty() {
+            return;
+        }
+
+        if let Err(err) = clipboard::copy(&text) {
+            self.session.add_message(Message::system(format!("Clipboard unavailable: {err}")));
+        }
+    }
+
+    /// Drops the current selection and the line text cached for it.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_lines.clear();
+        self.drag_point = None;
+    }
+
+    /// True when the cell sits inside the chat viewport.
+    fn is_over_chat(&self, column: u16, row: u16) -> bool {
+        self.last_chat_rect.is_some_and(|rect| {
+            column >= rect.x
+                && column < rect.x.saturating_add(rect.width)
+                && row >= rect.y
+                && row < rect.y.saturating_add(rect.height)
+        })
+    }
+
+    /// Lines a drag held at the edge of the feed scrolls it: negative upwards, positive downwards,
+    /// `None` while the pointer stays inside the viewport.
+    ///
+    /// The feed is the first area on screen, so it starts at row 0 and the pointer can never sit
+    /// above it: reaching its top row is the only way to ask for more content upwards, which is
+    /// what a terminal does when the pointer hits the top of the window. Downwards the composer
+    /// sits below the feed, so leaving the viewport stays the signal.
+    fn selection_scroll_delta(&self, row: u16) -> Option<i32> {
+        let rect = self.last_chat_rect?;
+        if row <= rect.y {
+            return Some(-1);
+        }
+        if row >= rect.y.saturating_add(rect.height) {
+            return Some(1);
+        }
+        None
+    }
+
+    /// Maps a screen cell onto `(rendered line index, display column)`.
+    ///
+    /// Cells outside the viewport clamp to its edge, which is what lets a drag continue past the
+    /// top or bottom without jumping to another line.
+    fn chat_point(&self, column: u16, row: u16) -> Option<(usize, u16)> {
+        let rect = self.last_chat_rect?;
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+        let row_in_view = row.saturating_sub(rect.y).min(rect.height - 1);
+        let col_in_view = column.saturating_sub(rect.x).min(rect.width - 1);
+        Some((self.scroll_offset as usize + row_in_view as usize, col_in_view))
+    }
+
+    /// Text covered by the active selection, one entry per rendered line.
+    pub fn selection_text(&self) -> String {
+        let Some(selection) = self.selection else {
+            return String::new();
+        };
+        let ((start_line, start_col), (end_line, end_col)) = selection.ordered();
+        let mut out = String::new();
+
+        for line_idx in start_line..=end_line {
+            let Some(line) = self.selection_lines.get(line_idx) else {
+                continue;
+            };
+            if line_idx > start_line {
+                out.push('\n');
+            }
+            let from = if line_idx == start_line { start_col } else { 0 };
+            let to = if line_idx == end_line { end_col } else { u16::MAX };
+            let (first_char, last_char) = char_range_for_display_columns(line, from, to);
+            out.extend(line.chars().skip(first_char).take(last_char.saturating_sub(first_char)));
+        }
+        out
     }
 
     pub fn clear_status(&mut self) {
@@ -351,6 +605,31 @@ impl App {
         });
     }
 
+    /// Slash-command candidates for the current prompt.
+    ///
+    /// Returns an empty list unless the menu is genuinely active: the prompt must
+    /// start with `/` AND the user must not be browsing prompt history (Up/Down).
+    /// Recalling an entry such as `/resume` from history fills the buffer with an
+    /// exact command name, which would otherwise hijack the arrows for autocomplete
+    /// navigation and trap the user on a single-item list.
+    pub fn matching_slash_commands(&self) -> Vec<&'static str> {
+        if self.history_idx.is_some() || !self.input_buffer.starts_with('/') {
+            return Vec::new();
+        }
+
+        let filter = self.input_buffer.to_lowercase();
+        ALL_COMMANDS
+            .iter()
+            .filter(|c| c.name.starts_with(&filter))
+            .map(|c| c.name)
+            .collect()
+    }
+
+    /// True when the slash-completion menu should own the arrow keys.
+    pub fn is_slash_menu_active(&self) -> bool {
+        !self.matching_slash_commands().is_empty()
+    }
+
     pub fn slash_popup_target_height(&self) -> f32 {
         let is_modal_open = self.sudo_dialog.is_open
             || self.model_dialog.is_open
@@ -358,17 +637,13 @@ impl App {
             || self.session_dialog.is_open
             || self.user_dialog.is_open;
 
-        if !is_modal_open && self.input_buffer.starts_with('/') {
-            let filter = self.input_buffer.to_lowercase();
-            let count = ALL_COMMANDS
-                .iter()
-                .filter(|c| c.name.starts_with(&filter))
-                .count();
-            if count > 0 {
-                (count as f32 + 2.0).min(10.0)
-            } else {
-                0.0
-            }
+        if is_modal_open {
+            return 0.0;
+        }
+
+        let count = self.matching_slash_commands().len();
+        if count > 0 {
+            (count as f32 + 2.0).min(10.0)
         } else {
             0.0
         }
@@ -385,6 +660,41 @@ impl App {
         self.cached_render_width = 0;
         self.cached_session_id.clear();
         self.cached_logs_expanded = !self.logs_expanded;
+    }
+
+    /// Height (in rendered lines) of the chat feed as of the last drawn frame.
+    fn chat_visible_height(&self) -> usize {
+        self.last_chat_rect.map(|r| r.height as usize).unwrap_or(0)
+    }
+
+    /// Highest valid scroll offset for the chat feed, in rendered lines.
+    pub fn max_scroll_offset(&self) -> u16 {
+        self.total_rendered_items
+            .saturating_sub(self.chat_visible_height()) as u16
+    }
+
+    /// Scrolls the chat feed by `delta` rendered lines (negative scrolls up).
+    ///
+    /// Any scroll up disengages auto-scroll so new streamed content no longer drags the
+    /// viewport down; landing on the last line re-engages it. This is the single place
+    /// that mutates `scroll_offset`/`auto_scroll`, so wheel, PageUp/PageDown and keyboard
+    /// scrolling always agree on the clamp.
+    pub fn scroll_chat(&mut self, delta: i32) {
+        let max = self.max_scroll_offset();
+        let current = self.scroll_offset.min(max) as i32;
+        let next = (current + delta).clamp(0, max as i32) as u16;
+        self.scroll_offset = next;
+        self.auto_scroll = next >= max;
+    }
+
+    pub fn get_effective_allowed_commands(&self) -> Vec<String> {
+        let mut all = self.llm_client.get_config().allowed_commands.clone();
+        for cmd in &self.session_allowed_commands {
+            if !all.contains(cmd) {
+                all.push(cmd.clone());
+            }
+        }
+        all
     }
 
     pub fn trigger_local_health_check(&self) {
@@ -546,6 +856,7 @@ impl App {
             "/clear" => {
                 self.session.messages.clear();
                 self.invalidate_message_cache();
+                self.clear_selection();
                 self.thinking_state.reset();
                 self.streaming_text.clear();
                 true
@@ -572,12 +883,11 @@ impl App {
                     let local = self.llm_client.local_client();
                     let is_up = local.health_check().await;
                     let msg = format!(
-                        "Local LLM Status:\n- Enabled: {}\n- Endpoint: {}\n- Model: {}\n- Server Reachable: {}\n- Hybrid Compression: {}",
+                        "Local LLM Status:\n- Enabled: {}\n- Endpoint: {}\n- Model: {}\n- Server Reachable: {}",
                         cfg.local_llm_enabled,
                         cfg.local_llm_url,
                         cfg.local_llm_model,
-                        if is_up { "YES (Active)" } else { "NO (Offline / Fallback to Cloud)" },
-                        if cfg.hybrid_compression { "ON" } else { "OFF" }
+                        if is_up { "YES (Active)" } else { "NO (Offline)" }
                     );
                     self.session.add_message(Message::system(msg));
                     return true;
@@ -607,80 +917,16 @@ impl App {
                 }
                 true
             }
-            "/hybrid" => {
-                let mut cfg = self.llm_client.get_config();
+            "/web" | "/search" => {
                 if parts.len() > 1 {
-                    match parts[1].to_lowercase().as_str() {
-                        "mode" => {
-                            if parts.len() > 2 {
-                                if let Some(m) = corex_core::config::HybridMode::from_str_loose(parts[2]) {
-                                    cfg.hybrid_settings.mode = m;
-                                    cfg.local_llm_enabled = true;
-                                    self.llm_client.update_config(cfg.clone());
-                                    let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
-                                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-                                    self.session.add_message(Message::system(format!(
-                                        "Hybrid Strategy set to: {}\n{}",
-                                        m.display_name(), m.description()
-                                    )));
-                                } else {
-                                    self.session.add_message(Message::system(
-                                        "Available hybrid modes: triage | scout | review | compress"
-                                    ));
-                                }
-                            } else {
-                                self.session.add_message(Message::system(format!(
-                                    "Current Hybrid Strategy: {}\nUsage: /hybrid mode <triage|scout|review|compress>",
-                                    cfg.hybrid_settings.mode.display_name()
-                                )) );
-                            }
-                        }
-                        "on" | "true" | "1" => {
-                            cfg.hybrid_compression = true;
-                            cfg.local_llm_enabled = true;
-                            self.llm_client.update_config(cfg.clone());
-                            let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
-                            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-                            self.session.add_message(Message::system(format!(
-                                "Hybrid Mode ENABLED!\n- Strategy: {}\n- Primary Model: {}\n- Local Server: {}",
-                                cfg.hybrid_settings.mode.display_name(),
-                                cfg.model,
-                                cfg.local_llm_url
-                            )));
-                        }
-                        "off" | "false" | "0" => {
-                            cfg.hybrid_compression = false;
-                            cfg.local_llm_enabled = false;
-                            self.llm_client.update_config(cfg.clone());
-                            let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
-                            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-                            self.session.add_message(Message::system("Hybrid Mode DISABLED (Pure Cloud active)."));
-                        }
-                        "status" => {
-                            let is_up = self.llm_client.local_client().health_check().await;
-                            self.session.add_message(Message::system(format!(
-                                "Hybrid Configuration Status:\n- Enabled: {}\n- Strategy: {}\n- Local Server: {} ({})\n- Auto Output Compression: {}",
-                                cfg.local_llm_enabled,
-                                cfg.hybrid_settings.mode.display_name(),
-                                cfg.local_llm_url,
-                                if is_up { "ONLINE" } else { "OFFLINE" },
-                                if cfg.hybrid_settings.auto_compression { "ON" } else { "OFF" }
-                            )));
-                        }
-                        _ => {
-                            self.session.add_message(Message::system("Usage: /hybrid on | off | mode <triage|scout|review|compress> | status"));
-                        }
-                    }
+                    // Handled by streaming chat loop so the AI invokes web_search and synthesizes the answer
+                    false
                 } else {
-                    cfg.local_llm_enabled = !cfg.local_llm_enabled;
-                    let state = if cfg.local_llm_enabled { "ENABLED" } else { "DISABLED" };
-                    self.llm_client.update_config(cfg.clone());
-                    let _ = Config::save_hybrid_settings_with_workspace(&cfg.hybrid_settings, Some(&self.workspace_dir));
-                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-                    self.session.add_message(Message::system(format!("Hybrid Mode {}", state)));
+                    self.session.add_message(Message::system("Uso: /web <consulta> (Busca en la web con DeepSeek y sintetiza la respuesta)"));
+                    true
                 }
-                true
             }
+
             "/balance" | "/wallet" => {
                 if self.is_checking_balance {
                     self.set_status("Checking account balance...");
@@ -833,7 +1079,6 @@ impl App {
                     cfg.model = new_model.to_string();
                     if !new_model.contains("local") {
                         cfg.local_llm_enabled = false;
-                        cfg.hybrid_compression = false;
                     }
                     let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg.clone());
@@ -849,8 +1094,6 @@ impl App {
                         &cfg.model,
                         &cfg.flash_settings,
                         &cfg.pro_settings,
-                        &cfg.hybrid_settings,
-                        cfg.local_llm_enabled && cfg.hybrid_compression,
                         cfg.local_prompt_lite,
                     );
                 }
@@ -942,7 +1185,7 @@ impl App {
                 let maybe_newer = self.update_available.lock().ok().and_then(|l| l.clone());
                 let msg = if let Some(newer) = maybe_newer {
                     format!(
-                        "⚡ A new version of Corex is available: v{} → v{}\n\n\
+                        "A new version of Corex is available: v{} → v{}\n\n\
                         To update your installation, run in your terminal:\n\
                         • Via npm:       npm install -g corex-cli\n\
                         • From source:   cargo install --git https://github.com/sluisr/corex.git --force\n\
@@ -952,7 +1195,7 @@ impl App {
                     )
                 } else {
                     format!(
-                        "✓ Corex is up to date (v{}).\n\n\
+                        "Corex is up to date (v{}).\n\n\
                         If you wish to reinstall or update manually:\n\
                         • npm install -g corex-cli\n\
                         • cargo install --git https://github.com/sluisr/corex.git --force\n\
@@ -1063,21 +1306,30 @@ impl App {
             "/tasks" | "/background" => {
                 let mgr = corex_tools::background::get_task_manager();
                 if parts.len() == 1 {
-                    let guard = mgr.lock().unwrap();
+                    let guard = match mgr.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
                     let list = guard.list();
                     self.session.add_message(Message::system(format!("Background Tasks:\n\n{}", list)));
                 } else {
                     let sub = parts[1].to_lowercase();
                     match sub.as_str() {
                         "list" => {
-                            let guard = mgr.lock().unwrap();
+                            let guard = match mgr.lock() {
+                                Ok(g) => g,
+                                Err(e) => e.into_inner(),
+                            };
                             let list = guard.list();
                             self.session.add_message(Message::system(format!("Background Tasks:\n\n{}", list)));
                         }
                         "status" | "log" | "output" => {
                             if parts.len() > 2 {
                                 if let Ok(pid) = parts[2].parse::<u32>() {
-                                    let guard = mgr.lock().unwrap();
+                                    let guard = match mgr.lock() {
+                                        Ok(g) => g,
+                                        Err(e) => e.into_inner(),
+                                    };
                                     match guard.get_status(pid) {
                                         Some(st) => self.session.add_message(Message::system(st)),
                                         None => self.session.add_message(Message::system(format!("Task {} not found.", pid))),
@@ -1092,7 +1344,10 @@ impl App {
                         "kill" | "stop" => {
                             if parts.len() > 2 {
                                 if let Ok(pid) = parts[2].parse::<u32>() {
-                                    let mut guard = mgr.lock().unwrap();
+                                    let mut guard = match mgr.lock() {
+                                        Ok(g) => g,
+                                        Err(e) => e.into_inner(),
+                                    };
                                     if guard.kill(pid) {
                                         self.session.add_message(Message::system(format!("Terminated background task {}.", pid)));
                                     } else {
@@ -1109,7 +1364,10 @@ impl App {
                             if parts.len() > 3 {
                                 if let Ok(pid) = parts[2].parse::<u32>() {
                                     let input = parts[3..].join(" ");
-                                    let guard = mgr.lock().unwrap();
+                                    let guard = match mgr.lock() {
+                                        Ok(g) => g,
+                                        Err(e) => e.into_inner(),
+                                    };
                                     match guard.send_input(pid, input) {
                                         Ok(true) => self.session.add_message(Message::system(format!("Sent input to task {}.", pid))),
                                         _ => self.session.add_message(Message::system(format!("Failed to send input to task {}. (Task might be inactive)", pid))),
@@ -1123,7 +1381,10 @@ impl App {
                         }
                         _ => {
                             if let Ok(pid) = parts[1].parse::<u32>() {
-                                let guard = mgr.lock().unwrap();
+                                let guard = match mgr.lock() {
+                                    Ok(g) => g,
+                                    Err(e) => e.into_inner(),
+                                };
                                 match guard.get_status(pid) {
                                     Some(st) => self.session.add_message(Message::system(st)),
                                     None => self.session.add_message(Message::system(format!("Task {} not found.", pid))),
@@ -1170,6 +1431,8 @@ impl App {
                 help.push_str("  /key <sk..>  Set or update your DeepSeek API key\n");
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
                 help.push_str("\nKeyboard Shortcuts:\n  Enter: Submit | Ctrl+T: Toggle Thought Box | Ctrl+C: Cancel/Exit | Up/Down: History / Command Nav");
+                help.push_str("\n  Scroll chat: Mouse wheel | PageUp / PageDown | Shift+Up / Shift+Down");
+                help.push_str("\n  Copy text: drag to select, release to copy and clear the highlight");
                 self.session.add_message(Message::system(help));
                 true
             }
@@ -1186,10 +1449,30 @@ pub fn restore_terminal() {
     let _ = execute!(
         stdout,
         LeaveAlternateScreen,
-        DisableMouseCapture,
         DisableBracketedPaste,
+        DisableMouseCapture,
         crossterm::cursor::Show
     );
+}
+
+/// Mouse tracking modes the TUI actually consumes: `1000` (wheel and buttons), `1002` (drags,
+/// which drive text selection) and `1006` (SGR coordinates). crossterm's `EnableMouseCapture`
+/// additionally switches on `1003` (any-event motion), which turns every pixel of mouse travel
+/// into an event worth a redraw.
+const MOUSE_REPORTING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_REPORTING_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+/// Whether the TUI should request mouse reporting from the terminal.
+///
+/// Mouse reporting is what turns the wheel into `Event::Mouse`. The TUI runs in the
+/// alternate screen, which has no scrollback of its own, so without mouse reporting the
+/// wheel has nothing to scroll and the chat feed becomes unreachable. Set `COREX_MOUSE=0`
+/// to get native drag-to-select back (the wheel then only moves terminal scrollback).
+fn mouse_capture_enabled() -> bool {
+    match std::env::var("COREX_MOUSE") {
+        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
+        Err(_) => true,
+    }
 }
 
 /// RAII guard ensuring the terminal is always cleanly restored on drop (including panics and early returns).
@@ -1210,10 +1493,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Mouse reporting is applied by the loop below (reconcile step) so that startup
+    // and F2 share a single code path.
+    let mut mouse_capture_applied = false;
 
     let (event_tx, mut event_rx) = mpsc::channel::<(u64, StreamEvent)>(100);
 
@@ -1222,6 +1509,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     loop {
         app.poll_local_health_check();
+
+        // Reconcile terminal mouse reporting with the app state (COREX_MOUSE or F2).
+        if app.mouse_capture != mouse_capture_applied {
+            let out = terminal.backend_mut();
+            let codes = if app.mouse_capture {
+                MOUSE_REPORTING_ON
+            } else {
+                MOUSE_REPORTING_OFF
+            };
+            let _ = out.write_all(codes.as_bytes());
+            let _ = out.flush();
+            mouse_capture_applied = app.mouse_capture;
+            needs_redraw = true;
+        }
 
         // Check for finished background tasks and notify the user/session
         let newly_finished: Vec<(u32, Option<i32>, String, String)> = {
@@ -1256,6 +1557,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         };
 
+        let mut has_finished_tasks = false;
         for (pid, exit_code, dur, output) in newly_finished {
             let code_str = match exit_code {
                 Some(c) => c.to_string(),
@@ -1266,6 +1568,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             app.session.add_message(Message::system(msg_text));
             app.invalidate_message_cache();
             needs_redraw = true;
+            if exit_code.is_some() {
+                has_finished_tasks = true;
+            }
         }
 
         while let Ok(res) = app.balance_rx.try_recv() {
@@ -1304,21 +1609,27 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         if !app.is_streaming
-            && !app.message_queue.is_empty()
             && app.pending_confirmation.is_none()
             && !app.user_dialog.is_open
             && !app.sudo_dialog.is_open
             && !app.is_checking_balance
         {
-            if let Some(next_prompt) = app.message_queue.pop_front() {
-                app.session.add_message(Message::user(next_prompt));
+            if !app.message_queue.is_empty() {
+                if let Some(next_prompt) = app.message_queue.pop_front() {
+                    app.session.add_message(Message::user(next_prompt));
+                    app.start_stream_turn(event_tx.clone());
+                    needs_redraw = true;
+                }
+            } else if has_finished_tasks {
+                // Reactive Wakeup: Background tasks completed while idle -> autonomously synthesize response!
                 app.start_stream_turn(event_tx.clone());
                 needs_redraw = true;
             }
         }
 
         let has_active_tasks = !app.active_background_pids.is_empty();
-        let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
+        let is_header_animating = app.scroll_offset <= 4 && !app.is_streaming && app.last_interaction.elapsed() < Duration::from_secs(4);
+        let is_animating = app.is_slash_animating() || app.status_transition.is_animating() || is_header_animating;
 
         if needs_redraw || app.is_streaming || app.is_checking_balance || has_active_tasks || is_animating {
             terminal.draw(|f| {
@@ -1427,7 +1738,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             workspace_dir: app.workspace_dir.clone(),
                             yolo_mode: app.always_allow_tools,
                             sudo_password: get_sudo_password(),
-                            allowed_commands: app.llm_client.get_config().allowed_commands.clone(),
+                            allowed_commands: app.get_effective_allowed_commands(),
                         };
 
                         for call in &calls {
@@ -1498,6 +1809,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 diff_preview: combined_preview,
                                 selected_option: 0,
                                 diff_expanded: false,
+                                input_mode: false,
+                                feedback_text: String::new(),
                             });
                         } else {
                             // Execute all tools concurrently in parallel without blocking UI!
@@ -1570,18 +1883,29 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.thinking_state.reset();
                         app.clear_status();
 
-                        if let Some(txt) = assistant_text {
+                        if let Some(mut txt) = assistant_text {
+                            let user_cjk = corex_core::language::user_has_requested_cjk(&app.session.messages);
+                            if corex_core::language::is_unwanted_cjk_drift(&txt, user_cjk) {
+                                txt = corex_core::language::clean_cjk_drift_from_text(&txt);
+                            }
                             app.session.add_message(Message::assistant(txt, reasoning));
                         }
 
                         app.streaming_text.clear();
                         app.streaming_tool_calls.clear();
                         let _ = app.session.save();
+                        corex_core::trim_memory();
 
-                        // ⚡ Automatically dequeue and run next queued user prompt!
+                        // ⚡ Automatically dequeue and run next queued user prompt or synthesize finished task!
                         if let Some(next_prompt) = app.message_queue.pop_front() {
                             app.session.add_message(Message::user(next_prompt));
                             app.start_stream_turn(event_tx.clone());
+                        } else if let Some(last_msg) = app.session.messages.last() {
+                            if last_msg.role.as_str() == "system"
+                                && last_msg.text_content().map(|t| t.starts_with("TASK_DONE|")).unwrap_or(false)
+                            {
+                                app.start_stream_turn(event_tx.clone());
+                            }
                         }
                     }
                 }
@@ -1590,6 +1914,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.session.add_message(Message::system(notice));
                     app.invalidate_message_cache();
                     let _ = app.session.save();
+                    corex_core::trim_memory();
                 }
                 StreamEvent::Notice(notice) => {
                     app.session.add_message(Message::system(notice));
@@ -1602,6 +1927,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.session.add_message(Message::system(format!("Error: {}", err)));
                     app.streaming_text.clear();
                     app.streaming_tool_calls.clear();
+                    corex_core::trim_memory();
                     if let Some(next_prompt) = app.message_queue.pop_front() {
                         if app.input_buffer.is_empty() {
                             app.input_buffer = next_prompt;
@@ -1618,56 +1944,54 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         }
 
-        let tick_rate = if app.is_streaming || is_animating {
+        let is_fast_animating = app.is_streaming || app.is_slash_animating() || app.status_transition.is_animating();
+        let tick_rate = if is_fast_animating {
             Duration::from_millis(16)
+        } else if is_header_animating {
+            Duration::from_millis(60)
         } else {
             Duration::from_millis(80)
         };
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             needs_redraw = true;
+            app.last_interaction = Instant::now();
             match event::read()? {
                 Event::Paste(pasted) => {
+                    corex_core::forensic::ForensicLogger::log_event(
+                        "TUI_PASTE",
+                        &format!("Paste event ({} chars)", pasted.len()),
+                        &format!("Content:\n{}", pasted),
+                    );
                     app.handle_paste(pasted);
                 }
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.auto_scroll = false;
-                        app.scroll_offset = app.scroll_offset.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        let max_s = app.total_rendered_items.saturating_sub(10) as u16;
-                        app.scroll_offset = (app.scroll_offset + 3).min(max_s);
-                        if app.scroll_offset >= max_s {
-                            app.auto_scroll = true;
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(rect) = app.last_chat_rect {
-                            if mouse.column >= rect.x
-                                && mouse.column < rect.x + rect.width
-                                && mouse.row >= rect.y
-                                && mouse.row < rect.y + rect.height
-                            {
-                                let rel_y = (mouse.row - rect.y) as usize;
-                                let line_idx = app.scroll_offset as usize + rel_y;
-                                if line_idx < app.last_rendered_text_lines.len() {
-                                    let line_text = &app.last_rendered_text_lines[line_idx];
-                                    let click_col = mouse.column.saturating_sub(rect.x) as usize;
-                                    if let Some(url) = find_url_in_line(line_text, Some(click_col)) {
-                                        let _ = open::that(&url);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                },
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                    // Security: Never log raw keystrokes, input buffer, or passwords to forensic logs
+                    tracing::trace!(code = ?key.code, modifiers = ?key.modifiers, "TUI key pressed");
+
+                    // --- Mouse reporting toggle: F2 ---
+                    // Reclaims native click-drag selection/copy on demand without giving up
+                    // wheel scrolling (which stays available via PageUp/PageDown when OFF).
+                    if key.code == KeyCode::F(2) {
+                        app.toggle_mouse_capture();
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    // Esc drops an active selection without consuming the key, so it still
+                    // cancels streaming or closes a dialog further down this handler.
+                    if key.code == KeyCode::Esc && app.selection.is_some() {
+                        app.clear_selection();
+                        needs_redraw = true;
+                    }
+
                     // --- 0. Cancel active streaming / generation immediately on Esc or Ctrl+C ---
                     if app.is_streaming
                         && (key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)))
+                            || (key.code == KeyCode::Char('c') && is_ctrl))
                         {
                             if key.code == KeyCode::Esc && !app.message_queue.is_empty() {
                                 if let Some(queued) = app.message_queue.pop_back() {
@@ -1774,11 +2098,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             workspace_dir: app.workspace_dir.clone(),
                                             yolo_mode: app.always_allow_tools,
                                             sudo_password: Some(pwd),
-                                            allowed_commands: app
-                                                .llm_client
-                                                .get_config()
-                                                .allowed_commands
-                                                .clone(),
+                                            allowed_commands: app.get_effective_allowed_commands(),
                                         };
                                         app.is_streaming = true;
                                         tokio::spawn(async move {
@@ -1947,9 +2267,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             KeyCode::Char('3') => {
                                 app.model_dialog.current_tab = ModelTab::Pro;
                             }
-                            KeyCode::Char('4') => {
-                                app.model_dialog.current_tab = ModelTab::Hybrid;
-                            }
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 match app.model_dialog.current_tab {
                                     ModelTab::Models => {
@@ -1971,14 +2288,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             let _ = Config::save_pro_settings(&pro_settings);
                                         }
                                     }
-                                    ModelTab::Hybrid => {
-                                        app.model_dialog.hybrid_persist_permanent =
-                                            !app.model_dialog.hybrid_persist_permanent;
-                                        if app.model_dialog.hybrid_persist_permanent {
-                                            let hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                            let _ = Config::save_hybrid_settings(&hybrid_settings);
-                                        }
-                                    }
                                 }
                             }
                             _ => {
@@ -1991,7 +2300,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             }
                                             KeyCode::Down | KeyCode::Char('j') => {
                                                 app.model_dialog.selected_model_idx =
-                                                    (app.model_dialog.selected_model_idx + 1).min(3);
+                                                    (app.model_dialog.selected_model_idx + 1).min(2);
                                             }
                                             KeyCode::Enter => {
                                                 match app.model_dialog.selected_model_idx {
@@ -2000,7 +2309,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                         let mut cfg = app.llm_client.get_config();
                                                         cfg.model = "deepseek-flash".to_string();
                                                         cfg.local_llm_enabled = false;
-                                                        cfg.hybrid_compression = false;
                                                         cfg.flash_settings = app.model_dialog.to_flash_settings();
                                                         cfg.temperature = cfg.flash_settings.temperature;
                                                         cfg.reasoning_effort = cfg.flash_settings.reasoning_effort.clone();
@@ -2026,7 +2334,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                         let mut cfg = app.llm_client.get_config();
                                                         cfg.model = "deepseek-pro".to_string();
                                                         cfg.local_llm_enabled = false;
-                                                        cfg.hybrid_compression = false;
                                                         cfg.pro_settings = app.model_dialog.to_pro_settings();
                                                         cfg.reasoning_effort = cfg.pro_settings.reasoning_effort.clone();
                                                         if app.model_dialog.persist_model {
@@ -2048,9 +2355,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                         let mut cfg = app.llm_client.get_config();
                                                         cfg.model = "local-assistant".to_string();
                                                         cfg.local_llm_enabled = true;
-                                                        cfg.hybrid_compression = false;
-                                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
                                                         if app.model_dialog.persist_model {
                                                             let _ = cfg.save();
                                                         }
@@ -2060,31 +2364,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                         app.session.add_message(Message::system(format!(
                                                             "Activated 100% Standalone Offline Local Assistant\n- Engine: {}\n- Endpoint: {}\n- Cost: $0.00 (Zero cloud telemetry)",
                                                             cfg.local_llm_model, cfg.local_llm_url
-                                                        )));
-                                                        app.model_dialog.close();
-                                                    }
-                                                    3 => {
-                                                        app.model_dialog.active_engine = 3;
-                                                        let mut cfg = app.llm_client.get_config();
-                                                        cfg.model = "deepseek-flash".to_string();
-                                                        cfg.local_llm_enabled = true;
-                                                        cfg.hybrid_compression = true;
-                                                        cfg.hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                                        cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                                        cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                                        if app.model_dialog.persist_model {
-                                                            let _ = cfg.save();
-                                                            let _ = Config::save_hybrid_settings(&cfg.hybrid_settings);
-                                                        }
-                                                        app.llm_client.update_config(cfg.clone());
-                                                        app.session.model = cfg.model.clone();
-                                                        let _ = app.session.save();
-                                                        app.session.add_message(Message::system(format!(
-                                                            "Activated Smart Hybrid Dual-Engine Mode\n- Strategy: {}\n- Local SLM: {}\n- Endpoint: {}\n- Auto Compression: {}",
-                                                            cfg.hybrid_settings.mode.display_name(),
-                                                            cfg.local_llm_model,
-                                                            cfg.local_llm_url,
-                                                            if cfg.hybrid_settings.auto_compression { "Enabled (~70% token savings)" } else { "Disabled" }
                                                         )));
                                                         app.model_dialog.close();
                                                     }
@@ -2170,93 +2449,79 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             _ => {}
                                         }
                                     }
-                                    ModelTab::Hybrid => {
-                                        match key.code {
-                                            KeyCode::Up | KeyCode::Char('k') => {
-                                                app.model_dialog.hybrid_row_idx =
-                                                    app.model_dialog.hybrid_row_idx.saturating_sub(1);
-                                            }
-                                            KeyCode::Down | KeyCode::Char('j') => {
-                                                app.model_dialog.hybrid_row_idx =
-                                                    (app.model_dialog.hybrid_row_idx + 1).min(4);
-                                            }
-                                            KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
-                                                let forward = matches!(key.code, KeyCode::Right | KeyCode::Char('l'));
-                                                app.model_dialog.cycle_hybrid_row(forward);
-                                                let hybrid_settings = app.model_dialog.to_hybrid_settings();
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.hybrid_settings = hybrid_settings.clone();
-                                                cfg.local_llm_url = hybrid_settings.local_url.clone();
-                                                cfg.local_llm_model = hybrid_settings.secondary_local_model.clone();
-                                                cfg.hybrid_compression = hybrid_settings.auto_compression;
-                                                cfg.local_prompt_lite = app.model_dialog.local_prompt_lite;
-                                                if app.model_dialog.hybrid_persist_permanent {
-                                                    let _ = Config::save_hybrid_settings(&hybrid_settings);
-                                                    let _ = cfg.save();
-                                                }
-                                                app.llm_client.update_config(cfg);
-                                            }
-                                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                                let is_up = app.llm_client.local_client().health_check().await;
-                                                if is_up {
-                                                    app.model_dialog.server_status_msg = Some((
-                                                        format!("ONLINE (Reachable at {})", app.model_dialog.hybrid_local_url),
-                                                        ratatui::style::Color::Rgb(105, 240, 174),
-                                                    ));
-                                                } else {
-                                                    app.model_dialog.server_status_msg = Some((
-                                                        format!("OFFLINE (Cannot connect to {})", app.model_dialog.hybrid_local_url),
-                                                        ratatui::style::Color::Rgb(244, 67, 54),
-                                                    ));
-                                                }
-                                            }
-                                            KeyCode::Enter => {
-                                                // Activate pure Local mode (no cloud hybrid)
-                                                let mut cfg = app.llm_client.get_config();
-                                                cfg.model = "local-assistant".to_string();
-                                                cfg.local_llm_enabled = true;
-                                                cfg.hybrid_compression = false;
-                                                cfg.local_llm_model = app.model_dialog.hybrid_secondary_local_model.clone();
-                                                cfg.local_llm_url = app.model_dialog.hybrid_local_url.clone();
-                                                cfg.local_prompt_lite = app.model_dialog.local_prompt_lite;
-                                                if app.model_dialog.hybrid_persist_permanent {
-                                                    let _ = cfg.save();
-                                                }
-                                                app.model_dialog.active_engine = 2;
-                                                app.llm_client.update_config(cfg.clone());
-                                                app.session.model = cfg.model.clone();
-                                                let _ = app.session.save();
-                                                let prompt_mode = if cfg.local_prompt_lite { "Lite (SLM-optimized)" } else { "Full (Corex standard)" };
-                                                app.session.add_message(Message::system(format!(
-                                                    "Activated 100% Offline Local Mode\n- Model: {}\n- Endpoint: {}\n- Prompt Mode: {}\n- Cost: $0.00",
-                                                    cfg.local_llm_model,
-                                                    cfg.local_llm_url,
-                                                    prompt_mode
-                                                )));
-                                                app.model_dialog.close();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
                                 }
                             }
                         }
                         continue;
                     }
 
-                    // --- 3. Tool Confirmation Modal Active (1:1 DeepSeek Radio Selection) ---
+                    // --- 3. Tool Confirmation Modal Active (Modern CLI 5-Option Radio Selection) ---
                     if let Some(ref mut pending) = app.pending_confirmation {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+                        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let is_ctrl_o = (is_ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')))
+                            || key.code == KeyCode::Char('\x0f');
+
+                        if is_ctrl_o {
                             pending.diff_expanded = !pending.diff_expanded;
+                            app.logs_expanded = pending.diff_expanded;
+                            app.invalidate_message_cache();
+                            app.auto_scroll = true;
+                            needs_redraw = true;
                             continue;
                         }
+
+                        if pending.input_mode {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    pending.input_mode = false;
+                                    pending.feedback_text.clear();
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                KeyCode::Backspace => {
+                                    pending.feedback_text.pop();
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
+                                    pending.feedback_text.push(c);
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                KeyCode::Enter => {
+                                    let feedback = pending.feedback_text.trim().to_string();
+                                    let Some(pending_batch) = app.pending_confirmation.take() else {
+                                        continue;
+                                    };
+                                    let reason = if feedback.is_empty() {
+                                        "Tool execution denied by user.".to_string()
+                                    } else {
+                                        format!("Tool execution denied by user with instruction: {}", feedback)
+                                    };
+                                    for call in pending_batch.calls {
+                                        app.session.add_message(Message::tool_response(
+                                            call.id,
+                                            reason.clone(),
+                                        ));
+                                    }
+                                    app.start_stream_turn(event_tx.clone());
+                                    continue;
+                                }
+                                _ => {
+                                    continue;
+                                }
+                            }
+                        }
+
                         match key.code {
                             KeyCode::Up => {
                                 pending.selected_option = pending.selected_option.saturating_sub(1);
+                                needs_redraw = true;
                                 continue;
                             }
                             KeyCode::Down => {
-                                pending.selected_option = (pending.selected_option + 1).min(2);
+                                pending.selected_option = (pending.selected_option + 1).min(4);
+                                needs_redraw = true;
                                 continue;
                             }
                             _ => {}
@@ -2268,8 +2533,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             || (key.code == KeyCode::Enter && pending.selected_option == 0);
 
                         let should_allow_session = key.code == KeyCode::Char('2')
-                            || key.code == KeyCode::Char('a')
-                            || key.code == KeyCode::Char('A')
+                            || key.code == KeyCode::Char('s')
+                            || key.code == KeyCode::Char('S')
                             || (key.code == KeyCode::Enter && pending.selected_option == 1);
 
                         let should_deny = key.code == KeyCode::Char('3')
@@ -2278,12 +2543,70 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             || key.code == KeyCode::Esc
                             || (key.code == KeyCode::Enter && pending.selected_option == 2);
 
-                        if should_allow_once || should_allow_session {
-                            if should_allow_session {
-                                app.always_allow_tools = true;
+                        let should_allow_always = key.code == KeyCode::Char('4')
+                            || key.code == KeyCode::Char('p')
+                            || key.code == KeyCode::Char('P')
+                            || (key.code == KeyCode::Enter && pending.selected_option == 3);
+
+                        let should_prompt_feedback = key.code == KeyCode::Char('5')
+                            || key.code == KeyCode::Char('w')
+                            || key.code == KeyCode::Char('W')
+                            || (key.code == KeyCode::Enter && pending.selected_option == 4);
+
+                        if should_prompt_feedback {
+                            pending.input_mode = true;
+                            pending.selected_option = 4;
+                            needs_redraw = true;
+                            continue;
+                        }
+
+                        if should_allow_session {
+                            let mut added_rules = Vec::new();
+                            for call in &pending.calls {
+                                let rule = extract_tool_allow_rule(call);
+                                if !rule.is_empty() && !app.session_allowed_commands.contains(&rule) {
+                                    app.session_allowed_commands.push(rule.clone());
+                                    added_rules.push(rule);
+                                }
+                            }
+                            if !added_rules.is_empty() {
+                                app.session.add_message(Message::system(format!(
+                                    "Allowed for this session: {}",
+                                    added_rules.join(", ")
+                                )));
+                            }
+                        }
+
+                        if should_allow_always {
+                            let mut cfg = app.llm_client.get_config();
+                            let mut added_rules = Vec::new();
+
+                            for call in &pending.calls {
+                                let rule = extract_tool_allow_rule(call);
+                                if !rule.is_empty() && !cfg.allowed_commands.contains(&rule) {
+                                    cfg.allowed_commands.push(rule.clone());
+                                    added_rules.push(rule);
+                                }
                             }
 
-                            let pending_batch = app.pending_confirmation.take().unwrap();
+                            if let Err(e) = cfg.save_with_workspace(Some(&app.workspace_dir)) {
+                                app.session.add_message(Message::system(format!(
+                                    "Warning: Could not save allowed_commands to config: {}",
+                                    e
+                                )));
+                            } else if !added_rules.is_empty() {
+                                app.session.add_message(Message::system(format!(
+                                    "Added to ~/.corex/settings.json allowed_commands: {}",
+                                    added_rules.join(", ")
+                                )));
+                            }
+                            app.llm_client.update_config(cfg);
+                        }
+
+                        if should_allow_once || should_allow_session || should_allow_always {
+                            let Some(pending_batch) = app.pending_confirmation.take() else {
+                                continue;
+                            };
                             let calls = pending_batch.calls;
 
                             // Check if sudo password is required before running
@@ -2308,7 +2631,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 workspace_dir: app.workspace_dir.clone(),
                                 yolo_mode: app.always_allow_tools,
                                 sudo_password: get_sudo_password(),
-                                allowed_commands: app.llm_client.get_config().allowed_commands.clone(),
+                                allowed_commands: app.get_effective_allowed_commands(),
                             };
 
                             let tx = event_tx.clone();
@@ -2365,7 +2688,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             });
                             continue;
                         } else if should_deny {
-                            let pending_batch = app.pending_confirmation.take().unwrap();
+                            let Some(pending_batch) = app.pending_confirmation.take() else {
+                                continue;
+                            };
                             for call in pending_batch.calls {
                                 app.session.add_message(Message::tool_response(
                                     call.id,
@@ -2411,7 +2736,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     app.user_dialog.text_input[cur].pop();
                                 }
                             }
-                            KeyCode::Char(c) => {
+                            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
                                 let cur = app.user_dialog.current;
                                 if !app.user_dialog.questions[cur].has_options {
                                     app.user_dialog.text_input[cur].push(c);
@@ -2432,9 +2757,24 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     }
 
                     // --- 4. Global Control Hotkeys ---
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let is_ctrl_o = (is_ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')))
+                        || key.code == KeyCode::Char('\x0f');
+
+                    if is_ctrl_o {
+                        app.logs_expanded = !app.logs_expanded;
+                        if let Some(ref mut pending) = app.pending_confirmation {
+                            pending.diff_expanded = app.logs_expanded;
+                        }
+                        app.invalidate_message_cache();
+                        app.auto_scroll = true;
+                        needs_redraw = true;
+                        continue;
+                    }
+
+                    if is_ctrl {
                         match key.code {
-                            KeyCode::Char('c') => {
+                            KeyCode::Char('c') | KeyCode::Char('\x03') => {
                                 let is_recent = app.last_ctrl_c_press
                                     .map(|i| i.elapsed() <= std::time::Duration::from_secs(2))
                                     .unwrap_or(false);
@@ -2443,33 +2783,30 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     break;
                                 } else {
                                     app.last_ctrl_c_press = Some(std::time::Instant::now());
+                                    needs_redraw = true;
                                 }
+                                continue;
                             }
-                            KeyCode::Char('t') => {
+                            KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('\x14') => {
                                 app.thinking_state.is_expanded = !app.thinking_state.is_expanded;
+                                needs_redraw = true;
+                                continue;
                             }
-                            KeyCode::Char('l') => {
+                            KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Char('\x0c') => {
                                 terminal.clear()?;
                                 needs_redraw = true;
-                            }
-                            KeyCode::Char('o') => {
-                                app.logs_expanded = !app.logs_expanded;
-                                app.invalidate_message_cache();
-                                needs_redraw = true;
+                                continue;
                             }
                             _ => {}
                         }
-                        continue;
                     }
 
                     // --- 5. Input Prompt & Slash Autocomplete Navigation ---
-                    let is_slash_open = app.input_buffer.starts_with('/');
-                    let filter = app.input_buffer.to_lowercase();
-                    let matching_cmds: Vec<&'static str> = ALL_COMMANDS
-                        .iter()
-                        .filter(|c| c.name.starts_with(&filter))
-                        .map(|c| c.name)
-                        .collect();
+                    // Candidates are empty while browsing prompt history, so bare
+                    // Up/Down always keep walking the history instead of being
+                    // captured by the completion menu (e.g. recalled `/resume`).
+                    let matching_cmds = app.matching_slash_commands();
+                    let is_slash_open = !matching_cmds.is_empty();
 
                     match key.code {
                         KeyCode::Left => {
@@ -2553,18 +2890,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             }
                         }
                         KeyCode::Char(c) => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                            if is_ctrl || c.is_control() {
                                 match c {
-                                    'a' => app.cursor_idx = 0,
-                                    'e' => app.cursor_idx = app.input_buffer.len(),
-                                    'u' => {
+                                    'a' | 'A' | '\x01' => app.cursor_idx = 0,
+                                    'e' | 'E' | '\x05' => app.cursor_idx = app.input_buffer.len(),
+                                    'u' | 'U' | '\x15' => {
                                         app.input_buffer.drain(..app.cursor_idx);
                                         app.cursor_idx = 0;
                                     }
-                                    'k' => {
+                                    'k' | 'K' | '\x0b' => {
                                         app.input_buffer.truncate(app.cursor_idx);
                                     }
-                                    'w' => {
+                                    'w' | 'W' | '\x17' => {
                                         let before = &app.input_buffer[..app.cursor_idx];
                                         let trimmed = before.trim_end();
                                         let non_space = match trimmed.rfind(' ') {
@@ -2622,7 +2960,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.last_esc_press = None;
                         }
                         KeyCode::Esc => {
-                            if is_slash_open && !matching_cmds.is_empty() {
+                            if is_slash_open {
                                 app.input_buffer.clear();
                                 app.cursor_idx = 0;
                                 app.pastes.clear();
@@ -2650,14 +2988,36 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             }
                         }
                         KeyCode::Tab => {
-                            if is_slash_open && !matching_cmds.is_empty() {
+                            if is_slash_open {
                                 let selected = matching_cmds[app.slash_selected_idx % matching_cmds.len()];
                                 app.input_buffer = format!("{} ", selected);
                                 app.cursor_idx = app.input_buffer.len();
                             }
                         }
+                        // Chat feed scrolling. Bare Up/Down are reserved for prompt history and
+                        // the slash menu, so scrolling uses a modifier (Shift = full page).
+                        KeyCode::Up
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            app.scroll_chat(if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                -10
+                            } else {
+                                -3
+                            });
+                        }
+                        KeyCode::Down
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            app.scroll_chat(if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                10
+                            } else {
+                                3
+                            });
+                        }
                         KeyCode::Up => {
-                            if is_slash_open && !matching_cmds.is_empty() {
+                            if is_slash_open {
                                 if app.slash_selected_idx > 0 {
                                     app.slash_selected_idx -= 1;
                                 } else {
@@ -2699,52 +3059,27 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::PageUp => {
-                            app.auto_scroll = false;
-                            app.scroll_offset = app.scroll_offset.saturating_sub(10);
-                        }
-                        KeyCode::PageDown => {
-                            let max_s = app.total_rendered_items.saturating_sub(10) as u16;
-                            app.scroll_offset = (app.scroll_offset + 10).min(max_s);
-                            if app.scroll_offset >= max_s {
-                                app.auto_scroll = true;
-                            }
-                        }
+                        KeyCode::PageUp => app.scroll_chat(-10),
+                        KeyCode::PageDown => app.scroll_chat(10),
                         KeyCode::Enter => {
                             let text = app.input_buffer.trim().to_string();
                             if !text.is_empty() {
-                                let cmd_to_run = if is_slash_open && !matching_cmds.is_empty() && !text.contains(' ') {
+                                let cmd_to_run = if is_slash_open && !text.contains(' ') {
                                     matching_cmds[app.slash_selected_idx % matching_cmds.len()].to_string()
                                 } else {
                                     text.clone()
                                 };
 
-                                if app.input_history.last().map(|s| s.as_str()) != Some(&cmd_to_run) {
-                                    app.input_history.push(cmd_to_run.clone());
-                                    corex_core::HistoryStore::append(&cmd_to_run);
-                                }
-                                app.history_idx = None;
-                                app.saved_draft.clear();
-                                app.input_buffer.clear();
-                                app.cursor_idx = 0;
-                                app.slash_selected_idx = 0;
-                                app.slash_popup_height_current = 0.0;
-
-                                if cmd_to_run == "/quit" || cmd_to_run == "/exit" {
-                                    break;
-                                }
-
-                                if cmd_to_run.starts_with('/')
-                                    && app.handle_slash_command(&cmd_to_run).await {
-                                        continue;
-                                    }
-
                                 let mut user_prompt_clean = cmd_to_run.clone();
 
-                                // Strip $sudo: if present
+                                // Strip $sudo: and set sudo password in memory if present
                                 if let Some(pos) = user_prompt_clean.find("$sudo:") {
                                     let after = &user_prompt_clean[pos + 6..];
                                     let end = after.find(' ').unwrap_or(after.len());
+                                    let pwd = &after[..end];
+                                    if !pwd.is_empty() {
+                                        set_sudo_password(Some(pwd.to_string()));
+                                    }
                                     let before = &user_prompt_clean[..pos];
                                     let rest = &after[end..];
                                     user_prompt_clean = format!("{} {}", before.trim(), rest.trim()).trim().to_string();
@@ -2759,16 +3094,41 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         .to_string();
                                 }
 
+                                // Record sanitized command to input history (NEVER leak sudo password to history on disk)
+                                if app.input_history.last().map(|s| s.as_str()) != Some(&user_prompt_clean) && !user_prompt_clean.is_empty() {
+                                    app.input_history.push(user_prompt_clean.clone());
+                                    corex_core::HistoryStore::append(&user_prompt_clean);
+                                }
+                                app.history_idx = None;
+                                app.saved_draft.clear();
+                                app.input_buffer.clear();
+                                app.cursor_idx = 0;
+                                app.slash_selected_idx = 0;
+                                app.slash_popup_height_current = 0.0;
+
+                                if user_prompt_clean == "/quit" || user_prompt_clean == "/exit" {
+                                    break;
+                                }
+
+                                if user_prompt_clean.starts_with('/')
+                                    && app.handle_slash_command(&user_prompt_clean).await {
+                                        continue;
+                                    }
+
                                 if user_prompt_clean.is_empty() {
                                     continue;
                                 }
 
+                                // Expand pasted tags safely without re-scanning newly inserted text (prevents recursive OOM)
                                 for (id, pasted_content) in &app.pastes {
                                     let prefix = format!("[Pasted text #{}", id);
-                                    while let Some(start_idx) = user_prompt_clean.find(&prefix) {
+                                    let mut search_from = 0;
+                                    while let Some(rel_idx) = user_prompt_clean[search_from..].find(&prefix) {
+                                        let start_idx = search_from + rel_idx;
                                         let rest = &user_prompt_clean[start_idx..];
                                         if let Some(end_bracket) = rest.find(']') {
                                             user_prompt_clean.replace_range(start_idx..start_idx + end_bracket + 1, pasted_content);
+                                            search_from = start_idx + pasted_content.len();
                                         } else {
                                             break;
                                         }
@@ -2799,6 +3159,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
+
+            // A drag held above or below the feed keeps scrolling, the way a terminal does, so a
+            // selection can climb past the edge instead of stopping one line short of the text.
+            if app.autoscroll_selection() {
+                needs_redraw = true;
+            }
         }
     }
 
@@ -2883,7 +3249,7 @@ fn print_session_summary(app: &App) {
     };
 
     println!();
-    println!("\x1b[1;38;2;56;189;248m✦ UTI Session Summary\x1b[0m");
+    println!("\x1b[1;38;2;56;189;248m✦ Corex Session Summary\x1b[0m");
     println!("  \x1b[90mModel:\x1b[0m     \x1b[1m{}\x1b[0m", model_display);
     println!("  \x1b[90mDuration:\x1b[0m  {} \x1b[90m·\x1b[0m {} messages", duration_str, msg_count);
     println!("  \x1b[90mTokens:\x1b[0m    {}", tokens_str);
@@ -2892,7 +3258,7 @@ fn print_session_summary(app: &App) {
     }
     println!("  \x1b[90mCost:\x1b[0m      {}", cost_str);
     println!();
-    println!("  \x1b[90mResume:\x1b[0m    \x1b[38;2;135;215;215muti --resume {}\x1b[0m", app.session.id);
+    println!("  \x1b[90mResume:\x1b[0m    \x1b[38;2;135;215;215mcx --resume {}\x1b[0m", app.session.id);
     println!();
 }
 
@@ -2907,7 +3273,7 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
         workspace_dir: app.workspace_dir.clone(),
         yolo_mode: app.always_allow_tools,
         sudo_password: get_sudo_password(),
-        allowed_commands: app.llm_client.get_config().allowed_commands.clone(),
+        allowed_commands: app.get_effective_allowed_commands(),
     };
     let calls = app.user_dialog.calls.clone();
     let output = app.user_dialog.format_output();
@@ -2972,7 +3338,12 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
         if !url.is_empty() {
             urls.push((abs_start, abs_end, url));
         }
-        start = abs_start + end.max(1);
+        let step = if end == 0 {
+            url_rem.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+        } else {
+            end
+        };
+        start = abs_start + step;
     }
 
     if urls.is_empty() {
@@ -2992,6 +3363,30 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
     }
 
     None
+}
+
+pub fn extract_tool_allow_rule(call: &ToolCall) -> String {
+    if call.function.name == "run_shell_command" || call.function.name == "shell" || call.function.name == "run_command" {
+        if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
+            if let Some(cmd) = args_json.get("command").or_else(|| args_json.get("CommandLine")).and_then(|c| c.as_str()) {
+                let trimmed = cmd.trim();
+                let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                if parts.len() >= 2 && !parts[1].starts_with('-') {
+                    format!("{} {}", parts[0], parts[1])
+                } else if !parts.is_empty() {
+                    parts[0].to_string()
+                } else {
+                    trimmed.to_string()
+                }
+            } else {
+                call.function.name.clone()
+            }
+        } else {
+            call.function.name.clone()
+        }
+    } else {
+        call.function.name.clone()
+    }
 }
 
 pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
@@ -3020,11 +3415,25 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
                 .unwrap_or(raw_args);
             format!("Writing file: {}", path)
         }
-        "edit" | "apply_patch" => {
+        "edit" => {
             let path = args_val.as_ref()
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
             format!("Editing file: {}", path)
+        }
+        "apply_patch" => {
+            // The diff names its own target, so a call without `file_path` still says which file it
+            // touches instead of echoing the whole patch.
+            let target = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
+                .map(str::to_string)
+                .or_else(|| {
+                    args_val.as_ref()
+                        .and_then(|v| v.get("patch").and_then(|p| p.as_str()))
+                        .and_then(patch_target)
+                })
+                .unwrap_or_else(|| "patch".to_string());
+            format!("Editing file: {}", target)
         }
         "list_directory" | "list_dir" | "glob" | "ls" => {
             let path = args_val.as_ref()
@@ -3034,6 +3443,25 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
         }
         _ => format!("Executing: {}", name),
     }
+}
+
+/// Target file of an `apply_patch` call.
+///
+/// The diff names the file in its own `---`/`+++` headers, so a call that omits `file_path` can
+/// still say what it touches instead of dumping the whole patch into the header.
+fn patch_target(patch: &str) -> Option<String> {
+    patch
+        .lines()
+        .filter(|line| line.starts_with("+++ ") || line.starts_with("--- "))
+        .filter_map(|line| {
+            let path = line[4..].split('\t').next().unwrap_or("").trim();
+            if path.is_empty() || path == "/dev/null" {
+                return None;
+            }
+            let path = path.strip_prefix("b/").or_else(|| path.strip_prefix("a/")).unwrap_or(path);
+            Some(path.to_string())
+        })
+        .next()
 }
 
 fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span<'static>> {
@@ -3087,12 +3515,19 @@ fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span
             ]
         }
         "apply_patch" | "patch" => {
-            let path = args_val.as_ref()
-                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
-                .unwrap_or(raw_args);
+            let target = args_val.as_ref()
+                .and_then(|v| v.get("file_path").or_else(|| v.get("path")).or_else(|| v.get("file")).and_then(|p| p.as_str()))
+                .map(str::to_string)
+                .or_else(|| {
+                    args_val.as_ref()
+                        .and_then(|v| v.get("patch").or_else(|| v.get("input")).or_else(|| v.get("diff")).and_then(|p| p.as_str()))
+                        .and_then(patch_target)
+                })
+                .or_else(|| patch_target(raw_args))
+                .unwrap_or_else(|| "patch".to_string());
             vec![
                 Span::styled("  [PATCH] apply_patch ", Style::default().fg(theme.accent_yellow)),
-                Span::styled(path.to_string(), Style::default().fg(theme.accent_cyan)),
+                Span::styled(corex_core::truncate_ellipsis(&target, 60), Style::default().fg(theme.accent_cyan)),
             ]
         }
         "edit" | "replace" => {
@@ -3216,6 +3651,65 @@ fn format_input_with_cursor<'a>(
     (spans, cursor_col)
 }
 
+/// Hard-wraps the composer's styled spans to `width` columns.
+///
+/// Unlike the feed's word wrap, the input has to break mid-word when a single token is longer
+/// than a row; otherwise a long path or URL would still overflow the right edge. `indent` spaces
+/// are inserted at the start of every continuation line so the message stays aligned under the
+/// prompt prefix. Returns the wrapped lines plus the row the caret landed on, which the caller
+/// uses to keep the caret visible once the input spans more rows than the composer can show.
+fn wrap_composer_spans<'a>(
+    spans: Vec<Span<'a>>,
+    width: usize,
+    indent: usize,
+    cursor_flat: usize,
+) -> (Vec<Line<'a>>, usize) {
+    let width = width.max(1);
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut current: Vec<Span<'a>> = Vec::new();
+    let mut current_len = 0usize;
+    let mut flat = 0usize;
+    let mut cursor_row = 0usize;
+
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            if ch == '\n' {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_len = 0;
+                if indent > 0 {
+                    current.push(Span::raw(" ".repeat(indent)));
+                    current_len = indent;
+                }
+                flat += 1;
+                continue;
+            }
+
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_len + ch_width > width && current_len > 0 {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_len = 0;
+                if indent > 0 {
+                    current.push(Span::raw(" ".repeat(indent)));
+                    current_len = indent;
+                }
+            }
+
+            if flat == cursor_flat {
+                cursor_row = lines.len();
+            }
+
+            current.push(Span::styled(ch.to_string(), style));
+            current_len += ch_width;
+            flat += 1;
+        }
+    }
+
+    lines.push(Line::from(current));
+    (lines, cursor_row)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_about_card(
     version: &str,
     model: &str,
@@ -3344,7 +3838,7 @@ fn format_system_message(text: &str, theme: &Theme, content_max_width: usize, lo
     let first_line = raw_lines[0].trim();
 
     // 0. Dedicated Corex Info Card
-    if first_line.starts_with("COREX_INFO_CARD|") || first_line.starts_with("UTI_INFO_CARD|") {
+    if first_line.starts_with("COREX_INFO_CARD|") {
         let parts: Vec<&str> = first_line.split('|').collect();
         if parts.len() >= 9 {
             return render_about_card(
@@ -3392,6 +3886,15 @@ fn format_system_message(text: &str, theme: &Theme, content_max_width: usize, lo
             ("  ✕ ", Color::Rgb(220, 100, 100), label, Color::Rgb(220, 110, 110))
         };
 
+        // Output lines
+        let output_lines: Vec<&str> = raw_lines[1..]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let total = output_lines.len();
+        let max_lines = 5;
+
         let mut badge_spans = vec![
             Span::styled(icon, Style::default().fg(icon_color)),
             Span::styled(format!("[bg:{}] ", pid), Style::default().fg(muted_tag)),
@@ -3400,18 +3903,12 @@ fn format_system_message(text: &str, theme: &Theme, content_max_width: usize, lo
         if !duration.trim().is_empty() {
             badge_spans.push(Span::styled(format!(" ({})", duration.trim()), Style::default().fg(muted_dim)));
         }
+        if logs_expanded && total > max_lines {
+            badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(muted_dim)));
+        }
         lines.push(Line::from(badge_spans));
 
-        // Output lines
-        let output_lines: Vec<&str> = raw_lines[1..]
-            .iter()
-            .copied()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-
         if !output_lines.is_empty() {
-            let total = output_lines.len();
-            let max_lines = 5;
             if logs_expanded {
                 for line_str in &output_lines {
                     let clean = line_str.replace('\t', "    ");
@@ -3565,13 +4062,27 @@ fn render_single_message_with_pending(
     match msg.role.as_str() {
         "user" => {
             let content = msg.text_content().unwrap_or("");
-            let user_spans = vec![
-                Span::styled("❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(content.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-            ];
-            let mut wrapped = crate::markdown::wrap_spans(user_spans, content_max_width, "  ");
-            wrapped.push(Line::from(""));
-            lines.extend(wrapped);
+            for (idx, line) in content.split('\n').enumerate() {
+                let (spans, first_indent) = if idx == 0 {
+                    (
+                        vec![
+                            Span::styled("You: ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                            Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                        ],
+                        "  ",
+                    )
+                } else {
+                    (
+                        vec![
+                            Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                        ],
+                        "       ",
+                    )
+                };
+                let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, "       ");
+                lines.extend(wrapped);
+            }
+            lines.push(Line::from(""));
         }
         "assistant" => {
             if let Some(text) = msg.text_content() {
@@ -3616,36 +4127,43 @@ fn render_single_message_with_pending(
                 let wrapped_header = crate::markdown::wrap_spans(header_spans, content_max_width, "    ");
                 lines.extend(wrapped_header);
 
-                for prev_line in content_lines {
-                    if prev_line.trim().is_empty() {
+                for row in content_lines {
+                    if row.is_empty() {
                         continue;
                     }
-                    if let Some(body) = prev_line.strip_prefix('>') {
-                        let mut spans = vec![
-                            Span::styled("      > ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-                        ];
-                        if let Some((num, code)) = body.split_once('|') {
-                            spans.push(Span::styled(num.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)));
-                            spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
-                            spans.push(Span::styled(code.to_string(), Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)));
-                        } else {
-                            spans.push(Span::styled(body.to_string(), Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)));
-                        }
-                        lines.push(Line::from(spans));
+                    // The marker decides the colour, so what the edit dropped is painted as
+                    // prominently as what it added instead of blending into the context.
+                    let (marker, body) = match row.chars().next() {
+                        Some(marker @ ('-' | '+' | ' ')) => (marker, &row[1..]),
+                        _ => (' ', row),
+                    };
+                    let (marker_style, text_style, gutter_style) = match marker {
+                        '-' => (
+                            Style::default().fg(theme.diff_removed_fg).add_modifier(Modifier::BOLD),
+                            Style::default().fg(theme.diff_removed_fg),
+                            Style::default().fg(theme.diff_removed_fg),
+                        ),
+                        '+' => (
+                            Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD),
+                            Style::default().fg(theme.diff_added_fg),
+                            Style::default().fg(theme.diff_added_fg),
+                        ),
+                        _ => (
+                            Style::default(),
+                            Style::default().fg(theme.gray),
+                            Style::default().fg(theme.dark_gray),
+                        ),
+                    };
+
+                    let mut spans = vec![Span::styled(format!("      {} ", marker), marker_style)];
+                    if let Some((num, code)) = body.split_once('|') {
+                        spans.push(Span::styled(num.to_string(), gutter_style));
+                        spans.push(Span::styled("│", gutter_style));
+                        spans.push(Span::styled(code.to_string(), text_style));
                     } else {
-                        let clean_line = prev_line.strip_prefix(' ').unwrap_or(prev_line);
-                        let mut spans = vec![
-                            Span::styled("        ", Style::default()),
-                        ];
-                        if let Some((num, code)) = clean_line.split_once('|') {
-                            spans.push(Span::styled(num.to_string(), Style::default().fg(theme.dark_gray)));
-                            spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
-                            spans.push(Span::styled(code.to_string(), Style::default().fg(theme.gray)));
-                        } else {
-                            spans.push(Span::styled(clean_line.to_string(), Style::default().fg(theme.gray)));
-                        }
-                        lines.push(Line::from(spans));
+                        spans.push(Span::styled(body.to_string(), text_style));
                     }
+                    lines.push(Line::from(spans));
                 }
             } else if content.starts_with("[COMMAND SENT TO BACKGROUND]") || content.starts_with("[BACKGROUND TASK LAUNCHED]") {
                 let pid_str = content.lines().find(|l| l.contains("Task ID (PID):")).and_then(|l| l.split(':').nth(1)).map(|p| p.trim()).unwrap_or("?");
@@ -3701,6 +4219,8 @@ fn render_single_message_with_pending(
                     ];
                     if !logs_expanded {
                         header_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(theme.dark_gray)));
+                    } else {
+                        header_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(theme.dark_gray)));
                     }
                     lines.push(Line::from(header_spans));
 
@@ -3788,6 +4308,32 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         && !app.sudo_dialog.is_open;
     let activity_height = if show_activity { 1 } else { 0 };
 
+    // The prompt prefix and the composer height are resolved before the layout because the
+    // composer grows with the wrapped input: a long message must push the text onto extra rows
+    // instead of running off the right edge of the terminal.
+    let prompt_prefix = if app.always_allow_tools {
+        Span::styled("* ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else if app.plan_mode {
+        Span::styled("? ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("> ", Style::default().fg(app.theme.accent_blue).add_modifier(Modifier::BOLD))
+    };
+    let prefix_width = prompt_prefix.width();
+
+    const MAX_COMPOSER_LINES: usize = 6;
+    let composer_content_lines = {
+        let cursor_at_end = app.cursor_idx >= app.input_buffer.len();
+        let stream_width = unicode_width::UnicodeWidthStr::width(app.input_buffer.as_str())
+            + usize::from(!app.input_buffer.is_empty() && cursor_at_end);
+        let capacity = (size.width as usize).saturating_sub(prefix_width).max(1);
+        if app.pending_confirmation.is_some() || app.input_buffer.is_empty() {
+            1
+        } else {
+            stream_width.div_ceil(capacity).clamp(1, MAX_COMPOSER_LINES)
+        }
+    };
+    let composer_height = composer_content_lines as u16 + 2;
+
     let chunks = if popup_height > 0 {
         Layout::default()
             .direction(Direction::Vertical)
@@ -3795,7 +4341,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
                 Constraint::Min(5),               // Chat Feed
                 Constraint::Length(popup_height), // Autocomplete Popup Slot
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
-                Constraint::Length(3),            // Input Composer
+                Constraint::Length(composer_height), // Input Composer
                 Constraint::Length(1),            // Status Footer Bar
             ])
             .split(size)
@@ -3805,7 +4351,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             .constraints([
                 Constraint::Min(5),               // Chat Feed
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
-                Constraint::Length(3),            // Input Composer
+                Constraint::Length(composer_height), // Input Composer
                 Constraint::Length(1),            // Status Footer Bar
             ])
             .split(size)
@@ -3819,18 +4365,21 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let content_max_width = (chat_chunk.width as usize).saturating_sub(4).max(20);
-    let mut all_lines = Vec::new();
+    let mut all_lines = Vec::with_capacity(app.cached_message_lines.len() + 128);
 
     // 1. Header Banner (First item in scrollable feed!)
     let cfg = app.llm_client.get_config();
     let is_auth = !cfg.api_key.trim().is_empty();
     let is_local = cfg.local_llm_enabled;
     let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
+    let elapsed = app.start_time.elapsed().as_secs_f32();
     let header_lines = render_gradient_logo(
         env!("CARGO_PKG_VERSION"),
+        &cfg.model,
         is_auth,
         is_local,
         update_notice.as_deref(),
+        elapsed,
     );
     all_lines.extend(header_lines);
 
@@ -3857,9 +4406,9 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         app.cached_message_count = 0;
     }
 
-    if app.cached_message_count != target_cache_count {
-        app.cached_message_lines.clear();
-        for msg_idx in 0..target_cache_count {
+    if app.cached_message_count < target_cache_count {
+        let start_idx = app.cached_message_count;
+        for msg_idx in start_idx..target_cache_count {
             let msg = &app.session.messages[msg_idx];
             let next_msg = app.session.messages[..target_cache_count].get(msg_idx + 1);
             let rendered = render_single_message_with_pending(
@@ -3906,6 +4455,8 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             content_max_width,
             &app.theme,
             pending.diff_expanded,
+            pending.input_mode,
+            &pending.feedback_text,
         );
         all_lines.extend(conf_lines);
     }
@@ -3961,15 +4512,32 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 
     app.last_chat_rect = Some(chat_chunk);
-    app.last_rendered_text_lines = all_lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-        .collect();
+
+    // Resolving drag columns into characters needs the plain text of every rendered line.
+    // Only paid for while a selection is live.
+    app.selection_lines = if app.selection.is_some() {
+        all_lines.iter().map(|line| line_plain_text(line)).collect()
+    } else {
+        Vec::new()
+    };
 
     let message_paragraph = Paragraph::new(all_lines)
         .block(Block::default().borders(Borders::NONE))
         .scroll((app.scroll_offset, 0));
     frame.render_widget(message_paragraph, chat_chunk);
+
+    // Painted straight onto the rendered cells: the feed is built from generated lines, so this
+    // is the only place a selection can be highlighted without reworking the renderer.
+    if let Some(selection) = app.selection {
+        paint_selection(
+            frame.buffer_mut(),
+            chat_chunk,
+            app.scroll_offset,
+            &selection,
+            &app.selection_lines,
+            &app.theme,
+        );
+    }
 
     // 2.5. Fixed Activity / Status Bar (Directly above the Composer!)
     if show_activity {
@@ -4026,68 +4594,74 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 
     // 3. Input Prompt Composer
-    let prompt_prefix = if app.always_allow_tools {
-        Span::styled("* ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
-    } else if app.plan_mode {
-        Span::styled("? ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-    } else {
-        Span::styled("> ", Style::default().fg(app.theme.accent_blue).add_modifier(Modifier::BOLD))
-    };
-    let prefix_width = prompt_prefix.width();
-
     let show_esc_hint = app.last_esc_press
         .map(|i| i.elapsed() <= Duration::from_millis(500))
         .unwrap_or(false);
 
-    let (prompt_content, cursor_col) = if app.pending_confirmation.is_some() {
+    // `cursor_row` is the wrapped row the caret sits on; it drives the vertical scroll so the
+    // caret stays visible once the message occupies more rows than the composer can show.
+    let (composer_lines, cursor_row) = if app.pending_confirmation.is_some() {
         (
-            Line::from(vec![
-                prompt_prefix,
+            vec![Line::from(vec![
+                prompt_prefix.clone(),
                 Span::styled("(Press 1-3 or Enter to select, Esc to decline)", Style::default().fg(app.theme.dark_gray)),
-            ]),
-            0,
+            ])],
+            0usize,
         )
-    } else if show_esc_hint {
-        let msg = if app.input_buffer.is_empty() {
-            "Press Esc again to rewind."
-        } else {
-            "Press Esc again to clear prompt."
-        };
-        let (mut spans, col) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
-        spans.insert(0, prompt_prefix);
-        spans.push(Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray)));
-        (Line::from(spans), prefix_width + col)
-    } else if app.input_buffer.is_empty() {
+    } else if app.input_buffer.is_empty() && !show_esc_hint {
         (
-            Line::from(vec![
-                prompt_prefix,
+            vec![Line::from(vec![
+                prompt_prefix.clone(),
                 Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
                 Span::styled("Type your message or @path/to/file", Style::default().fg(app.theme.dark_gray)),
-            ]),
-            prefix_width,
+            ])],
+            0usize,
         )
     } else {
-        let (mut spans, col) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
-        spans.insert(0, prompt_prefix);
-        (Line::from(spans), prefix_width + col)
+        let hint = show_esc_hint.then(|| {
+            let msg = if app.input_buffer.is_empty() {
+                "Press Esc again to rewind."
+            } else {
+                "Press Esc again to clear prompt."
+            };
+            Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray))
+        });
+
+        let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
+
+        let mut clamped = app.cursor_idx.min(app.input_buffer.len());
+        while !app.input_buffer.is_char_boundary(clamped) {
+            clamped = clamped.saturating_sub(1);
+        }
+        // Char offset of the caret inside the flattened stream (prefix chars + input chars).
+        let cursor_flat =
+            prompt_prefix.content.chars().count() + app.input_buffer[..clamped].chars().count();
+
+        let mut spans: Vec<Span<'_>> = Vec::new();
+        spans.push(prompt_prefix.clone());
+        spans.extend(input_spans);
+        if let Some(hint_span) = hint {
+            spans.push(hint_span);
+        }
+
+        wrap_composer_spans(spans, size.width as usize, prefix_width, cursor_flat)
+    };
+
+    let visible_lines = composer_content_lines.max(1);
+    let scroll_y = if cursor_row >= visible_lines {
+        (cursor_row + 1 - visible_lines).min(composer_lines.len().saturating_sub(visible_lines))
+    } else {
+        0
     };
 
     let composer_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(app.theme.dark_gray));
 
-    let visible = (composer_chunk.width as usize).saturating_sub(1).max(1);
-    let margin = if visible > 10 { 5 } else { 0 };
-    let scroll_x = if cursor_col < visible {
-        0
-    } else {
-        (cursor_col + margin).saturating_sub(visible) as u16
-    };
-
     frame.render_widget(
-        Paragraph::new(prompt_content)
+        Paragraph::new(composer_lines)
             .block(composer_block)
-            .scroll((0, scroll_x)),
+            .scroll((scroll_y as u16, 0)),
         composer_chunk,
     );
 
@@ -4222,9 +4796,7 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         };
         center_spans.push(Span::styled(
             task_badge,
-            Style::default()
-                .fg(Color::Rgb(255, 213, 79))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(app.theme.gray),
         ));
     }
 
@@ -4279,9 +4851,381 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
+/// Plain text of a rendered chat line, with no styling attached.
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|span| span.content.as_ref()).collect()
+}
+
+/// Char range of `text` covered by the inclusive display-column interval `from..=to`.
+///
+/// Display columns are what the screen shows, so a double-width glyph (CJK, most emoji) covers
+/// two of them. A selection touching any cell of a wide glyph takes the whole glyph, which is
+/// what a terminal does with its own selection.
+fn char_range_for_display_columns(text: &str, from: u16, to: u16) -> (usize, usize) {
+    use unicode_width::UnicodeWidthChar;
+
+    let (from, to) = (from as u32, to as u32);
+    let mut column = 0u32;
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+
+    for (idx, ch) in text.chars().enumerate() {
+        let width = ch.width().unwrap_or(0) as u32;
+        let cell_start = column;
+        let cell_end = column + width;
+        column = cell_end;
+
+        if width == 0 {
+            // Zero-width marks ride along with the glyph they attach to.
+            if first.is_some() && cell_start <= to {
+                last = Some(idx);
+            }
+            continue;
+        }
+
+        if first.is_none() && cell_end > from {
+            first = Some(idx);
+        }
+        if cell_start <= to {
+            last = Some(idx);
+        } else {
+            break;
+        }
+    }
+
+    let first = first.unwrap_or_else(|| text.chars().count());
+    let last = last.map(|index| index + 1).unwrap_or(first).max(first);
+    (first, last)
+}
+
+/// Highlights the selected cells of the chat viewport.
+///
+/// The feed is drawn from generated lines, so rather than threading selection state through the
+/// renderer this simply restyles the cells that already reached the screen.
+fn paint_selection(
+    buffer: &mut Buffer,
+    chat: Rect,
+    scroll_offset: u16,
+    selection: &Selection,
+    lines: &[String],
+    theme: &Theme,
+) {
+    use unicode_width::UnicodeWidthStr;
+
+    let ((start_line, start_col), (end_line, end_col)) = selection.ordered();
+    let scroll = scroll_offset as usize;
+    // Only the background is touched: the text keeps its own colour, so a selection reads like a
+    // native terminal one instead of flattening the feed into a slab of accent colour.
+    let style = Style::default().bg(theme.selection_bg);
+
+    for line_idx in start_line..=end_line {
+        if line_idx < scroll {
+            continue;
+        }
+        let row_in_view = line_idx - scroll;
+        if row_in_view >= chat.height as usize {
+            break;
+        }
+        let y = chat.y + row_in_view as u16;
+
+        // Middle lines are selected whole, but only up to the width of their own text:
+        // highlighting the padding out to the viewport edge would look like a block of blanks.
+        let text_width = lines
+            .get(line_idx)
+            .map(|line| line.width() as u16)
+            .unwrap_or(chat.width);
+        let from = if line_idx == start_line { start_col } else { 0 };
+        let to = if line_idx == end_line {
+            end_col
+        } else {
+            chat.width.saturating_sub(1)
+        };
+        let to = to.min(text_width.saturating_sub(1));
+
+        for col in from..=to {
+            if col >= chat.width {
+                break;
+            }
+            if let Some(cell) = buffer.cell_mut((chat.x + col, y)) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_selection_ordering_is_direction_agnostic() {
+        let forward = Selection { anchor: (1, 2), cursor: (3, 4) };
+        let backward = Selection { anchor: (3, 4), cursor: (1, 2) };
+        assert_eq!(forward.ordered(), ((1, 2), (3, 4)));
+        assert_eq!(backward.ordered(), ((1, 2), (3, 4)));
+        assert!(!forward.is_empty());
+        assert!(Selection { anchor: (1, 1), cursor: (1, 1) }.is_empty());
+    }
+
+    #[test]
+    fn test_char_range_handles_wide_glyphs_and_clamping() {
+        // ASCII columns map 1:1 onto characters.
+        assert_eq!(char_range_for_display_columns("hello", 0, 1), (0, 2));
+        assert_eq!(char_range_for_display_columns("hello", 2, 2), (2, 3));
+        // A double-width glyph covers two cells and is taken whole either way.
+        assert_eq!(char_range_for_display_columns("日本", 0, 0), (0, 1));
+        assert_eq!(char_range_for_display_columns("日本", 2, 3), (1, 2));
+        assert_eq!(char_range_for_display_columns("日本", 0, 3), (0, 2));
+        // Columns past the end of the line clamp instead of panicking.
+        assert_eq!(char_range_for_display_columns("hi", 0, 99), (0, 2));
+        assert_eq!(char_range_for_display_columns("", 0, 5), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn test_selection_text_spans_multiple_rendered_lines() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
+        app.selection_lines = vec![
+            "first line".to_string(),
+            "second line".to_string(),
+            "third".to_string(),
+        ];
+        app.selection = Some(Selection { anchor: (0, 0), cursor: (0, 4) });
+        assert_eq!(app.selection_text(), "first");
+        // Dragging backwards selects exactly the same text.
+        app.selection = Some(Selection { anchor: (0, 4), cursor: (0, 0) });
+        assert_eq!(app.selection_text(), "first");
+        // Multi-line selections join the covered lines with newlines.
+        app.selection = Some(Selection { anchor: (0, 6), cursor: (2, 2) });
+        assert_eq!(app.selection_text(), "line\nsecond line\nthi");
+    }
+
+    #[tokio::test]
+    async fn test_chat_point_maps_screen_cells_through_scroll() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(2, 5, 30, 10));
+        app.scroll_offset = 100;
+        // A cell inside the viewport maps onto its absolute rendered line.
+        assert_eq!(app.chat_point(4, 7), Some((102, 2)));
+        // Cells outside it clamp to the nearest edge instead of escaping the viewport.
+        assert_eq!(app.chat_point(0, 0), Some((100, 0)));
+        assert_eq!(app.chat_point(99, 99), Some((109, 29)));
+    }
+
+    #[tokio::test]
+    async fn test_dragging_past_the_top_edge_scrolls_the_feed() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 2, 40, 8));
+        app.total_rendered_items = 200;
+        app.auto_scroll = false;
+        app.scroll_offset = 100;
+        app.begin_selection(0, 5);
+        assert_eq!(app.selection.map(|selection| selection.anchor), Some((103, 0)));
+        // Pulling above the viewport scrolls up and keeps the selection anchored.
+        app.extend_selection(0, 1);
+        assert_eq!(app.scroll_offset, 99);
+        assert_eq!(app.selection.map(|selection| selection.cursor), Some((99, 0)));
+    }
+
+    #[tokio::test]
+    async fn test_clicking_outside_the_feed_clears_the_selection() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
+        app.begin_selection(3, 3);
+        assert!(app.selection.is_some());
+        // The composer sits below the feed.
+        app.begin_selection(3, 20);
+        assert!(app.selection.is_none());
+        // A press with no drag carries no text, so releasing it copies nothing and still clears.
+        app.begin_selection(1, 1);
+        app.commit_selection();
+        assert!(app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_copying_stays_out_of_the_chat_feed() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
+        app.selection_lines = vec!["        ".to_string()];
+
+        // Selecting blank space carries no text: no feed message, no clipboard call.
+        app.selection = Some(Selection { anchor: (0, 0), cursor: (0, 7) });
+        let before = app.session.messages.len();
+        app.commit_selection();
+        assert_eq!(app.session.messages.len(), before);
+        // Releasing the drag drops the highlight too: the app owns the mouse, so it owns this.
+        assert!(app.selection.is_none());
+        assert!(app.selection_lines.is_empty());
+    }
+
+    /// Builds the mouse events the drag tests below feed to the app.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[tokio::test]
+    async fn test_a_drag_held_above_the_feed_keeps_climbing_the_conversation() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 2, 40, 8));
+        app.total_rendered_items = 500;
+        app.auto_scroll = false;
+        app.scroll_offset = 300;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 1, 1));
+        assert_eq!(app.scroll_offset, 299, "the drag itself already moves a line");
+
+        // Holding the pointer above the feed keeps scrolling on every tick: drag events stop as
+        // soon as the mouse stops moving, so this is what lets a selection reach far-off text.
+        for _ in 0..50 {
+            assert!(app.autoscroll_selection());
+        }
+        assert_eq!(app.scroll_offset, 149);
+        // The endpoint stays glued to the line under the pointer, which never moved.
+        assert_eq!(app.selection.unwrap().cursor, app.chat_point(1, 1).unwrap());
+
+        // Releasing the button ends it: nothing scrolls on its own any more.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 1));
+        assert!(!app.autoscroll_selection());
+        assert!(app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_drag_reaching_the_top_row_keeps_scrolling_the_feed() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        // The feed is the first area on screen, so its top row is screen row 0: the highest a
+        // pointer can ever reach. Dragging there is the only way to ask for more content upwards.
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 20));
+        app.total_rendered_items = 500;
+        app.auto_scroll = true;
+        app.scroll_offset = 480;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 10));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 5, 0));
+        assert_eq!(app.scroll_offset, 479, "the drag unfreezes the pinned feed");
+        assert!(!app.auto_scroll);
+
+        // Held on that row the feed keeps climbing on every tick.
+        for _ in 0..10 {
+            assert!(app.autoscroll_selection());
+        }
+        assert_eq!(app.scroll_offset, 449);
+        assert_eq!(app.selection.unwrap().cursor, app.chat_point(5, 0).unwrap());
+
+        // Copying on release leaves the feed exactly where the user was reading.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0));
+        assert!(!app.autoscroll_selection());
+        assert_eq!(app.scroll_offset, 449);
+    }
+
+    #[tokio::test]
+    async fn test_a_drag_inside_the_viewport_never_autoscrolls() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 2, 40, 8));
+        app.total_rendered_items = 500;
+        app.auto_scroll = false;
+        app.scroll_offset = 300;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 6));
+        assert!(!app.autoscroll_selection());
+        assert_eq!(app.scroll_offset, 300);
+
+        // Nor without a live drag at all.
+        app.clear_selection();
+        assert!(!app.autoscroll_selection());
+    }
+
+    #[tokio::test]
+    async fn test_the_wheel_keeps_working_while_selecting() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
+        app.total_rendered_items = 200;
+        app.auto_scroll = false;
+        app.scroll_offset = 100;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 5));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 8));
+        assert_eq!(app.selection.unwrap().cursor.0, 108);
+
+        // Scrolling with the button held takes the endpoint with the view, so the selection stays
+        // anchored to the text instead of to the screen.
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 8));
+        assert_eq!(app.scroll_offset, 97);
+        let selection = app.selection.unwrap();
+        assert_eq!(selection.anchor.0, 105, "the anchor does not move");
+        assert_eq!(selection.cursor.0, 105, "the endpoint follows the text");
+
+        // With nothing selected the wheel is a plain scroll again.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 8));
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 8));
+        assert_eq!(app.scroll_offset, 94);
+    }
+
+    #[tokio::test]
+    async fn test_scroll_chat_clamps_and_manages_auto_scroll() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        // 100 rendered lines inside a 20-line viewport -> 80 scrollable lines.
+        app.total_rendered_items = 100;
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 20));
+        assert_eq!(app.max_scroll_offset(), 80);
+
+        // Auto-scroll sits at the bottom; scrolling up disengages it.
+        app.auto_scroll = true;
+        app.scroll_offset = 80;
+        app.scroll_chat(-3);
+        assert_eq!(app.scroll_offset, 77);
+        assert!(!app.auto_scroll);
+
+        // Scrolling back down onto the last line re-engages auto-scroll.
+        app.scroll_chat(3);
+        assert_eq!(app.scroll_offset, 80);
+        assert!(app.auto_scroll);
+
+        // Overscrolling in both directions is clamped to the valid range.
+        app.scroll_chat(-1_000);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.auto_scroll);
+        app.scroll_chat(1_000);
+        assert_eq!(app.scroll_offset, 80);
+        assert!(app.auto_scroll);
+
+        // Content shorter than the viewport: nothing to scroll, auto-scroll stays on.
+        app.total_rendered_items = 5;
+        app.auto_scroll = false;
+        app.scroll_chat(-5);
+        assert_eq!(app.max_scroll_offset(), 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_mouse_capture_toggle_updates_state_and_reports() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        let before = app.session.messages.len();
+        app.set_mouse_capture(false);
+        assert!(!app.mouse_capture, "set_mouse_capture(false) must disable reporting");
+        assert_eq!(app.session.messages.len(), before + 1, "each toggle must report the new state");
+
+        // Toggling flips the state in the opposite direction.
+        app.toggle_mouse_capture();
+        assert!(app.mouse_capture);
+        app.toggle_mouse_capture();
+        assert!(!app.mouse_capture);
+    }
 
     #[test]
     fn test_tool_large_output_is_truncated_in_render() {
@@ -4323,6 +5267,26 @@ mod tests {
         assert!(all_expanded.contains("line 8"));
     }
 
+    #[test]
+    fn test_edited_file_preview_paints_removals_as_removals() {
+        let theme = Theme::default();
+        let output = "Successfully edited src/lib.rs (line 2):\n    1 | context\n-   2 | gone\n+   2 | fresh\n    3 | tail\n";
+        let msg = Message::tool_response("call_1".to_string(), output);
+
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
+        let fg_of = |needle: &str| -> Option<Color> {
+            let line = lines.iter().find(|line| {
+                let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+                text.contains(needle)
+            })?;
+            line.spans.last().and_then(|span| span.style.fg)
+        };
+
+        assert_eq!(fg_of("gone"), Some(theme.diff_removed_fg), "a line the edit removed must read as removed");
+        assert_eq!(fg_of("fresh"), Some(theme.diff_added_fg), "and a line it added as added");
+        assert_eq!(fg_of("context"), Some(theme.gray), "untouched context is neither: it just dims");
+    }
+
     #[tokio::test]
     async fn test_app_cache_invalidation() {
         let client = LlmClient::new(corex_core::config::Config::default());
@@ -4356,14 +5320,18 @@ mod tests {
     fn test_paste_expansion_logic() {
         let mut user_prompt_clean = "Explain this: [Pasted text #1 +2 lines] and fix it.".to_string();
         let mut pastes = std::collections::HashMap::new();
-        pastes.insert(1, "error line 1\nerror line 2\nerror line 3".to_string());
+        // Content itself contains [Pasted text #1] to test recursion immunity!
+        pastes.insert(1, "error line 1 with [Pasted text #1] inside\nerror line 2\nerror line 3".to_string());
 
         for (id, pasted_content) in &pastes {
             let prefix = format!("[Pasted text #{}", id);
-            while let Some(start_idx) = user_prompt_clean.find(&prefix) {
+            let mut search_from = 0;
+            while let Some(rel_idx) = user_prompt_clean[search_from..].find(&prefix) {
+                let start_idx = search_from + rel_idx;
                 let rest = &user_prompt_clean[start_idx..];
                 if let Some(end_bracket) = rest.find(']') {
                     user_prompt_clean.replace_range(start_idx..start_idx + end_bracket + 1, pasted_content);
+                    search_from = start_idx + pasted_content.len();
                 } else {
                     break;
                 }
@@ -4372,7 +5340,7 @@ mod tests {
 
         assert_eq!(
             user_prompt_clean,
-            "Explain this: error line 1\nerror line 2\nerror line 3 and fix it."
+            "Explain this: error line 1 with [Pasted text #1] inside\nerror line 2\nerror line 3 and fix it."
         );
     }
 
@@ -4454,6 +5422,46 @@ mod tests {
         assert_eq!(app.slash_popup_target_height(), 0.0);
     }
 
+    #[tokio::test]
+    async fn test_slash_menu_disabled_while_browsing_history() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+
+        // Typing an exact command name opens the completion menu...
+        app.input_buffer = "/resume".to_string();
+        app.history_idx = None;
+        assert!(app.is_slash_menu_active());
+        assert_eq!(app.matching_slash_commands(), vec!["/resume"]);
+        assert_eq!(app.slash_popup_target_height(), 3.0);
+
+        // ...but recalling that same command from history must NOT, otherwise the
+        // single-item menu would swallow the arrow keys and block history browsing.
+        app.history_idx = Some(3);
+        assert!(!app.is_slash_menu_active());
+        assert!(app.matching_slash_commands().is_empty());
+        assert_eq!(app.slash_popup_target_height(), 0.0);
+
+        // Any exact command name recalled from history is equally safe.
+        for entry in ["/resume", "/chat", "/save", "/model", "/yolo"] {
+            app.input_buffer = entry.to_string();
+
+            // Freshly typed -> the menu is active (this is the state that used to trap the arrows).
+            app.history_idx = None;
+            assert!(app.is_slash_menu_active(), "typed '{entry}' should open the menu");
+
+            // Recalled from history -> the menu is inert, so Up/Down keep browsing.
+            app.history_idx = Some(0);
+            assert!(!app.is_slash_menu_active(), "recalled '{entry}' must not capture the arrow keys");
+
+            // Entries with arguments never match a bare command name in either mode.
+            app.input_buffer = format!("{entry} 2");
+            assert!(!app.is_slash_menu_active());
+            app.history_idx = None;
+            assert!(!app.is_slash_menu_active());
+        }
+    }
+
     #[test]
     fn test_format_system_message_model_activation() {
         let theme = Theme::default();
@@ -4472,12 +5480,12 @@ mod tests {
             Some("https://sluisr.com".to_string())
         );
         assert_eq!(
-            find_url_in_line("│   Official Website       https://uti.sluisr.com                            │", None),
-            Some("https://uti.sluisr.com".to_string())
+            find_url_in_line("│   Official Website       https://corex.sluisr.com                          │", None),
+            Some("https://corex.sluisr.com".to_string())
         );
         assert_eq!(
-            find_url_in_line("Visit https://github.com/sluisr/uti-cli/issues.", None),
-            Some("https://github.com/sluisr/uti-cli/issues".to_string())
+            find_url_in_line("Visit https://github.com/sluisr/corex/issues.", None),
+            Some("https://github.com/sluisr/corex/issues".to_string())
         );
         assert_eq!(
             find_url_in_line("Active Model: deepseek-flash", None),
@@ -4547,6 +5555,27 @@ mod tests {
         assert_eq!(app.pastes.len(), 1);
     }
 
+    #[test]
+    fn test_user_message_box_rendering() {
+        let theme = Theme::default();
+        let msg = Message::user("hola mundo".to_string());
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
+
+        let rendered_text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+
+        // 1. Must NOT contain the old "❯ " glyph
+        for line in &rendered_text {
+            assert!(!line.contains('❯'), "User message should not contain ❯: {}", line);
+        }
+
+        // 2. Clean typography: starts with "You: " and the user message
+        assert!(rendered_text[0].contains("You:"));
+        assert!(rendered_text[0].contains("hola mundo"));
+    }
+
     #[tokio::test]
     async fn test_message_queuing_while_streaming() {
         let client = LlmClient::new(corex_core::config::Config::default());
@@ -4574,4 +5603,68 @@ mod tests {
         assert_eq!(app.session.messages[1].text_content(), Some("Second queued task"));
         assert!(app.message_queue.is_empty());
     }
+
+    #[test]
+    fn test_ctrl_o_key_variants() {
+        let is_ctrl_o = |key: crossterm::event::KeyEvent| -> bool {
+            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            (is_ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')))
+                || key.code == KeyCode::Char('\x0f')
+        };
+
+        // 1. Standard lowercase Ctrl+o
+        let key1 = crossterm::event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(is_ctrl_o(key1));
+
+        // 2. Uppercase Ctrl+O (Shift or CapsLock)
+        let key2 = crossterm::event::KeyEvent::new(KeyCode::Char('O'), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(is_ctrl_o(key2));
+
+        // 3. Raw ASCII 0x0F (sent by legacy/tmux terminal modes without CSI u)
+        let key3 = crossterm::event::KeyEvent::new(KeyCode::Char('\x0f'), KeyModifiers::NONE);
+        assert!(is_ctrl_o(key3));
+
+        let key4 = crossterm::event::KeyEvent::new(KeyCode::Char('\x0f'), KeyModifiers::CONTROL);
+        assert!(is_ctrl_o(key4));
+
+        // 4. False positives check
+        let normal_o = crossterm::event::KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert!(!is_ctrl_o(normal_o));
+
+        let ctrl_p = crossterm::event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert!(!is_ctrl_o(ctrl_p));
+    }
+
+    #[tokio::test]
+    async fn test_session_allowed_commands_does_not_activate_yolo() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        assert!(!app.always_allow_tools);
+        assert!(app.session_allowed_commands.is_empty());
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: corex_core::types::FunctionCall {
+                name: "run_shell_command".to_string(),
+                arguments: serde_json::json!({ "command": "cargo test --workspace" }).to_string(),
+            },
+        };
+
+        let rule = extract_tool_allow_rule(&call);
+        assert_eq!(rule, "cargo test");
+
+        // Simulate choosing option 2 ("Allow for this session")
+        app.session_allowed_commands.push(rule.clone());
+
+        // YOLO mode must still be FALSE!
+        assert!(!app.always_allow_tools);
+
+        // Effective allowed commands must include "cargo test"
+        let eff = app.get_effective_allowed_commands();
+        assert!(eff.contains(&"cargo test".to_string()));
+    }
 }
+
+

@@ -17,6 +17,8 @@ pub struct Theme {
     pub gray: Color,
     pub dark_gray: Color,
     pub border: Color,
+    /// Background used to highlight a mouse selection in the chat feed.
+    pub selection_bg: Color,
 }
 
 impl Default for Theme {
@@ -38,6 +40,9 @@ impl Default for Theme {
             gray: Color::Rgb(175, 175, 175),
             dark_gray: Color::Rgb(95, 95, 95),
             border: Color::Rgb(135, 175, 255),
+            // A quiet lift over the terminal's own background: the text keeps its colour, so a
+            // selection reads like a native one instead of a slab of accent colour.
+            selection_bg: Color::Rgb(58, 58, 68),
         }
     }
 }

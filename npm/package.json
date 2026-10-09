@@ -1,11 +1,10 @@
 {
   "name": "corex-cli",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Corex — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs",
   "bin": {
     "cx": "bin/cx.js",
-    "corex": "bin/cx.js",
-    "uti": "bin/cx.js"
+    "corex": "bin/cx.js"
   },
   "files": [
     "bin/",
@@ -21,7 +20,6 @@
   "keywords": [
     "corex",
     "cx",
-    "uti",
     "deepseek",
     "deepseek-v4",
     "ai",

@@ -34,12 +34,17 @@ impl McpClient {
     pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
+        // Cleanse sensitive core process credentials from MCP child processes
+        cmd.env_remove("COREX_SUDO_PASSWORD");
+        cmd.env_remove("DEEPSEEK_SUDO_PASSWORD");
+        cmd.env_remove("SUDO_ASKPASS");
+        cmd.env_remove("SSH_ASKPASS");
         for (k, v) in &cfg.env {
             cmd.env(k, v);
         }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().with_context(|| {
@@ -78,27 +83,36 @@ impl McpClient {
 
         let expected_id = request.get("id").and_then(|v| v.as_u64());
 
-        // Read lines until matching response is found
+        // Read lines until matching response is found (with 60s timeout to prevent hanging)
         let mut reader = self.stdout_reader.lock().await;
         let mut line = String::new();
-        while reader.read_line(&mut line).await? > 0 {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                line.clear();
-                continue;
-            }
+        let timeout_duration = std::time::Duration::from_secs(60);
 
-            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
-                    if Some(id) == expected_id {
-                        return Ok(parsed);
+        let read_future = async {
+            while reader.read_line(&mut line).await? > 0 {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    line.clear();
+                    continue;
+                }
+
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    if let Some(id) = parsed.get("id").and_then(|v| v.as_u64()) {
+                        if Some(id) == expected_id {
+                            return Ok(parsed);
+                        }
                     }
                 }
+                line.clear();
             }
-            line.clear();
-        }
 
-        bail!("MCP server closed stdout stream unexpectedly")
+            bail!("MCP server closed stdout stream unexpectedly")
+        };
+
+        match tokio::time::timeout(timeout_duration, read_future).await {
+            Ok(res) => res,
+            Err(_) => bail!("Timeout waiting for MCP server response (60s)"),
+        }
     }
 
     async fn initialize(&self) -> Result<()> {
