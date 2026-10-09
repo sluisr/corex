@@ -116,10 +116,10 @@ cargo install --git https://github.com/sluisr/corex.git --force
 
 ```bash
 # Run headlessly or interactively without installation:
-npx corex
+npx @sluisr/corex
 
 # Or install globally:
-npm install -g corex
+npm install -g @sluisr/corex
 ```
 
 ### Method 4: Build from Source

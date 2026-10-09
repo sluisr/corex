@@ -1,8 +1,8 @@
-# ⚡ corex (`cx`)
+# ⚡ @sluisr/corex (`cx`)
 
 > **Corex** — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs.
 
-[![npm version](https://img.shields.io/npm/v/corex?color=blue)](https://www.npmjs.com/package/corex)
+[![npm version](https://img.shields.io/npm/v/@sluisr/corex?color=blue)](https://www.npmjs.com/package/@sluisr/corex)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/sluisr/corex/blob/main/LICENSE)
 
 ## 📦 Installation
@@ -10,13 +10,13 @@
 Install globally via npm:
 
 ```bash
-npm install -g corex
+npm install -g @sluisr/corex
 ```
 
 Or run directly without installing using `npx`:
 
 ```bash
-npx corex
+npx @sluisr/corex
 ```
 
 ## 🚀 Usage
