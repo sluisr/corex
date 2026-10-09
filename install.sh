@@ -21,7 +21,11 @@ case "$OS" in
         TARGET="x86_64-unknown-linux-gnu"
         ;;
       aarch64|arm64)
-        TARGET="aarch64-unknown-linux-musl"
+        if [ -n "$PREFIX" ] || [ -d "/data/data/com.termux" ]; then
+          TARGET="aarch64-linux-android"
+        else
+          TARGET="aarch64-linux-android"
+        fi
         ;;
       *)
         echo "Error: Unsupported architecture $ARCH on Linux."
