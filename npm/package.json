@@ -1,6 +1,6 @@
 {
   "name": "@sluisr/corex",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Corex — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs",
   "bin": {
     "cx": "bin/cx.js",
@@ -11,9 +11,6 @@
     "scripts/",
     "README.md"
   ],
-  "scripts": {
-    "postinstall": "node scripts/install.js"
-  },
   "publishConfig": {
     "access": "public"
   },

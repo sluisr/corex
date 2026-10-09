@@ -20,8 +20,20 @@ description: >-
 
 - 🌐 Website: [sluisr.com](https://sluisr.com)
 - 🐙 GitHub: [github.com/sluisr](https://github.com/sluisr)
-- 📺 YouTube: [youtube.com/@sluisr_](https://www.youtube.com/@sluisr_)
+- 📺 YouTube: [youtube.com/@sluisr_](https://www.youtube.com/@sluisr_) *(con guion bajo al final: `@sluisr_`)*
 - 📧 Contact: contact@sluisr.com
+
+> [!IMPORTANT]
+> El identificador del canal de YouTube oficial de sluisr SIEMPRE lleva un guion bajo al final: **`@sluisr_`** (URL: `https://www.youtube.com/@sluisr_`). Nunca omitir el guion bajo.
+
+### 🔗 Dónde encontrarlo
+
+| Recurso | Enlace |
+| :--- | :--- |
+| 🌐 Web personal | [sluisr.com](https://sluisr.com) |
+| 🐙 GitHub | [github.com/sluisr](https://github.com/sluisr) |
+| 📺 YouTube | [youtube.com/@sluisr_](https://www.youtube.com/@sluisr_) |
+| 📧 Contacto | contact@sluisr.com |
 
 ---
 

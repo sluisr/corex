@@ -3,6 +3,7 @@
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
@@ -66,14 +67,44 @@ function getBinaryInfo() {
   const platform = process.platform;
   const arch = process.arch;
 
-  const target = PLATFORM_MAP[platform]?.[arch];
+  const target = PLATFORM_MAP[platform] && PLATFORM_MAP[platform][arch];
   if (!target) {
     throw new Error(
-      `Unsupported platform: ${platform} (${arch}). Please build from source via cargo: cargo install --git https://github.com/${REPO}`
+      `Unsupported operating system / architecture: ${platform}-${arch}. Supported: Linux (x64), macOS (arm64, x64), Windows (x64).`
     );
   }
-
   return target;
+}
+
+function getBinDir() {
+  // Check if local package bin directory is writable
+  const localBin = path.join(__dirname, '..', 'bin');
+  try {
+    fs.mkdirSync(localBin, { recursive: true });
+    fs.accessSync(localBin, fs.constants.W_OK);
+    return localBin;
+  } catch (_) {
+    // Fall back to ~/.corex/bin which is always writable by the current user without sudo
+    const userBin = path.join(os.homedir(), '.corex', 'bin');
+    fs.mkdirSync(userBin, { recursive: true });
+    return userBin;
+  }
+}
+
+function getBinaryPath() {
+  const target = getBinaryInfo();
+  // 1. Check local package bin first
+  const localBin = path.join(__dirname, '..', 'bin', target.binName);
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
+  // 2. Check user cache directory (~/.corex/bin)
+  const userBin = path.join(os.homedir(), '.corex', 'bin', target.binName);
+  if (fs.existsSync(userBin)) {
+    return userBin;
+  }
+  // 3. Fallback to preferred target path
+  return path.join(getBinDir(), target.binName);
 }
 
 function downloadFile(url, dest, redirectCount = 0) {
@@ -118,8 +149,7 @@ function downloadFile(url, dest, redirectCount = 0) {
         res.pipe(fileStream);
 
         fileStream.on('finish', () => {
-          fileStream.close();
-          resolve();
+          fileStream.close(resolve);
         });
 
         fileStream.on('error', (err) => {
@@ -143,16 +173,9 @@ function downloadFile(url, dest, redirectCount = 0) {
 
 async function install() {
   const target = getBinaryInfo();
-  const binDir = path.join(__dirname, '..', 'bin');
+  const binDir = getBinDir();
   const targetBinPath = path.join(binDir, target.binName);
 
-  if (!fs.existsSync(binDir)) {
-    fs.mkdirSync(binDir, { recursive: true });
-  }
-
-  // If the binary already exists, re-verify its checksum before trusting it. Skipping
-  // verification here would let a tampered or corrupted binary (planted by a preinstall script or
-  // a previous failed download) execute unverified — exactly what the checksum guards against.
   if (fs.existsSync(targetBinPath)) {
     try {
       verifyChecksum(targetBinPath, target.sha256);
@@ -220,4 +243,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { install, getBinaryInfo, verifyChecksum };
+module.exports = { install, getBinaryInfo, getBinaryPath, verifyChecksum };
