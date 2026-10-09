@@ -5,7 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/sluisr/corex?style=flat-square&color=2563eb&label=release)](https://github.com/sluisr/corex/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/sluisr/corex/ci.yml?style=flat-square&label=ci)](https://github.com/sluisr/corex/actions)
 [![Rust](https://img.shields.io/badge/rust-2021-f97316?style=flat-square)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
 ---
 
@@ -248,8 +248,9 @@ Configuration and logs are stored under `~/.corex/`:
 
 ---
 
-## License & Credits
+## License & Commercial Licensing
 
-- **Author:** [sluisr](https://sluisr.com/)
+- **Open Source License:** GNU Affero General Public License v3.0 ([AGPL-3.0-only](LICENSE)).
+- **Author:** [sluisr](https://sluisr.com/) (`contact@sluisr.com`)
 - **Repository:** [https://github.com/sluisr/corex](https://github.com/sluisr/corex)
-- **License:** Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+- **Dual Licensing:** If your organization requires embedding Corex within proprietary closed-source infrastructure or commercial SaaS without AGPL-3.0 copyleft obligations, custom commercial licenses and enterprise support agreements are available upon request. Contact `contact@sluisr.com`.

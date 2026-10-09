@@ -3,7 +3,7 @@
 > **Corex** — High-Performance Autonomous AI Coding Agent for DeepSeek API & Local LLMs.
 
 [![npm version](https://img.shields.io/npm/v/@sluisr/corex?color=blue)](https://www.npmjs.com/package/@sluisr/corex)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](https://github.com/sluisr/corex/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](https://github.com/sluisr/corex/blob/main/LICENSE)
 
 ## 📦 Installation
 
@@ -51,4 +51,4 @@ cx -p "Analyze this project and run all unit tests"
 * **Changelog:** [corex.sluisr.com/changelog](https://corex.sluisr.com/changelog)
 
 ---
-© 2026 **sluisr**. Licensed under Apache 2.0.
+© 2026 **sluisr**. Licensed under GNU Affero General Public License v3.0 (AGPL-3.0-only). Commercial licensing options available upon request.

@@ -57,8 +57,8 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 
 ## 📌 Current Status
 
-- **Version:** `0.3.0` (actively developed)
-- **License:** Apache 2.0 — fully open source
+- **Version:** `0.4.0` (actively developed)
+- **License:** GNU AGPLv3 (`AGPL-3.0-only`) with dual-licensing options
 - **Platforms:** Linux, macOS, Windows
 
 ---
