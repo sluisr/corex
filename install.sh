@@ -4,6 +4,8 @@ set -e
 REPO="sluisr/corex"
 if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
   INSTALL_DIR="$PREFIX/bin"
+elif [ -d "/data/data/com.termux/files/usr/bin" ]; then
+  INSTALL_DIR="/data/data/com.termux/files/usr/bin"
 else
   INSTALL_DIR="/usr/local/bin"
 fi
