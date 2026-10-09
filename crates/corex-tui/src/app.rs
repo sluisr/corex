@@ -1187,7 +1187,7 @@ impl App {
                     format!(
                         "A new version of Corex is available: v{} → v{}\n\n\
                         To update your installation, run in your terminal:\n\
-                        • Via npm:       npm install -g corex-cli\n\
+                        • Via npm:       npm install -g @sluisr/corex\n\
                         • From source:   cargo install --git https://github.com/sluisr/corex.git --force\n\
                         • Or download precompiled binaries from:\n\
                           https://github.com/sluisr/corex/releases/latest",
@@ -1197,7 +1197,7 @@ impl App {
                     format!(
                         "Corex is up to date (v{}).\n\n\
                         If you wish to reinstall or update manually:\n\
-                        • npm install -g corex-cli\n\
+                        • npm install -g @sluisr/corex\n\
                         • cargo install --git https://github.com/sluisr/corex.git --force\n\
                         • https://github.com/sluisr/corex/releases",
                         current

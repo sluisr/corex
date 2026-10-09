@@ -115,7 +115,7 @@ pub async fn run() -> Result<()> {
         if let Some(newer) = corex_core::update::check_for_update_online(current).await {
             println!("\nUpdate available: v{} → v{}\n", current, newer);
             println!("To update Corex, run in your terminal:");
-            println!("  • Via npm:       npm install -g corex-cli");
+            println!("  • Via npm:       npm install -g @sluisr/corex");
             println!("  • From source:   cargo install --git https://github.com/sluisr/corex.git --force");
             println!("  • Or download precompiled binaries from:");
             println!("    https://github.com/sluisr/corex/releases/latest\n");
