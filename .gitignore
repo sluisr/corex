@@ -11,7 +11,8 @@
 .vscode/
 .corex/
 .uti/
-uti-web/
+web/dist/
+web/node_modules/
 npm/bin/cx
 npm/bin/cx.exe
 npm/bin/corex
