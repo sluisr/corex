@@ -54,7 +54,10 @@ case "$OS" in
 esac
 
 echo "[corex] Detecting latest version..."
-LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | cut -d '"' -f 4)
+LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null | sed 's|.*/tag/||' | tr -d '\r\n')
+if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
+  LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4)
+fi
 VERSION="${LATEST_TAG:-v0.5.0}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
