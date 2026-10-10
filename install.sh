@@ -55,7 +55,7 @@ esac
 
 echo "[corex] Detecting latest version..."
 LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | cut -d '"' -f 4)
-VERSION="${LATEST_TAG:-v0.3.0}"
+VERSION="${LATEST_TAG:-v0.5.0}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"
