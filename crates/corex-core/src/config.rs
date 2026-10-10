@@ -503,6 +503,7 @@ impl Config {
     }
 
     pub fn load_with_workspace(workspace: Option<&Path>) -> Self {
+        let _ = crate::engine_signature();
         let mut config = Config::default();
 
         // 1. Global config (~/.corex/settings.json, fallback ~/.deepseek/settings.json)

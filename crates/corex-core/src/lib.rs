@@ -13,6 +13,15 @@ pub mod session;
 pub mod types;
 pub mod update;
 
+/// Original Engine Watermark & Copyright Signature
+pub const COREX_ENGINE_WATERMARK: &str = "COREX_ENGINE_ORIGINAL_AUTHOR_SLUISR_AGPLv3_SIGNATURE_cx8375d4b8";
+
+/// Returns the engine author signature to prevent optimization stripping.
+#[inline(always)]
+pub fn engine_signature() -> &'static str {
+    std::hint::black_box(COREX_ENGINE_WATERMARK)
+}
+
 pub use client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
 pub use config::{Config, McpServerConfig};
 pub use file_lock::lock_path;
