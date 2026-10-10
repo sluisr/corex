@@ -4,7 +4,7 @@ use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::overlay::begin_modal;
@@ -229,12 +229,12 @@ impl ModelDialogState {
                     format!("key: {}", mask_key(&key))
                 });
             } else {
-                let key = p.api_key();
+                let key = cfg.provider_api_keys.get(&p.name).cloned().filter(|k| !k.trim().is_empty()).unwrap_or_else(|| p.api_key());
                 self.ready.push(!key.trim().is_empty());
                 self.hints.push(if key.is_empty() {
                     format!("export {}=…  to enable", p.api_key_env)
                 } else {
-                    format!("key: {} (env {})", mask_key(&key), p.api_key_env)
+                    format!("key: {} (configured)", mask_key(&key))
                 });
             }
         }
@@ -510,8 +510,18 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         return;
     }
 
-    let dialog_width = 100.min(area.width.saturating_sub(4)).max(60.min(area.width));
-    let dialog_height = 22.min(area.height.saturating_sub(2));
+    let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
+
+    let dialog_width = if is_mobile {
+        area.width.saturating_sub(2).max(20)
+    } else {
+        100.min(area.width.saturating_sub(4)).max(60.min(area.width))
+    };
+    let dialog_height = if is_mobile {
+        area.height.saturating_sub(2).min(28)
+    } else {
+        22.min(area.height.saturating_sub(2))
+    };
     let x = area.width.saturating_sub(dialog_width) / 2;
     let y = area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
@@ -528,30 +538,54 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
 
     let vertical = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
     let (body, footer_area) = (vertical[0], vertical[1]);
-    let horizontal = Layout::horizontal([
-        Constraint::Length(26),
-        Constraint::Length(1),
-        Constraint::Min(20),
-    ])
-    .split(body);
 
-    render_providers_pane(frame, horizontal[0], state, theme);
-    let sep: Vec<Line> = (0..horizontal[1].height)
-        .map(|_| Line::from(Span::styled("│", Style::default().fg(RULE))))
-        .collect();
-    frame.render_widget(Paragraph::new(sep), horizontal[1]);
-    render_detail_pane(frame, horizontal[2], state, theme);
+    if is_mobile {
+        let vert_body = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Length(1),
+            Constraint::Min(4),
+        ])
+        .split(body);
+
+        render_providers_pane(frame, vert_body[0], state, theme);
+        let sep = vec![Line::from(Span::styled("─".repeat(vert_body[1].width as usize), Style::default().fg(RULE)))];
+        frame.render_widget(Paragraph::new(sep), vert_body[1]);
+        render_detail_pane(frame, vert_body[2], state, theme);
+    } else {
+        let horizontal = Layout::horizontal([
+            Constraint::Length(26),
+            Constraint::Length(1),
+            Constraint::Min(20),
+        ])
+        .split(body);
+
+        render_providers_pane(frame, horizontal[0], state, theme);
+        let sep: Vec<Line> = (0..horizontal[1].height)
+            .map(|_| Line::from(Span::styled("│", Style::default().fg(RULE))))
+            .collect();
+        frame.render_widget(Paragraph::new(sep), horizontal[1]);
+        render_detail_pane(frame, horizontal[2], state, theme);
+    }
 
     let mut footer = vec![Span::raw(" ")];
-    footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme.gray));
-    footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme.gray));
-    match state.pane {
-        Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme.gray)),
-        Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme.gray)),
-        Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme.gray)),
+    if is_mobile {
+        match state.pane {
+            Pane::Providers => footer.extend(key_badge("Tab/→", "Models", theme.accent_cyan, theme.gray)),
+            Pane::Models => footer.extend(key_badge("Enter", "Use", theme.accent_green, theme.gray)),
+            Pane::Settings => footer.extend(key_badge("◄/►", "Adj", theme.accent_green, theme.gray)),
+        }
+        footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
+    } else {
+        footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme.gray));
+        footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme.gray));
+        match state.pane {
+            Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme.gray)),
+            Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme.gray)),
+            Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme.gray)),
+        }
+        footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme.gray));
+        footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
     }
-    footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme.gray));
-    footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
     let footer_lines = vec![
         Line::from(Span::styled("─".repeat(footer_area.width as usize), Style::default().fg(RULE))),
         Line::from(footer),

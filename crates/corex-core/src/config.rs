@@ -129,6 +129,9 @@ pub struct Config {
     /// behavior (`base_url` / `api_key`, i.e. DeepSeek by default).
     #[serde(default)]
     pub active_provider: Option<String>,
+    /// Persisted API keys for external providers (e.g. google, openai, anthropic).
+    #[serde(default)]
+    pub provider_api_keys: HashMap<String, String>,
 }
 
 fn default_auto_compact() -> bool {
@@ -204,6 +207,16 @@ pub fn is_openai_base_url(url: &str) -> bool {
     url_host(url).map(|h| host_is_or_sub(&h, "openai.com")).unwrap_or(false)
 }
 
+/// True when `base_url` points to Anthropic's official API.
+pub fn is_anthropic_base_url(url: &str) -> bool {
+    url_host(url).map(|h| host_is_or_sub(&h, "anthropic.com")).unwrap_or(false)
+}
+
+/// True when `base_url` points to Google Gemini's official API.
+pub fn is_google_base_url(url: &str) -> bool {
+    url_host(url).map(|h| host_is_or_sub(&h, "generativelanguage.googleapis.com") || host_is_or_sub(&h, "aiplatform.googleapis.com")).unwrap_or(false)
+}
+
 /// True for "pro"/reasoner model profiles. Matches whole name segments so that names such as
 /// `improved-coder` or `approx-7b` are not mistaken for the pro profile.
 pub fn is_pro_model(model: &str) -> bool {
@@ -260,6 +273,7 @@ impl Default for Config {
             allowed_commands: Vec::new(),
             providers: Vec::new(),
             active_provider: None,
+            provider_api_keys: HashMap::new(),
         }
     }
 }
@@ -271,30 +285,107 @@ impl Config {
     }
 
     /// The remote (non-DeepSeek, non-local) provider currently selected, if any.
-    fn external_provider(&self) -> Option<crate::providers::ProviderConfig> {
-        let name = self.active_provider.as_deref()?;
-        self.all_providers()
-            .into_iter()
-            .find(|p| {
-                p.name == name
-                    && !p.is_deepseek()
-                    && !p.is_local()
-                    && validate_base_url(&p.base_url).is_ok()
-            })
+    pub fn external_provider(&self) -> Option<crate::providers::ProviderConfig> {
+        let all = self.all_providers();
+        if let Some(ref name) = self.active_provider {
+            return all
+                .into_iter()
+                .find(|p| {
+                    p.name == *name
+                        && !p.is_deepseek()
+                        && !p.is_local()
+                        && validate_base_url(&p.base_url).is_ok()
+                });
+        }
+        // Fallback 1: Match by model ID
+        if let Some(p) = all.iter().find(|p| !p.is_deepseek() && !p.is_local() && p.models.iter().any(|m| m.id == self.model)) {
+            return Some(p.clone());
+        }
+        // Fallback 2: Match by base_url
+        let host = url_host(&self.base_url).unwrap_or_default();
+        if !is_deepseek_base_url(&self.base_url) && !is_loopback_host(&host) {
+            if let Some(p) = all.iter().find(|p| !p.is_deepseek() && !p.is_local() && !p.base_url.is_empty() && self.base_url.starts_with(&p.base_url)) {
+                return Some(p.clone());
+            }
+        }
+        None
     }
 
     /// `(base_url, api_key)` that requests must use. Switching provider never overwrites the
-    /// stored DeepSeek `base_url` / `api_key`; the other provider's key comes from its env var.
+    /// stored DeepSeek `base_url` / `api_key`; the other provider's key comes from its env var or persisted provider_api_keys.
     pub fn endpoint(&self) -> (String, String) {
         match self.external_provider() {
-            Some(p) => (p.base_url.clone(), p.api_key()),
+            Some(p) => {
+                let key = self.provider_api_keys.get(&p.name).cloned()
+                    .filter(|k| !k.trim().is_empty())
+                    .unwrap_or_else(|| p.api_key());
+                let effective_key = if !key.trim().is_empty() {
+                    key
+                } else if !self.api_key.trim().is_empty() {
+                    self.api_key.clone()
+                } else {
+                    String::new()
+                };
+                (p.base_url.clone(), effective_key)
+            }
             None => (self.base_url.clone(), self.api_key.clone()),
         }
     }
 
     /// True when requests go to DeepSeek (enables DeepSeek-only request fields and model aliases).
     pub fn is_deepseek_endpoint(&self) -> bool {
-        self.external_provider().is_none()
+        if self.external_provider().is_some() {
+            return false;
+        }
+        if self.active_provider.as_deref() == Some(crate::providers::DEEPSEEK_ID) {
+            return true;
+        }
+        if self.active_provider.is_none() {
+            return is_deepseek_base_url(&self.base_url);
+        }
+        false
+    }
+
+    /// Resolves the provider classification to adapt protocols (OpenAI, Anthropic, Google, DeepSeek, Local).
+    pub fn provider_kind(&self) -> crate::providers::ProviderKind {
+        if self.local_llm_enabled || self.model.starts_with("local") {
+            return crate::providers::ProviderKind::Local;
+        }
+        if let Some(ref name) = self.active_provider {
+            match name.as_str() {
+                crate::providers::DEEPSEEK_ID => return crate::providers::ProviderKind::DeepSeek,
+                crate::providers::OPENAI_ID => return crate::providers::ProviderKind::OpenAi,
+                crate::providers::ANTHROPIC_ID => return crate::providers::ProviderKind::Anthropic,
+                crate::providers::GOOGLE_ID => return crate::providers::ProviderKind::Google,
+                crate::providers::GITHUB_ID => return crate::providers::ProviderKind::GitHub,
+                crate::providers::GROQ_ID => return crate::providers::ProviderKind::Groq,
+                crate::providers::OPENROUTER_ID => return crate::providers::ProviderKind::OpenRouter,
+                crate::providers::MISTRAL_ID => return crate::providers::ProviderKind::Mistral,
+                crate::providers::LOCAL_ID => return crate::providers::ProviderKind::Local,
+                _ => {}
+            }
+        }
+        let (url, _) = self.endpoint();
+        let url_lower = url.to_lowercase();
+        if url_lower.contains("anthropic.com") {
+            crate::providers::ProviderKind::Anthropic
+        } else if url_lower.contains("openai.com") {
+            crate::providers::ProviderKind::OpenAi
+        } else if url_lower.contains("generativelanguage.googleapis.com") {
+            crate::providers::ProviderKind::Google
+        } else if url_lower.contains("models.inference.ai.azure.com") {
+            crate::providers::ProviderKind::GitHub
+        } else if url_lower.contains("groq.com") {
+            crate::providers::ProviderKind::Groq
+        } else if url_lower.contains("openrouter.ai") {
+            crate::providers::ProviderKind::OpenRouter
+        } else if url_lower.contains("mistral.ai") {
+            crate::providers::ProviderKind::Mistral
+        } else if url_lower.contains("deepseek.com") {
+            crate::providers::ProviderKind::DeepSeek
+        } else {
+            crate::providers::ProviderKind::GenericOpenAi
+        }
     }
 }
 
@@ -502,10 +593,37 @@ impl Config {
             eprintln!("[corex] warning: {}; falling back to {}", e, default_base_url_static());
             config.base_url = default_base_url_static().to_string();
         }
-        // OpenAI keys are only ever sent to OpenAI.
+        // Provider-specific keys are only sent to their designated endpoints:
         if config.api_key.trim().is_empty() && is_openai_base_url(&config.base_url) {
             if let Ok(k) = std::env::var("OPENAI_API_KEY") {
                 config.api_key = k;
+            }
+        }
+        if config.api_key.trim().is_empty() && is_anthropic_base_url(&config.base_url) {
+            if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+                config.api_key = k;
+            }
+        }
+        if config.api_key.trim().is_empty() && is_google_base_url(&config.base_url) {
+            if let Ok(k) = std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY")) {
+                config.api_key = k;
+            }
+        }
+        // Auto-migrate retired/deprecated models from Google AI Studio (2.0-flash / 2.5-flash / 2.5-pro -> 3.5-flash-lite)
+        if config.active_provider.as_deref() == Some("google")
+            && (config.model == "gemini-2.0-flash" || config.model == "gemini-2.5-flash" || config.model == "gemini-1.5-flash" || config.model == "gemini-2.5-pro")
+        {
+            config.model = "gemini-3.5-flash-lite".to_string();
+        }
+
+        // Export persisted provider API keys to environment if not already set
+        for (prov, key) in &config.provider_api_keys {
+            if !key.trim().is_empty() {
+                if let Some(p) = config.all_providers().iter().find(|p| p.name == *prov) {
+                    if !p.api_key_env.is_empty() && std::env::var(&p.api_key_env).unwrap_or_default().is_empty() {
+                        std::env::set_var(&p.api_key_env, key);
+                    }
+                }
             }
         }
         if let Ok(m) = std::env::var("COREX_MODEL")

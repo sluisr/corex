@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use corex_core::session::{Session, SessionSummary};
 
@@ -90,10 +90,20 @@ pub fn render_session_dialog(
     // Actualizamos la preview del elemento seleccionado si ha cambiado
     state.update_preview();
 
-    let dialog_width = 104.min(area.width.saturating_sub(4)).max(56);
-    let dialog_height = (area.height * 4 / 5)
-        .clamp(16, 26)
-        .min(area.height.saturating_sub(2));
+    let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
+
+    let dialog_width = if is_mobile {
+        area.width.saturating_sub(2).max(20)
+    } else {
+        104.min(area.width.saturating_sub(4)).max(56.min(area.width))
+    };
+    let dialog_height = if is_mobile {
+        area.height.saturating_sub(2).min(28)
+    } else {
+        (area.height * 4 / 5)
+            .clamp(16, 26)
+            .min(area.height.saturating_sub(2))
+    };
 
     let x = (area.width.saturating_sub(dialog_width)) / 2;
     let y = (area.height.saturating_sub(dialog_height)) / 2;
@@ -193,22 +203,26 @@ pub fn render_session_dialog(
         };
         frame.render_widget(Paragraph::new(empty_msg), vert_chunks[2]);
     } else {
-        // En pantallas suficientemente anchas hacemos Split horizontal (Lista | Preview)
-        let split_h = Layout::horizontal([
-            Constraint::Percentage(58),
-            Constraint::Length(1), // Separador vertical
-            Constraint::Percentage(42),
-        ])
-        .split(vert_chunks[2]);
+        let is_compact = is_mobile;
+        if is_compact {
+            render_session_list(frame, vert_chunks[2], &filtered, state.selected_idx, theme);
+        } else {
+            let split_h = Layout::horizontal([
+                Constraint::Percentage(58),
+                Constraint::Length(1), // Separador vertical
+                Constraint::Percentage(42),
+            ])
+            .split(vert_chunks[2]);
 
-        render_session_list(frame, split_h[0], &filtered, state.selected_idx, theme);
-        
-        let v_sep: Vec<Line> = (0..split_h[1].height)
-            .map(|_| Line::from(Span::styled("│", div_style)))
-            .collect();
-        frame.render_widget(Paragraph::new(v_sep), split_h[1]);
+            render_session_list(frame, split_h[0], &filtered, state.selected_idx, theme);
+            
+            let v_sep: Vec<Line> = (0..split_h[1].height)
+                .map(|_| Line::from(Span::styled("│", div_style)))
+                .collect();
+            frame.render_widget(Paragraph::new(v_sep), split_h[1]);
 
-        render_session_preview(frame, split_h[2], state.cached_preview_session.as_ref(), theme);
+            render_session_preview(frame, split_h[2], state.cached_preview_session.as_ref(), theme);
+        }
     }
 
     // Divider 2
@@ -224,18 +238,25 @@ pub fn render_session_dialog(
             Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled("] ", Style::default().fg(Color::Rgb(70, 85, 110))),
             Span::styled(desc, Style::default().fg(theme.gray)),
-            Span::raw("   "),
+            Span::raw(" "),
         ]
     };
 
-    let mut footer = vec![Span::raw("  ")];
-    footer.extend(key_badge("Enter", "Resume", theme.accent_blue));
-    footer.extend(key_badge("x", "Delete", theme.accent_red));
-    footer.extend(key_badge("↑/↓", "Navigate", theme.accent_cyan));
-    if !state.search_query.is_empty() {
-        footer.extend(key_badge("Esc", "Clear Filter", theme.accent_yellow));
-    } else {
+    let mut footer = vec![Span::raw(" ")];
+    let is_compact = is_mobile;
+    if is_compact {
+        footer.extend(key_badge("Enter", "Open", theme.accent_blue));
+        footer.extend(key_badge("x", "Del", theme.accent_red));
         footer.extend(key_badge("Esc", "Close", theme.gray));
+    } else {
+        footer.extend(key_badge("Enter", "Resume", theme.accent_blue));
+        footer.extend(key_badge("x", "Delete", theme.accent_red));
+        footer.extend(key_badge("↑/↓", "Navigate", theme.accent_cyan));
+        if !state.search_query.is_empty() {
+            footer.extend(key_badge("Esc", "Clear Filter", theme.accent_yellow));
+        } else {
+            footer.extend(key_badge("Esc", "Close", theme.gray));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(footer)), vert_chunks[4]);
 }
@@ -271,14 +292,20 @@ fn render_session_list(
         // Model badge
         let (model_tag, model_fg) = if s.model.starts_with("local") {
             ("[Local]", Color::Rgb(255, 215, 130))
+        } else if s.model.contains("claude") || s.model.contains("anthropic") {
+            ("[Claude]", Color::Rgb(255, 167, 38))
+        } else if s.model.contains("gemini") {
+            ("[Gemini]", Color::Rgb(79, 195, 247))
+        } else if s.model.contains("gpt") || s.model.contains("openai") || s.model.starts_with("o1") || s.model.starts_with("o3") {
+            ("[ GPT ]", Color::Rgb(105, 240, 174))
+        } else if s.model.contains("llama") {
+            ("[Llama]", Color::Rgb(179, 136, 255))
+        } else if s.model.contains("codestral") || s.model.contains("mistral") {
+            ("[Mistral]", Color::Rgb(255, 112, 67))
         } else if s.model.contains("pro") || s.model.contains("reasoner") {
             ("[ Pro ]", Color::Rgb(215, 175, 255))
         } else if s.model.contains("flash") {
             ("[Flash]", Color::Rgb(135, 215, 235))
-        } else if s.model.contains("gpt") || s.model.contains("openai") {
-            ("[ GPT ]", Color::Rgb(105, 240, 174))
-        } else if s.model.contains("claude") || s.model.contains("anthropic") {
-            ("[Claude]", Color::Rgb(255, 167, 38))
         } else {
             ("[Cloud]", Color::Rgb(129, 199, 245))
         };

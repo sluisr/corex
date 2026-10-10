@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-10-10
+
+### Added
+- **Multi-Provider Ecosystem (Real Official Protocols)**: Full native protocol support for OpenAI (`/chat/completions`, `o1`/`o3-mini` reasoning effort & temperature stripping), Anthropic Claude (dedicated `/v1/messages` SSE adapter, `tool_use`/`tool_result` translation), Google Gemini (`/v1beta/openai`), GitHub Models (`models.inference.ai.azure.com`), Groq (500+ tokens/s Free Tier), OpenRouter, and Mistral AI.
+- **Mobile Vertical / Termux Responsive UX**:
+  - **Touch-to-Keyboard in Termux**: Automatically detects mobile vertical (portrait) screens and disables terminal mouse reporting by default, allowing native Android screen taps in Termux to open the virtual keyboard instantly.
+  - **Mobile Portrait Responsive Layout**: Redesigned header banner, 2-column non-overlapping status bar, adaptive input composer placeholder, and full-width/stacked modals for `/model`, `/resume`, and auth dialogs on screens narrower than 68 columns.
+- **Google Gemini 3.x Streaming & Thought Signatures**: Full support for `gemini-3.5-flash-lite`, `gemini-3.8-flash`, and Google AI Studio OpenAI compatibility endpoint, handling delta tool call chunk schemas, `thought_signature` state preservation across tool turns, and automatic legacy sanitization.
+- **Automated Checksum & Dynamic NPM Installer**: Replaced manual SHA-256 hash maintenance with automatic release checksum generation in GitHub Actions and dynamic verification in the npm installer.
+- **Non-Intrusive Dynamic Auth Flow**: Eliminated forced startup modal; Corex now starts cleanly and contextually requests the exact API key corresponding to the selected provider with direct portal links.
+
+---
+
 ## [0.4.0] - 2026-10-09
 
 ### Added

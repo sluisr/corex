@@ -181,6 +181,7 @@ impl LocalLlmClient {
                                                     id: tc.id.clone(),
                                                     name: tc.function.as_ref().and_then(|f| f.name.clone()),
                                                     arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
+                                                    extra_content: tc.extra_content.clone(),
                                                 }).await;
                                             }
                                         }

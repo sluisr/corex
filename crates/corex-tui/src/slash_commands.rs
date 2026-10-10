@@ -179,6 +179,20 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         group: APP,
     },
     CommandItem {
+        name: "/mouse",
+        args: "",
+        description: "Toggle mouse reporting (wheel/drag vs native touch)",
+        aliases: &[],
+        group: APP,
+    },
+    CommandItem {
+        name: "/keyboard",
+        args: "",
+        description: "Request soft keyboard (Termux / Android)",
+        aliases: &[],
+        group: APP,
+    },
+    CommandItem {
         name: "/quit",
         args: "",
         description: "Exit the Corex session",

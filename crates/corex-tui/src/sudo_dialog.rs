@@ -2,7 +2,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use corex_core::types::ToolCall;
@@ -165,14 +165,7 @@ mod tests {
         assert!(state.pending_call.is_none());
         assert!(state.pending_calls.is_empty());
 
-        let call = ToolCall {
-            id: "call_123".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: r#"{"command":"sudo apt update"}"#.to_string(),
-            },
-        };
+        let call = ToolCall::new("call_123", "run_shell_command", r#"{"command":"sudo apt update"}"#);
 
         state.open(call.clone(), "sudo apt update".to_string());
         assert!(state.is_open);
@@ -190,22 +183,8 @@ mod tests {
     #[test]
     fn test_sudo_dialog_open_batch() {
         let mut state = SudoDialogState::new();
-        let call1 = ToolCall {
-            id: "call_1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: r#"{"command":"sudo apt update"}"#.to_string(),
-            },
-        };
-        let call2 = ToolCall {
-            id: "call_2".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: r#"{"command":"sudo apt upgrade -y"}"#.to_string(),
-            },
-        };
+        let call1 = ToolCall::new("call_1", "run_shell_command", r#"{"command":"sudo apt update"}"#);
+        let call2 = ToolCall::new("call_2", "run_shell_command", r#"{"command":"sudo apt upgrade -y"}"#);
 
         state.open_batch(vec![call1, call2], "sudo apt update && sudo apt upgrade -y".to_string());
         assert!(state.is_open);

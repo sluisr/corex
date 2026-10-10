@@ -86,16 +86,20 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar -czvf ../../../${{ env.ARCHIVE_NAME }} cx corex
           cd ../../..
+          sha256sum ${{ env.ARCHIVE_NAME }} | cut -d ' ' -f 1 > ${{ env.ARCHIVE_NAME }}.sha256
 
       - name: Package release asset (Windows)
         if: runner.os == 'Windows'
         run: |
           Compress-Archive -Path target\${{ matrix.target }}\release\cx.exe,target\${{ matrix.target }}\release\corex.exe -DestinationPath ${{ env.ARCHIVE_NAME }}
+          (Get-FileHash -Path ${{ env.ARCHIVE_NAME }} -Algorithm SHA256).Hash.ToLower().Trim() | Out-File -FilePath "${{ env.ARCHIVE_NAME }}.sha256" -Encoding ascii
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.4.0' }}
-          files: ${{ env.ARCHIVE_NAME }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.5.0' }}
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

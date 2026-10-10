@@ -32,7 +32,9 @@ pub enum StreamEvent {
         id: Option<String>,
         name: Option<String>,
         arguments: Option<String>,
+        extra_content: Option<serde_json::Value>,
     },
+    ExtraContentDelta(serde_json::Value),
     UsageUpdate(Usage),
     Completed {
         finish_reason: Option<String>,
@@ -245,6 +247,54 @@ impl LlmClient {
                 }
             }
             idx += 1;
+        }
+    }
+
+    /// Sanitizes tool call history for Google Gemini models:
+    /// Google requires a valid cryptographic `thought_signature` on every tool_call in functionCall parts.
+    /// If older turns (e.g. from previous sessions or other models like DeepSeek) lack `thought_signature`,
+    /// Google rejects the entire request with 400 Bad Request ("Function call is missing a thought_signature").
+    /// This method safely converts unsigned tool calls and their responses into readable text assistant turns.
+    pub fn sanitize_for_google_tool_calls(messages: &mut Vec<Message>) {
+        let mut i = 0;
+        while i < messages.len() {
+            if messages[i].role == "assistant" {
+                let has_unsigned_tool_call = if let Some(ref calls) = messages[i].tool_calls {
+                    calls.iter().any(|c| {
+                        c.extra_content.as_ref()
+                            .and_then(|ec| ec.get("google"))
+                            .and_then(|g| g.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.is_empty())
+                            .unwrap_or(true)
+                    })
+                } else {
+                    false
+                };
+
+                if has_unsigned_tool_call {
+                    let calls = messages[i].tool_calls.take().unwrap_or_default();
+                    let mut converted_text = messages[i].text_content().unwrap_or("").to_string();
+
+                    let j = i + 1;
+                    while j < messages.len() && messages[j].role == "tool" {
+                        let tool_msg = messages.remove(j);
+                        let tool_output = tool_msg.text_content().unwrap_or("");
+                        let tool_id = tool_msg.tool_call_id.as_deref().unwrap_or("");
+                        let call_name = calls.iter().find(|c| c.id == tool_id).map(|c| c.function.name.as_str()).unwrap_or("tool");
+                        if !converted_text.is_empty() {
+                            converted_text.push_str("\n\n");
+                        }
+                        converted_text.push_str(&format!("[Executed {}: {}]", call_name, tool_output.trim()));
+                    }
+
+                    if converted_text.trim().is_empty() {
+                        converted_text = "[Tool calls completed]".to_string();
+                    }
+                    messages[i].content = Some(MessageContent::Text(converted_text));
+                }
+            }
+            i += 1;
         }
     }
 
@@ -554,6 +604,9 @@ impl LlmClient {
         Self::cap_history_if_needed(&mut messages);
         // 3. Sanitize tool call sequences so no orphaned messages exist
         Self::sanitize_tool_call_sequences(&mut messages);
+        if cfg.provider_kind() == crate::providers::ProviderKind::Google {
+            Self::sanitize_for_google_tool_calls(&mut messages);
+        }
         // 4. Truncate active tool outputs exceeding safety limits
         Self::truncate_tool_outputs(&mut messages);
 
@@ -572,10 +625,25 @@ impl LlmClient {
         // the tail of the context window as a standalone message, never inside a tool payload:
         // tool results are untrusted data, so splicing an instruction there would be read as
         // file contents and would contradict the instruction to ignore directives in tool output.
-        crate::language::apply_recency_anchor(&mut messages);
+        if is_deepseek {
+            crate::language::apply_recency_anchor(&mut messages);
+        }
 
         if let Some(ref mut t_list) = tools {
             Self::sort_tools(t_list);
+        }
+
+        let provider_kind = cfg.provider_kind();
+        if provider_kind == crate::providers::ProviderKind::Anthropic {
+            return self.stream_chat_anthropic(
+                &endpoint_url,
+                api_key,
+                &cfg.model,
+                messages,
+                tools,
+                cancel_token,
+                auto_compact_event,
+            ).await;
         }
 
         let has_tools = tools.is_some();
@@ -606,7 +674,17 @@ impl LlmClient {
         }
 
         let api_model = if !is_deepseek {
-            cfg.model.clone()
+            if provider_kind == crate::providers::ProviderKind::Google {
+                if cfg.model == "gemini-2.5-flash" || cfg.model == "gemini-2.0-flash" || cfg.model == "gemini-1.5-flash" {
+                    "gemini-3.5-flash-lite".to_string()
+                } else if cfg.model == "gemini-2.5-pro" {
+                    "gemini-3.8-flash".to_string()
+                } else {
+                    cfg.model.clone()
+                }
+            } else {
+                cfg.model.clone()
+            }
         } else if cfg.model == "deepseek-v4-pro"
             || cfg.model == "deepseek-reasoner"
             || cfg.model.contains("pro")
@@ -662,8 +740,10 @@ impl LlmClient {
             || normalized_reasoning_effort == "off"
             || normalized_reasoning_effort == "false";
 
-        // `thinking` / `reasoning_effort` are DeepSeek extensions: other OpenAI-compatible
-        // providers may reject unknown fields, so they get a plain chat-completions request.
+        let is_openai_reasoning = api_model.starts_with("o1") || api_model.starts_with("o3");
+
+        // `thinking` / `reasoning_effort` are DeepSeek extensions; OpenAI reasoning models (o1/o3)
+        // support standard `reasoning_effort`. Other OpenAI-compatible providers reject unknown fields.
         let thinking_config = if !is_deepseek {
             None
         } else if is_thinking_disabled {
@@ -676,15 +756,26 @@ impl LlmClient {
             })
         };
 
-        let effective_reasoning_effort = if !is_deepseek {
-            None
-        } else if is_thinking_disabled {
-            Some("none".to_string())
+        let effective_reasoning_effort = if is_deepseek {
+            if is_thinking_disabled {
+                Some("none".to_string())
+            } else {
+                Some(normalized_reasoning_effort)
+            }
+        } else if is_openai_reasoning {
+            match normalized_reasoning_effort.to_lowercase().as_str() {
+                "low" => Some("low".to_string()),
+                "high" | "max" | "xhigh" => Some("high".to_string()),
+                _ => Some("medium".to_string()),
+            }
         } else {
-            Some(normalized_reasoning_effort)
+            None
         };
 
-        let effective_temperature = if !is_deepseek {
+        let effective_temperature = if is_openai_reasoning {
+            // OpenAI o1/o3 reject the temperature parameter with 400 Bad Request
+            None
+        } else if !is_deepseek {
             Some(cfg.temperature)
         } else if is_thinking_disabled {
             if api_model.contains("flash") {
@@ -711,9 +802,22 @@ impl LlmClient {
             }),
         };
 
+        let provider_label = match provider_kind {
+            crate::providers::ProviderKind::DeepSeek => "DeepSeek Cloud",
+            crate::providers::ProviderKind::OpenAi => "OpenAI Cloud",
+            crate::providers::ProviderKind::Google => "Google Gemini",
+            crate::providers::ProviderKind::GitHub => "GitHub Models",
+            crate::providers::ProviderKind::Groq => "Groq Cloud",
+            crate::providers::ProviderKind::OpenRouter => "OpenRouter",
+            crate::providers::ProviderKind::Mistral => "Mistral AI",
+            crate::providers::ProviderKind::Local => "Local LLM",
+            crate::providers::ProviderKind::Anthropic => "Anthropic Claude",
+            crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
+        };
+
         let body_serialized = serde_json::to_string_pretty(&request_body).unwrap_or_default();
         crate::forensic::ForensicLogger::log_llm_request(
-            "DeepSeek Cloud",
+            provider_label,
             &api_model,
             &url,
             messages_count,
@@ -734,6 +838,7 @@ impl LlmClient {
         let (tx, rx) = mpsc::channel::<StreamEvent>(100);
 
         let api_model_clone = api_model.clone();
+        let provider_label_clone = provider_label.to_string();
         tokio::spawn(async move {
             if let Some((compacted_messages, notice)) = auto_compact_event {
                 let _ = tx.send(StreamEvent::ContextCompacted { compacted_messages, notice }).await;
@@ -754,8 +859,8 @@ impl LlmClient {
                         break;
                     }
                     _ = tokio::time::sleep(timeout_duration) => {
-                        crate::forensic::ForensicLogger::log_error("stream_chat", "Stream idle timeout: DeepSeek API did not respond for 180 seconds.");
-                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: DeepSeek API did not respond for 180 seconds.".to_string())).await;
+                        crate::forensic::ForensicLogger::log_error("stream_chat", "Stream idle timeout: API did not respond for 180 seconds.");
+                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: API did not respond for 180 seconds.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
@@ -767,7 +872,7 @@ impl LlmClient {
                                 if msg.data.trim() == "[DONE]" {
                                     let duration_ms = start_time.elapsed().as_millis();
                                     crate::forensic::ForensicLogger::log_llm_response(
-                                        "DeepSeek Cloud",
+                                        &provider_label_clone,
                                         &api_model_clone,
                                         total_content_chars,
                                         total_reasoning_chars,
@@ -811,20 +916,26 @@ impl LlmClient {
                                             if !tc_deltas.is_empty() && first_token_time.is_none() {
                                                 first_token_time = Some(start_time.elapsed().as_millis());
                                             }
-                                            for tc in tc_deltas {
+                                            for (pos, tc) in tc_deltas.iter().enumerate() {
+                                                let effective_index = if tc.index == 0 && pos > 0 { pos } else { tc.index };
                                                 let _ = tx.send(StreamEvent::ToolCallDelta {
-                                                    index: tc.index,
+                                                    index: effective_index,
                                                     id: tc.id.clone(),
                                                     name: tc.function.as_ref().and_then(|f| f.name.clone()),
                                                     arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
+                                                    extra_content: tc.extra_content.clone(),
                                                 }).await;
                                             }
+                                        }
+
+                                        if let Some(ref ec) = choice.delta.extra_content {
+                                            let _ = tx.send(StreamEvent::ExtraContentDelta(ec.clone())).await;
                                         }
 
                                         if let Some(ref reason) = choice.finish_reason {
                                             let duration_ms = start_time.elapsed().as_millis();
                                             crate::forensic::ForensicLogger::log_llm_response(
-                                                "DeepSeek Cloud",
+                                                &provider_label_clone,
                                                 &api_model_clone,
                                                 total_content_chars,
                                                 total_reasoning_chars,
@@ -842,13 +953,29 @@ impl LlmClient {
                             Some(Err(err)) => {
                                 error!("[SSE] Error: {}", err);
                                 crate::forensic::ForensicLogger::log_error("stream_chat_sse", &err.to_string());
-                                let _ = tx.send(StreamEvent::Error(format!("Stream error: {}", err))).await;
+                                let friendly_err = match err {
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let body_text = resp.text().await.unwrap_or_default();
+                                        crate::forensic::ForensicLogger::log_error("stream_chat_sse_body", &body_text);
+                                        if status == reqwest::StatusCode::UNAUTHORIZED {
+                                            format!("Authentication error (401 Unauthorized): Invalid or missing API key for {}. Please check your API key in ~/.corex/settings.json or export the environment variable.", provider_label_clone)
+                                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                            format!("Rate limit or quota exceeded (429 Too Many Requests) from {}.", provider_label_clone)
+                                        } else if !body_text.is_empty() {
+                                            format!("API error ({}): {}", status, body_text)
+                                        } else {
+                                            format!("Stream error: Invalid status code {}", status)
+                                        }
+                                    }
+                                    other => format!("Stream error: {}", other),
+                                };
+                                let _ = tx.send(StreamEvent::Error(friendly_err)).await;
                                 break;
                             }
                             None => {
                                 let duration_ms = start_time.elapsed().as_millis();
                                 crate::forensic::ForensicLogger::log_llm_response(
-                                    "DeepSeek Cloud",
+                                    &provider_label_clone,
                                     &api_model_clone,
                                     total_content_chars,
                                     total_reasoning_chars,
@@ -856,6 +983,190 @@ impl LlmClient {
                                     first_token_time,
                                     final_reason.as_deref(),
                                     final_usage.as_ref(),
+                                );
+                                let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Handles streaming requests to Anthropic's official `/v1/messages` endpoint.
+    pub async fn stream_chat_anthropic(
+        &self,
+        endpoint_url: &str,
+        api_key: &str,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancel_token: CancellationToken,
+        auto_compact_event: Option<(Vec<Message>, String)>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let base_url = endpoint_url.trim_end_matches('/');
+        let url = if base_url.ends_with("/v1") {
+            format!("{}/messages", base_url)
+        } else {
+            format!("{}/v1/messages", base_url)
+        };
+
+        let (system, anthropic_messages, anthropic_tools) =
+            crate::anthropic::convert_messages_and_tools(&messages, tools.as_deref());
+
+        let cfg = self.get_config();
+        let max_tokens = if model.contains("claude-3-7") || model.contains("claude-3-5") {
+            8192
+        } else {
+            4096
+        };
+
+        let is_thinking = model.contains("3-7")
+            && (cfg.reasoning_effort == "high" || cfg.reasoning_effort == "dynamic");
+        let thinking_config = if is_thinking {
+            Some(crate::anthropic::AnthropicThinkingConfig {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 2048,
+            })
+        } else {
+            None
+        };
+
+        let temperature = if is_thinking {
+            None
+        } else {
+            Some(cfg.temperature)
+        };
+
+        let request_body = crate::anthropic::AnthropicRequest {
+            model: model.to_string(),
+            max_tokens,
+            system,
+            messages: anthropic_messages,
+            tools: anthropic_tools,
+            stream: true,
+            temperature,
+            thinking: thinking_config,
+        };
+
+        let body_serialized = serde_json::to_string_pretty(&request_body).unwrap_or_default();
+        crate::forensic::ForensicLogger::log_llm_request(
+            "Anthropic Claude",
+            model,
+            &url,
+            messages.len(),
+            tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            &body_serialized,
+        );
+
+        let req_builder = self
+            .http
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("Content-Type", "application/json")
+            .json(&request_body);
+
+        let mut event_source = req_builder.eventsource()?;
+        let (tx, rx) = mpsc::channel::<StreamEvent>(100);
+        let model_clone = model.to_string();
+
+        tokio::spawn(async move {
+            if let Some((compacted_messages, notice)) = auto_compact_event {
+                let _ = tx.send(StreamEvent::ContextCompacted { compacted_messages, notice }).await;
+            }
+            let start_time = std::time::Instant::now();
+            let mut first_token_time = None;
+            let timeout_duration = std::time::Duration::from_secs(180);
+            let mut total_content_chars = 0;
+            let mut total_reasoning_chars = 0;
+            let mut current_usage = Usage::default();
+            let mut final_reason: Option<String> = None;
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        crate::forensic::ForensicLogger::log_error("stream_chat_anthropic", "Request cancelled by user");
+                        let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
+                        break;
+                    }
+                    _ = tokio::time::sleep(timeout_duration) => {
+                        crate::forensic::ForensicLogger::log_error("stream_chat_anthropic", "Stream idle timeout: Anthropic API did not respond for 180 seconds.");
+                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: Anthropic API did not respond for 180 seconds.".to_string())).await;
+                        break;
+                    }
+                    event = event_source.next() => {
+                        match event {
+                            Some(Ok(Event::Open)) => {
+                                debug!("[ANTHROPIC SSE] Stream opened");
+                            }
+                            Some(Ok(Event::Message(msg))) => {
+                                if let Some(evs) = crate::anthropic::parse_anthropic_sse_data(&msg.data, &mut current_usage) {
+                                    for ev in evs {
+                                        match &ev {
+                                            StreamEvent::ContentDelta(text) => {
+                                                if first_token_time.is_none() {
+                                                    first_token_time = Some(start_time.elapsed().as_millis());
+                                                }
+                                                total_content_chars += text.len();
+                                            }
+                                            StreamEvent::ReasoningDelta(cot) => {
+                                                if first_token_time.is_none() {
+                                                    first_token_time = Some(start_time.elapsed().as_millis());
+                                                }
+                                                total_reasoning_chars += cot.len();
+                                            }
+                                            StreamEvent::Completed { finish_reason } => {
+                                                final_reason = finish_reason.clone();
+                                                let duration_ms = start_time.elapsed().as_millis();
+                                                crate::forensic::ForensicLogger::log_llm_response(
+                                                    "Anthropic Claude",
+                                                    &model_clone,
+                                                    total_content_chars,
+                                                    total_reasoning_chars,
+                                                    duration_ms,
+                                                    first_token_time,
+                                                    final_reason.as_deref().or(Some("stop")),
+                                                    Some(&current_usage),
+                                                );
+                                                let _ = tx.send(ev).await;
+                                                return;
+                                            }
+                                            _ => {}
+                                        }
+                                        let _ = tx.send(ev).await;
+                                    }
+                                }
+                            }
+                            Some(Err(err)) => {
+                                error!("[ANTHROPIC SSE] Error: {}", err);
+                                crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse", &err.to_string());
+                                let friendly_err = match err {
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, _) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                                        "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Export ANTHROPIC_API_KEY or configure ~/.corex/settings.json".to_string()
+                                    }
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, _) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                                        "Rate limit or quota exceeded (429 Too Many Requests) from Anthropic API.".to_string()
+                                    }
+                                    other => format!("Anthropic Stream error: {}", other),
+                                };
+                                let _ = tx.send(StreamEvent::Error(friendly_err)).await;
+                                break;
+                            }
+                            None => {
+                                let duration_ms = start_time.elapsed().as_millis();
+                                crate::forensic::ForensicLogger::log_llm_response(
+                                    "Anthropic Claude",
+                                    &model_clone,
+                                    total_content_chars,
+                                    total_reasoning_chars,
+                                    duration_ms,
+                                    first_token_time,
+                                    final_reason.as_deref(),
+                                    Some(&current_usage),
                                 );
                                 let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
                                 break;
@@ -912,14 +1223,7 @@ mod tests {
             Message::assistant_with_tools(
                 None,
                 None,
-                vec![ToolCall {
-                    id: "call_123".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "run_shell_command".to_string(),
-                        arguments: "{\"command\":\"ls\"}".to_string(),
-                    },
-                }],
+                vec![ToolCall::new("call_123", "run_shell_command", "{\"command\":\"ls\"}")],
             ),
             Message::tool_response("call_123", "file1.txt\nfile2.txt"),
         ];
@@ -939,14 +1243,7 @@ mod tests {
             Message::assistant_with_tools(
                 None,
                 None,
-                vec![ToolCall {
-                    id: "call_sudo".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "run_shell_command".to_string(),
-                        arguments: "{\"command\":\"sudo whoami\"}".to_string(),
-                    },
-                }],
+                vec![ToolCall::new("call_sudo", "run_shell_command", "{\"command\":\"sudo whoami\"}")],
             ),
             Message::system("Sudo password saved in session RAM"),
             Message::tool_response("call_sudo", "root\n"),
@@ -992,6 +1289,81 @@ mod tests {
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].text_content().unwrap(), "Hello 1");
         assert!(messages[2].text_content().unwrap().contains("<CONTEXT_SUMMARY>"));
+    }
+
+    #[test]
+    fn test_provider_kind_classification() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::DeepSeek);
+
+        cfg.active_provider = Some("openai".to_string());
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::OpenAi);
+
+        cfg.active_provider = Some("anthropic".to_string());
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Anthropic);
+
+        cfg.active_provider = Some("google".to_string());
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Google);
+
+        cfg.active_provider = Some("github".to_string());
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::GitHub);
+
+        cfg.local_llm_enabled = true;
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Local);
+    }
+
+    #[test]
+    fn test_google_and_openai_endpoint_resolution() {
+        let mut cfg = Config::default();
+        cfg.active_provider = Some("google".to_string());
+        let (url, _) = cfg.endpoint();
+        assert!(url.contains("generativelanguage.googleapis.com"));
+        assert!(!cfg.is_deepseek_endpoint());
+
+        cfg.active_provider = Some("openai".to_string());
+        let (url_oai, _) = cfg.endpoint();
+        assert!(url_oai.contains("api.openai.com"));
+        assert!(!cfg.is_deepseek_endpoint());
+
+        cfg.active_provider = Some("anthropic".to_string());
+        let (url_ant, _) = cfg.endpoint();
+        assert!(url_ant.contains("api.anthropic.com"));
+        assert!(!cfg.is_deepseek_endpoint());
+
+        cfg.active_provider = Some("groq".to_string());
+        let (url_groq, _) = cfg.endpoint();
+        assert!(url_groq.contains("api.groq.com"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Groq);
+
+        cfg.active_provider = Some("openrouter".to_string());
+        let (url_or, _) = cfg.endpoint();
+        assert!(url_or.contains("openrouter.ai"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::OpenRouter);
+
+        cfg.active_provider = Some("mistral".to_string());
+        let (url_mis, _) = cfg.endpoint();
+        assert!(url_mis.contains("api.mistral.ai"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Mistral);
+    }
+
+    #[test]
+    fn test_model_inference_without_explicit_provider() {
+        let mut cfg = Config::default();
+        cfg.active_provider = None;
+        cfg.model = "gemini-3.5-flash-lite".to_string();
+        let (url, _) = cfg.endpoint();
+        assert!(url.contains("generativelanguage.googleapis.com"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Google);
+
+        cfg.model = "claude-3-7-sonnet-20250219".to_string();
+        let (url_ant, _) = cfg.endpoint();
+        assert!(url_ant.contains("api.anthropic.com"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Anthropic);
+
+        cfg.model = "gpt-4o".to_string();
+        let (url_oai, _) = cfg.endpoint();
+        assert!(url_oai.contains("api.openai.com"));
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::OpenAi);
     }
 }
 

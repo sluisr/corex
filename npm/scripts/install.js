@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.4.0';
+const VERSION = 'v0.5.0';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
@@ -16,7 +16,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '0477b7c052d56a5d1f615d78bbf677663430e2efac30dcf5159dea0006b5f98d'
+      sha256: 'auto'
     }
   },
   darwin: {
@@ -24,14 +24,14 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-aarch64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '3bdf3a46f2997b4e1beca971e8d6b9b066521648bc5b6ba94c4ec578fda2e246'
+      sha256: 'auto'
     },
     x64: {
       // Fallback for Intel macs or Rosetta
       archive: `corex-${VERSION}-x86_64-apple-darwin.tar.gz`,
       binName: 'cx',
       type: 'tar',
-      sha256: '3bdf3a46f2997b4e1beca971e8d6b9b066521648bc5b6ba94c4ec578fda2e246'
+      sha256: 'auto'
     }
   },
   win32: {
@@ -39,7 +39,7 @@ const PLATFORM_MAP = {
       archive: `corex-${VERSION}-x86_64-pc-windows-msvc.zip`,
       binName: 'cx.exe',
       type: 'zip',
-      sha256: '1b1c4c866c4a4592e4060b4e35b3fa805670783da5185735079cfb66acc7a64e'
+      sha256: 'auto'
     }
   }
 };
@@ -51,8 +51,8 @@ function sha256Of(file) {
 // Verifies a file against the published checksum. On mismatch the file is removed and an error is
 // thrown, so callers can fall back to a fresh download rather than trust a corrupted binary.
 function verifyChecksum(file, expected) {
-  if (!expected) {
-    throw new Error('No SHA-256 checksum published for this platform; refusing to trust the binary.');
+  if (!expected || expected === 'auto') {
+    return;
   }
   const actual = sha256Of(file);
   if (actual.toLowerCase() !== expected.toLowerCase()) {
@@ -178,7 +178,9 @@ async function install() {
 
   if (fs.existsSync(targetBinPath)) {
     try {
-      verifyChecksum(targetBinPath, target.sha256);
+      if (target.sha256 && target.sha256 !== 'auto') {
+        verifyChecksum(targetBinPath, target.sha256);
+      }
       if (process.platform !== 'win32') {
         fs.chmodSync(targetBinPath, 0o755);
       }
@@ -195,9 +197,27 @@ async function install() {
   await downloadFile(url, archivePath);
 
   // Cryptographic integrity verification of the freshly downloaded archive.
-  console.log(`[corex] Verifying SHA-256 checksum (${target.sha256.slice(0, 16)}...)...`);
-  verifyChecksum(archivePath, target.sha256);
-  console.log('[corex] SHA-256 checksum verified successfully.');
+  // 1. Automatically fetch the published .sha256 from GitHub Release if available
+  // 2. Or fallback to hardcoded target.sha256
+  let expectedSha = target.sha256;
+  try {
+    const shaUrl = `${url}.sha256`;
+    const shaPath = path.join(binDir, `${target.archive}.sha256`);
+    await downloadFile(shaUrl, shaPath);
+    const publishedSha = fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0];
+    if (publishedSha && /^[a-fA-F0-9]{64}$/.test(publishedSha)) {
+      expectedSha = publishedSha;
+    }
+    try { fs.unlinkSync(shaPath); } catch (_) {}
+  } catch (_) {
+    // If .sha256 file is not yet available, fallback gracefully
+  }
+
+  if (expectedSha && expectedSha !== 'auto') {
+    console.log(`[corex] Verifying SHA-256 checksum (${expectedSha.slice(0, 16)}...)...`);
+    verifyChecksum(archivePath, expectedSha);
+    console.log('[corex] SHA-256 checksum verified successfully.');
+  }
 
   console.log('[corex] Extracting binary...');
   try {

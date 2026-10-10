@@ -21,6 +21,22 @@ pub struct ToolCall {
     #[serde(rename = "type")]
     pub call_type: String,
     pub function: FunctionCall,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
+}
+
+impl ToolCall {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+            extra_content: None,
+        }
+    }
 }
 
 // ─── Vision / multipart message content ────────────────────────────────────
@@ -143,6 +159,8 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 impl Message {
@@ -324,11 +342,14 @@ pub struct ChatCompletionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaToolCall {
+    #[serde(default)]
     pub index: usize,
     pub id: Option<String>,
     #[serde(rename = "type")]
     pub call_type: Option<String>,
     pub function: Option<DeltaFunctionCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,16 +358,19 @@ pub struct DeltaFunctionCall {
     pub arguments: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionDelta {
     pub role: Option<String>,
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<DeltaToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChoice {
+    #[serde(default)]
     pub index: usize,
     pub delta: ChatCompletionDelta,
     pub finish_reason: Option<String>,
@@ -354,10 +378,15 @@ pub struct ChatCompletionChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunk {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub object: String,
+    #[serde(default)]
     pub created: u64,
+    #[serde(default)]
     pub model: String,
+    #[serde(default)]
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: Option<Usage>,
 }

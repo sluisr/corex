@@ -323,6 +323,7 @@ async fn run_headless(
         let mut current_tool_calls: Vec<ToolCall> = Vec::new();
         let mut assistant_text = String::new();
         let mut reasoning_text = String::new();
+        let mut current_extra_content: Option<serde_json::Value> = None;
         let mut active_spinner: Option<StatusSpinner> = None;
         let mut current_stage: u8 = 0; // 0 = idle, 1 = reasoning, 2 = content
 
@@ -356,7 +357,7 @@ async fn run_headless(
                         current_stage = 2;
                     }
                 }
-                StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                StreamEvent::ToolCallDelta { index, id, name, arguments, extra_content } => {
                     while current_tool_calls.len() <= index {
                         current_tool_calls.push(ToolCall {
                             id: String::new(),
@@ -365,6 +366,7 @@ async fn run_headless(
                                 name: String::new(),
                                 arguments: String::new(),
                             },
+                            extra_content: None,
                         });
                     }
                     if let Some(i) = id {
@@ -376,6 +378,12 @@ async fn run_headless(
                     if let Some(a) = arguments {
                         current_tool_calls[index].function.arguments.push_str(&a);
                     }
+                    if let Some(ec) = extra_content {
+                        current_tool_calls[index].extra_content = Some(ec);
+                    }
+                }
+                StreamEvent::ExtraContentDelta(ec) => {
+                    current_extra_content = Some(ec);
                 }
                 StreamEvent::Notice(msg) => {
                     if let Some(mut s) = active_spinner.take() {
@@ -418,6 +426,12 @@ async fn run_headless(
         if !current_tool_calls.is_empty() {
             let text_opt = if assistant_text.is_empty() { None } else { Some(assistant_text) };
             let cot_opt = if reasoning_text.is_empty() { None } else { Some(reasoning_text) };
+
+            for call in &mut current_tool_calls {
+                if call.extra_content.is_none() {
+                    call.extra_content = current_extra_content.clone();
+                }
+            }
 
             messages.push(Message::assistant_with_tools(
                 text_opt,

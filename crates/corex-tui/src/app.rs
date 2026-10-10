@@ -33,7 +33,7 @@ use corex_tools::registry::ToolRegistry;
 use corex_tools::types::ToolContext;
 use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
-use crate::ascii::render_gradient_logo;
+use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive};
 use crate::auth_dialog::{render_auth_dialog, AuthDialogState};
 use crate::clipboard;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
@@ -248,6 +248,7 @@ pub struct App {
     pub thinking_state: ThinkingState,
     pub streaming_text: String,
     pub streaming_tool_calls: Vec<ToolCall>,
+    pub streaming_extra_content: Option<serde_json::Value>,
 
     pub pending_confirmation: Option<PendingToolBatch>,
     pub user_dialog: UserDialogState,
@@ -304,14 +305,11 @@ impl App {
         let cfg = llm_client.get_config();
         let persistent_history = corex_core::HistoryStore::load();
 
-        let mut auth_dialog = AuthDialogState::new();
-        if cfg.api_key.trim().is_empty() && !cfg.local_llm_enabled {
-            auth_dialog.open();
-        }
+        let auth_dialog = AuthDialogState::new();
 
         let is_online = Arc::new(AtomicBool::new(false));
         let (balance_tx, balance_rx) = mpsc::channel(10);
-        let app = Self {
+        let mut app = Self {
             session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir)),
             llm_client: llm_client.clone(),
             tool_registry: ToolRegistry::new(),
@@ -331,6 +329,7 @@ impl App {
             thinking_state: ThinkingState::new(),
             streaming_text: String::new(),
             streaming_tool_calls: Vec::new(),
+            streaming_extra_content: None,
 
             pending_confirmation: None,
             user_dialog: UserDialogState::new(),
@@ -381,6 +380,9 @@ impl App {
         };
         app.trigger_local_health_check();
         app.trigger_update_check();
+        if cfg.api_key.trim().is_empty() && cfg.endpoint().1.trim().is_empty() && !cfg.local_llm_enabled {
+            app.set_status("💡 No API key configured · Type /model to choose AI or /local");
+        }
         app
     }
 
@@ -407,6 +409,20 @@ impl App {
     /// Flips mouse reporting on/off (bound to F2).
     pub fn toggle_mouse_capture(&mut self) {
         self.set_mouse_capture(!self.mouse_capture);
+    }
+
+    /// Responds to terminal resize events: clears rendering caches and dynamically adapts
+    /// mouse reporting on mobile vertical screens unless COREX_MOUSE is pinned.
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
+        self.cached_message_lines.clear();
+        self.cached_render_width = 0;
+        self.last_chat_rect = None;
+        if std::env::var("COREX_MOUSE").is_err() {
+            let should_capture = !is_mobile_portrait(width, height);
+            if self.mouse_capture != should_capture {
+                self.mouse_capture = should_capture;
+            }
+        }
     }
 
     // --- Chat text selection (driven by mouse drags, see `Selection`) ---
@@ -801,6 +817,7 @@ impl App {
 
         self.streaming_text.clear();
         self.streaming_tool_calls.clear();
+        self.streaming_extra_content = None;
         self.thinking_state.reset();
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
@@ -1105,15 +1122,33 @@ impl App {
                 true
             }
             "/key" | "/auth" => {
+                let cfg = self.llm_client.get_config();
+                let prov = cfg.active_provider.clone().unwrap_or_else(|| "deepseek".to_string());
+                let p_opt = cfg.all_providers().into_iter().find(|p| p.name == prov);
+                let label = p_opt.as_ref().map(|p| p.display_name()).unwrap_or("DeepSeek").to_string();
+                let env_var = p_opt.as_ref().map(|p| p.api_key_env.as_str()).unwrap_or("DEEPSEEK_API_KEY").to_string();
+
                 if parts.len() > 1 {
                     let key_str = parts[1..].join(" ").trim().to_string();
-                    let mut cfg = self.llm_client.get_config();
-                    cfg.api_key = key_str.clone();
-                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-                    self.llm_client.update_config(cfg);
-                    self.session.add_message(Message::system("DeepSeek API key updated and saved to ~/.corex/settings.json."));
+                    if !env_var.is_empty() {
+                        std::env::set_var(&env_var, &key_str);
+                    }
+                    let mut new_cfg = cfg.clone();
+                    if prov == "deepseek" {
+                        new_cfg.api_key = key_str.clone();
+                    }
+                    let _ = new_cfg.save_with_workspace(Some(&self.workspace_dir));
+                    self.llm_client.update_config(new_cfg);
+                    self.session.add_message(Message::system(format!(
+                        "API key updated and saved for {} (${})!",
+                        label, env_var
+                    )));
                 } else {
-                    self.auth_dialog.open();
+                    let portal = self.model_dialog.providers.iter()
+                        .find(|p| p.name == prov)
+                        .map(|p| p.portal_url())
+                        .unwrap_or("https://platform.deepseek.com");
+                    self.auth_dialog.open_for_provider(None, &prov, &label, &env_var, portal);
                 }
                 true
             }
@@ -1198,6 +1233,15 @@ impl App {
                     )
                 };
                 self.session.add_message(Message::system(msg));
+                true
+            }
+            "/mouse" => {
+                self.toggle_mouse_capture();
+                true
+            }
+            "/keyboard" => {
+                try_show_termux_soft_keyboard();
+                self.session.add_message(Message::system("📱 Virtual keyboard requested (Termux tap-to-type active on mobile vertical screens)."));
                 true
             }
             "/prefix" => {
@@ -1477,17 +1521,59 @@ pub fn restore_terminal() {
 const MOUSE_REPORTING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_REPORTING_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+/// True if running inside an Android or Termux environment.
+pub fn is_android_or_termux() -> bool {
+    std::env::var("TERMUX_VERSION").is_ok()
+        || std::env::var("PREFIX").map(|p| p.contains("com.termux")).unwrap_or(false)
+        || std::env::var("ANDROID_ROOT").is_ok()
+        || std::path::Path::new("/data/data/com.termux").exists()
+}
+
+/// Returns true if the TUI is running in a mobile vertical (portrait) viewport.
+///
+/// Triggers exclusively when:
+/// 1. Running inside Android/Termux on a portrait screen (`height >= width || width < 75`).
+/// 2. Manually requested via `COREX_MOBILE=1` environment variable.
+///
+/// On PC / desktop terminals, this always returns false to preserve the standard full desktop interface.
+pub fn is_mobile_portrait(width: u16, height: u16) -> bool {
+    if let Ok(v) = std::env::var("COREX_MOBILE") {
+        return matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    if is_android_or_termux() && (height >= width || width < 75) {
+        return true;
+    }
+    false
+}
+
+/// Attempts to trigger Termux soft keyboard via termux-api if installed.
+pub fn try_show_termux_soft_keyboard() {
+    if is_android_or_termux() {
+        let _ = std::process::Command::new("termux-keyboard")
+            .arg("-s")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 /// Whether the TUI should request mouse reporting from the terminal.
 ///
-/// Mouse reporting is what turns the wheel into `Event::Mouse`. The TUI runs in the
-/// alternate screen, which has no scrollback of its own, so without mouse reporting the
-/// wheel has nothing to scroll and the chat feed becomes unreachable. Set `COREX_MOUSE=0`
-/// to get native drag-to-select back (the wheel then only moves terminal scrollback).
+/// On mobile vertical screens (especially Termux on Android), mouse reporting is DISABLED by default.
+/// In Termux, enabling mouse reporting intercepts touches as mouse clicks instead of letting Android
+/// open the virtual soft keyboard. Disabling mouse reporting lets Termux natively pop up the keyboard
+/// upon tapping anywhere on the screen!
+///
+/// Set `COREX_MOUSE=1` to force mouse reporting on mobile, or `COREX_MOUSE=0` to force it off everywhere.
 fn mouse_capture_enabled() -> bool {
-    match std::env::var("COREX_MOUSE") {
-        Ok(v) => !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"),
-        Err(_) => true,
+    if let Ok(v) = std::env::var("COREX_MOUSE") {
+        return !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off");
     }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    if is_mobile_portrait(cols, rows) {
+        return false;
+    }
+    true
 }
 
 /// RAII guard ensuring the terminal is always cleanly restored on drop (including panics and early returns).
@@ -1689,7 +1775,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.streaming_text.push_str(&delta);
                     app.set_status("Generating response...");
                 }
-                StreamEvent::ToolCallDelta { index, id, name, arguments } => {
+                StreamEvent::ToolCallDelta { index, id, name, arguments, extra_content } => {
                     while app.streaming_tool_calls.len() <= index {
                         app.streaming_tool_calls.push(ToolCall {
                             id: String::new(),
@@ -1698,6 +1784,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 name: String::new(),
                                 arguments: String::new(),
                             },
+                            extra_content: None,
                         });
                     }
                     if let Some(i) = id {
@@ -1709,6 +1796,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     if let Some(a) = arguments {
                         app.streaming_tool_calls[index].function.arguments.push_str(&a);
                     }
+                    if let Some(ec) = extra_content {
+                        app.streaming_tool_calls[index].extra_content = Some(ec);
+                    }
+                }
+                StreamEvent::ExtraContentDelta(ec) => {
+                    app.streaming_extra_content = Some(ec);
                 }
                 StreamEvent::UsageUpdate(usage) => {
                     app.session.update_usage(&usage);
@@ -1750,12 +1843,17 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         app.llm_client.reasoning_cache().insert(key, cot.clone());
                     }
 
-                    let valid_calls: Vec<ToolCall> = app.streaming_tool_calls
+                    let mut valid_calls: Vec<ToolCall> = app.streaming_tool_calls
                         .drain(..)
                         .filter(|c| !c.function.name.trim().is_empty())
                         .collect();
 
                     if !valid_calls.is_empty() {
+                        for call in &mut valid_calls {
+                            if call.extra_content.is_none() {
+                                call.extra_content = app.streaming_extra_content.clone();
+                            }
+                        }
                         let calls = valid_calls;
                         app.session.add_message(Message::assistant_with_tools(
                             assistant_text,
@@ -1764,6 +1862,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         ));
 
                         app.streaming_text.clear();
+                        app.streaming_extra_content = None;
                         let _ = app.session.save();
 
                         // 1. Check if ANY tool in the batch needs user confirmation
@@ -1924,11 +2023,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             if corex_core::language::is_unwanted_cjk_drift(&txt, user_cjk) {
                                 txt = corex_core::language::clean_cjk_drift_from_text(&txt);
                             }
-                            app.session.add_message(Message::assistant(txt, reasoning));
+                            let mut assistant_msg = Message::assistant(txt, reasoning);
+                            assistant_msg.extra_content = app.streaming_extra_content.take();
+                            app.session.add_message(assistant_msg);
                         }
 
                         app.streaming_text.clear();
                         app.streaming_tool_calls.clear();
+                        app.streaming_extra_content = None;
                         let _ = app.session.save();
                         corex_core::trim_memory();
 
@@ -2003,10 +2105,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 // A resize or regaining focus can leave ghost cells the diff renderer believes
                 // are correct; wipe the backing buffer so the next draw repaints everything.
-                Event::Resize(..) | Event::FocusGained => {
+                Event::Resize(w, h) => {
+                    let _ = terminal.clear();
+                    app.handle_resize(w, h);
+                }
+                Event::FocusGained => {
                     let _ = terminal.clear();
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                    let (w, h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                    if is_mobile_portrait(w, h) {
+                        try_show_termux_soft_keyboard();
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -2205,7 +2317,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             KeyCode::Esc => {
                                 app.auth_dialog.close();
                                 app.session.add_message(Message::system(
-                                    "Auth dialog skipped. Set your API key anytime via /key <sk-...> or select offline models via /model."
+                                    "Auth dialog cancelled. You can set keys anytime via /model, /key, or run offline via /local."
                                 ));
                             }
                             KeyCode::Backspace => {
@@ -2219,12 +2331,37 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 if key_str.is_empty() {
                                     app.auth_dialog.error_msg = Some("API key cannot be empty.".to_string());
                                 } else {
+                                    let env_var = app.auth_dialog.api_key_env.clone();
+                                    let prov_name = app.auth_dialog.provider_name.clone();
+                                    let prov_label = app.auth_dialog.provider_label.clone();
+                                    let pending = app.auth_dialog.pending_activation;
+
+                                    if !env_var.is_empty() {
+                                        std::env::set_var(&env_var, &key_str);
+                                    }
+
                                     let mut cfg = app.llm_client.get_config();
-                                    cfg.api_key = key_str.clone();
+                                    if prov_name == "deepseek" {
+                                        cfg.api_key = key_str.clone();
+                                    } else {
+                                        cfg.provider_api_keys.insert(prov_name.clone(), key_str.clone());
+                                    }
                                     let _ = cfg.save_with_workspace(Some(&app.workspace_dir));
                                     app.llm_client.update_config(cfg);
+                                    if let Some(pos) = app.model_dialog.providers.iter().position(|p| p.name == prov_name) {
+                                        if pos < app.model_dialog.ready.len() {
+                                            app.model_dialog.ready[pos] = true;
+                                        }
+                                    }
                                     app.auth_dialog.close();
-                                    app.session.add_message(Message::system("API key saved successfully to ~/.corex/settings.json. Ready to assist!"));
+                                    app.session.add_message(Message::system(format!(
+                                        "API key saved for {} (${})!",
+                                        prov_label, env_var
+                                    )));
+
+                                    if let Some((p_idx, m_idx)) = pending {
+                                        app.activate_model(p_idx, m_idx);
+                                    }
                                 }
                             }
                             _ => {}
@@ -3033,18 +3170,23 @@ fn print_session_summary(app: &App) {
     let cfg = app.llm_client.get_config();
     let is_local = cfg.local_llm_enabled;
 
+    let is_deepseek = cfg.is_deepseek_endpoint();
     let model_display = if is_local {
         if !cfg.local_llm_model.is_empty() {
             format!("Local Offline Assistant ({})", cfg.local_llm_model)
         } else {
             "Local Offline Assistant (Air-gapped SLM)".to_string()
         }
-    } else if cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" {
+    } else if is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat") {
         "DeepSeek-V4.1-Flash".to_string()
-    } else if cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" {
+    } else if is_deepseek && (cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner") {
         "DeepSeek-V4-Pro".to_string()
     } else {
-        cfg.model.clone()
+        let all = cfg.all_providers();
+        let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
+        prov.and_then(|p| p.models.iter().find(|m| m.id == cfg.model))
+            .map(|m| format!("{} · {}", prov.map(|p| p.display_name()).unwrap_or(""), m.display_name()))
+            .unwrap_or_else(|| cfg.model.clone())
     };
 
     let elapsed = chrono::Utc::now().signed_duration_since(app.session.created_at).num_seconds().max(0);
@@ -4228,14 +4370,26 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
     let is_local = cfg.local_llm_enabled;
     let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
     let elapsed = app.start_time.elapsed().as_secs_f32();
-    let header_lines = render_gradient_logo(
-        env!("CARGO_PKG_VERSION"),
-        &cfg.model,
-        is_auth,
-        is_local,
-        update_notice.as_deref(),
-        elapsed,
-    );
+    let header_lines = if is_mobile_portrait(size.width, size.height) {
+        render_gradient_logo_adaptive(
+            env!("CARGO_PKG_VERSION"),
+            &cfg.model,
+            is_auth,
+            is_local,
+            update_notice.as_deref(),
+            elapsed,
+            chat_chunk.width as usize,
+        )
+    } else {
+        render_gradient_logo(
+            env!("CARGO_PKG_VERSION"),
+            &cfg.model,
+            is_auth,
+            is_local,
+            update_notice.as_deref(),
+            elapsed,
+        )
+    };
     all_lines.extend(header_lines);
 
     // 2. Cached Messages & Tool Executions List
@@ -4464,11 +4618,17 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
             0usize,
         )
     } else if app.input_buffer.is_empty() && !show_esc_hint {
+        let is_mobile = is_mobile_portrait(size.width, size.height);
+        let placeholder = if is_mobile {
+            "Type message or /help"
+        } else {
+            "Type your message or @path/to/file"
+        };
         (
             vec![Line::from(vec![
                 prompt_prefix.clone(),
                 Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
-                Span::styled("Type your message or @path/to/file", Style::default().fg(app.theme.dark_gray)),
+                Span::styled(placeholder, Style::default().fg(app.theme.dark_gray)),
             ])],
             0usize,
         )
@@ -4554,8 +4714,9 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
 
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
-    let is_flash = cfg.model.contains("flash") || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4-Flash";
-    let is_pro = cfg.model.contains("pro") || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro";
+    let is_deepseek = cfg.is_deepseek_endpoint();
+    let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4-Flash");
+    let is_pro = is_deepseek && (cfg.model == "deepseek-pro" || cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro");
 
     if is_flash {
         let temp = cfg.temperature;
@@ -4608,7 +4769,36 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         right_spans.push(Span::styled(format!("Local: {} ", cfg.local_llm_model), Style::default().fg(Color::Rgb(105, 240, 174)).add_modifier(Modifier::BOLD)));
         right_spans.push(Span::styled("· Offline @ $0.00 ", Style::default().fg(app.theme.gray)));
     } else {
-        right_spans.push(Span::styled(format!("{} ", cfg.model), Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
+        let display_name = {
+            let all = cfg.all_providers();
+            let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
+            prov.and_then(|p| p.models.iter().find(|m| m.id == cfg.model))
+                .map(|m| m.display_name().to_string())
+                .unwrap_or_else(|| cfg.model.clone())
+        };
+
+        let temp = cfg.temperature;
+        let temp_color = if temp <= 0.2 {
+            Color::Rgb(79, 195, 247)
+        } else if temp <= 0.5 {
+            Color::Rgb(105, 240, 174)
+        } else if temp <= 1.0 {
+            Color::Rgb(255, 213, 79)
+        } else if temp <= 1.5 {
+            Color::Rgb(255, 152, 0)
+        } else {
+            Color::Rgb(244, 67, 54)
+        };
+
+        right_spans.push(Span::styled(display_name, Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
+        right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
+        right_spans.push(Span::styled(format!("{:.1}", temp), Style::default().fg(temp_color)));
+        if !cfg.reasoning_effort.is_empty() {
+            right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
+            right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(app.theme.accent_cyan)));
+        } else {
+            right_spans.push(Span::raw(" "));
+        }
     }
 
     if cfg.local_llm_enabled && !cfg.model.starts_with("local") {
@@ -4667,18 +4857,37 @@ fn render_ui(frame: &mut Frame, app: &mut App) {
         ));
     }
 
-    let footer_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .split(status_chunk);
+    let is_mobile = is_mobile_portrait(size.width, size.height);
+    if is_mobile {
+        let footer_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Percentage(55),
+            ])
+            .split(status_chunk);
 
-    frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
-    frame.render_widget(Paragraph::new(Line::from(center_spans)).alignment(Alignment::Center), footer_cols[1]);
-    frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[2]);
+        frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
+        let mobile_right = if active_tasks > 0 {
+            center_spans
+        } else {
+            right_spans
+        };
+        frame.render_widget(Paragraph::new(Line::from(mobile_right)).alignment(Alignment::Right), footer_cols[1]);
+    } else {
+        let footer_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(33),
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+            ])
+            .split(status_chunk);
+
+        frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
+        frame.render_widget(Paragraph::new(Line::from(center_spans)).alignment(Alignment::Center), footer_cols[1]);
+        frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[2]);
+    }
 
     // 5. Sudo Authentication Dialog Modal if open
     if app.sudo_dialog.is_open {
@@ -4868,12 +5077,21 @@ impl App {
             return;
         };
 
-        if !self.model_dialog.ready.get(provider_idx).copied().unwrap_or(false) {
-            self.session.add_message(Message::system(format!(
-                "Provider '{}' has no API key. Export {} and reopen /model.",
+        let cfg = self.llm_client.get_config();
+        let is_ready = self.model_dialog.ready.get(provider_idx).copied().unwrap_or(false)
+            || cfg.provider_api_keys.get(&provider.name).map(|k| !k.trim().is_empty()).unwrap_or(false)
+            || provider.is_ready();
+
+        if !is_ready {
+            let portal = provider.portal_url();
+            self.model_dialog.close();
+            self.auth_dialog.open_for_provider(
+                Some((provider_idx, model_idx)),
+                &provider.name,
                 provider.display_name(),
-                provider.api_key_env
-            )));
+                &provider.api_key_env,
+                portal,
+            );
             return;
         }
 
@@ -5632,14 +5850,7 @@ mod tests {
         assert!(!app.always_allow_tools);
         assert!(app.session_allowed_commands.is_empty());
 
-        let call = ToolCall {
-            id: "call_1".to_string(),
-            call_type: "function".to_string(),
-            function: corex_core::types::FunctionCall {
-                name: "run_shell_command".to_string(),
-                arguments: serde_json::json!({ "command": "cargo test --workspace" }).to_string(),
-            },
-        };
+        let call = ToolCall::new("call_1", "run_shell_command", serde_json::json!({ "command": "cargo test --workspace" }).to_string());
 
         let rule = extract_tool_allow_rule(&call);
         assert_eq!(rule, "cargo test");
