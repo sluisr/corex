@@ -1,6 +1,6 @@
 # Corex (`cx`)
 
-> High-performance autonomous terminal agent for DeepSeek API and local LLMs, written in native Rust.
+> High-performance autonomous terminal agent for DeepSeek, Gemini, Claude, OpenAI, and local LLMs, written in native Rust.
 
 [![Release](https://img.shields.io/github/v/release/sluisr/corex?style=flat-square&color=2563eb&label=release)](https://github.com/sluisr/corex/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/sluisr/corex/ci.yml?style=flat-square&label=ci)](https://github.com/sluisr/corex/actions)
@@ -19,16 +19,17 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 
 ## Key Highlights
 
-- **Native Systems Architecture:** Compiled static binary (~6 MB stripped) with zero external runtime dependencies. Instant startup (<10ms) and minimal RAM utilization (~21 MB RSS).
-- **DeepSeek V4.1 Cloud Engine:** Full support for `deepseek-flash` (522B vision-language MoE, 1M context) and `deepseek-v4-pro` (CoT deep reasoning architecture).
-- **Air-Gapped Offline Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1` for 100% private, zero-cost ($0.00) execution.
+- **Native Systems Architecture:** Compiled static binary (~7.0 MB stripped) with zero external runtime dependencies. Instant startup (<10ms) and minimal RAM utilization (~11.9 MB RSS, with only ~2.2 MB anonymous heap).
+- **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash & 2.5 with Thought Signatures), Anthropic Claude (Claude 3.7 / 3.5 Sonnet via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq (500+ tok/s), GitHub Models, OpenRouter, and Mistral AI.
+- **Air-Gapped Offline Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1` for 100% private, zero-cost ($0.00) execution with 0 bytes network egress.
+- **Mobile Vertical / Termux Responsive UX:** Auto-detection for Android Termux portrait screens, native tap-to-keyboard, non-overlapping 2-column status bar, and stacked modals for narrow terminals.
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
 - **Enterprise Sandbox & Path Guards:** Path-level concurrency locking (`lock_path`) and strict protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
 - **Native Clipboard Integration:** Seamless terminal text copying via OSC 52 sequences and platform clipboard integration.
-- **KV Cache Preservation:** Context management and tool compression maintain up to a 96%+ KV Cache hit rate, reducing DeepSeek API token costs by up to ~90%.
+- **KV Cache Preservation:** Context management and tool compression maintain up to a 96%+ KV Cache hit rate across supported providers.
 - **Forensic Telemetry:** Real-time tracking of Time-To-First-Token (TTFT), tokens/sec throughput, cache hit percentage, and exact financial costs ($USD).
-- **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands.
+- **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands, plus contextual non-intrusive provider auth.
 - **Model Context Protocol (MCP):** Compatible with standard MCP servers (database connectors, GitHub tools, Docker controllers).
 
 ---
@@ -41,9 +42,9 @@ Corex is compiled with Link-Time Optimization (`lto = "fat"`), single codegen un
 
 | Component | Minimum Specification | Recommended |
 | :--- | :--- | :--- |
-| **RAM** | 64 MB | 128 MB+ |
+| **RAM** | 32 MB | 64 MB+ |
 | **CPU** | Any 64-bit x86_64 or ARM64 processor | Multi-core processor |
-| **Disk Footprint** | ~5 MB (download) / ~6 MB (binary) | 50 MB (including logs) |
+| **Disk Footprint** | ~5 MB (download) / ~7.0 MB (stripped binary) | 50 MB (including logs) |
 | **Operating System** | Linux (glibc 2.17+ or musl), macOS 11+ (Apple Silicon & Intel), Windows 10/11 | Any modern OS |
 | **Terminal** | ANSI / 256-color terminal | Truecolor (24-bit) terminal |
 
@@ -52,9 +53,9 @@ Corex is compiled with Link-Time Optimization (`lto = "fat"`), single codegen un
 | Metric | Corex (Native Rust) | Node.js / TS CLIs | Electron CLIs |
 | :--- | :--- | :--- | :--- |
 | **Download Size** | **~4.5 – 5.2 MB** | ~80 – 150 MB | ~180 – 350 MB |
-| **Binary Size** | **~6.1 MB** (static stripped) | Multi-file tree + Node | Chromium + Node bundle |
-| **Memory (Idle)** | **~21.5 MB RSS** | ~120 – 220 MB | ~350 – 600 MB |
-| **Memory (Active Streaming)** | **~25 – 35 MB RSS** | ~180 – 350 MB | ~500 – 850 MB |
+| **Binary Size** | **~7.0 MB** (static stripped) | Multi-file tree + Node | Chromium + Node bundle |
+| **Memory (Idle)** | **~11.9 MB RSS** (~2.2 MB Heap) | ~120 – 220 MB | ~350 – 600 MB |
+| **Memory (Active Streaming)** | **~14 – 18 MB RSS** | ~180 – 350 MB | ~500 – 850 MB |
 | **Cold Startup Latency** | **< 10 ms** | ~600 – 1,400 ms | ~2,000 – 4,000 ms |
 | **Idle CPU Utilization** | **< 0.1%** | ~1 – 3% | ~3 – 8% |
 | **External Dependencies** | **None** | Node.js >= 18, npm | Node, Chromium |
@@ -73,26 +74,27 @@ Corex supports two independent execution paradigms, selectable at runtime via `/
                   ┌───────────────────────┴───────────────────────┐
                   ▼                                               ▼
        ┌──────────────────────┐                       ┌──────────────────────┐
-       │     1. Cloud API     │                       │   2. Offline Local   │
-       │  (DeepSeek V4.1 API) │                       │ (llama-server / SLM) │
+       │ 1. Frontier Cloud    │                       │  2. Sovereign Local  │
+       │ (DeepSeek / Gemini / │                       │ (llama-server/Ollama/│
+       │  Claude / OpenAI...) │                       │  Air-Gapped Privacy) │
        └──────────────────────┘                       └──────────────────────┘
 ```
 
-### 1. Cloud API Models (DeepSeek Cloud)
-- **Engines:** `deepseek-flash` (DeepSeek-V4.1-Flash multimodal with vision & 1M context) and `deepseek-v4-pro` (Reasoning / Thinking CoT architecture).
-- **Behavior:** High-throughput streaming with adaptive reasoning effort per task complexity.
-- **Best For:** Complex multi-file refactoring, full-stack implementation, and heavy reasoning tasks.
+### 1. Frontier Cloud Matrix
+- **Providers:** DeepSeek (`deepseek-flash`, `deepseek-v4-pro`), Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-2.5-pro`), Anthropic (`claude-3-7-sonnet`, `claude-3-5-sonnet`), OpenAI (`o1`, `o3-mini`, `gpt-4o`), Groq (Llama 3.3 70B @ 500+ tok/s), OpenRouter, Mistral AI, and GitHub Models.
+- **Behavior:** High-throughput streaming with Google thought signatures, adaptive reasoning effort, and transparent multi-turn tool calling.
+- **Best For:** Heavy architectural refactoring, full-stack implementations, and complex reasoning tasks.
 
-### 2. Offline Local LLM (Air-Gapped & Private)
+### 2. Offline Sovereign Local LLM (Air-Gapped & Private)
 - **Engines:** Any GGUF model served via `llama-server` (llama.cpp) or `Ollama` on `http://127.0.0.1:8080/v1`.
-- **Behavior:** 100% offline, air-gapped execution. Zero network calls, zero telemetry, and $0.00 API cost.
-- **Best For:** Proprietary codebases, air-gapped environments, and offline development.
+- **Behavior:** 100% offline, air-gapped execution. Zero network calls, zero telemetry, null-routed egress, and $0.00 API cost.
+- **Best For:** Proprietary codebases, classified perimeters, air-gapped environments, and offline development.
 
 ---
 
 ## Installation
 
-### Method 1: Pre-compiled Binary (Recommended for Linux & macOS)
+### Method 1: Pre-compiled Binary (Recommended for Linux, macOS & Android)
 
 Install via the official installation script:
 
@@ -104,6 +106,7 @@ Or download binaries manually from the [GitHub Releases](https://github.com/slui
 - Linux (`x86_64-unknown-linux-gnu`)
 - macOS Apple Silicon (`aarch64-apple-darwin`)
 - macOS Intel (`x86_64-apple-darwin`)
+- Android Termux (`aarch64-linux-android`)
 - Windows (`x86_64-pc-windows-msvc`)
 
 ### Method 2: From Source via Cargo
@@ -135,17 +138,36 @@ sudo cp target/release/cx /usr/local/bin/
 
 ## Authentication & Configuration
 
-### Cloud API Credentials
+### Cloud Provider Credentials
 
-Obtain an API key from [platform.deepseek.com](https://platform.deepseek.com/api_keys) and export it:
+Corex features dynamic, contextual authentication. You can export the environment variable for your preferred provider:
 
 ```bash
+# DeepSeek API
 export COREX_API_KEY="sk-your-deepseek-api-key"
 # or
 export DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+
+# Google Gemini API
+export GEMINI_API_KEY="AIzaSy-your-gemini-key"
+
+# Anthropic Claude API
+export ANTHROPIC_API_KEY="sk-ant-your-claude-key"
+
+# OpenAI API
+export OPENAI_API_KEY="sk-your-openai-key"
+
+# Groq Cloud API
+export GROQ_API_KEY="gsk_your-groq-key"
+
+# Mistral AI API
+export MISTRAL_API_KEY="your-mistral-key"
+
+# GitHub Models
+export GITHUB_TOKEN="ghp_your-github-token"
 ```
 
-You can also configure your credentials interactively within the TUI by typing `/auth`.
+You can also configure credentials interactively at any time inside the TUI by typing `/auth` or selecting a model via `/model`.
 
 ### Local LLM Endpoint Setup (Optional)
 
@@ -197,7 +219,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 
 | Command | Description |
 | :--- | :--- |
-| `/model` | Select active model (`Flash`, `Pro`, or `Local Offline Assistant`). |
+| `/model` | Master-detail catalog: select provider/model (DeepSeek, Gemini, Claude, OpenAI, Groq, Local) & tune CoT sliders. |
 | `/auth` | Configure API credentials securely. |
 | `/balance` | Check current account credits and token balance asynchronously (`/wallet`). |
 | `/fim <file>` | Fill-in-the-Middle code completion at cursor location. |
@@ -230,6 +252,7 @@ Corex exposes native tools directly to the reasoning engine:
 - **`run_shell_command`:** Sandboxed shell execution with safety checks, adaptive background detachment, and sudo AskPass.
 - **`manage_task`:** Background process manager supporting process inspection, signals, and standard input forwarding.
 - **`web_search` & `web_fetch`:** Live search engine integration and clean HTML-to-markdown extraction.
+- **`delegate_subagent` & `manage_subagents`:** Parallel delegation to specialized autonomous subagents (`scout`, `tester`, `researcher`, `worker`) with context isolation and reactive completion notifications.
 - **`write_todos`:** Multi-step autonomous task tracking and verification.
 - **Persistent Memory:** Context retention across runs via `./COREX.md` (project) and `~/.corex/COREX.md` (global).
 
@@ -237,11 +260,12 @@ Corex exposes native tools directly to the reasoning engine:
 
 ## Configuration Files
 
-Configuration and logs are stored under `~/.corex/`:
+Configuration and logs are stored globally in `~/.corex/` and can be overridden per workspace:
 
 | Path | Description |
 | :--- | :--- |
-| `~/.corex/settings.json` | API keys, base URLs, and default engine configuration. |
+| `~/.corex/settings.json` | Global settings, provider keys, base URLs, and allowed commands. |
+| `.corex/settings.json` | Project-level workspace overrides (checked into repo or local). |
 | `~/.corex/flash_settings.json` | CoT reasoning depth configuration for Flash. |
 | `~/.corex/pro_settings.json` | Deep reasoning configuration for Pro. |
 | `~/.corex/logs/` | Daily forensic audit logs (`corex-forensic-YYYY-MM-DD.log`). |

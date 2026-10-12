@@ -35,7 +35,7 @@ cx -p "Analyze this project and run all unit tests"
 
 ## ⚡ Features
 
-* 🦀 **100% Pure Native Rust:** Single standalone machine binary with sub-10ms startup time and ~21 MB memory footprint.
+* 🦀 **100% Pure Native Rust:** Single standalone machine binary with sub-10ms startup time and ~11.9 MB memory footprint (~2.2 MB dynamic heap).
 * ⌨️ **Ergonomic Command (`cx`):** Single-hand, zero-friction launch from your terminal.
 * 🧠 **DeepSeek V4.1 Engine:** Native support for `deepseek-flash` (vision-language MoE, 1M context) and `deepseek-v4-pro` (Reasoning CoT).
 * 🔒 **100% Offline Local LLM (@ $0.00):** Private inference with `llama-server`, `llama.cpp`, or `Ollama` on port 8080.
