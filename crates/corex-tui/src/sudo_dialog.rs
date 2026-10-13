@@ -156,7 +156,6 @@ pub fn render_sudo_dialog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corex_core::types::FunctionCall;
 
     #[test]
     fn test_sudo_dialog_open_and_close() {

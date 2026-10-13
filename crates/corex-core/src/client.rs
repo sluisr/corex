@@ -869,84 +869,59 @@ impl LlmClient {
                                 debug!("[SSE] Stream opened");
                             }
                             Some(Ok(Event::Message(msg))) => {
-                                if msg.data.trim() == "[DONE]" {
-                                    let duration_ms = start_time.elapsed().as_millis();
-                                    crate::forensic::ForensicLogger::log_llm_response(
-                                        &provider_label_clone,
-                                        &api_model_clone,
-                                        total_content_chars,
-                                        total_reasoning_chars,
-                                        duration_ms,
-                                        first_token_time,
-                                        final_reason.as_deref().or(Some("stop")),
-                                        final_usage.as_ref(),
-                                    );
-                                    let _ = tx.send(StreamEvent::Completed { finish_reason: Some("stop".to_string()) }).await;
-                                    break;
-                                }
-
-                                if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(&msg.data) {
-                                    if let Some(usage) = chunk.usage {
-                                        final_usage = Some(usage.clone());
-                                        let _ = tx.send(StreamEvent::UsageUpdate(usage)).await;
-                                    }
-
-                                    if let Some(choice) = chunk.choices.first() {
-                                        if let Some(ref cot) = choice.delta.reasoning_content {
-                                            if !cot.is_empty() {
+                                if let Some(events) = parse_openai_sse_data(&msg.data) {
+                                    let mut should_break = false;
+                                    for ev in events {
+                                        match ev {
+                                            StreamEvent::UsageUpdate(ref u) => {
+                                                final_usage = Some(u.clone());
+                                                let _ = tx.send(ev).await;
+                                            }
+                                            StreamEvent::ReasoningDelta(ref cot) => {
                                                 if first_token_time.is_none() {
                                                     first_token_time = Some(start_time.elapsed().as_millis());
                                                 }
                                                 total_reasoning_chars += cot.len();
-                                                let _ = tx.send(StreamEvent::ReasoningDelta(cot.clone())).await;
+                                                let _ = tx.send(ev).await;
                                             }
-                                        }
-
-                                        if let Some(ref text) = choice.delta.content {
-                                            if !text.is_empty() {
+                                            StreamEvent::ContentDelta(ref text) => {
                                                 if first_token_time.is_none() {
                                                     first_token_time = Some(start_time.elapsed().as_millis());
                                                 }
                                                 total_content_chars += text.len();
-                                                let _ = tx.send(StreamEvent::ContentDelta(text.clone())).await;
+                                                let _ = tx.send(ev).await;
+                                            }
+                                            StreamEvent::ToolCallDelta { .. } => {
+                                                if first_token_time.is_none() {
+                                                    first_token_time = Some(start_time.elapsed().as_millis());
+                                                }
+                                                let _ = tx.send(ev).await;
+                                            }
+                                            StreamEvent::ExtraContentDelta(_) => {
+                                                let _ = tx.send(ev).await;
+                                            }
+                                            StreamEvent::Completed { ref finish_reason } => {
+                                                let duration_ms = start_time.elapsed().as_millis();
+                                                crate::forensic::ForensicLogger::log_llm_response(
+                                                    &provider_label_clone,
+                                                    &api_model_clone,
+                                                    total_content_chars,
+                                                    total_reasoning_chars,
+                                                    duration_ms,
+                                                    first_token_time,
+                                                    finish_reason.as_deref().or(final_reason.as_deref()),
+                                                    final_usage.as_ref(),
+                                                );
+                                                let _ = tx.send(ev).await;
+                                                should_break = true;
+                                            }
+                                            other => {
+                                                let _ = tx.send(other).await;
                                             }
                                         }
-
-                                        if let Some(ref tc_deltas) = choice.delta.tool_calls {
-                                            if !tc_deltas.is_empty() && first_token_time.is_none() {
-                                                first_token_time = Some(start_time.elapsed().as_millis());
-                                            }
-                                            for (pos, tc) in tc_deltas.iter().enumerate() {
-                                                let effective_index = if tc.index == 0 && pos > 0 { pos } else { tc.index };
-                                                let _ = tx.send(StreamEvent::ToolCallDelta {
-                                                    index: effective_index,
-                                                    id: tc.id.clone(),
-                                                    name: tc.function.as_ref().and_then(|f| f.name.clone()),
-                                                    arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
-                                                    extra_content: tc.extra_content.clone(),
-                                                }).await;
-                                            }
-                                        }
-
-                                        if let Some(ref ec) = choice.delta.extra_content {
-                                            let _ = tx.send(StreamEvent::ExtraContentDelta(ec.clone())).await;
-                                        }
-
-                                        if let Some(ref reason) = choice.finish_reason {
-                                            let duration_ms = start_time.elapsed().as_millis();
-                                            crate::forensic::ForensicLogger::log_llm_response(
-                                                &provider_label_clone,
-                                                &api_model_clone,
-                                                total_content_chars,
-                                                total_reasoning_chars,
-                                                duration_ms,
-                                                first_token_time,
-                                                Some(reason),
-                                                final_usage.as_ref(),
-                                            );
-                                            let _ = tx.send(StreamEvent::Completed { finish_reason: Some(reason.clone()) }).await;
-                                            break;
-                                        }
+                                    }
+                                    if should_break {
+                                        break;
                                     }
                                 }
                             }
@@ -997,6 +972,7 @@ impl LlmClient {
     }
 
     /// Handles streaming requests to Anthropic's official `/v1/messages` endpoint.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_anthropic(
         &self,
         endpoint_url: &str,
@@ -1209,6 +1185,62 @@ impl LlmClient {
         let bal = resp.json::<BalanceResponse>().await?;
         Ok(bal)
     }
+}
+
+/// Parses a single raw OpenAI-compatible SSE data payload (e.g. from DeepSeek, OpenAI, Gemini, Groq, Mistral, Ollama)
+/// into a list of `StreamEvent`s.
+pub fn parse_openai_sse_data(data: &str) -> Option<Vec<StreamEvent>> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "[DONE]" {
+        return Some(vec![StreamEvent::Completed { finish_reason: None }]);
+    }
+
+    let chunk = serde_json::from_str::<ChatCompletionChunk>(trimmed).ok()?;
+    let mut events = Vec::new();
+
+    if let Some(usage) = chunk.usage {
+        events.push(StreamEvent::UsageUpdate(usage));
+    }
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(ref cot) = choice.delta.reasoning_content {
+            if !cot.is_empty() {
+                events.push(StreamEvent::ReasoningDelta(cot.clone()));
+            }
+        }
+
+        if let Some(ref text) = choice.delta.content {
+            if !text.is_empty() {
+                events.push(StreamEvent::ContentDelta(text.clone()));
+            }
+        }
+
+        if let Some(ref tc_deltas) = choice.delta.tool_calls {
+            for (pos, tc) in tc_deltas.iter().enumerate() {
+                let effective_index = if tc.index == 0 && pos > 0 { pos } else { tc.index };
+                events.push(StreamEvent::ToolCallDelta {
+                    index: effective_index,
+                    id: tc.id.clone(),
+                    name: tc.function.as_ref().and_then(|f| f.name.clone()),
+                    arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),
+                    extra_content: tc.extra_content.clone(),
+                });
+            }
+        }
+
+        if let Some(ref ec) = choice.delta.extra_content {
+            events.push(StreamEvent::ExtraContentDelta(ec.clone()));
+        }
+
+        if let Some(ref reason) = choice.finish_reason {
+            events.push(StreamEvent::Completed { finish_reason: Some(reason.clone()) });
+        }
+    }
+
+    Some(events)
 }
 
 #[cfg(test)]

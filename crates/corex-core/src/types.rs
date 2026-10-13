@@ -340,9 +340,36 @@ pub struct ChatCompletionRequest {
 
 // ─── Chat Completion Response Chunk ──────────────────────────────────────────
 
+fn deserialize_arguments_flex<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(other) => Ok(Some(other.to_string())),
+    }
+}
+
+fn deserialize_index_flex<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Number(n) => Ok(n.as_u64().unwrap_or(0) as usize),
+        serde_json::Value::String(s) => Ok(s.parse::<usize>().unwrap_or(0)),
+        _ => Ok(0),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaToolCall {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_index_flex")]
     pub index: usize,
     pub id: Option<String>,
     #[serde(rename = "type")]
@@ -355,6 +382,7 @@ pub struct DeltaToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaFunctionCall {
     pub name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_arguments_flex")]
     pub arguments: Option<String>,
 }
 

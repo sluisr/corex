@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tokio_util::sync::CancellationToken;
 
 use corex_core::client::{get_sudo_password, LlmClient, StreamEvent};
@@ -72,6 +72,17 @@ struct Cli {
     #[arg(long)]
     local_model: Option<String>,
 
+    /// Update Corex to the latest release in-place (alias: --upgrade)
+    #[arg(long = "upgrade", alias = "update")]
+    upgrade: bool,
+
+    /// Force update or reinstallation even if already on the latest version
+    #[arg(long = "force", short = 'f')]
+    force: bool,
+
+    /// Generate shell autocompletion script (bash, zsh, fish, powershell, elvish)
+    #[arg(long = "completions", value_enum)]
+    completions: Option<clap_complete::Shell>,
 }
 
 pub async fn run() -> Result<()> {
@@ -108,19 +119,54 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Handle "cx update" command directly
-    if cli.message.is_none() && cli.query.len() == 1 && (cli.query[0] == "update" || cli.query[0] == "--update") {
-        let current = env!("CARGO_PKG_VERSION");
-        println!("Checking for Corex updates...");
-        if let Some(newer) = corex_core::update::check_for_update_online(current).await {
-            println!("\nUpdate available: v{} → v{}\n", current, newer);
-            println!("To update Corex, run in your terminal:");
-            println!("  • Via npm:       npm install -g @sluisr/corex");
-            println!("  • From source:   cargo install --git https://github.com/sluisr/corex.git --force");
-            println!("  • Or download precompiled binaries from:");
-            println!("    https://github.com/sluisr/corex/releases/latest\n");
+    // Handle --completions or "cx completions <shell>"
+    let completions_shell = cli.completions.or_else(|| {
+        if cli.message.is_none() && !cli.query.is_empty() && cli.query[0] == "completions" {
+            cli.query.get(1).and_then(|s| s.parse::<clap_complete::Shell>().ok())
         } else {
-            println!("Corex is already on the latest version (v{}).", current);
+            None
+        }
+    });
+
+    if let Some(shell) = completions_shell {
+        let mut cmd = Cli::command();
+        clap_complete::generate(shell, &mut cmd, "cx", &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if cli.message.is_none() && !cli.query.is_empty() && cli.query[0] == "completions" && cli.query.len() == 1 {
+        println!("Usage: cx --completions <bash|zsh|fish|powershell|elvish>");
+        return Ok(());
+    }
+
+    // Handle in-place self-update: "cx update", "cx upgrade", "cx --upgrade", "cx --update"
+    let is_update_cmd = cli.upgrade
+        || (cli.message.is_none()
+            && !cli.query.is_empty()
+            && (cli.query[0] == "update" || cli.query[0] == "upgrade" || cli.query[0] == "--update" || cli.query[0] == "--upgrade"));
+
+    if is_update_cmd {
+        let current = env!("CARGO_PKG_VERSION");
+        let force = cli.force || cli.query.iter().any(|q| q == "--force" || q == "-f");
+        println!("🚀 Corex In-Place Self-Updater (v{})", current);
+        match corex_core::update::perform_self_update(current, force, |msg| {
+            println!("  • {}", msg);
+        }).await {
+            Ok(summary) => {
+                println!(
+                    "\n✨ Successfully updated Corex from v{} to v{}!\n📍 Binary: {}\n🎯 Target: {}\n",
+                    summary.previous_version,
+                    summary.updated_version,
+                    summary.binary_path.display(),
+                    summary.target_triple
+                );
+            }
+            Err(e) => {
+                eprintln!("\n⚠️ Update notice: {}", e);
+                if !force && e.contains("already on the latest version") {
+                    println!("To force re-download the latest release, run:\n  cx update --force\n");
+                }
+            }
         }
         return Ok(());
     }
@@ -440,7 +486,7 @@ async fn run_headless(
             ));
 
             for call in &current_tool_calls {
-                let args_json = serde_json::from_str(&call.function.arguments)
+                let args_json = corex_core::parse_lenient_json(&call.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
 
                 let (action_label, target_detail) = if call.function.name == "run_shell_command" || call.function.name == "shell" || call.function.name == "run_command" {

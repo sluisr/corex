@@ -43,7 +43,7 @@ description: >-
 
 It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalone static binary with:
 
-- 🦀 **100% pure Rust** — single binary, <10ms startup, ~21MB RAM idle
+- 🦀 **100% pure Rust** — single binary, <10ms startup, ~11.9MB RAM idle (~2.2MB Heap)
 - 🔒 **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
 - 🧠 **DeepSeek V4.1** — Flash (1M context, native vision) + Pro (CoT reasoning)
 - ⚡ **Adaptive CoT** — automatic reasoning depth per task complexity

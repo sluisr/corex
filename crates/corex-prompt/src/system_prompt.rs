@@ -23,6 +23,15 @@ TOOL USAGE RULES (mandatory):
   * NEVER use 'sleep <seconds>' or busy polling loops ('while ... sleep') to wait for background processes.
   * REACTIVE WAKEUP: When a background task completes, a `TASK_DONE|<pid>|<exit_code>|<duration>\n<output>` system notification is delivered. When invoked, immediately review the output and report the results directly to the user. Never leave the user waiting without an answer once a task completes.
   * If a background task was a temporary probe/audit and you have obtained the results, clean it up with `manage_task(action: "kill", task_id: PID)`.
+- MULTI-AGENT & SUBTASK DELEGATION:
+  * When a task benefits from parallel exploration, background verification, or context isolation, use `delegate_subagent` to spawn specialized subagents (`scout`, `tester`, `researcher`, `worker`).
+  * `scout`: Read-only repository exploration and symbol finding (at $0.00 cost before cloud editing).
+  * `tester`: Automated test runner, compiler check, or linter verifier running in the background while you continue work.
+  * `researcher`: Documentation gathering, specification inspection, or external references.
+  * `worker`: General autonomous subtasks executed concurrently.
+  * Subagents run with their own isolated context to prevent context window saturation.
+  * To monitor, inspect output, or cancel subagents: use `manage_subagents` (actions: 'list', 'status', 'cancel').
+  * REACTIVE WAKEUP: When a subagent completes, a `SUBAGENT_DONE|<id>|<role>|<duration>\n<output>` system notification is delivered. Review the findings and synthesize them directly for the user.
 - DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("cuál de las tres", "dime y arranco", "la pelota es tuya", "paro", "qué prefieres"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
 - When you state that you are stopping, waiting, or placing the decision in the user's hands ("la pelota es tuya", "paro", "no ejecuto nada hasta que digas"), DO NOT attach tool calls.
 - LANGUAGE FIDELITY: Maintain strict language consistency with the user. All tool summaries, answers, and technical deep-dives must match the user's conversation language. Never drift into Chinese or unprompted languages.
@@ -237,6 +246,7 @@ mod tests {
         assert!(prompt.contains("NEVER prepend decorative echo banners"));
         assert!(prompt.contains("NEVER do `echo \"...\" && sudo <cmd>`"));
         assert!(prompt.contains("DECISION & QUESTION EXCLUSIVITY"));
+        assert!(prompt.contains("MULTI-AGENT & SUBTASK DELEGATION"));
         assert!(prompt.contains("NEVER output Chinese characters"));
     }
 

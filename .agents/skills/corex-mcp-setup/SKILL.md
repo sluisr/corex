@@ -111,11 +111,14 @@ Corex spawns the server as a subprocess and communicates via **JSON-RPC over std
 
 | Command | What it does |
 | :--- | :--- |
-| `/mcp` | List all configured servers and the tools they expose |
-| `/mcp status` | Show connection status for each server |
-| `/mcp reload` | Disconnect and reconnect all MCP servers |
+| `/mcp` or `/mcp status` | List all configured servers, connection status, and discovered tools |
+| `/mcp catalog` | Browse the built-in catalog of vetted community templates |
+| `/mcp add <catalog-id>` | Instantly add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
+| `/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
+| `/mcp remove <name>` | Remove an MCP server from configuration and reload tools |
+| `/mcp reload` | Reconnect and rediscover all configured MCP servers |
 
-MCP tools are loaded at startup. If you edit `settings.json` to add a server, restart `cx` or run `/mcp reload`.
+MCP servers can be added in one command via `/mcp add <id>` or configured manually in `~/.corex/settings.json`. Dynamic tool discovery registers tools immediately without needing a full restart.
 
 ---
 

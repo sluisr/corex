@@ -137,8 +137,8 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/mcp",
-        args: "[status|reload]",
-        description: "List and manage MCP servers",
+        args: "[status|catalog|add|remove|reload]",
+        description: "Manage MCP servers, discover catalog templates, or add tools",
         aliases: &[],
         group: TOOLS,
     },
@@ -166,8 +166,8 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/update",
-        args: "",
-        description: "Check for new Corex updates",
+        args: "[apply|force]",
+        description: "Check or apply in-place Corex updates",
         aliases: &[],
         group: APP,
     },
