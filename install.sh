@@ -155,5 +155,31 @@ if [ -x "$CX_BIN" ]; then
   fi
 fi
 
-echo "✓ Corex ${VERSION} installed successfully!"
-echo "Run 'cx' in any project directory to launch."
+# Set up output styling
+if [ -t 1 ]; then
+  BOLD="\033[1m"
+  GREEN="\033[1;32m"
+  CYAN="\033[1;36m"
+  YELLOW="\033[1;33m"
+  BLUE="\033[1;34m"
+  DIM="\033[2m"
+  RESET="\033[0m"
+else
+  BOLD=""
+  GREEN=""
+  CYAN=""
+  YELLOW=""
+  BLUE=""
+  DIM=""
+  RESET=""
+fi
+
+printf "\n%b✓ Corex %s installed successfully to %s/cx%b\n\n" "$GREEN" "$VERSION" "$INSTALL_DIR" "$RESET"
+printf "%b🚀 Quick Start:%b\n" "$BOLD" "$RESET"
+printf "   %bcx%b                  Launch Corex in the current project\n" "$CYAN" "$RESET"
+printf "   %bcx --help%b           View options, subagents, and CLI flags\n\n" "$CYAN" "$RESET"
+printf "%b🌟 Links & Community:%b\n" "$BOLD" "$RESET"
+printf "   %b⭐ GitHub:%b   https://github.com/sluisr/corex %b(Leave a star if you find it useful!)%b\n" "$YELLOW" "$RESET" "$DIM" "$RESET"
+printf "   %b💬 Discord:%b  https://discord.gg/MGMt6M6Yx %b(Join the community)%b\n" "$BLUE" "$RESET" "$DIM" "$RESET"
+printf "   %b🌍 Website:%b  https://corex.sluisr.com\n" "$CYAN" "$RESET"
+printf "   %b👤 Author:%b   https://sluisr.com\n\n" "$DIM" "$RESET"

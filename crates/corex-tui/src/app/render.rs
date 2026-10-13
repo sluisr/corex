@@ -107,6 +107,9 @@ pub fn render_about_card(
         make_row("Official Website", vec![
             Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),
+        make_row("Discord Community", vec![
+            Span::styled(corex_core::truncate_ellipsis("https://discord.gg/MGMt6M6Yx", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
+        ]),
         make_row("Changelog & Releases", vec![
             Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
         ]),

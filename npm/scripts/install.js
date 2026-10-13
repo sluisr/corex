@@ -259,8 +259,14 @@ async function install() {
     fs.chmodSync(targetBinPath, 0o755);
   }
 
-  console.log(`[corex] Corex ${VERSION} successfully verified and installed to ${targetBinPath}`);
-}
+  console.log(`\n✓ Corex ${VERSION} successfully verified and installed to ${targetBinPath}`);
+  console.log('\n🚀 Quick Start:');
+  console.log('   cx                  Launch Corex in the current project');
+  console.log('   cx --help           View options, subagents, and CLI flags\n');
+  console.log('🌟 Links & Community:');
+  console.log('   ⭐ GitHub:   https://github.com/sluisr/corex (Star the repo!)');
+  console.log('   💬 Discord:  https://discord.gg/MGMt6M6Yx (Join the community)');
+  console.log('   🌍 Website:  https://corex.sluisr.com\n');
 
 if (require.main === module) {
   install().catch((err) => {

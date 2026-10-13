@@ -46,6 +46,7 @@ cx -p "Analyze this project and run all unit tests"
 ## 🔗 Links
 
 * **Official Website:** [corex.sluisr.com](https://corex.sluisr.com)
+* **Discord Community:** [discord.gg/MGMt6M6Yx](https://discord.gg/MGMt6M6Yx)
 * **GitHub Repository:** [github.com/sluisr/corex](https://github.com/sluisr/corex)
 * **Bug Reports & Issues:** [github.com/sluisr/corex/issues](https://github.com/sluisr/corex/issues)
 * **Changelog:** [corex.sluisr.com/changelog](https://corex.sluisr.com/changelog)
