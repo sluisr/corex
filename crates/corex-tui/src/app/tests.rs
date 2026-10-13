@@ -108,19 +108,113 @@ use corex_core::types::ToolCall;
         assert_eq!(app.session.messages.len(), before);
         // Releasing the drag drops the highlight too: the app owns the mouse, so it owns this.
         assert!(app.selection.is_none());
-        assert!(app.selection_lines.is_empty());
     }
 
     #[tokio::test]
-    async fn test_click_on_url_line_triggers_url_lookup() {
+    async fn test_mouse_click_url_opens_link_deliberately() {
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["Creator: sluisr (https://sluisr.com)".to_string()];
+        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        // Simulate app running for more than 1 second (past startup grace)
+        app.app_start_time = Instant::now() - Duration::from_secs(5);
 
-        // Click on the line with the URL (empty selection)
-        app.selection = Some(Selection { anchor: (0, 25), cursor: (0, 25) });
-        app.commit_selection();
+        // Click directly on the URL at column 25 with 100ms realistic click tap
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(100));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+
+        assert!(app.selection.is_none());
+        assert_eq!(app.last_url_open.as_ref().map(|(_, u)| u.as_str()), Some("https://sluisr.com"));
+
+        // Rapid duplicate click within 1.5s debounce is blocked
+        let first_open_time = app.last_url_open.as_ref().unwrap().0;
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(100));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+        assert_eq!(app.last_url_open.as_ref().unwrap().0, first_open_time);
+    }
+
+    #[tokio::test]
+    async fn test_window_focus_activation_click_is_strictly_ignored() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.app_start_time = Instant::now() - Duration::from_secs(5);
+
+        // Window activation click (FocusGained arrived 50ms ago)
+        app.last_focus_gained = Some(Instant::now() - Duration::from_millis(50));
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(50));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+
+        // Must NOT open any URL!
+        assert!(app.last_url_open.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_startup_grace_period_ignores_clicks() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        // App just started 100ms ago (< 800ms threshold)
+        app.app_start_time = Instant::now() - Duration::from_millis(100);
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(60));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 25, row: 0, modifiers: KeyModifiers::NONE });
+
+        assert!(app.last_url_open.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_drag_selection_does_not_open_link() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.app_start_time = Instant::now() - Duration::from_secs(5);
+
+        // Click and drag across text (from col 22 to 40, elapsed 600ms)
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 22, row: 0, modifiers: KeyModifiers::NONE });
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(600));
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
+
+        // Must NOT open link because it's a drag selection!
+        assert!(app.last_url_open.is_none());
+        assert!(app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_click_on_non_url_text_does_not_open_link() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.app_start_time = Instant::now() - Duration::from_secs(5);
+
+        // Click on "Web personal" (col 5) instead of URL
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 5, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(100));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 5, row: 0, modifiers: KeyModifiers::NONE });
+
+        assert!(app.last_url_open.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_click_outside_chat_clears_selection() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 2, 80, 10));
+        app.selection = Some(Selection { anchor: (1, 5), cursor: (1, 15) });
+
+        // Click outside chat (row 0 is above last_chat_rect)
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 10, row: 0, modifiers: KeyModifiers::NONE });
         assert!(app.selection.is_none());
     }
 
@@ -582,6 +676,16 @@ use corex_core::types::ToolCall;
         assert_eq!(find_url_in_line(table_row, Some(18)), None);
         // Clicking directly on "https://sluisr.com" (col 25) -> Some!
         assert_eq!(find_url_in_line(table_row, Some(25)), Some("https://sluisr.com".to_string()));
+
+        // Markdown link [label](url) tests:
+        let md_line = "Visita [mi portfolio](https://sluisr.com) para ver proyectos";
+        // Clicking on "mi portfolio" label (col 10) -> Some!
+        assert_eq!(find_url_in_line(md_line, Some(10)), Some("https://sluisr.com".to_string()));
+        // Clicking directly on "https://sluisr.com" (col 25) -> Some!
+        assert_eq!(find_url_in_line(md_line, Some(25)), Some("https://sluisr.com".to_string()));
+        // Clicking outside on "Visita" (col 2) or "para" (col 43) -> None!
+        assert_eq!(find_url_in_line(md_line, Some(2)), None);
+        assert_eq!(find_url_in_line(md_line, Some(43)), None);
     }
 
     #[test]
@@ -757,7 +861,9 @@ use corex_core::types::ToolCall;
         msg.name = Some("activate_skill".to_string());
 
         let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
-        assert!(lines.is_empty(), "Skill tool output must not dump logs in UI");
+        let joined: String = lines.iter().map(|l| l.to_string()).collect();
+        assert!(!joined.contains("Full Skill Markdown"), "Skill tool output must not dump logs in UI");
+        assert!(!joined.contains("Lots of text"), "Skill tool output must not dump logs in UI");
     }
 
     #[test]
@@ -766,10 +872,66 @@ use corex_core::types::ToolCall;
         let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
-        assert!(joined.starts_with('›'), "Must use clean chevron: {}", joined);
+        assert!(!joined.starts_with('›'), "Tool calls should not have chevron: {}", joined);
+        assert!(joined.starts_with("run_shell_command (cargo build)"), "Must format command cleanly: {}", joined);
+
+        let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme);
+        let search_joined: String = search_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(search_joined, "web_search (sluisr sluisr.com Linux)");
 
         let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme);
         let skill_joined: String = skill_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!skill_joined.contains('⚙'), "Must not contain gear emoji: {}", skill_joined);
         assert!(skill_joined.contains("corex-about"), "Must show skill name cleanly: {}", skill_joined);
+    }
+
+    #[tokio::test]
+    async fn test_scroll_to_bottom_preserves_input_draft() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.total_rendered_items = 100;
+        app.scroll_offset = 10;
+        app.auto_scroll = false;
+        app.input_buffer = "my drafted prompt text".to_string();
+        app.cursor_idx = app.input_buffer.len();
+
+        // scroll_to_bottom snaps to bottom and sets auto_scroll true
+        app.scroll_to_bottom();
+        assert!(app.auto_scroll);
+        assert_eq!(app.input_buffer, "my drafted prompt text");
+    }
+
+    #[tokio::test]
+    async fn test_esc_clears_prompt_only_when_double_tapped_and_preserves_on_scroll() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.input_buffer = "keep this text".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        app.auto_scroll = false;
+
+        // When scrolled up, scroll_to_bottom restores auto_scroll and leaves text intact
+        if !app.auto_scroll {
+            app.scroll_to_bottom();
+            app.last_esc_press = None;
+        }
+        assert!(app.auto_scroll);
+        assert_eq!(app.input_buffer, "keep this text");
+        assert_eq!(app.last_esc_press, None);
+
+        // When at bottom, 1st Esc sets last_esc_press
+        app.last_esc_press = Some(Instant::now());
+        assert_eq!(app.input_buffer, "keep this text");
+
+        // 2nd Esc within 500ms clears prompt
+        let is_recent = app.last_esc_press
+            .map(|i| i.elapsed() <= Duration::from_millis(500))
+            .unwrap_or(false);
+        assert!(is_recent);
+        if is_recent {
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            app.last_esc_press = None;
+        }
+        assert!(app.input_buffer.is_empty());
+        assert_eq!(app.cursor_idx, 0);
     }

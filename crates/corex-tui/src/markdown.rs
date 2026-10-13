@@ -81,33 +81,32 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
                 result_lines.push(Line::from(""));
             }
-            let mut spans = vec![
-                Span::styled("◈ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-            ];
-            spans.extend(parse_inline_spans(h1, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
+            let spans = parse_inline_spans(h1, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
             continue;
         }
         if let Some(h2) = line.strip_prefix("## ") {
             if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
                 result_lines.push(Line::from(""));
             }
-            let mut spans = vec![
-                Span::styled("◆ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-            ];
-            spans.extend(parse_inline_spans(h2, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
+            let spans = parse_inline_spans(h2, theme, Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
             continue;
         }
         if let Some(h3) = line.strip_prefix("### ") {
             if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
                 result_lines.push(Line::from(""));
             }
-            let mut spans = vec![
-                Span::styled("▸ ", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
-            ];
-            spans.extend(parse_inline_spans(h3, theme, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)));
-            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "    "));
+            let spans = parse_inline_spans(h3, theme, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
+            continue;
+        }
+        if let Some(h4) = line.strip_prefix("#### ") {
+            if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
+                result_lines.push(Line::from(""));
+            }
+            let spans = parse_inline_spans(h4, theme, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD));
+            result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
             continue;
         }
 
@@ -1164,9 +1163,11 @@ mod tests {
         let text = "## Lo bueno ✅\n- CPU muy capaz: El procesador es eficiente y con buena potencia para su gama.\n";
         let lines = render_markdown(text, &theme, 40);
 
-        // Header should not contain raw literal "## "
+        // Header should not contain raw literal "## " or geometric bullets
         let header_str: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!header_str.contains("##"), "header contains raw hashes: {}", header_str);
+        assert!(!header_str.contains('◆'), "header contains geometric bullet: {}", header_str);
+        assert!(!header_str.contains('▸'), "header contains geometric bullet: {}", header_str);
         assert!(header_str.contains("Lo bueno"), "header text missing: {}", header_str);
 
         // First bullet line starts with "  • " (4 visible chars)

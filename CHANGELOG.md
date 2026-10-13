@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.3] - 2026-10-14
+
+### Fixed
+- **Terminal Window Focus & Ghost Click Protection**: Resolved issue where focusing or activating the terminal window via mouse click inadvertently opened hyperlinks. Added a 400ms `FocusGained` guard and an 800ms startup grace period to strictly discard background focus clicks.
+- **Detached URL Launcher (Zero Dependency)**: Removed the external `open` crate dependency in favor of native asynchronous detached process spawning (`xdg-open`, `gio`, `open`, `powershell`), completely isolating the terminal event loop from browser launch latency.
+- **Rapid-Click Hyperlink Debouncing**: Prevented multiple browser tabs from spawning upon double or rapid clicking with a 1.5s per-URL and 3.0s global debounce window.
+- **Conflicting Multiplexer Shortcuts**: Cleaned up legacy `Alt+Down` bindings that conflicted with terminal multiplexers (e.g. `tmux` pane navigation).
+
+### Added
+- **Geometric "C" Emblem & Minimalist Static Logo**: Redesigned the primary banner with an elegant geometric chevron emblem (`◢◤` and `◥◣`) in solid satin titanium gray, accompanied by a clean, static satin-white `Corex` title without distracting letter-shimmer animations, structured across an unbroken 2-line layout on both desktop and mobile terminals.
+- **Uncluttered Markdown Headers**: Stripped decorative geometric glyphs (`◈`, `◆`, `▸`) from markdown headers `h1`–`h3`, introduced native `h4` styling, and normalized body block indentation to a clean 2 spaces.
+- **Matte Satin Status & Telemetry Bar**: Refined bottom-right model indicator and reasoning telemetry with a subdued satin-gray palette, replacing harsh neon colors with soft pastel tones.
+- **Smart Return-to-Bottom on `Esc`**: While scrolled up inspecting conversation history or reports, pressing `Esc` immediately snaps the view to the bottom of the feed while **preserving all drafted prompt text** in the composer. Double-tapping `Esc` within 500ms when at the bottom continues to clear the prompt.
+- **Auto-Scroll on Message Send**: Pressing `Enter` to submit a message (or auto-dequeuing queued turns) immediately snaps the viewport to the bottom so streaming AI tokens and user prompts are never obscured.
+- **Native `End` Key Navigation**: Pressing `End` (or `Fn+Right`) while scrolled up navigates directly to the bottom of the feed and advances the prompt cursor.
+- **Comprehensive UX Test Coverage**: Added exhaustive test suites verifying focus guards, URL click hit-testing, selection boundaries, draft preservation, and multi-state `Esc` navigation.
+
+---
+
 ## [0.6.2] - 2026-10-13
 
 ### Fixed

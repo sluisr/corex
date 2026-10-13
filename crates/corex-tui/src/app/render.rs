@@ -443,6 +443,9 @@ pub fn render_single_message_with_pending(
                     ];
                     lines.extend(crate::markdown::wrap_spans(line_spans, content_max_width, "    "));
                 }
+                if is_last_tool {
+                    lines.push(Line::from(""));
+                }
                 return lines;
             }
 
@@ -866,13 +869,8 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 
     app.last_chat_rect = Some(chat_chunk);
 
-    // Resolving drag columns into characters needs the plain text of every rendered line.
-    // Only paid for while a selection is live.
-    app.selection_lines = if app.selection.is_some() {
-        all_lines.iter().map(|line| line_plain_text(line)).collect()
-    } else {
-        Vec::new()
-    };
+    // Resolving drag columns into characters and finding clicked URLs needs the plain text of every rendered line.
+    app.selection_lines = all_lines.iter().map(|line| line_plain_text(line)).collect();
 
     let message_paragraph = Paragraph::new(all_lines)
         .block(Block::default().borders(Borders::NONE))
@@ -1073,20 +1071,15 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4-Flash");
     let is_pro = is_deepseek && (cfg.model == "deepseek-pro" || cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro");
 
-    if is_flash {
-        let temp = cfg.temperature;
-        let temp_color = if temp <= 0.2 {
-            Color::Rgb(79, 195, 247)
-        } else if temp <= 0.5 {
-            Color::Rgb(105, 240, 174)
-        } else if temp <= 1.0 {
-            Color::Rgb(255, 213, 79)
-        } else if temp <= 1.5 {
-            Color::Rgb(255, 152, 0)
-        } else {
-            Color::Rgb(244, 67, 54)
-        };
+    let model_style = Style::default().fg(Color::Rgb(120, 125, 138));
+    let sep_style = Style::default().fg(Color::Rgb(80, 85, 95));
+    let temp_color = if cfg.temperature > 1.2 {
+        Color::Rgb(225, 185, 140)
+    } else {
+        Color::Rgb(135, 215, 215)
+    };
 
+    if is_flash {
         let effort = if (cfg.local_llm_enabled || cfg.reasoning_effort == "dynamic") && !cfg.flash_settings.code_reasoning_effort.is_empty() {
             &cfg.flash_settings.code_reasoning_effort
         } else {
@@ -1094,35 +1087,34 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
         };
 
         let r_color = match effort.as_str() {
-            "none" => Color::Rgb(158, 158, 158),
-            "low" => Color::Rgb(79, 195, 247),
-            "high" => Color::Rgb(255, 213, 79),
-            "xhigh" => Color::Rgb(255, 110, 64),
-            "max" => Color::Rgb(224, 64, 251),
-            _ => app.theme.accent_cyan,
+            "none" => Color::Rgb(120, 125, 135),
+            "low" => Color::Rgb(160, 200, 225),
+            "high" => Color::Rgb(185, 160, 225),
+            "xhigh" | "max" => Color::Rgb(215, 165, 240),
+            _ => Color::Rgb(185, 160, 225),
         };
 
-        right_spans.push(Span::styled("DeepSeek-V4.1-Flash", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
-        right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
-        right_spans.push(Span::styled(format!("{:.1}", temp), Style::default().fg(temp_color)));
-        right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
+        right_spans.push(Span::styled("DeepSeek-V4.1-Flash", model_style));
+        right_spans.push(Span::styled(" · ", sep_style));
+        right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
+        right_spans.push(Span::styled(" · ", sep_style));
         right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
     } else if is_pro {
         let effort = &cfg.pro_settings.reasoning_effort;
         let r_color = match effort.as_str() {
-            "low" => Color::Rgb(105, 240, 174),
-            "medium" => Color::Rgb(255, 152, 0),
-            "high" => Color::Rgb(244, 67, 54),
-            "max" => Color::Rgb(224, 64, 251),
-            _ => app.theme.accent_cyan,
+            "low" => Color::Rgb(160, 200, 225),
+            "medium" => Color::Rgb(185, 160, 225),
+            "high" | "max" => Color::Rgb(215, 165, 240),
+            _ => Color::Rgb(185, 160, 225),
         };
 
-        right_spans.push(Span::styled("DeepSeek-V4-Pro", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
-        right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
+        right_spans.push(Span::styled("DeepSeek-V4-Pro", model_style));
+        right_spans.push(Span::styled(" · ", sep_style));
         right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
     } else if cfg.model.starts_with("local") {
-        right_spans.push(Span::styled(format!("Local: {} ", cfg.local_llm_model), Style::default().fg(Color::Rgb(105, 240, 174)).add_modifier(Modifier::BOLD)));
-        right_spans.push(Span::styled("· Offline @ $0.00 ", Style::default().fg(app.theme.gray)));
+        right_spans.push(Span::styled(format!("Local: {}", cfg.local_llm_model), model_style));
+        right_spans.push(Span::styled(" · ", sep_style));
+        right_spans.push(Span::styled("Offline @ $0.00 ", Style::default().fg(Color::Rgb(105, 240, 174))));
     } else {
         let display_name = {
             let all = cfg.all_providers();
@@ -1132,32 +1124,27 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
                 .unwrap_or_else(|| cfg.model.clone())
         };
 
-        let temp = cfg.temperature;
-        let temp_color = if temp <= 0.2 {
-            Color::Rgb(79, 195, 247)
-        } else if temp <= 0.5 {
-            Color::Rgb(105, 240, 174)
-        } else if temp <= 1.0 {
-            Color::Rgb(255, 213, 79)
-        } else if temp <= 1.5 {
-            Color::Rgb(255, 152, 0)
-        } else {
-            Color::Rgb(244, 67, 54)
+        let r_color = match cfg.reasoning_effort.as_str() {
+            "none" => Color::Rgb(120, 125, 135),
+            "low" => Color::Rgb(160, 200, 225),
+            "high" => Color::Rgb(185, 160, 225),
+            "xhigh" | "max" => Color::Rgb(215, 165, 240),
+            _ => Color::Rgb(185, 160, 225),
         };
 
-        right_spans.push(Span::styled(display_name, Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)));
-        right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
-        right_spans.push(Span::styled(format!("{:.1}", temp), Style::default().fg(temp_color)));
+        right_spans.push(Span::styled(display_name, model_style));
+        right_spans.push(Span::styled(" · ", sep_style));
+        right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         if !cfg.reasoning_effort.is_empty() {
-            right_spans.push(Span::styled(" · ", Style::default().fg(app.theme.gray)));
-            right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(app.theme.accent_cyan)));
+            right_spans.push(Span::styled(" · ", sep_style));
+            right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(r_color)));
         } else {
             right_spans.push(Span::raw(" "));
         }
     }
 
     if cfg.local_llm_enabled && !cfg.model.starts_with("local") {
-        right_spans.push(Span::styled("+Local ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
+        right_spans.push(Span::styled("+Local ", Style::default().fg(app.theme.accent_cyan)));
     }
 
     // Center spans: Local LLM status indicator and Active Background Tasks badge

@@ -511,6 +511,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         // ⚡ Automatically dequeue and run next queued user prompt or synthesize finished task!
                         if let Some(next_prompt) = app.message_queue.pop_front() {
                             app.session.add_message(Message::user(next_prompt));
+                            app.scroll_to_bottom();
                             app.start_stream_turn(event_tx.clone());
                         } else if let Some(last_msg) = app.session.messages.last() {
                             if last_msg.role.as_str() == "system"
@@ -585,6 +586,15 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 Event::FocusGained => {
                     let _ = terminal.clear();
+                    app.last_focus_gained = Some(Instant::now());
+                    app.mouse_down_time = None;
+                    app.mouse_down_pos = None;
+                    app.clear_selection();
+                }
+                Event::FocusLost => {
+                    app.mouse_down_time = None;
+                    app.mouse_down_pos = None;
+                    app.clear_selection();
                 }
                 Event::Mouse(mouse) => {
                     app.handle_mouse(mouse);
@@ -1351,6 +1361,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.cursor_idx = app.input_buffer.len();
                             if !app.auto_scroll {
                                 app.scroll_to_bottom();
+                                needs_redraw = true;
                             }
                         }
                         KeyCode::Delete => {
@@ -1455,17 +1466,18 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.last_esc_press = None;
                         }
                         KeyCode::Esc => {
-                            if !app.auto_scroll && app.input_buffer.is_empty() && !is_slash_open {
-                                app.scroll_to_bottom();
-                                needs_redraw = true;
-                                continue;
-                            }
                             if is_slash_open {
                                 app.input_buffer.clear();
                                 app.cursor_idx = 0;
                                 app.pastes.clear();
                                 app.slash_selected_idx = 0;
                                 app.last_esc_press = None;
+                            } else if !app.auto_scroll {
+                                // 1st ESC when scrolled up -> jump straight to bottom without modifying input buffer!
+                                app.scroll_to_bottom();
+                                app.last_esc_press = None;
+                                needs_redraw = true;
+                                continue;
                             } else {
                                 let is_recent = app.last_esc_press
                                     .map(|i| i.elapsed() <= Duration::from_millis(500))
@@ -1638,6 +1650,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                                 if app.is_streaming {
                                     app.message_queue.push_back(user_prompt_clean);
+                                    app.scroll_to_bottom();
                                     needs_redraw = true;
                                     continue;
                                 }

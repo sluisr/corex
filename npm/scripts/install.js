@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.6.2';
+const VERSION = 'v0.6.3';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
