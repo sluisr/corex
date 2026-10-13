@@ -872,17 +872,24 @@ use corex_core::types::ToolCall;
         let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
-        assert!(!joined.starts_with('›'), "Tool calls should not have chevron: {}", joined);
-        assert!(joined.starts_with("run_shell_command (cargo build)"), "Must format command cleanly: {}", joined);
+        assert_eq!(joined, "Bash › cargo build");
 
         let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme);
         let search_joined: String = search_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(search_joined, "web_search (sluisr sluisr.com Linux)");
+        assert_eq!(search_joined, "Web › \"sluisr sluisr.com Linux\"");
 
         let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme);
         let skill_joined: String = skill_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!skill_joined.contains('⚙'), "Must not contain gear emoji: {}", skill_joined);
-        assert!(skill_joined.contains("corex-about"), "Must show skill name cleanly: {}", skill_joined);
+        assert_eq!(skill_joined, "Skill › corex-about");
+
+        let read_spans = format_tool_call_spans("read_file", r#"{"file_path":"src/main.rs"}"#, &theme);
+        let read_joined: String = read_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(read_joined, "Read › src/main.rs");
+
+        let list_spans = format_tool_call_spans("list_directory", r#"{"path":"crates"}"#, &theme);
+        let list_joined: String = list_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(list_joined, "List › crates/");
     }
 
     #[tokio::test]

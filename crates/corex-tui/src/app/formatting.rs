@@ -279,27 +279,53 @@ pub fn patch_target(patch: &str) -> Option<String> {
         .next()
 }
 
+/// Helper to trim current working directory or home directory prefix from a path
+pub fn format_relative_path(path_str: &str) -> String {
+    let clean = path_str.trim();
+    if clean.is_empty() {
+        return ".".to_string();
+    }
+    let p = std::path::Path::new(clean);
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(rel) = p.strip_prefix(&cwd) {
+            let rel_str = rel.to_string_lossy();
+            if rel_str.is_empty() {
+                return ".".to_string();
+            }
+            return rel_str.to_string();
+        }
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+        if let Ok(rel) = p.strip_prefix(&home) {
+            return format!("~/{}", rel.to_string_lossy());
+        }
+    }
+    clean.to_string()
+}
+
 pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span<'static>> {
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-    let (tool_style, display_arg) = match name {
+    let (action_label, action_style, display_arg) = match name {
         "run_shell_command" | "shell" => {
             let cmd = args_val.as_ref()
                 .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()))
                 .unwrap_or(raw_args)
                 .trim();
-            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(cmd, 60).to_string())
+            ("Bash", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(cmd, 70).to_string())
         }
         "read_file" => {
             let path = args_val.as_ref()
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
-            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), path.to_string())
+            let rel = format_relative_path(path);
+            ("Read", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), rel)
         }
         "write_file" => {
             let path = args_val.as_ref()
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
-            (Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), path.to_string())
+            let rel = format_relative_path(path);
+            ("Write", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), rel)
         }
         "edit" | "apply_patch" => {
             let path = args_val.as_ref()
@@ -311,19 +337,36 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                         .and_then(patch_target)
                 })
                 .unwrap_or_else(|| "patch".to_string());
-            (Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), path)
+            let rel = format_relative_path(&path);
+            ("Edit", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), rel)
+        }
+        "list_directory" | "ls" => {
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("path").or_else(|| v.get("dir_path")).and_then(|p| p.as_str()))
+                .unwrap_or(".");
+            let mut rel = format_relative_path(path);
+            if !rel.ends_with('/') && rel != "." {
+                rel.push('/');
+            }
+            ("List", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), rel)
+        }
+        "glob" => {
+            let pattern = args_val.as_ref()
+                .and_then(|v| v.get("pattern").and_then(|p| p.as_str()))
+                .unwrap_or(raw_args);
+            ("Glob", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), pattern.to_string())
         }
         "web_search" => {
             let q = args_val.as_ref()
                 .and_then(|v| v.get("query").and_then(|c| c.as_str()))
                 .unwrap_or(raw_args);
-            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(q, 60).to_string())
+            ("Web", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), format!("\"{}\"", corex_core::truncate_ellipsis(q, 60)))
         }
         "web_fetch" => {
             let url = args_val.as_ref()
                 .and_then(|v| v.get("url").and_then(|c| c.as_str()))
                 .unwrap_or(raw_args);
-            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(url, 60).to_string())
+            ("Web", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(url, 60).to_string())
         }
         "grep_search" | "grep" => {
             let q = args_val.as_ref()
@@ -333,32 +376,34 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 .and_then(|v| v.get("path").and_then(|c| c.as_str()))
                 .filter(|p| !p.is_empty() && *p != ".");
             let text = if let Some(p) = path {
-                format!("{} in {}", q, p)
+                let rel = format_relative_path(p);
+                format!("\"{}\" in {}", q, rel)
             } else {
-                q.to_string()
+                format!("\"{}\"", q)
             };
-            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(&text, 60).to_string())
+            ("Grep", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(&text, 60).to_string())
         }
         "activate_skill" => {
             let skill_name = args_val.as_ref()
                 .and_then(|v| v.get("name").and_then(|n| n.as_str()))
                 .unwrap_or(raw_args);
-            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), skill_name.to_string())
+            ("Skill", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD), skill_name.to_string())
         }
         "delegate_subagent" => {
             let role = args_val.as_ref().and_then(|v| v.get("role").and_then(|r| r.as_str())).unwrap_or("worker");
             let task = args_val.as_ref().and_then(|v| v.get("task").and_then(|t| t.as_str())).unwrap_or("");
-            (Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD), format!("{}: {}", role, corex_core::truncate_ellipsis(task, 40)))
+            ("Agent", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD), format!("{}: {}", role, corex_core::truncate_ellipsis(task, 40)))
         }
         _ => {
             let clean = clean_tool_args(name, raw_args);
-            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), clean)
+            (name, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), clean)
         }
     };
 
     vec![
-        Span::styled(name.to_string(), tool_style),
-        Span::styled(format!(" ({})", display_arg), Style::default().fg(theme.dark_gray)),
+        Span::styled(action_label.to_string(), action_style),
+        Span::styled(" › ", Style::default().fg(theme.dark_gray)),
+        Span::styled(display_arg, Style::default().fg(theme.gray)),
     ]
 }
 

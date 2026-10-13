@@ -350,54 +350,93 @@ pub fn build_streaming_tool_preview_lines(
         let tool_name = &call.function.name;
         let raw_args = &call.function.arguments;
 
-        let display_cmd = if tool_name == "run_shell_command" || tool_name == "shell" || tool_name.is_empty() {
-            let parsed_cmd = serde_json::from_str::<serde_json::Value>(raw_args)
-                .ok()
-                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_string()));
+        let (action_label, display_arg) = match tool_name.as_str() {
+            "run_shell_command" | "shell" | "" => {
+                let parsed_cmd = serde_json::from_str::<serde_json::Value>(raw_args)
+                    .ok()
+                    .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()).map(|s| s.to_string()));
 
-            parsed_cmd.unwrap_or_else(|| {
-                if let Some(pos) = raw_args.find("\"command\":") {
-                    let after = raw_args[pos + 10..].trim();
-                    let unquoted = after
-                        .trim_start_matches('"')
-                        .trim_end_matches('"')
-                        .trim_end_matches('}')
-                        .trim();
-                    unquoted.to_string()
-                } else if raw_args.trim().is_empty() {
-                    "analyzing...".to_string()
-                } else {
-                    raw_args.to_string()
+                let cmd = parsed_cmd.unwrap_or_else(|| {
+                    if let Some(pos) = raw_args.find("\"command\":") {
+                        let after = raw_args[pos + 10..].trim();
+                        after.trim_start_matches('"').trim_end_matches('"').trim_end_matches('}').trim().to_string()
+                    } else if raw_args.trim().is_empty() {
+                        "analyzing...".to_string()
+                    } else {
+                        raw_args.to_string()
+                    }
+                });
+                ("Bash", cmd)
+            }
+            "read_file" => {
+                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| raw_args.to_string());
+                ("Read", crate::app::formatting::format_relative_path(&path))
+            }
+            "write_file" => {
+                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| raw_args.to_string());
+                ("Write", crate::app::formatting::format_relative_path(&path))
+            }
+            "edit" | "apply_patch" => {
+                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .or_else(|| crate::app::formatting::patch_target(raw_args))
+                    .unwrap_or_else(|| "patch".to_string());
+                ("Edit", crate::app::formatting::format_relative_path(&path))
+            }
+            "list_directory" | "ls" => {
+                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("path").or_else(|| v.get("dir_path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| ".".to_string());
+                let mut rel = crate::app::formatting::format_relative_path(&path);
+                if !rel.ends_with('/') && rel != "." {
+                    rel.push('/');
                 }
-            })
-        } else {
-            let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-            let primary_arg = parsed.as_ref().and_then(|v| {
-                v.get("path")
-                    .or_else(|| v.get("dir_path"))
-                    .or_else(|| v.get("file_path"))
-                    .or_else(|| v.get("query"))
-                    .or_else(|| v.get("pattern"))
-                    .and_then(|s| s.as_str())
-            });
-
-            if let Some(arg) = primary_arg {
-                format!("{}: {}", tool_name, arg)
-            } else if !raw_args.trim().is_empty() {
-                format!("{}: {}", tool_name, raw_args)
-            } else {
-                format!("{}...", tool_name)
+                ("List", rel)
+            }
+            "web_search" => {
+                let q = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("query").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| raw_args.to_string());
+                ("Web", format!("\"{}\"", q))
+            }
+            "grep_search" | "grep" => {
+                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
+                let q = parsed.as_ref().and_then(|v| v.get("query").and_then(|s| s.as_str())).unwrap_or("");
+                let path = parsed.as_ref().and_then(|v| v.get("path").and_then(|s| s.as_str())).unwrap_or("");
+                let text = if !path.is_empty() && path != "." {
+                    format!("\"{}\" in {}", q, crate::app::formatting::format_relative_path(path))
+                } else {
+                    format!("\"{}\"", q)
+                };
+                ("Grep", text)
+            }
+            other => {
+                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
+                let primary_arg = parsed.as_ref().and_then(|v| {
+                    v.get("path")
+                        .or_else(|| v.get("dir_path"))
+                        .or_else(|| v.get("file_path"))
+                        .or_else(|| v.get("query"))
+                        .or_else(|| v.get("pattern"))
+                        .and_then(|s| s.as_str())
+                });
+                if let Some(arg) = primary_arg {
+                    (other, crate::app::formatting::format_relative_path(arg))
+                } else if !raw_args.trim().is_empty() {
+                    (other, raw_args.to_string())
+                } else {
+                    (other, "...".to_string())
+                }
             }
         };
 
-        let unescaped_cmd = display_cmd.replace("\\\"", "\"").replace("\\\\", "\\");
-        let (prefix, clean_body) = if unescaped_cmd.trim_start().starts_with('$') {
-            ("$ ", unescaped_cmd.trim_start()[1..].trim_start())
-        } else if tool_name == "run_shell_command" || tool_name == "shell" || tool_name.is_empty() {
-            ("$ ", unescaped_cmd.as_str())
-        } else {
-            ("⊷ ", unescaped_cmd.as_str())
-        };
+        let formatted = format!("{} › {}", action_label, display_arg);
+        let unescaped_cmd = formatted.replace("\\\"", "\"").replace("\\\\", "\\");
+        let (prefix, clean_body) = ("", unescaped_cmd.as_str());
 
         let cursor_span = if is_last {
             Some(Span::styled("█", Style::default().fg(theme.accent_cyan)))
