@@ -109,13 +109,28 @@ Or download binaries manually from the [GitHub Releases](https://github.com/slui
 - Android Termux (`aarch64-linux-android`)
 - Windows (`x86_64-pc-windows-msvc`)
 
-### Method 2: From Source via Cargo
+### Method 2: Homebrew (macOS & Linuxbrew)
+
+Install via the official Homebrew tap:
+
+```bash
+brew install sluisr/tap/cx
+```
+
+Or tap and install:
+
+```bash
+brew tap sluisr/tap
+brew install cx
+```
+
+### Method 3: From Source via Cargo
 
 ```bash
 cargo install --git https://github.com/sluisr/corex.git --force
 ```
 
-### Method 3: Via npm / npx
+### Method 4: Via npm / npx
 
 ```bash
 # Run headlessly or interactively without installation:
@@ -125,7 +140,7 @@ npx @sluisr/corex
 npm install -g @sluisr/corex
 ```
 
-### Method 4: Build from Source
+### Method 5: Build from Source
 
 ```bash
 git clone https://github.com/sluisr/corex.git
