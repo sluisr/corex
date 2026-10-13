@@ -90,6 +90,11 @@ impl App {
             selection: None,
             selection_lines: Vec::new(),
             drag_point: None,
+            app_start_time: Instant::now(),
+            last_focus_gained: None,
+            mouse_down_time: None,
+            mouse_down_pos: None,
+            last_url_open: None,
             session_allowed_commands: Vec::new(),
             logs_expanded: false,
             git_branch: branch,
@@ -168,14 +173,24 @@ impl App {
 
     // --- Chat text selection (driven by mouse drags, see `Selection`) ---
 
-    /// Routes a mouse event: the wheel scrolls the feed, the left button selects text.
+    /// Routes a mouse event: the wheel scrolls the feed, the left button selects text or opens links.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_selection(-3),
             MouseEventKind::ScrollDown => self.scroll_selection(3),
-            MouseEventKind::Down(MouseButton::Left) => self.begin_selection(mouse.column, mouse.row),
-            MouseEventKind::Drag(MouseButton::Left) => self.extend_selection(mouse.column, mouse.row),
-            MouseEventKind::Up(MouseButton::Left) => self.commit_selection(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down_time = Some(Instant::now());
+                self.mouse_down_pos = Some((mouse.column, mouse.row));
+                self.begin_selection(mouse.column, mouse.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.extend_selection(mouse.column, mouse.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let down_time = self.mouse_down_time.take();
+                let down_pos = self.mouse_down_pos.take();
+                self.commit_selection_with_click(mouse.column, mouse.row, down_time, down_pos);
+            }
             _ => {}
         }
     }
@@ -260,24 +275,73 @@ impl App {
     /// it ever sees the gesture, so nothing above it can clear a highlight it did not paint. The
     /// copy itself stays silent.
     pub fn commit_selection(&mut self) {
+        self.commit_selection_with_click(0, 0, None, None);
+    }
+
+    /// Commits active selection. If the gesture is a clean, intentional point click directly
+    /// on a URL (and not an accidental window-focus click or drag), opens the link in the background.
+    /// Otherwise, if text was selected, copies it to the system clipboard silently.
+    pub fn commit_selection_with_click(
+        &mut self,
+        up_col: u16,
+        up_row: u16,
+        down_time: Option<Instant>,
+        down_pos: Option<(u16, u16)>,
+    ) {
         let Some(selection) = self.selection else { return };
 
-        // Read the text before clearing: it is derived from the live selection.
-        let text = self.selection_text();
-        if selection.is_empty() {
-            let (line_idx, char_idx) = selection.anchor;
+        // 1. Is this a deliberate point click? (Human tap: between 30ms and 500ms, max 1 cell jitter)
+        let is_point_click = if let (Some(t), Some((dc, dr))) = (down_time, down_pos) {
+            let elapsed = t.elapsed();
+            let duration_ok = elapsed >= Duration::from_millis(30) && elapsed <= Duration::from_millis(500);
+            let distance_ok = dc.abs_diff(up_col) <= 1 && dr == up_row;
+            let selection_empty = selection.is_empty()
+                || (selection.anchor.0 == selection.cursor.0 && selection.anchor.1.abs_diff(selection.cursor.1) <= 1);
+            duration_ok && distance_ok && selection_empty
+        } else {
+            false
+        };
+
+        // 2. Window Focus Activation Guard:
+        // Window managers (Hyprland, Wayland, X11) pass click-through when focusing an inactive window.
+        // A click within 400ms of FocusGained is a window activation click, NOT a deliberate URL click!
+        let is_focus_activation = self.last_focus_gained
+            .map(|t| t.elapsed() < Duration::from_millis(400))
+            .unwrap_or(false);
+
+        // 3. App startup grace period (first 800ms of app lifecycle):
+        let is_startup_grace = self.app_start_time.elapsed() < Duration::from_millis(800);
+
+        if is_point_click && !is_focus_activation && !is_startup_grace {
+            let (line_idx, char_col) = selection.anchor;
             if let Some(line) = self.selection_lines.get(line_idx) {
-                if let Some(url) = formatting::find_url_in_line(line, Some(char_idx as usize)) {
-                    let _ = open::that(&url);
+                if let Some(url) = formatting::find_url_in_line(line, Some(char_col as usize)) {
+                    // 4. Strict Debounce:
+                    // Minimum 1.5s between ANY URL open, 3.0s between opening the exact same URL.
+                    let already_opened_recently = self.last_url_open
+                        .as_ref()
+                        .map(|(t, prev_url)| {
+                            t.elapsed() < Duration::from_millis(1500)
+                                || (prev_url == &url && t.elapsed() < Duration::from_millis(3000))
+                        })
+                        .unwrap_or(false);
+
+                    if !already_opened_recently {
+                        self.last_url_open = Some((Instant::now(), url.clone()));
+                        open_url_detached(&url);
+                    }
+
+                    self.clear_selection();
+                    return;
                 }
             }
-            self.clear_selection();
-            return;
         }
+
+        let text = self.selection_text();
 
         self.clear_selection();
 
-        if text.trim().is_empty() {
+        if selection.is_empty() || text.trim().is_empty() {
             return;
         }
 
@@ -286,10 +350,9 @@ impl App {
         }
     }
 
-    /// Drops the current selection and the line text cached for it.
+    /// Drops the current selection and drag point.
     pub fn clear_selection(&mut self) {
         self.selection = None;
-        self.selection_lines.clear();
         self.drag_point = None;
     }
 
@@ -1531,6 +1594,38 @@ impl App {
         )));
         self.model_dialog.mark_active(provider_idx, model_idx);
         self.model_dialog.close();
+    }
+}
+
+/// Opens a URL in the user's default browser completely detached in the background.
+/// Never blocks the event loop, never inherits terminal stdio, never interferes with raw mode.
+pub fn open_url_detached(url: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
     }
 }
 

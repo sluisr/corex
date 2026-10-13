@@ -27,17 +27,31 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
             url.pop();
         }
         let abs_byte_end = abs_byte_start + url.len();
+
+        // Check if this URL is part of a markdown link: [label](url)
+        let mut abs_token_start = abs_byte_start;
+        let mut abs_token_end = abs_byte_end;
+        if abs_byte_start >= 2 && line_text[..abs_byte_start].ends_with("](") {
+            let before = &line_text[..abs_byte_start - 2];
+            if let Some(bracket_idx) = before.rfind('[') {
+                abs_token_start = bracket_idx;
+                if line_text[abs_byte_end..].starts_with(')') {
+                    abs_token_end = abs_byte_end + 1;
+                }
+            }
+        }
+
         if !url.is_empty() {
-            // Compute exact display columns (visual character cells) for this URL
+            // Compute exact display columns (visual character cells) for this link token
             let mut col = 0usize;
             let mut start_col = None;
             let mut end_col = None;
             for (byte_idx, ch) in line_text.char_indices() {
                 let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if byte_idx == abs_byte_start {
+                if byte_idx == abs_token_start {
                     start_col = Some(col);
                 }
-                if byte_idx + ch.len_utf8() == abs_byte_end {
+                if byte_idx + ch.len_utf8() == abs_token_end {
                     end_col = Some(col + w);
                 }
                 col += w;
@@ -148,6 +162,24 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
                 .unwrap_or(".");
             format!("Exploring directory: {}", path)
         }
+        "web_search" => {
+            let q = args_val.as_ref()
+                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args);
+            format!("Searching web: {}", corex_core::truncate_ellipsis(q, 50))
+        }
+        "web_fetch" => {
+            let url = args_val.as_ref()
+                .and_then(|v| v.get("url").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args);
+            format!("Fetching URL: {}", corex_core::truncate_ellipsis(url, 50))
+        }
+        "grep_search" | "grep" => {
+            let q = args_val.as_ref()
+                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args);
+            format!("Searching code: {}", corex_core::truncate_ellipsis(q, 50))
+        }
         "activate_skill" => {
             let skill_name = args_val.as_ref()
                 .and_then(|v| v.get("name").and_then(|n| n.as_str()))
@@ -156,6 +188,79 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
         }
         _ => format!("Executing: {}", name),
     }
+}
+
+pub fn clean_tool_args(name: &str, raw_args: &str) -> String {
+    let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
+    if let Some(val) = &args_val {
+        if let Some(obj) = val.as_object() {
+            match name {
+                "web_search" => {
+                    if let Some(q) = obj.get("query").and_then(|v| v.as_str()) {
+                        return corex_core::truncate_ellipsis(q, 60).to_string();
+                    }
+                }
+                "web_fetch" => {
+                    if let Some(u) = obj.get("url").and_then(|v| v.as_str()) {
+                        return corex_core::truncate_ellipsis(u, 60).to_string();
+                    }
+                }
+                "grep_search" | "grep" => {
+                    let q = obj.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = obj.get("path").and_then(|v| v.as_str());
+                    if let Some(p) = path {
+                        if !p.is_empty() && p != "." {
+                            return format!("{} in {}", q, p);
+                        }
+                    }
+                    if !q.is_empty() {
+                        return q.to_string();
+                    }
+                }
+                "glob" => {
+                    if let Some(p) = obj.get("pattern").and_then(|v| v.as_str()) {
+                        return p.to_string();
+                    }
+                }
+                "delegate_subagent" => {
+                    let role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("worker");
+                    let task = obj.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                    return format!("{}: {}", role, corex_core::truncate_ellipsis(task, 40));
+                }
+                _ => {}
+            }
+
+            for key in ["query", "url", "command", "pattern", "path", "file_path", "name", "task", "prompt"] {
+                if let Some(v) = obj.get(key) {
+                    if let Some(s) = v.as_str() {
+                        return corex_core::truncate_ellipsis(s, 60).to_string();
+                    }
+                }
+            }
+            if obj.len() == 1 {
+                if let Some((_, v)) = obj.iter().next() {
+                    if let Some(s) = v.as_str() {
+                        return corex_core::truncate_ellipsis(s, 60).to_string();
+                    } else {
+                        return corex_core::truncate_ellipsis(&v.to_string(), 60).to_string();
+                    }
+                }
+            }
+            let formatted_pairs: Vec<String> = obj.iter()
+                .map(|(k, v)| {
+                    if let Some(s) = v.as_str() {
+                        format!("{}={}", k, corex_core::truncate_ellipsis(s, 30))
+                    } else {
+                        format!("{}={}", k, v)
+                    }
+                })
+                .collect();
+            if !formatted_pairs.is_empty() {
+                return corex_core::truncate_ellipsis(&formatted_pairs.join(", "), 60).to_string();
+            }
+        }
+    }
+    corex_core::truncate_ellipsis(raw_args, 60).to_string()
 }
 
 /// Target file of an `apply_patch` call.
@@ -176,37 +281,25 @@ pub fn patch_target(patch: &str) -> Option<String> {
 
 pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span<'static>> {
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-    match name {
+    let (tool_style, display_arg) = match name {
         "run_shell_command" | "shell" => {
             let cmd = args_val.as_ref()
                 .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()))
                 .unwrap_or(raw_args)
                 .trim();
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", cmd), Style::default().fg(theme.dark_gray)),
-            ]
+            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(cmd, 60).to_string())
         }
         "read_file" => {
             let path = args_val.as_ref()
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
-            ]
+            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), path.to_string())
         }
         "write_file" => {
             let path = args_val.as_ref()
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
-            ]
+            (Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), path.to_string())
         }
         "edit" | "apply_patch" => {
             let path = args_val.as_ref()
@@ -218,31 +311,55 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                         .and_then(patch_target)
                 })
                 .unwrap_or_else(|| "patch".to_string());
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
-            ]
+            (Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD), path)
+        }
+        "web_search" => {
+            let q = args_val.as_ref()
+                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args);
+            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(q, 60).to_string())
+        }
+        "web_fetch" => {
+            let url = args_val.as_ref()
+                .and_then(|v| v.get("url").and_then(|c| c.as_str()))
+                .unwrap_or(raw_args);
+            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(url, 60).to_string())
+        }
+        "grep_search" | "grep" => {
+            let q = args_val.as_ref()
+                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
+                .unwrap_or("");
+            let path = args_val.as_ref()
+                .and_then(|v| v.get("path").and_then(|c| c.as_str()))
+                .filter(|p| !p.is_empty() && *p != ".");
+            let text = if let Some(p) = path {
+                format!("{} in {}", q, p)
+            } else {
+                q.to_string()
+            };
+            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), corex_core::truncate_ellipsis(&text, 60).to_string())
         }
         "activate_skill" => {
             let skill_name = args_val.as_ref()
                 .and_then(|v| v.get("name").and_then(|n| n.as_str()))
                 .unwrap_or(raw_args);
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", skill_name), Style::default().fg(theme.dark_gray)),
-            ]
+            (Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), skill_name.to_string())
+        }
+        "delegate_subagent" => {
+            let role = args_val.as_ref().and_then(|v| v.get("role").and_then(|r| r.as_str())).unwrap_or("worker");
+            let task = args_val.as_ref().and_then(|v| v.get("task").and_then(|t| t.as_str())).unwrap_or("");
+            (Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD), format!("{}: {}", role, corex_core::truncate_ellipsis(task, 40)))
         }
         _ => {
-            let display_args = corex_core::truncate_ellipsis(raw_args, 40);
-            vec![
-                Span::styled("› ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(name.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({})", display_args), Style::default().fg(theme.dark_gray)),
-            ]
+            let clean = clean_tool_args(name, raw_args);
+            (Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), clean)
         }
-    }
+    };
+
+    vec![
+        Span::styled(name.to_string(), tool_style),
+        Span::styled(format!(" ({})", display_arg), Style::default().fg(theme.dark_gray)),
+    ]
 }
 
 pub fn format_input_spans<'a>(text: &'a str, theme: &'a Theme) -> Vec<Span<'a>> {

@@ -247,6 +247,11 @@ pub struct App {
     pub selection_lines: Vec<String>,
     /// Last cell the pointer was seen at while the left button is down.
     pub drag_point: Option<(u16, u16)>,
+    pub app_start_time: Instant,
+    pub last_focus_gained: Option<Instant>,
+    pub mouse_down_time: Option<Instant>,
+    pub mouse_down_pos: Option<(u16, u16)>,
+    pub last_url_open: Option<(Instant, String)>,
     pub session_allowed_commands: Vec<String>,
     pub logs_expanded: bool,
     pub git_branch: String,
