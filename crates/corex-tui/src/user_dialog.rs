@@ -1,13 +1,11 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::symbols;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use corex_core::types::ToolCall;
 
-use crate::overlay::begin_modal;
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -155,6 +153,23 @@ fn wrap_question(text: &str, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: u16) -> u16 {
+    let Some(q) = state.questions.get(state.current) else {
+        return 6;
+    };
+    let usable_w = (width as usize).saturating_sub(6).max(20);
+    let q_lines_count = wrap_question(&q.question, usable_w).len().max(1);
+    let opt_count = if q.has_options {
+        q.options.len().min(8)
+    } else {
+        1
+    };
+    // Content lines: question lines + 1 blank + opt_count + 1 blank + 1 hint
+    // Borders: top + bottom = 2
+    let content = q_lines_count + 1 + opt_count + 1 + 1;
+    (content as u16 + 2).min(max_height.saturating_sub(6)).max(6)
+}
+
 pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState, theme: &Theme) {
     let Some(q) = state.questions.get(state.current) else {
         return;
@@ -163,28 +178,50 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     let title = q
         .header
         .clone()
-        .unwrap_or_else(|| format!("Question {}/{}", state.current + 1, total));
+        .unwrap_or_else(|| {
+            if total > 1 {
+                format!("Pregunta {} de {}", state.current + 1, total)
+            } else {
+                "Pregunta".to_string()
+            }
+        });
 
-    let max_opts = q.options.len().min(8);
-    let height = (7 + max_opts as u16).min(area.height.saturating_sub(6)).max(8);
-    // Compact box with generous side margins so the chat text doesn't touch
-    // the frame edges.
-    let width = area.width.saturating_sub(24).clamp(40, 76);
-    let x = (area.width.saturating_sub(width)) / 2;
-    let y = (area.height.saturating_sub(height)) / 2;
-    let dialog = Rect::new(x, y, width, height);
-
-    // Dim the chat behind the modal so it does not visually collide.
-    begin_modal(frame, area, dialog, 2, 1);
-
+    let usable_w = (area.width as usize).saturating_sub(6).max(20);
     let mut lines: Vec<Line> = Vec::new();
-    lines.extend(wrap_question(&q.question, width as usize - 4));
+
+    // 1. Question text wrapped with clean prompt bullet
+    let q_lines = wrap_question(&q.question, usable_w);
+    for (i, ql) in q_lines.into_iter().enumerate() {
+        if i == 0 {
+            let mut spans = vec![
+                Span::styled(" › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+            ];
+            spans.extend(ql.spans);
+            lines.push(Line::from(spans));
+        } else {
+            let mut spans = vec![
+                Span::raw("   "),
+            ];
+            spans.extend(ql.spans);
+            lines.push(Line::from(spans));
+        }
+    }
     lines.push(Line::from(""));
 
+    // 2. Options or text input
     if q.has_options {
-        for (i, opt) in q.options.iter().enumerate().take(max_opts) {
-            let is_sel = i == state.selected[state.current];
+        let max_opts = q.options.len().min(8);
+        let cur_sel = state.selected[state.current];
+        let window_start = if cur_sel >= max_opts {
+            cur_sel + 1 - max_opts
+        } else {
+            0
+        };
+
+        for (idx, opt) in q.options.iter().enumerate().skip(window_start).take(max_opts) {
+            let is_sel = idx == cur_sel;
             let bullet = if is_sel { "●" } else { "○" };
+            let num = format!("{}. ", idx + 1);
             let style = if is_sel {
                 Style::default()
                     .fg(theme.accent_blue)
@@ -192,16 +229,31 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
             } else {
                 Style::default().fg(theme.gray)
             };
+            let cursor = if is_sel { " ❯ " } else { "   " };
+
             lines.push(Line::from(vec![
-                Span::styled(format!("   {} ", bullet), style),
-                Span::styled(opt.clone(), style),
+                Span::styled(cursor, if is_sel { Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD) } else { Style::default() }),
+                Span::styled(num, if is_sel { Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme.dark_gray) }),
+                Span::styled(format!("{} ", bullet), style),
+                Span::styled(
+                    opt.clone(),
+                    if is_sel {
+                        Style::default().fg(Color::Rgb(240, 245, 255)).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.gray)
+                    },
+                ),
             ]));
         }
+
         if q.options.len() > max_opts {
-            lines.push(Line::from(Span::styled(
-                format!("   ... ({} more)", q.options.len() - max_opts),
-                Style::default().fg(theme.dark_gray),
-            )));
+            let remaining = q.options.len() - (window_start + max_opts);
+            if remaining > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("     ... ({} más abajo)", remaining),
+                    Style::default().fg(theme.dark_gray),
+                )));
+            }
         }
     } else {
         let input = &state.text_input[state.current];
@@ -229,9 +281,13 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
 
     lines.push(Line::from(""));
     let hint = if q.has_options {
-        "[↑/↓] navigate   [Enter] select   [Esc] cancel"
+        if q.options.len() <= 9 {
+            format!("[1-{} o ↑/↓] Seleccionar   [Enter] Confirmar   [Esc] Cancelar", q.options.len())
+        } else {
+            "[↑/↓] Navegar   [Enter] Confirmar   [Esc] Cancelar".to_string()
+        }
     } else {
-        "[Enter] answer   [Esc] cancel"
+        "[Enter] Confirmar   [Esc] Cancelar".to_string()
     };
     lines.push(Line::from(Span::styled(
         format!("   {}", hint),
@@ -239,12 +295,13 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     )));
 
     let block = Block::default()
-        .title(format!(" {} ", title))
-        .borders(Borders::ALL)
-        .border_set(symbols::border::PLAIN)
-        .border_style(Style::default().fg(theme.accent_blue));
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::Rgb(75, 110, 155)))
+        .title_top(Line::from(vec![
+            Span::styled(format!(" ─[ {} ] ", title), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+        ]));
 
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), dialog);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[cfg(test)]
@@ -289,5 +346,15 @@ mod tests {
         state.open(qs, Vec::new(), "call-1".to_string());
         state.cancelled = true;
         assert!(state.format_output().contains("cancelled"));
+    }
+
+    #[test]
+    fn test_calculate_dialog_height() {
+        let raw = r#"{"questions":[{"question":"¿Qué proyecto?","options":["A","B","C"]}]}"#;
+        let qs = parse_questions(raw).unwrap();
+        let mut state = UserDialogState::new();
+        state.open(qs, Vec::new(), "call-1".to_string());
+        let h = calculate_dialog_height(&state, 80, 24);
+        assert!(h >= 7 && h <= 12, "height should be reasonably compact: {}", h);
     }
 }

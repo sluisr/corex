@@ -120,20 +120,16 @@ struct ParsedHunk {
 }
 
 fn parse_hunk_starts(header: &str) -> Option<(usize, usize)> {
-    let old_start = if let Some(start_pos) = header.find('-') {
-        let rest = &header[start_pos + 1..];
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        num_str.parse::<usize>().ok()?
-    } else {
-        return None;
-    };
-    let new_start = if let Some(start_pos) = header.find('+') {
-        let rest = &header[start_pos + 1..];
-        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        num_str.parse::<usize>().ok()?
-    } else {
-        return None;
-    };
+    let start_pos = header.find('-')?;
+    let rest = &header[start_pos + 1..];
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let old_start = num_str.parse::<usize>().ok()?;
+
+    let start_pos = header.find('+')?;
+    let rest = &header[start_pos + 1..];
+    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let new_start = num_str.parse::<usize>().ok()?;
+
     Some((old_start, new_start))
 }
 
@@ -381,14 +377,13 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
         let sub_old = &old_lines[1..target_len - 1];
         let sub_len = sub_old.len();
         for &i in &candidates {
-            if i + 1 + sub_len <= file_lines.len() {
-                if file_lines[i + 1..i + 1 + sub_len]
+            if i + 1 + sub_len <= file_lines.len()
+                && file_lines[i + 1..i + 1 + sub_len]
                     .iter()
                     .zip(sub_old.iter())
                     .all(|(f, o)| f.trim() == o.trim())
-                {
-                    return Some((i, i + target_len));
-                }
+            {
+                return Some((i, i + target_len));
             }
         }
     }

@@ -281,8 +281,7 @@ fn render_session_list(
     let end_idx = (start_idx + max_visible).min(sessions.len());
 
     let mut lines = Vec::new();
-    for i in start_idx..end_idx {
-        let s = sessions[i];
+    for (i, &s) in sessions.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_selected = i == selected;
         let row_bg = if is_selected { selected_bg } else { Color::Reset };
 

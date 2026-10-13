@@ -133,11 +133,12 @@ pub fn render_gradient_logo_adaptive(
         }
         lines.push(Line::from(line1));
 
-        let mut line2 = Vec::new();
-        line2.push(Span::raw("  "));
-        line2.push(Span::styled("/help", Style::default().fg(muted_gray)));
-        line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-        line2.push(Span::styled("/model", Style::default().fg(muted_gray)));
+        let mut line2 = vec![
+            Span::raw("  "),
+            Span::styled("/help", Style::default().fg(muted_gray)),
+            Span::styled(" · ", Style::default().fg(sep_gray)),
+            Span::styled("/model", Style::default().fg(muted_gray)),
+        ];
         if !authenticated && !local_mode {
             line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
             line2.push(Span::styled("/key", Style::default().fg(muted_gray)));

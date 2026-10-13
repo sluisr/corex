@@ -29,6 +29,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
+        let _ = crate::verify_tools_provenance();
         let mut registry = Self {
             tools: HashMap::new(),
             registered_definitions: Vec::new(),

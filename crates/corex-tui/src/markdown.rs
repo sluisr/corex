@@ -455,6 +455,156 @@ fn parse_inline_spans(
             continue;
         }
 
+        // 4. Markdown Links: [label](url)
+        if ch == '[' {
+            let mut lookahead = chars.clone();
+            let mut label = String::new();
+            let mut found_close_bracket = false;
+            for next_ch in lookahead.by_ref() {
+                if next_ch == ']' {
+                    found_close_bracket = true;
+                    break;
+                }
+                if next_ch == '\n' || label.len() > 300 {
+                    break;
+                }
+                label.push(next_ch);
+            }
+
+            if found_close_bracket && lookahead.peek() == Some(&'(') {
+                lookahead.next(); // consume '('
+                let mut url = String::new();
+                let mut found_close_paren = false;
+                for next_ch in lookahead.by_ref() {
+                    if next_ch == ')' {
+                        found_close_paren = true;
+                        break;
+                    }
+                    if next_ch == '\n' || next_ch == ' ' || url.len() > 500 {
+                        break;
+                    }
+                    url.push(next_ch);
+                }
+
+                if found_close_paren
+                    && (url.starts_with("http://")
+                        || url.starts_with("https://")
+                        || url.starts_with("mailto:")
+                        || url.starts_with('/')
+                        || url.starts_with('#'))
+                {
+                    chars = lookahead;
+
+                    if !buffer.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
+                    }
+
+                    let link_style = Style::default()
+                        .fg(theme.accent_blue)
+                        .add_modifier(Modifier::UNDERLINED);
+
+                    let clean_label = label.trim();
+                    let clean_url = url.trim();
+
+                    let norm_url = clean_url
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_start_matches("www.")
+                        .trim_end_matches('/');
+                    let norm_label = clean_label
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_start_matches("www.")
+                        .trim_end_matches('/');
+
+                    if clean_label.is_empty() || norm_url == norm_label {
+                        // Label is identical to the URL -> render as single clean clickable link
+                        spans.push(Span::styled(clean_url.to_string(), link_style));
+                    } else {
+                        // Single contiguous styled link token so table wrap never splits brackets
+                        spans.push(Span::styled(format!("[{}]({})", clean_label, clean_url), link_style));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // 5. Standalone URL: https:// or http://
+        if ch == 'h' {
+            let mut lookahead = chars.clone();
+            let mut prefix = String::from("h");
+            for _ in 0..7 {
+                if let Some(next_ch) = lookahead.next() {
+                    prefix.push(next_ch);
+                    if prefix == "https://" || prefix == "http://" {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if prefix == "https://" || prefix == "http://" {
+                if !buffer.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
+                }
+                let mut url = prefix;
+                chars = lookahead;
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch.is_whitespace() || next_ch == ')' || next_ch == ']' || next_ch == '>' || next_ch == '"' || next_ch == '\'' || next_ch == '│' || next_ch == '|' {
+                        break;
+                    }
+                    url.push(chars.next().unwrap());
+                }
+                let mut trailing_punct = String::new();
+                while url.ends_with('.') || url.ends_with(',') || url.ends_with(';') {
+                    trailing_punct.insert(0, url.pop().unwrap());
+                }
+                spans.push(Span::styled(
+                    url,
+                    Style::default().fg(theme.accent_blue).add_modifier(Modifier::UNDERLINED),
+                ));
+                if !trailing_punct.is_empty() {
+                    buffer.push_str(&trailing_punct);
+                }
+                continue;
+            }
+        }
+
+        // 6. Standalone Email (e.g. contact@sluisr.com)
+        if ch == '@' && !buffer.is_empty() {
+            let user_part_len = buffer
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '_' || *c == '+' || *c == '-')
+                .count();
+
+            if user_part_len > 0 {
+                let mut lookahead = chars.clone();
+                let mut domain = String::new();
+                while let Some(&next_ch) = lookahead.peek() {
+                    if next_ch.is_whitespace() || next_ch == ')' || next_ch == ']' || next_ch == '>' || next_ch == '"' || next_ch == '\'' || next_ch == '│' || next_ch == '|' || next_ch == ',' || next_ch == ';' {
+                        break;
+                    }
+                    domain.push(lookahead.next().unwrap());
+                }
+
+                if domain.contains('.') && domain.split('.').next_back().map(|ext| ext.len() >= 2).unwrap_or(false) {
+                    chars = lookahead;
+                    let split_idx = buffer.len() - user_part_len;
+                    let user_part: String = buffer.drain(split_idx..).collect();
+                    if !buffer.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
+                    }
+                    let email = format!("{}@{}", user_part, domain);
+                    spans.push(Span::styled(
+                        email,
+                        Style::default().fg(theme.accent_blue).add_modifier(Modifier::UNDERLINED),
+                    ));
+                    continue;
+                }
+            }
+        }
+
         buffer.push(ch);
     }
 
@@ -1052,5 +1202,30 @@ mod tests {
             let s: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(s.ends_with('│') || s.ends_with('┤'), "Line missing border: {}", s);
         }
+    }
+
+    #[test]
+    fn test_markdown_inline_url_and_email_styling() {
+        let theme = Theme::default();
+        let spans = parse_inline_spans(
+            "Visita [sluisr.com](https://sluisr.com), canal https://www.youtube.com/@sluisr_ o escribe a contact@sluisr.com",
+            &theme,
+            Style::default(),
+        );
+
+        // 1. [sluisr.com](https://sluisr.com) rendered as single clean link https://sluisr.com
+        let link_span = spans.iter().find(|s| s.content == "https://sluisr.com").expect("clean link missing");
+        assert_eq!(link_span.style.fg, Some(theme.accent_blue));
+        assert!(link_span.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        // 2. Standalone YouTube URL
+        let yt_span = spans.iter().find(|s| s.content == "https://www.youtube.com/@sluisr_").expect("youtube url missing");
+        assert_eq!(yt_span.style.fg, Some(theme.accent_blue));
+        assert!(yt_span.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        // 3. Email contact@sluisr.com
+        let mail_span = spans.iter().find(|s| s.content == "contact@sluisr.com").expect("email missing");
+        assert_eq!(mail_span.style.fg, Some(theme.accent_blue));
+        assert!(mail_span.style.add_modifier.contains(Modifier::UNDERLINED));
     }
 }

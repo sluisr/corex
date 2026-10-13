@@ -43,12 +43,11 @@ pub fn copy(text: &str) -> Result<Route, String> {
         return Ok(Route::Wayland);
     }
 
-    if std::env::var_os("DISPLAY").is_some() {
-        if pipe_to("xclip", &["-selection", "clipboard"], text).is_ok()
-            || pipe_to("xsel", &["--clipboard", "--input"], text).is_ok()
-        {
-            return Ok(Route::X11);
-        }
+    if std::env::var_os("DISPLAY").is_some()
+        && (pipe_to("xclip", &["-selection", "clipboard"], text).is_ok()
+            || pipe_to("xsel", &["--clipboard", "--input"], text).is_ok())
+    {
+        return Ok(Route::X11);
     }
 
     // Last resort: let the terminal emulator do it. tmux forwards the sequence too when it runs

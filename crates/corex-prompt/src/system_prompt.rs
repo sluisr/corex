@@ -155,21 +155,27 @@ impl PromptBuilder {
     }
 
     fn discover_skills(&self) -> String {
+        let mut discovered: BTreeMap<String, String> = BTreeMap::new();
+
+        // 1. Built-in skills (baseline embedded in binary, always present)
+        for skill in corex_core::builtin_skills::get_all_builtin_skills() {
+            let (name, desc) = parse_skill_metadata(skill.content, skill.name);
+            discovered.insert(name, desc);
+        }
+
+        // 2. Discover custom skills or overrides from workspace and user global dirs
         let mut skill_dirs = Vec::new();
 
-        // 1. Workspace .agents/skills
+        // Workspace .agents/skills and .corex/skills
         skill_dirs.push(self.workspace_dir.join(".agents").join("skills"));
-        // 2. Workspace .corex/skills
         skill_dirs.push(self.workspace_dir.join(".corex").join("skills"));
 
-        // 3. User global ~/.agents/skills, ~/.corex/skills, ~/.gemini/skills
+        // User global ~/.agents/skills, ~/.corex/skills, ~/.gemini/skills
         if let Some(dirs) = BaseDirs::new() {
             skill_dirs.push(dirs.home_dir().join(".agents").join("skills"));
             skill_dirs.push(dirs.home_dir().join(".corex").join("skills"));
             skill_dirs.push(dirs.home_dir().join(".gemini").join("skills"));
         }
-
-        let mut discovered: BTreeMap<String, String> = BTreeMap::new();
 
         for dir in skill_dirs {
             if !dir.is_dir() {
@@ -182,12 +188,9 @@ impl PromptBuilder {
                         let skill_file = path.join("SKILL.md");
                         if skill_file.is_file() {
                             let folder_name = entry.file_name().to_string_lossy().to_string();
-                            if discovered.contains_key(&folder_name) {
-                                continue;
-                            }
                             if let Ok(content) = fs::read_to_string(&skill_file) {
                                 let (name, desc) = parse_skill_metadata(&content, &folder_name);
-                                discovered.entry(name).or_insert(desc);
+                                discovered.insert(name, desc);
                             }
                         }
                     }
@@ -306,9 +309,9 @@ pub(crate) fn parse_skill_metadata(content: &str, fallback_name: &str) -> (Strin
     let mut description = String::new();
 
     let trimmed = content.trim_start();
-    if trimmed.starts_with("---") {
-        if let Some(end_idx) = trimmed[3..].find("---") {
-            let frontmatter = &trimmed[3..3 + end_idx];
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end_idx) = rest.find("---") {
+            let frontmatter = &rest[..end_idx];
             let mut in_desc = false;
             let mut desc_lines = Vec::new();
 
@@ -410,5 +413,16 @@ description: >-
         assert!(prompt.contains("# AVAILABLE PROCEDURAL SKILLS"));
         assert!(prompt.contains("corex-about"));
         assert!(prompt.contains("corex-fim"));
+    }
+
+    #[test]
+    fn test_system_prompt_discovers_builtin_skills_in_empty_workspace() {
+        let builder = PromptBuilder::new("/tmp/non-existent-workspace-12345");
+        let prompt = builder.build();
+
+        assert!(prompt.contains("# AVAILABLE PROCEDURAL SKILLS"));
+        assert!(prompt.contains("corex-about"));
+        assert!(prompt.contains("corex-fim"));
+        assert!(prompt.contains("corex-local-llm"));
     }
 }

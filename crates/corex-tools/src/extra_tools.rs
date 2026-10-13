@@ -353,7 +353,12 @@ impl Tool for ActivateSkillTool {
             }
         }
 
-        Ok(ToolOutput::error(format!("Skill '{}' not found in .agents/skills or .corex/skills", name)))
+        // Built-in skills fallback (always available anywhere)
+        if let Some(content) = corex_core::builtin_skills::get_builtin_skill(name) {
+            return Ok(ToolOutput::success(content));
+        }
+
+        Ok(ToolOutput::error(format!("Skill '{}' not found in .agents/skills, .corex/skills or built-in skills", name)))
     }
 }
 
@@ -868,5 +873,27 @@ impl Tool for UpdateTopicTool {
 
         fs::write(path, serde_json::to_string_pretty(&topic_json)?)?;
         Ok(ToolOutput::success(format!("Topic updated: {}", title)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn test_activate_skill_loads_builtin() {
+        let tool = ActivateSkillTool;
+        let ctx = ToolContext {
+            workspace_dir: PathBuf::from("/tmp/nonexistent-skill-workspace-xyz"),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec![],
+        };
+
+        let result = tool.execute(json!({"name": "corex-about"}), &ctx).await.unwrap();
+        assert!(!result.is_error);
+        assert!(result.output.contains("sluisr"));
+        assert!(result.output.contains("Corex"));
     }
 }
