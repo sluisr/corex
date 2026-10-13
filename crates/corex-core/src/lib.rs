@@ -4,12 +4,14 @@ pub mod config;
 pub mod file_lock;
 pub mod forensic;
 pub mod history;
+pub mod json_repair;
 pub mod language;
 pub mod local_client;
 pub mod providers;
 pub mod reasoning_cache;
 pub mod secure_fs;
 pub mod session;
+pub mod subagent;
 pub mod types;
 pub mod update;
 
@@ -36,15 +38,17 @@ pub fn engine_signature() -> String {
     verify_author_signature()
 }
 
-pub use client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
+pub use client::{get_sudo_password, parse_openai_sse_data, set_sudo_password, LlmClient, StreamEvent};
 pub use config::{Config, McpServerConfig};
 pub use file_lock::lock_path;
 pub use forensic::ForensicLogger;
 pub use history::HistoryStore;
+pub use json_repair::parse_lenient_json;
 pub use local_client::LocalLlmClient;
 pub use reasoning_cache::ReasoningCache;
 pub use secure_fs::{ensure_private_dir, sanitize_for_terminal, write_private, write_private_atomic};
 pub use session::{Session, SessionSummary};
+pub use subagent::{get_subagent_manager, SubagentManager, SubagentRole, SubagentStatus, SubagentTask};
 pub use types::*;
 
 /// Trims free memory pages back to the OS allocator on Linux (glibc malloc_trim).

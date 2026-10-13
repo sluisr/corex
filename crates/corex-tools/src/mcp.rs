@@ -300,3 +300,116 @@ pub async fn load_mcp_servers(
 
     (tools, statuses)
 }
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpCatalogItem {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub command: &'static str,
+    pub default_args: &'static [&'static str],
+    pub env_keys: &'static [&'static str],
+    pub example: &'static str,
+}
+
+pub static MCP_CATALOG: &[McpCatalogItem] = &[
+    McpCatalogItem {
+        id: "github",
+        name: "GitHub",
+        description: "Search repos, inspect code, manage issues and pull requests via official GitHub MCP",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-github"],
+        env_keys: &["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        example: "/mcp add github",
+    },
+    McpCatalogItem {
+        id: "sqlite",
+        name: "SQLite Database",
+        description: "Inspect schema and run SQL queries against local SQLite database files",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-sqlite", "--db-path", "app.db"],
+        env_keys: &[],
+        example: "/mcp add sqlite app.db",
+    },
+    McpCatalogItem {
+        id: "postgres",
+        name: "PostgreSQL Database",
+        description: "Connect to PostgreSQL databases, inspect tables, and run read/write queries",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"],
+        env_keys: &[],
+        example: "/mcp add postgres postgresql://localhost/mydb",
+    },
+    McpCatalogItem {
+        id: "filesystem",
+        name: "Secure Filesystem",
+        description: "Sandboxed filesystem tools scoped to specific authorized directories",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-filesystem", "."],
+        env_keys: &[],
+        example: "/mcp add filesystem .",
+    },
+    McpCatalogItem {
+        id: "memory",
+        name: "Knowledge Graph Memory",
+        description: "Persistent graph memory across coding sessions and projects",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-memory"],
+        env_keys: &[],
+        example: "/mcp add memory",
+    },
+    McpCatalogItem {
+        id: "brave-search",
+        name: "Brave Web Search",
+        description: "Live web search and news indexing through Brave Search API",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-brave-search"],
+        env_keys: &["BRAVE_API_KEY"],
+        example: "/mcp add brave-search",
+    },
+    McpCatalogItem {
+        id: "fetch",
+        name: "Web Fetch & HTML Reader",
+        description: "Fetch web pages and convert HTML to readable Markdown",
+        command: "uvx",
+        default_args: &["mcp-server-fetch"],
+        env_keys: &[],
+        example: "/mcp add fetch",
+    },
+    McpCatalogItem {
+        id: "puppeteer",
+        name: "Puppeteer Web Automation",
+        description: "Headless Chromium browser control, navigation, screenshots, and form filling",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-puppeteer"],
+        env_keys: &[],
+        example: "/mcp add puppeteer",
+    },
+    McpCatalogItem {
+        id: "docker",
+        name: "Docker Container Manager",
+        description: "Inspect containers, check container logs, start/stop services via Docker daemon",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-docker"],
+        env_keys: &[],
+        example: "/mcp add docker",
+    },
+    McpCatalogItem {
+        id: "slack",
+        name: "Slack Channel Integration",
+        description: "Post messages and inspect threads in Slack workspaces",
+        command: "npx",
+        default_args: &["-y", "@modelcontextprotocol/server-slack"],
+        env_keys: &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
+        example: "/mcp add slack",
+    },
+];
+
+pub fn get_mcp_catalog() -> &'static [McpCatalogItem] {
+    MCP_CATALOG
+}
+
+pub fn find_catalog_item(id: &str) -> Option<&'static McpCatalogItem> {
+    MCP_CATALOG.iter().find(|item| item.id.eq_ignore_ascii_case(id))
+}
+

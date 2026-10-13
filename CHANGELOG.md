@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-10-13
+
+### Added
+- **Autonomous Multi-Agent Coordination Engine (Subagents)**:
+  - **Specialized Actor Roles**: Introduced `SubagentRole` with 4 dedicated roles:
+    - 🔭 `Scout`: Zero-cost read-only codebase exploration and symbol searching before cloud edits.
+    - 🧪 `Tester`: Automated background test runner, linter checker, and compiler validator.
+    - 📚 `Researcher`: Documentation reader, API specification extractor, and reference finder.
+    - ⚙️ `Worker`: General-purpose autonomous subtask executor.
+  - **Isolated Context Boundaries**: Subagents run with isolated context memory, preventing context window exhaustion in the lead orchestrator turn.
+  - **Native Agent Tools**: Added `delegate_subagent` (synchronous or background delegation) and `manage_subagents` (`list`, `status`, `cancel`) registered in the core runtime.
+  - **Reactive Notifications**: Background subagents automatically wake up the lead agent upon completion without requiring polling.
+- **Architectural Refactoring of `corex-tui`**:
+  - Decomposed the legacy monolithic `app.rs` (~5,870 lines) into a modular structure:
+    - `app/mod.rs`: Application core, session state, slash command dispatch, and lifecycle.
+    - `app/event_loop.rs`: Async event loop, multi-channel streaming, keyboard and mouse event dispatching.
+    - `app/render.rs`: Responsive Ratatui rendering pipelines, viewport layout, message feed, and borders.
+    - `app/formatting.rs`: Span builder, Markdown rendering, syntax highlights, and visual badges.
+    - `app/mobile.rs`: Termux portrait detection and tap-to-type soft keyboard toggle.
+    - `app/state.rs`: Unified reactive app state, selection ranges, and input history.
+    - `app/terminal.rs`: Terminal alternate screen and raw mode initialization/restoration.
+    - `app/tests.rs`: Comprehensive test suite for TUI components.
+- **In-Place Self-Updater (`cx update` / `cx --upgrade` / `/update apply`)**:
+  - Direct atomic binary upgrade without requiring external package managers (`cargo` or `npm`).
+  - Automatic OS/Arch detection (`linux-x64`, `linux-arm64`, `android-arm64`, `macos-arm64`, `macos-x64`, `windows-x64`).
+  - Cryptographic verification via SHA-256 release checksums before binary extraction.
+  - In-place atomic replacement via `fs::rename` avoiding Linux `ETXTBSY` ("Text file busy") and Windows file locking.
+  - Interactive TUI update command `/update apply` and force reinstall via `cx update --force`.
+- **Full Shell Autocompletion**:
+  - Added `clap_complete` generating contextual shell autocompletions for Bash, Zsh, Fish, PowerShell, and Elvish.
+  - New flag `cx --completions <shell>` and command `cx completions <shell>`.
+  - Automatic completion script setup in `install.sh` for Zsh (`site-functions`), Bash (`bash_completion.d`), and Fish (`completions`).
+- **Native Linux ARM64 (aarch64) Support**:
+  - Dedicated `aarch64-unknown-linux-gnu` cross-compilation target in release CI workflow for Raspberry Pi, AWS Graviton, Hetzner ARM, and Docker ARM64.
+  - Clean separation from `aarch64-linux-android` (Termux) in `install.sh` and npm installer.
+- **Resilient JSON Repair Engine & Unified Multi-Provider Tool Calling**:
+  - Implemented `parse_lenient_json` to seamlessly repair Markdown codeblocks, nested stringified JSON payloads, trailing commas, single quotes, and truncated SSE streams.
+  - Flexible deserialization for non-standard tool call indices and raw object arguments (Ollama, Gemini, Claude 3.7, DeepSeek V4.1).
+- **Interactive MCP Server Catalog & Commands**:
+  - Added `/mcp catalog`, `/mcp add <catalog_id|custom>`, and `/mcp remove <name>` directly inside the TUI for seamless tool expansion.
+- **Security & Engine Authorship Signature**:
+  - Implemented XOR-encrypted steganographic authorship signature (`verify_author_signature`, `engine_signature`) in the core binary.
+- **Nix Flake & Ecosystem Packaging**:
+  - Added native `flake.nix` for declarative zero-install Nix flakes.
+  - Memory trimmer routine (`trim_memory` via glibc `malloc_trim`) to prevent memory fragmentation and ensure minimal RSS usage.
+  - Documentation and distribution assets for Homebrew tap and Crates.io publication.
+- **CI/CD Pipeline Automation**:
+  - Automated release publishing workflow to both Crates.io and npm Registry on tag push (`v*`).
+
+---
+
 ## [0.5.0] - 2026-10-10
 
 ### Added

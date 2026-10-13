@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Ultra-fast, native Rust autonomous AI coding agent for DeepSeek, Gemini, Claude, OpenAI & Local LLMs"
 
 [dependencies]
 corex-core = { workspace = true }
@@ -21,3 +25,4 @@ tracing-subscriber = { workspace = true }
 colored = { workspace = true }
 directories = { workspace = true }
 crossterm = { workspace = true }
+clap_complete = { workspace = true }

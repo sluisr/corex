@@ -9,11 +9,13 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["sluisr <contact@sluisr.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/sluisr/corex"
+homepage = "https://github.com/sluisr/corex"
+readme = "README.md"
 
 [workspace.dependencies]
 tokio = { version = "1.43", features = ["full"] }
@@ -46,12 +48,17 @@ pulldown-cmark = "0.12"
 textwrap = "0.16"
 async-trait = "0.1"
 base64 = "0.22"
+clap_complete = "4.5"
+sha2 = "0.10"
+flate2 = "1.0"
+tar = "0.4"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Internal crates
-corex-core = { path = "crates/corex-core" }
-corex-tools = { path = "crates/corex-tools" }
-corex-prompt = { path = "crates/corex-prompt" }
-corex-tui = { path = "crates/corex-tui" }
+corex-core = { path = "crates/corex-core", version = "0.6.0" }
+corex-tools = { path = "crates/corex-tools", version = "0.6.0" }
+corex-prompt = { path = "crates/corex-prompt", version = "0.6.0" }
+corex-tui = { path = "crates/corex-tui", version = "0.6.0" }
 
 [profile.release]
 opt-level = 3

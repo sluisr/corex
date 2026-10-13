@@ -19,6 +19,7 @@ use crate::extra_tools::{
     TrackerGetTaskTool, TrackerListTasksTool, TrackerAddDependencyTool,
     TrackerVisualizeTool, UpdateTopicTool,
 };
+use crate::subagent::{DelegateSubagentTool, ManageSubagentsTool};
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -61,6 +62,8 @@ impl ToolRegistry {
         let tracker_add_dependency = Arc::new(TrackerAddDependencyTool);
         let tracker_visualize = Arc::new(TrackerVisualizeTool);
         let update_topic = Arc::new(UpdateTopicTool);
+        let delegate_subagent = Arc::new(DelegateSubagentTool);
+        let manage_subagents = Arc::new(ManageSubagentsTool);
 
         // Register official primary tool definitions
         registry.register_primary(apply_patch.clone());
@@ -91,6 +94,8 @@ impl ToolRegistry {
         registry.register_primary(tracker_add_dependency);
         registry.register_primary(tracker_visualize);
         registry.register_primary(update_topic);
+        registry.register_primary(delegate_subagent.clone());
+        registry.register_primary(manage_subagents.clone());
 
         // Dynamic 1:1 aliases so DeepSeek / Codex / Gemini can invoke either canonical name or alias:
         registry.tools.insert("replace".to_string(), edit.clone());
@@ -107,17 +112,35 @@ impl ToolRegistry {
         registry.tools.insert("view_file".to_string(), read_file);
         registry.tools.insert("find_files".to_string(), glob.clone());
         registry.tools.insert("tasks".to_string(), manage_task);
+        registry.tools.insert("invoke_subagent".to_string(), delegate_subagent.clone());
+        registry.tools.insert("subagent".to_string(), delegate_subagent);
+        registry.tools.insert("subagents".to_string(), manage_subagents);
 
         registry
     }
 
     fn register_primary(&mut self, tool: Arc<dyn Tool>) {
-        self.registered_definitions.push(tool.to_definition());
+        let def = tool.to_definition();
+        if let Some(pos) = self.registered_definitions.iter().position(|d| d.function.name == def.function.name) {
+            self.registered_definitions[pos] = def;
+        } else {
+            self.registered_definitions.push(def);
+        }
         self.tools.insert(tool.name().to_string(), tool);
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.register_primary(tool);
+    }
+
+    pub fn unregister(&mut self, name: &str) {
+        self.tools.remove(name);
+        self.registered_definitions.retain(|d| d.function.name != name);
+    }
+
+    pub fn unregister_prefix(&mut self, prefix: &str) {
+        self.tools.retain(|k, _| !k.starts_with(prefix));
+        self.registered_definitions.retain(|d| !d.function.name.starts_with(prefix));
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {

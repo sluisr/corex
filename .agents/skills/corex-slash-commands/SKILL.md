@@ -104,9 +104,12 @@ cx web what is the current Bitcoin price
 
 | Command | Description |
 | :--- | :--- |
-| `/mcp` | List all configured MCP servers and their tools |
-| `/mcp status` | Show connection status of each MCP server |
-| `/mcp reload` | Reconnect all MCP servers |
+| `/mcp` | List configured MCP servers, status, and exposed tools |
+| `/mcp catalog` | Browse vetted community templates (GitHub, SQLite, Postgres, Memory, etc.) |
+| `/mcp add <id>` | Add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
+| `/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
+| `/mcp remove <name>` | Remove an MCP server and reload configuration |
+| `/mcp reload` | Reconnect and rediscover tools across all configured MCP servers |
 
 ---
 
@@ -147,7 +150,7 @@ cx --yolo
 | Command | Description |
 | :--- | :--- |
 | `/info` | Version, author credits, official links, and session telemetry |
-| `/update` | Check for a newer Corex version and see upgrade instructions |
+| `/update` | Check for updates, or apply in-place atomically (`/update apply` / `/update force`) |
 | `/help` | Show keyboard shortcuts and command list |
 | `/clear` | Clear the terminal conversation view |
 | `/quit` | Exit the session (saves state for later resumption) |

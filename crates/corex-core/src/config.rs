@@ -222,7 +222,7 @@ pub fn is_google_base_url(url: &str) -> bool {
 pub fn is_pro_model(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.contains("reasoner")
-        || m.split(|c: char| c == '-' || c == '_' || c == ':' || c == '/' || c == '.')
+        || m.split(['-', '_', ':', '/', '.'])
             .any(|seg| seg == "pro")
 }
 
@@ -687,6 +687,28 @@ impl Config {
 
         let content = serde_json::to_string_pretty(&to_save)?;
         Self::save_to_destinations(&content, "settings.json", workspace)
+    }
+
+    pub fn add_mcp_server(
+        &mut self,
+        name: String,
+        server: McpServerConfig,
+        workspace: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        self.mcp_servers.insert(name, server);
+        self.save_with_workspace(workspace)
+    }
+
+    pub fn remove_mcp_server(
+        &mut self,
+        name: &str,
+        workspace: Option<&Path>,
+    ) -> anyhow::Result<bool> {
+        let existed = self.mcp_servers.remove(name).is_some();
+        if existed {
+            self.save_with_workspace(workspace)?;
+        }
+        Ok(existed)
     }
 }
 

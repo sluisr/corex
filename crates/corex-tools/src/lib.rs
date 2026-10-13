@@ -8,12 +8,16 @@ pub mod types;
 pub mod web;
 pub mod extra_tools;
 pub mod mcp;
+pub mod subagent;
 
 pub use apply_patch::ApplyPatchTool;
 pub use background::{get_task_manager, ManageTaskTool, TaskManager};
 pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
-pub use mcp::{load_mcp_servers, McpClient, McpServerStatus, McpTool};
+pub use mcp::{
+    find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,
+    McpServerStatus, McpTool,
+};
 pub use registry::ToolRegistry;
 pub use shell::{command_requires_sudo, extract_first_sudo_command, ShellTool};
 pub use types::{Tool, ToolContext, ToolOutput};
@@ -24,4 +28,5 @@ pub use extra_tools::{
     TrackerGetTaskTool, TrackerListTasksTool, TrackerAddDependencyTool,
     TrackerVisualizeTool, UpdateTopicTool,
 };
+pub use subagent::{DelegateSubagentTool, ManageSubagentsTool};
 

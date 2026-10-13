@@ -24,7 +24,7 @@ case "$OS" in
         if [ -n "$PREFIX" ] || [ -d "/data/data/com.termux" ]; then
           TARGET="aarch64-linux-android"
         else
-          TARGET="aarch64-linux-android"
+          TARGET="aarch64-unknown-linux-gnu"
         fi
         ;;
       *)
@@ -58,7 +58,7 @@ LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
   LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4)
 fi
-VERSION="${LATEST_TAG:-v0.5.0}"
+VERSION="${LATEST_TAG:-v0.6.0}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"
@@ -68,6 +68,30 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 echo "[corex] Downloading ${ARCHIVE_NAME}..."
 curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_NAME"
+
+# Verify SHA-256 integrity signature if published alongside the release asset
+if curl -fsSL "${DOWNLOAD_URL}.sha256" -o "$TMP_DIR/${ARCHIVE_NAME}.sha256" 2>/dev/null; then
+  EXPECTED_SHA=$(cut -d ' ' -f 1 < "$TMP_DIR/${ARCHIVE_NAME}.sha256" | tr -d '\r\n')
+  if [ -n "$EXPECTED_SHA" ]; then
+    echo "[corex] Verifying SHA-256 signature..."
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL_SHA=$(sha256sum "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
+    elif command -v shasum >/dev/null 2>&1; then
+      ACTUAL_SHA=$(shasum -a 256 "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
+    else
+      ACTUAL_SHA=""
+    fi
+    if [ -n "$ACTUAL_SHA" ]; then
+      if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+        echo "Error: SHA-256 checksum verification failed!"
+        echo "Expected: $EXPECTED_SHA"
+        echo "Actual:   $ACTUAL_SHA"
+        exit 1
+      fi
+      echo "  ✓ SHA-256 signature verified."
+    fi
+  fi
+fi
 
 echo "[corex] Extracting binary..."
 tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
@@ -92,6 +116,43 @@ $SUDO chmod +x "$INSTALL_DIR/cx"
 if [ -f "$TMP_DIR/corex" ]; then
   $SUDO cp "$TMP_DIR/corex" "$INSTALL_DIR/corex"
   $SUDO chmod +x "$INSTALL_DIR/corex"
+fi
+
+# Set up shell autocompletions (Zsh, Bash, Fish)
+CX_BIN="$INSTALL_DIR/cx"
+if [ -x "$CX_BIN" ]; then
+  # Zsh autocompletions
+  for zsh_dir in "/usr/local/share/zsh/site-functions" "/usr/share/zsh/site-functions" "$HOME/.zfunc"; do
+    if [ -d "$zsh_dir" ] || [ "$zsh_dir" = "$HOME/.zfunc" ]; then
+      mkdir -p "$zsh_dir" 2>/dev/null || true
+      if [ -w "$zsh_dir" ]; then
+        "$CX_BIN" --completions zsh > "$zsh_dir/_cx" 2>/dev/null && echo "  ✓ Zsh autocompletions installed to $zsh_dir/_cx" && break || true
+      elif [ -n "$SUDO" ] && [ -d "$zsh_dir" ]; then
+        "$CX_BIN" --completions zsh | $SUDO tee "$zsh_dir/_cx" >/dev/null 2>&1 && echo "  ✓ Zsh autocompletions installed to $zsh_dir/_cx" && break || true
+      fi
+    fi
+  done
+
+  # Bash autocompletions
+  for bash_dir in "/etc/bash_completion.d" "/usr/local/etc/bash_completion.d" "$HOME/.local/share/bash-completion/completions"; do
+    if [ -d "$bash_dir" ] || [ "$bash_dir" = "$HOME/.local/share/bash-completion/completions" ]; then
+      mkdir -p "$bash_dir" 2>/dev/null || true
+      if [ -w "$bash_dir" ]; then
+        "$CX_BIN" --completions bash > "$bash_dir/cx" 2>/dev/null && echo "  ✓ Bash autocompletions installed to $bash_dir/cx" && break || true
+      elif [ -n "$SUDO" ] && [ -d "$bash_dir" ]; then
+        "$CX_BIN" --completions bash | $SUDO tee "$bash_dir/cx" >/dev/null 2>&1 && echo "  ✓ Bash autocompletions installed to $bash_dir/cx" && break || true
+      fi
+    fi
+  done
+
+  # Fish autocompletions
+  fish_dir="$HOME/.config/fish/completions"
+  if [ -d "$fish_dir" ] || command -v fish >/dev/null 2>&1; then
+    mkdir -p "$fish_dir" 2>/dev/null || true
+    if [ -w "$fish_dir" ]; then
+      "$CX_BIN" --completions fish > "$fish_dir/cx.fish" 2>/dev/null && echo "  ✓ Fish autocompletions installed to $fish_dir/cx.fish" || true
+    fi
+  fi
 fi
 
 echo "✓ Corex ${VERSION} installed successfully!"

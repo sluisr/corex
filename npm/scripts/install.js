@@ -7,13 +7,19 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.5.0';
+const VERSION = 'v0.6.0';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
   linux: {
     x64: {
       archive: `corex-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`,
+      binName: 'cx',
+      type: 'tar',
+      sha256: 'auto'
+    },
+    arm64: {
+      archive: `corex-${VERSION}-aarch64-unknown-linux-gnu.tar.gz`,
       binName: 'cx',
       type: 'tar',
       sha256: 'auto'

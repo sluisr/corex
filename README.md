@@ -103,7 +103,8 @@ curl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | sh
 ```
 
 Or download binaries manually from the [GitHub Releases](https://github.com/sluisr/corex/releases) page for:
-- Linux (`x86_64-unknown-linux-gnu`)
+- Linux x86_64 (`x86_64-unknown-linux-gnu`)
+- Linux ARM64 (`aarch64-unknown-linux-gnu`)
 - macOS Apple Silicon (`aarch64-apple-darwin`)
 - macOS Intel (`x86_64-apple-darwin`)
 - Android Termux (`aarch64-linux-android`)
@@ -240,6 +241,15 @@ cx -m deepseek-v4-pro -p "Prove correctness of this algorithm"
 
 # Target specific workspace
 cx -C /path/to/project -p "Run tests"
+
+# Self-update binary in-place with SHA-256 verification
+cx update
+cx update --force
+
+# Generate shell completions (Bash, Zsh, Fish)
+cx --completions zsh > ~/.zfunc/_cx
+cx --completions bash > ~/.local/share/bash-completion/completions/cx
+cx --completions fish > ~/.config/fish/completions/cx.fish
 ```
 
 ---
@@ -263,11 +273,11 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/save <tag>` | Save a checkpoint of the current session. |
 | `/rewind` | Revert conversation history by one turn. |
 | `/compact` / `/compress` | Compress session context to conserve token limits. |
-| `/mcp` | Inspect and reload Model Context Protocol servers. |
+| `/mcp` | Interactive Model Context Protocol server catalog (`/mcp catalog`, `/mcp add`, `/mcp reload`). |
 | `/tasks` | Manage background tasks (`status`, `kill`, `send_input`). |
 | `/stats` | View session metrics, KV Cache hit rates, and financial cost. |
 | `/info` | Display system telemetry, version, and links. |
-| `/update` | Check for newer releases on GitHub. |
+| `/update` | Check for updates or apply in-place atomically (`/update apply` / `/update force`). |
 | `/clear` | Clear the terminal viewport. |
 | `/help` | Display shortcuts and usage guidelines. |
 | `/quit` / `/exit` | Terminate session and save state. |
