@@ -422,7 +422,7 @@ where
         if sha_resp.status().is_success() {
             if let Ok(expected_sha) = sha_resp.text().await {
                 let computed = verify_sha256(&archive_bytes, &expected_sha)?;
-                progress(&format!("✓ SHA-256 signature verified: {}", &computed[..16]));
+                progress(&format!("SHA-256 signature verified: {}", &computed[..16]));
             }
         }
     }

@@ -148,13 +148,13 @@ pub async fn run() -> Result<()> {
     if is_update_cmd {
         let current = env!("CARGO_PKG_VERSION");
         let force = cli.force || cli.query.iter().any(|q| q == "--force" || q == "-f");
-        println!("🚀 Corex In-Place Self-Updater (v{})", current);
+        println!("Corex In-Place Self-Updater (v{})", current);
         match corex_core::update::perform_self_update(current, force, |msg| {
-            println!("  • {}", msg);
+            println!("  › {}", msg);
         }).await {
             Ok(summary) => {
                 println!(
-                    "\n✨ Successfully updated Corex from v{} to v{}!\n📍 Binary: {}\n🎯 Target: {}\n",
+                    "\n✓ Successfully updated Corex from v{} to v{}!\n  Binary: {}\n  Target: {}\n",
                     summary.previous_version,
                     summary.updated_version,
                     summary.binary_path.display(),
@@ -162,7 +162,7 @@ pub async fn run() -> Result<()> {
                 );
             }
             Err(e) => {
-                eprintln!("\n⚠️ Update notice: {}", e);
+                eprintln!("\nNotice: {}", e);
                 if !force && e.contains("already on the latest version") {
                     println!("To force re-download the latest release, run:\n  cx update --force\n");
                 }
