@@ -277,7 +277,7 @@ pub fn build_tool_confirmation_lines(
 
         let cursor_char = "█";
         result.push(Line::from(vec![
-            Span::styled("    ❯ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            Span::styled("    › ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
             Span::styled(feedback_text.to_string(), Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
             Span::styled(cursor_char, Style::default().fg(theme.accent_cyan)),
         ]));

@@ -621,7 +621,7 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
         }
         lines.push(Line::from(vec![
             Span::styled(
-                if selected { " ❯ " } else { "   " },
+                if selected { " › " } else { "   " },
                 Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("{} ", dot), Style::default().fg(dot_col).bg(bg)),
@@ -696,7 +696,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
         }
         lines.push(Line::from(vec![
             Span::styled(
-                if selected { " ❯ " } else { "   " },
+                if selected { " › " } else { "   " },
                 Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
             ),
             Span::styled(radio, Style::default().fg(radio_col).bg(bg).add_modifier(Modifier::BOLD)),
@@ -746,7 +746,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
         let desc_w = w.saturating_sub(3 + 20 + 2 + 11 + 2 + 2);
         lines.push(Line::from(vec![
             Span::styled(
-                if selected { " ❯ " } else { "   " },
+                if selected { " › " } else { "   " },
                 Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
             ),
             Span::styled(pad_right(label, 20), label_style),

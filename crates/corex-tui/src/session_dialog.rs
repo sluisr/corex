@@ -285,7 +285,7 @@ fn render_session_list(
         let is_selected = i == selected;
         let row_bg = if is_selected { selected_bg } else { Color::Reset };
 
-        let cursor = if is_selected { " ❯ " } else { "   " };
+        let cursor = if is_selected { " › " } else { "   " };
         let cursor_style = Style::default().fg(theme.accent_blue).bg(row_bg).add_modifier(Modifier::BOLD);
 
         // Model badge
