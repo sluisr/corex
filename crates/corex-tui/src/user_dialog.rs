@@ -155,7 +155,7 @@ fn wrap_question(text: &str, width: usize) -> Vec<Line<'static>> {
 
 pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: u16) -> u16 {
     let Some(q) = state.questions.get(state.current) else {
-        return 6;
+        return 5;
     };
     let usable_w = (width as usize).saturating_sub(6).max(20);
     let q_lines_count = wrap_question(&q.question, usable_w).len().max(1);
@@ -164,27 +164,16 @@ pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: 
     } else {
         1
     };
-    // Content lines: question lines + 1 blank + opt_count + 1 blank + 1 hint
+    // Content lines: question lines + opt_count + 1 hint
     // Borders: top + bottom = 2
-    let content = q_lines_count + 1 + opt_count + 1 + 1;
-    (content as u16 + 2).min(max_height.saturating_sub(6)).max(6)
+    let content = q_lines_count + opt_count + 1;
+    (content as u16 + 2).min(max_height.saturating_sub(6)).max(5)
 }
 
 pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState, theme: &Theme) {
     let Some(q) = state.questions.get(state.current) else {
         return;
     };
-    let total = state.questions.len();
-    let title = q
-        .header
-        .clone()
-        .unwrap_or_else(|| {
-            if total > 1 {
-                format!("Pregunta {} de {}", state.current + 1, total)
-            } else {
-                "Pregunta".to_string()
-            }
-        });
 
     let usable_w = (area.width as usize).saturating_sub(6).max(20);
     let mut lines: Vec<Line> = Vec::new();
@@ -206,7 +195,6 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
             lines.push(Line::from(spans));
         }
     }
-    lines.push(Line::from(""));
 
     // 2. Options or text input
     if q.has_options {
@@ -220,21 +208,26 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
 
         for (idx, opt) in q.options.iter().enumerate().skip(window_start).take(max_opts) {
             let is_sel = idx == cur_sel;
-            let bullet = if is_sel { "●" } else { "○" };
             let num = format!("{}. ", idx + 1);
-            let style = if is_sel {
-                Style::default()
-                    .fg(theme.accent_blue)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.gray)
-            };
-            let cursor = if is_sel { " ❯ " } else { "   " };
+            let cursor = if is_sel { "  ❯ " } else { "    " };
 
             lines.push(Line::from(vec![
-                Span::styled(cursor, if is_sel { Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD) } else { Style::default() }),
-                Span::styled(num, if is_sel { Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme.dark_gray) }),
-                Span::styled(format!("{} ", bullet), style),
+                Span::styled(
+                    cursor,
+                    if is_sel {
+                        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(
+                    num,
+                    if is_sel {
+                        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.dark_gray)
+                    },
+                ),
                 Span::styled(
                     opt.clone(),
                     if is_sel {
@@ -273,33 +266,31 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
         };
 
         lines.push(Line::from(vec![
-            Span::styled("   ❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+            Span::styled("  ❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
             Span::styled(display_text, Style::default().fg(theme.foreground)),
             Span::styled("█", Style::default().fg(theme.accent_blue)),
         ]));
     }
 
-    lines.push(Line::from(""));
+    // 3. Hint footer
     let hint = if q.has_options {
         if q.options.len() <= 9 {
-            format!("[1-{} o ↑/↓] Seleccionar   [Enter] Confirmar   [Esc] Cancelar", q.options.len())
+            format!("  ↑↓ o 1-{} · enter confirmar · esc cancelar", q.options.len())
         } else {
-            "[↑/↓] Navegar   [Enter] Confirmar   [Esc] Cancelar".to_string()
+            "  ↑↓ navegar · enter confirmar · esc cancelar".to_string()
         }
     } else {
-        "[Enter] Confirmar   [Esc] Cancelar".to_string()
+        "  enter confirmar · esc cancelar".to_string()
     };
     lines.push(Line::from(Span::styled(
-        format!("   {}", hint),
+        hint,
         Style::default().fg(theme.dark_gray),
     )));
 
+    // Clean unbroken border line
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::Rgb(75, 110, 155)))
-        .title_top(Line::from(vec![
-            Span::styled(format!(" ─[ {} ] ", title), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-        ]));
+        .border_style(Style::default().fg(Color::Rgb(75, 110, 155)));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }

@@ -116,9 +116,47 @@ jobs:
     needs: [build-and-release]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Aggregate checksums and update release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "Fetching checksum assets for release $TAG..."
+          mkdir -p /tmp/checksums
+          gh release download "$TAG" -p "*.sha256" -D /tmp/checksums
+          
+          NOTES="## Release $TAG
+
+High-performance autonomous AI terminal agent compiled in native Rust.
+
+### Canonical Release Checksums (SHA-256)
+
+| Platform | Archive File | SHA-256 Checksum |
+|---|---|---|
+"
+          for file in /tmp/checksums/*.sha256; do
+            filename=$(basename "$file" .sha256)
+            hash=$(tr -d '[:space:]' < "$file")
+            case "$filename" in
+              *x86_64-unknown-linux-gnu*) plat="Linux x86_64" ;;
+              *aarch64-unknown-linux-gnu*) plat="Linux ARM64" ;;
+              *aarch64-apple-darwin*) plat="macOS Apple Silicon" ;;
+              *x86_64-apple-darwin*) plat="macOS Intel" ;;
+              *aarch64-linux-android*) plat="Android Termux" ;;
+              *x86_64-pc-windows-msvc*) plat="Windows x86_64" ;;
+              *) plat="Generic" ;;
+            esac
+            NOTES+="\n| $plat | \`$filename\` | \`$hash\` |"
+          done
+          
+          echo -e "$NOTES" > /tmp/release_notes.md
+          gh release edit "$TAG" --notes-file /tmp/release_notes.md
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
