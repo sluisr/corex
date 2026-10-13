@@ -124,13 +124,29 @@ brew tap sluisr/tap
 brew install cx
 ```
 
-### Method 3: From Source via Cargo
+### Method 3: Official Crates.io (Cargo)
+
+Install the official package from crates.io:
 
 ```bash
-cargo install --git https://github.com/sluisr/corex.git --force
+cargo install corex-cli
 ```
 
-### Method 4: Via npm / npx
+### Method 4: Nix Flake (NixOS & Linux/macOS Flakes)
+
+Run directly without installing any local toolchains:
+
+```bash
+nix run github:sluisr/corex
+```
+
+Or enter a temporary shell with `cx`:
+
+```bash
+nix shell github:sluisr/corex
+```
+
+### Method 5: Via npm / npx
 
 ```bash
 # Run headlessly or interactively without installation:
@@ -140,7 +156,7 @@ npx @sluisr/corex
 npm install -g @sluisr/corex
 ```
 
-### Method 5: Build from Source
+### Method 6: Build from Source
 
 ```bash
 git clone https://github.com/sluisr/corex.git
