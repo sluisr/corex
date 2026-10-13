@@ -309,7 +309,7 @@ impl Tool for ActivateSkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Loads specialized procedural expertise from .corex/skills or global skills directories."
+        "Loads specialized procedural expertise from .agents/skills, .corex/skills, or global skills directories."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -331,9 +331,13 @@ impl Tool for ActivateSkillTool {
             None => return Ok(ToolOutput::error("Missing 'name' argument.")),
         };
 
-        // Search precedence: 1. Workspace .corex/skills 2. Global ~/.corex/skills 3. Fallback .gemini/skills
+        // Search precedence: 1. Workspace .agents/skills 2. Workspace .corex/skills 3. Global ~/.agents/skills 4. Global ~/.corex/skills 5. Fallback .gemini/skills
         let candidates = [
+            context.workspace_dir.join(".agents").join("skills").join(name).join("SKILL.md"),
             context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
+            directories::BaseDirs::new()
+                .map(|b| b.home_dir().join(".agents").join("skills").join(name).join("SKILL.md"))
+                .unwrap_or_else(|| Path::new("").to_path_buf()),
             directories::BaseDirs::new()
                 .map(|b| b.home_dir().join(".corex").join("skills").join(name).join("SKILL.md"))
                 .unwrap_or_else(|| Path::new("").to_path_buf()),
@@ -349,7 +353,7 @@ impl Tool for ActivateSkillTool {
             }
         }
 
-        Ok(ToolOutput::error(format!("Skill '{}' not found in .corex/skills", name)))
+        Ok(ToolOutput::error(format!("Skill '{}' not found in .agents/skills or .corex/skills", name)))
     }
 }
 
