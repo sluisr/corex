@@ -131,18 +131,8 @@ jobs:
           mkdir -p /tmp/checksums
           gh release download "$TAG" -p "*.sha256" -D /tmp/checksums
           
-          VERSION_NUM="${TAG#v}"
-          CHANGELOG_SECTION=$(python3 -c "
-import sys, re
-try:
-    with open('CHANGELOG.md') as f:
-        content = f.read()
-    match = re.search(r'## \[${VERSION_NUM}\][^\n]*\n(.*?)(?=\n## \[|\Z)', content, re.DOTALL)
-    if match:
-        print(match.group(1).strip())
-except Exception:
-    pass
-" 2>/dev/null || true)
+          export TAG
+          CHANGELOG_SECTION=$(python3 -c "import sys, re, os; tag = os.environ.get('TAG', '').lstrip('v'); content = open('CHANGELOG.md').read(); m = re.search(r'## \[' + re.escape(tag) + r'\][^\n]*\n(.*?)(?=\n## \[|\Z)', content, re.DOTALL); print(m.group(1).strip()) if m else None" 2>/dev/null || true)
 
           if [ -n "$CHANGELOG_SECTION" ]; then
             NOTES="## Release $TAG\n\n$CHANGELOG_SECTION\n\n---\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n|---|---|---|\n"
