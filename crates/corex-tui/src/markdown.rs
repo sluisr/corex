@@ -549,6 +549,95 @@ fn split_markdown_row(line: &str) -> Vec<String> {
     cells
 }
 
+fn wrap_cell_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Vec<Span<'static>>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut current_line_width = 0usize;
+
+    for span in spans {
+        let text = span.content.into_owned();
+        let style = span.style;
+
+        // Split text into tokens: words and spaces
+        let mut tokens: Vec<&str> = Vec::new();
+        let mut start = 0;
+        let bytes = text.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b' ' {
+                if i > start {
+                    tokens.push(&text[start..i]);
+                }
+                tokens.push(" ");
+                start = i + 1;
+            }
+        }
+        if start < text.len() {
+            tokens.push(&text[start..]);
+        }
+
+        for token in tokens {
+            if token == " " {
+                if current_line_width > 0 && current_line_width < max_width {
+                    current_line.push(Span::styled(" ", style));
+                    current_line_width += 1;
+                }
+                continue;
+            }
+
+            let token_w = unicode_width::UnicodeWidthStr::width(token);
+            if current_line_width + token_w <= max_width {
+                current_line.push(Span::styled(token.to_string(), style));
+                current_line_width += token_w;
+            } else if token_w > max_width {
+                // Token is wider than the column itself (e.g. long unbroken URL)
+                let mut chunk = String::new();
+                let mut chunk_w = 0usize;
+
+                for c in token.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                    if current_line_width + chunk_w + cw > max_width {
+                        if !chunk.is_empty() {
+                            current_line.push(Span::styled(std::mem::take(&mut chunk), style));
+                        }
+                        if !current_line.is_empty() {
+                            lines.push(std::mem::take(&mut current_line));
+                        }
+                        current_line_width = 0;
+                        chunk_w = 0;
+                    }
+                    chunk.push(c);
+                    chunk_w += cw;
+                }
+                if !chunk.is_empty() {
+                    current_line.push(Span::styled(chunk, style));
+                    current_line_width += chunk_w;
+                }
+            } else {
+                // Token fits on the next line
+                if !current_line.is_empty() {
+                    lines.push(std::mem::take(&mut current_line));
+                }
+                current_line.push(Span::styled(token.to_string(), style));
+                current_line_width = token_w;
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+
+    lines
+}
+
 fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
     let mut grid: Vec<Vec<String>> = rows.iter().map(|r| split_markdown_row(r)).collect();
 
@@ -687,40 +776,42 @@ fn render_table(rows: &[String], theme: &Theme, max_width: usize) -> Vec<Line<'s
                 Span::styled("┤", Style::default().fg(theme.dark_gray)),
             ]));
         } else {
-            let mut line_spans = vec![Span::styled("  │", Style::default().fg(theme.dark_gray))];
             let base_cell_style = if is_header_row {
                 Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.foreground)
             };
 
+            let mut wrapped_cells = Vec::new();
             for (i, cell) in row.iter().enumerate() {
                 if i >= num_cols {
                     break;
                 }
                 let target_w = col_widths[i];
                 let cell_spans = parse_inline_spans(cell, theme, base_cell_style);
-                let visible_width: usize = cell_spans.iter().map(|s| s.width()).sum();
-
-                let (rendered_spans, actual_w) = if visible_width > target_w {
-                    let truncated = truncate_spans_to_width(&cell_spans, target_w);
-                    let tr_w: usize = truncated.iter().map(|s| s.width()).sum();
-                    (truncated, tr_w)
-                } else {
-                    (cell_spans, visible_width)
-                };
-
-                let pad = target_w.saturating_sub(actual_w);
-                
-                line_spans.push(Span::raw(" "));
-                line_spans.extend(rendered_spans);
-                if pad > 0 {
-                    line_spans.push(Span::raw(" ".repeat(pad)));
-                }
-                line_spans.push(Span::raw(" "));
-                line_spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
+                let cell_lines = wrap_cell_spans(cell_spans, target_w);
+                wrapped_cells.push(cell_lines);
             }
-            result_lines.push(Line::from(line_spans));
+
+            let row_height = wrapped_cells.iter().map(|cl| cl.len()).max().unwrap_or(1);
+            for sub_row_idx in 0..row_height {
+                let mut line_spans = vec![Span::styled("  │", Style::default().fg(theme.dark_gray))];
+                for (i, cell_lines) in wrapped_cells.iter().enumerate() {
+                    let target_w = col_widths[i];
+                    let sub_spans = cell_lines.get(sub_row_idx).cloned().unwrap_or_default();
+                    let actual_w: usize = sub_spans.iter().map(|s| s.width()).sum();
+                    let pad = target_w.saturating_sub(actual_w);
+
+                    line_spans.push(Span::raw(" "));
+                    line_spans.extend(sub_spans);
+                    if pad > 0 {
+                        line_spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                    line_spans.push(Span::raw(" "));
+                    line_spans.push(Span::styled("│", Style::default().fg(theme.dark_gray)));
+                }
+                result_lines.push(Line::from(line_spans));
+            }
         }
     }
 
@@ -937,6 +1028,29 @@ mod tests {
             let bullet_line2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(bullet_line2.starts_with("    "), "hanging indent missing: {}", bullet_line2);
             assert!(!bullet_line2.starts_with("     "), "over-indented: {}", bullet_line2);
+        }
+    }
+
+    #[test]
+    fn test_markdown_table_cell_wrapping_preserves_full_content() {
+        let theme = Theme::default();
+        let text = "| Proyecto | Descripción | Enlace |\n|---|---|---|\n| DeepSeek CLI | Adaptación no oficial de Gemini CLI para la API de DeepSeek. | [GitHub](https://github.com/sluisr/deepseek-cli) · [npm](https://npmjs.com/@sluisr/deepseek-cli) |\n";
+        let max_width = 80;
+        let lines = render_markdown(text, &theme, max_width);
+        assert!(!lines.is_empty());
+
+        let table_str: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
+        // Content should NOT be truncated with ellipsis
+        assert!(!table_str.contains('…'), "Table content should wrap, not truncate with ellipsis: {}", table_str);
+        assert!(table_str.contains("Adaptación"), "Description missing start: {}", table_str);
+        assert!(table_str.contains("DeepSeek"), "Description missing end: {}", table_str);
+        assert!(table_str.contains("sluisr/deepseek-cli"), "URL segment missing: {}", table_str);
+        assert!(table_str.contains("@sluisr/d"), "npm link segment missing: {}", table_str);
+
+        // All table rows must have intact right borders
+        for line in &lines {
+            let s: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(s.ends_with('│') || s.ends_with('┤'), "Line missing border: {}", s);
         }
     }
 }

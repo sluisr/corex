@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use directories::BaseDirs;
@@ -32,6 +33,10 @@ TOOL USAGE RULES (mandatory):
   * Subagents run with their own isolated context to prevent context window saturation.
   * To monitor, inspect output, or cancel subagents: use `manage_subagents` (actions: 'list', 'status', 'cancel').
   * REACTIVE WAKEUP: When a subagent completes, a `SUBAGENT_DONE|<id>|<role>|<duration>\n<output>` system notification is delivered. Review the findings and synthesize them directly for the user.
+- SKILL ACTIVATION MANDATE:
+  * You have access to specialized procedural skills via `activate_skill`.
+  * When the user asks about Corex, its author sluisr, project architecture, FIM, local LLMs, MCP setup, sessions, slash commands, or troubleshooting, you MUST IMMEDIATELY call `activate_skill` with the matching skill (e.g. `activate_skill(name: "corex-about")`) BEFORE answering or searching the web.
+  * NEVER claim that you don't know who created you or who sluisr is when `corex-about` is available. Always load the skill and use its authoritative data.
 - DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("cuál de las tres", "dime y arranco", "la pelota es tuya", "paro", "qué prefieres"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
 - When you state that you are stopping, waiting, or placing the decision in the user's hands ("la pelota es tuya", "paro", "no ejecuto nada hasta que digas"), DO NOT attach tool calls.
 - LANGUAGE FIDELITY: Maintain strict language consistency with the user. All tool summaries, answers, and technical deep-dives must match the user's conversation language. Never drift into Chinese or unprompted languages.
@@ -149,6 +154,59 @@ impl PromptBuilder {
         memory
     }
 
+    fn discover_skills(&self) -> String {
+        let mut skill_dirs = Vec::new();
+
+        // 1. Workspace .agents/skills
+        skill_dirs.push(self.workspace_dir.join(".agents").join("skills"));
+        // 2. Workspace .corex/skills
+        skill_dirs.push(self.workspace_dir.join(".corex").join("skills"));
+
+        // 3. User global ~/.agents/skills, ~/.corex/skills, ~/.gemini/skills
+        if let Some(dirs) = BaseDirs::new() {
+            skill_dirs.push(dirs.home_dir().join(".agents").join("skills"));
+            skill_dirs.push(dirs.home_dir().join(".corex").join("skills"));
+            skill_dirs.push(dirs.home_dir().join(".gemini").join("skills"));
+        }
+
+        let mut discovered: BTreeMap<String, String> = BTreeMap::new();
+
+        for dir in skill_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let skill_file = path.join("SKILL.md");
+                        if skill_file.is_file() {
+                            let folder_name = entry.file_name().to_string_lossy().to_string();
+                            if discovered.contains_key(&folder_name) {
+                                continue;
+                            }
+                            if let Ok(content) = fs::read_to_string(&skill_file) {
+                                let (name, desc) = parse_skill_metadata(&content, &folder_name);
+                                discovered.entry(name).or_insert(desc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if discovered.is_empty() {
+            return String::new();
+        }
+
+        let mut output = String::from("\n# AVAILABLE PROCEDURAL SKILLS\nThe following specialized skills are available to assist you. When a user's request matches a skill's description, domain, or trigger phrases, you MUST immediately call `activate_skill(name: \"<skill-name>\")` to load full procedural instructions before answering or searching externally.\n\n");
+        for (name, desc) in discovered {
+            output.push_str(&format!("- **{}**: {}\n", name, desc));
+        }
+
+        output
+    }
+
     pub fn build(&self) -> String {
         let mut prompt = String::new();
 
@@ -178,6 +236,11 @@ impl PromptBuilder {
             prompt.push_str("\n\n# PLANNING MODE ACTIVE\n");
             prompt.push_str("- You are in architectural planning mode. Focus on reading and analyzing the codebase.\n");
             prompt.push_str("- Propose clear step-by-step plans before making any destructive edits.\n");
+        }
+
+        let skills = self.discover_skills();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
         }
 
         let memory = self.read_memory();
@@ -224,6 +287,11 @@ impl PromptBuilder {
             prompt.push_str("sudo is pre-authenticated for this session. Use it freely when root is needed.\n\n");
         }
 
+        let skills = self.discover_skills();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+        }
+
         let memory = self.read_memory();
         if !memory.is_empty() {
             prompt.push_str(&memory);
@@ -231,6 +299,59 @@ impl PromptBuilder {
 
         prompt
     }
+}
+
+pub(crate) fn parse_skill_metadata(content: &str, fallback_name: &str) -> (String, String) {
+    let mut name = fallback_name.to_string();
+    let mut description = String::new();
+
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("---") {
+        if let Some(end_idx) = trimmed[3..].find("---") {
+            let frontmatter = &trimmed[3..3 + end_idx];
+            let mut in_desc = false;
+            let mut desc_lines = Vec::new();
+
+            for line in frontmatter.lines() {
+                let trimmed_line = line.trim();
+                if trimmed_line.starts_with("name:") {
+                    in_desc = false;
+                    let val = trimmed_line.trim_start_matches("name:").trim();
+                    let val = val.trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        name = val.to_string();
+                    }
+                } else if trimmed_line.starts_with("description:") {
+                    in_desc = true;
+                    let val = trimmed_line.trim_start_matches("description:").trim();
+                    let val = val.trim_start_matches(">-").trim_start_matches('>').trim_start_matches('|').trim();
+                    let val = val.trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        desc_lines.push(val.to_string());
+                    }
+                } else if in_desc {
+                    if trimmed_line.is_empty() {
+                        continue;
+                    }
+                    if line.starts_with(|c: char| !c.is_whitespace()) && line.contains(':') {
+                        in_desc = false;
+                    } else {
+                        desc_lines.push(trimmed_line.to_string());
+                    }
+                }
+            }
+
+            if !desc_lines.is_empty() {
+                description = desc_lines.join(" ");
+            }
+        }
+    }
+
+    if description.is_empty() {
+        description = format!("Specialized procedural skill for {}", name);
+    }
+
+    (name, description)
 }
 
 #[cfg(test)]
@@ -259,5 +380,35 @@ mod tests {
         let builder_with_sudo = PromptBuilder::new("/tmp/test-workspace").with_sudo_password(true);
         let prompt_with_sudo = builder_with_sudo.build();
         assert!(prompt_with_sudo.contains("SUDO AUTHENTICATION: Sudo password is provided silently"));
+    }
+
+    #[test]
+    fn test_parse_skill_metadata() {
+        let content = r#"---
+name: test-skill
+description: >-
+  This is a multiline
+  skill description.
+---
+# Content"#;
+        let (name, desc) = parse_skill_metadata(content, "fallback");
+        assert_eq!(name, "test-skill");
+        assert_eq!(desc, "This is a multiline skill description.");
+
+        let no_frontmatter = "# Just Markdown";
+        let (name2, desc2) = parse_skill_metadata(no_frontmatter, "my-fallback");
+        assert_eq!(name2, "my-fallback");
+        assert_eq!(desc2, "Specialized procedural skill for my-fallback");
+    }
+
+    #[test]
+    fn test_system_prompt_discovers_skills() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let builder = PromptBuilder::new(workspace);
+        let prompt = builder.build();
+
+        assert!(prompt.contains("# AVAILABLE PROCEDURAL SKILLS"));
+        assert!(prompt.contains("corex-about"));
+        assert!(prompt.contains("corex-fim"));
     }
 }
