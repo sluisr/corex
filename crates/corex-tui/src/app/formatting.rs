@@ -6,6 +6,8 @@ use corex_core::types::ToolCall;
 use crate::theme::Theme;
 
 pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<String> {
+    use unicode_width::UnicodeWidthChar;
+
     let mut urls = Vec::new();
     let mut start = 0;
     while start < line_text.len() {
@@ -15,8 +17,8 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
             Some(idx) => idx,
             None => break,
         };
-        let abs_start = start + p;
-        let url_rem = &line_text[abs_start..];
+        let abs_byte_start = start + p;
+        let url_rem = &line_text[abs_byte_start..];
         let end = url_rem
             .find(|c: char| c.is_whitespace() || c == ')' || c == ']' || c == '>' || c == '"' || c == '\'' || c == '│' || c == '|' || c == '}' || c == '<')
             .unwrap_or(url_rem.len());
@@ -24,16 +26,32 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
         while url.ends_with('.') || url.ends_with(',') || url.ends_with(';') {
             url.pop();
         }
-        let abs_end = abs_start + url.len();
+        let abs_byte_end = abs_byte_start + url.len();
         if !url.is_empty() {
-            urls.push((abs_start, abs_end, url));
+            // Compute exact display columns (visual character cells) for this URL
+            let mut col = 0usize;
+            let mut start_col = None;
+            let mut end_col = None;
+            for (byte_idx, ch) in line_text.char_indices() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if byte_idx == abs_byte_start {
+                    start_col = Some(col);
+                }
+                if byte_idx + ch.len_utf8() == abs_byte_end {
+                    end_col = Some(col + w);
+                }
+                col += w;
+            }
+            if let (Some(sc), Some(ec)) = (start_col, end_col) {
+                urls.push((sc, ec, url));
+            }
         }
         let step = if end == 0 {
             url_rem.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
         } else {
             end
         };
-        start = abs_start + step;
+        start = abs_byte_start + step;
     }
 
     if urls.is_empty() {
@@ -41,18 +59,17 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
     }
 
     if let Some(col) = click_col {
-        for (s, e, u) in &urls {
-            if col + 3 >= *s && col <= *e + 3 {
+        for (sc, ec, u) in &urls {
+            // Only match if the click is strictly on the visual text of the URL
+            if col >= *sc && col < *ec {
                 return Some(u.clone());
             }
         }
+        // Clicked elsewhere on the line -> never open any URL
+        return None;
     }
 
-    if urls.len() == 1 {
-        return Some(urls[0].2.clone());
-    }
-
-    None
+    urls.first().map(|(_, _, u)| u.clone())
 }
 
 pub fn extract_tool_allow_rule(call: &ToolCall) -> String {

@@ -310,7 +310,7 @@ pub fn render_command_popup(
         if is_selected {
             selected_line = lines.len();
         }
-        let prefix = if is_selected { "❯ " } else { "  " };
+        let prefix = if is_selected { "› " } else { "  " };
 
         let style = if is_selected {
             Style::default()

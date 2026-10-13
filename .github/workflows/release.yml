@@ -104,7 +104,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.6.1' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.6.2' }}
           files: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.ARCHIVE_NAME }}.sha256
@@ -131,15 +131,24 @@ jobs:
           mkdir -p /tmp/checksums
           gh release download "$TAG" -p "*.sha256" -D /tmp/checksums
           
-          NOTES="## Release $TAG
+          VERSION_NUM="${TAG#v}"
+          CHANGELOG_SECTION=$(python3 -c "
+import sys, re
+try:
+    with open('CHANGELOG.md') as f:
+        content = f.read()
+    match = re.search(r'## \[${VERSION_NUM}\][^\n]*\n(.*?)(?=\n## \[|\Z)', content, re.DOTALL)
+    if match:
+        print(match.group(1).strip())
+except Exception:
+    pass
+" 2>/dev/null || true)
 
-High-performance autonomous AI terminal agent compiled in native Rust.
-
-### Canonical Release Checksums (SHA-256)
-
-| Platform | Archive File | SHA-256 Checksum |
-|---|---|---|
-"
+          if [ -n "$CHANGELOG_SECTION" ]; then
+            NOTES="## Release $TAG\n\n$CHANGELOG_SECTION\n\n---\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n|---|---|---|\n"
+          else
+            NOTES="## Release $TAG\n\nHigh-performance autonomous AI terminal agent compiled in native Rust.\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n|---|---|---|\n"
+          fi
           for file in /tmp/checksums/*.sha256; do
             filename=$(basename "$file" .sha256)
             hash=$(tr -d '[:space:]' < "$file")

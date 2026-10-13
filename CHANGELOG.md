@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.2] - 2026-10-13
+
+### Fixed
+- **Strict Visual URL Click Hit-Testing**: Fixed false-positive where clicking anywhere on a line containing a URL (table borders, descriptions, or whitespace) erroneously launched the browser via `open::that()`. Hit-testing now uses exact visual display columns (`UnicodeWidthChar`), opening links only when clicked directly on the URL text.
+- **Uncluttered Question Prompt Border**: Removed awkward bracketed title tags (`─[ Pregunta TUI ]─`) and redundant bullet circles (`●` and `○`), providing an unbroken, clean horizontal border matching the composer design.
+
+### Added
+- **Inline Bottom-Anchored User Dialog (`ask_user`)**: Replaced centered floating popups with an elegant, non-intrusive selector integrated into the bottom composer slot. Conversation history remains 100% visible, sharp, and readable above the question.
+- **Fast 1-Key Numeric Selection & Scrolling**: Immediate option selection via number keys (`1`–`9`) and `PageUp`/`PageDown` chat history scrolling while deciding responses.
+- **Unified Minimalist Chevron (`›`)**: Replaced heavy `❯` glyphs across all menus, drawers, and modal prompts (`model_dialog`, `session_dialog`, `auth_dialog`, `slash_commands`, `sudo_dialog`, `diff_view`, and `user_dialog`) with the sleek chevron `›`.
+- **Automated Release Notes Pipeline**: Updated release workflow to automatically parse and publish `CHANGELOG.md` release notes directly to GitHub Releases alongside canonical SHA-256 asset digests.
+
+---
+
 ## [0.6.1] - 2026-10-13
 
 ### Fixed

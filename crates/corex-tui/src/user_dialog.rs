@@ -209,7 +209,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
         for (idx, opt) in q.options.iter().enumerate().skip(window_start).take(max_opts) {
             let is_sel = idx == cur_sel;
             let num = format!("{}. ", idx + 1);
-            let cursor = if is_sel { "  ❯ " } else { "    " };
+            let cursor = if is_sel { "  › " } else { "    " };
 
             lines.push(Line::from(vec![
                 Span::styled(
@@ -266,7 +266,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
         };
 
         lines.push(Line::from(vec![
-            Span::styled("  ❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+            Span::styled("  › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
             Span::styled(display_text, Style::default().fg(theme.foreground)),
             Span::styled("█", Style::default().fg(theme.accent_blue)),
         ]));

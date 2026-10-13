@@ -573,6 +573,15 @@ use corex_core::types::ToolCall;
             find_url_in_line("Active Model: deepseek-flash", None),
             None
         );
+
+        // Click column tests: clicking outside the URL must NEVER open it!
+        let table_row = "  │ 🌐 Web personal │ https://sluisr.com               │";
+        // Clicking on "Web personal" (col 5) -> None!
+        assert_eq!(find_url_in_line(table_row, Some(5)), None);
+        // Clicking on table divider (col 18) -> None!
+        assert_eq!(find_url_in_line(table_row, Some(18)), None);
+        // Clicking directly on "https://sluisr.com" (col 25) -> Some!
+        assert_eq!(find_url_in_line(table_row, Some(25)), Some("https://sluisr.com".to_string()));
     }
 
     #[test]

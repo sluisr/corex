@@ -132,7 +132,7 @@ pub fn render_auth_dialog(
     };
 
     lines.push(Line::from(vec![
-        Span::styled("  ❯ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+        Span::styled("  › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
         input_span,
         cursor,
     ]));
