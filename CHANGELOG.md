@@ -97,8 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Flexible deserialization for non-standard tool call indices and raw object arguments (Ollama, Gemini, Claude 3.7, DeepSeek V4.1).
 - **Interactive MCP Server Catalog & Commands**:
   - Added `/mcp catalog`, `/mcp add <catalog_id|custom>`, and `/mcp remove <name>` directly inside the TUI for seamless tool expansion.
-- **Security & Engine Authorship Signature**:
-  - Implemented XOR-encrypted steganographic authorship signature (`verify_author_signature`, `engine_signature`) in the core binary.
+- **Internal Engine Invariant Verification**:
+  - Implemented compile-time invariant validation and internal matrix verification in the core runtime.
 - **Nix Flake & Ecosystem Packaging**:
   - Added native `flake.nix` for declarative zero-install Nix flakes.
   - Memory trimmer routine (`trim_memory` via glibc `malloc_trim`) to prevent memory fragmentation and ensure minimal RSS usage.
