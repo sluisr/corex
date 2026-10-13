@@ -2,10 +2,14 @@
 set -e
 
 REPO="sluisr/corex"
+# Determine installation target directory
+ACTIVE_CX="$(command -v cx 2>/dev/null || true)"
 if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
   INSTALL_DIR="$PREFIX/bin"
 elif [ -d "/data/data/com.termux/files/usr/bin" ]; then
   INSTALL_DIR="/data/data/com.termux/files/usr/bin"
+elif [ -n "$ACTIVE_CX" ] && [ -x "$ACTIVE_CX" ] && [ ! -L "$ACTIVE_CX" ]; then
+  INSTALL_DIR="$(dirname "$ACTIVE_CX")"
 else
   INSTALL_DIR="/usr/local/bin"
 fi
@@ -118,11 +122,24 @@ if [ -f "$TMP_DIR/corex" ]; then
   $SUDO chmod +x "$INSTALL_DIR/corex"
 fi
 
+# Synchronize any other cx/corex binaries in PATH to prevent older versions from shadowing
+if command -v which >/dev/null 2>&1; then
+  for existing_bin in $(which -a cx corex 2>/dev/null | sort -u); do
+    if [ "$existing_bin" != "$INSTALL_DIR/cx" ] && [ "$existing_bin" != "$INSTALL_DIR/corex" ] && [ -f "$existing_bin" ] && [ ! -L "$existing_bin" ]; then
+      if [ -w "$existing_bin" ]; then
+        cp "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
+      elif [ -n "$SUDO" ]; then
+        $SUDO cp "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
+      fi
+    fi
+  done
+fi
+
 # Set up shell autocompletions (Zsh, Bash, Fish)
 CX_BIN="$INSTALL_DIR/cx"
 if [ -x "$CX_BIN" ]; then
   # Zsh autocompletions
-  for zsh_dir in "/usr/local/share/zsh/site-functions" "/usr/share/zsh/site-functions" "$HOME/.zfunc"; do
+  for zsh_dir in "$HOME/.zfunc" "/usr/local/share/zsh/site-functions" "/usr/share/zsh/site-functions"; do
     if [ -d "$zsh_dir" ] || [ "$zsh_dir" = "$HOME/.zfunc" ]; then
       mkdir -p "$zsh_dir" 2>/dev/null || true
       if [ -w "$zsh_dir" ]; then
@@ -153,6 +170,9 @@ if [ -x "$CX_BIN" ]; then
       "$CX_BIN" --completions fish > "$fish_dir/cx.fish" 2>/dev/null && echo "  ✓ Fish autocompletions installed to $fish_dir/cx.fish" || true
     fi
   fi
+
+  # Invalidate cached zcompdump so new shell sessions reload completions immediately
+  rm -f "$HOME/.zcompdump"* 2>/dev/null || true
 fi
 
 # Set up output styling
