@@ -428,6 +428,24 @@ pub fn render_single_message_with_pending(
             let content = msg.text_content().unwrap_or("");
             let is_last_tool = next_msg.map(|m| m.role.as_str() != "tool").unwrap_or(true);
 
+            // Skills are internal procedural knowledge loaded for the AI — suppress raw log dumping
+            let is_skill = msg.name.as_deref() == Some("activate_skill")
+                || content.starts_with("---\nname:")
+                || content.starts_with("# Corex — ")
+                || content.contains("Specialized procedural skill for");
+
+            if is_skill {
+                let is_err = content.starts_with("Error") || content.starts_with("Failed") || content.starts_with("Skill '");
+                if is_err {
+                    let line_spans = vec![
+                        Span::styled("    ✕ ", Style::default().fg(Color::Red)),
+                        Span::styled(content.lines().next().unwrap_or("Failed to load skill").to_string(), Style::default().fg(theme.gray)),
+                    ];
+                    lines.extend(crate::markdown::wrap_spans(line_spans, content_max_width, "    "));
+                }
+                return lines;
+            }
+
             let check_slice = corex_core::safe_truncate_str(content, 2048);
             if check_slice.contains("denied by user") || check_slice.contains("declined") {
                 let line_spans = vec![
@@ -651,7 +669,11 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             stream_width.div_ceil(capacity).clamp(1, MAX_COMPOSER_LINES)
         }
     };
-    let composer_height = composer_content_lines as u16 + 2;
+    let composer_height = if app.user_dialog.is_open {
+        crate::user_dialog::calculate_dialog_height(&app.user_dialog, size.width, size.height)
+    } else {
+        composer_content_lines as u16 + 2
+    };
 
     let chunks = if popup_height > 0 {
         Layout::default()
@@ -904,21 +926,22 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             ));
         }
 
-        let right_span = if queue_count > 0 {
-            Span::styled("(Esc para descolar) ", Style::default().fg(app.theme.dark_gray))
+        let mut right_spans = Vec::new();
+        if queue_count > 0 {
+            right_spans.push(Span::styled("(Esc para descolar) ", Style::default().fg(app.theme.dark_gray)));
         } else {
-            Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray))
-        };
+            right_spans.push(Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray)));
+        }
 
         let left_len: usize = left_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
-        let right_len = unicode_width::UnicodeWidthStr::width(right_span.content.as_ref());
+        let right_len: usize = right_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
         let bar_width = activity_chunk.width as usize;
 
         let mut spans = left_spans;
         if bar_width > left_len + right_len {
             let pad = bar_width - (left_len + right_len);
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(right_span);
+            spans.extend(right_spans);
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
@@ -991,16 +1014,26 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
         0
     };
 
+    let composer_border_color = if !app.auto_scroll {
+        Color::Rgb(75, 110, 155)
+    } else {
+        app.theme.dark_gray
+    };
+
     let composer_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(app.theme.dark_gray));
+        .border_style(Style::default().fg(composer_border_color));
 
-    frame.render_widget(
-        Paragraph::new(composer_lines)
-            .block(composer_block)
-            .scroll((scroll_y as u16, 0)),
-        composer_chunk,
-    );
+    if app.user_dialog.is_open {
+        render_user_dialog(frame, composer_chunk, &app.user_dialog, &app.theme);
+    } else {
+        frame.render_widget(
+            Paragraph::new(composer_lines)
+                .block(composer_block)
+                .scroll((scroll_y as u16, 0)),
+            composer_chunk,
+        );
+    }
 
     // Render slash command popup if active
     if let Some(p_chunk) = popup_chunk {
@@ -1229,11 +1262,6 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     // 8. Session Dialog Modal if open
     if app.session_dialog.is_open {
         render_session_dialog(frame, size, &mut app.session_dialog, &app.theme);
-    }
-
-    // 9. Interactive Ask-User Dialog Modal if open (rendered on top)
-    if app.user_dialog.is_open {
-        render_user_dialog(frame, size, &app.user_dialog, &app.theme);
     }
 }
 

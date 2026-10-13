@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.1] - 2026-10-13
+
+### Fixed
+- **TUI Multi-Line Table Cell Word-Wrapping**: Replaced legacy cell truncation (`…`) with dynamic multi-line word-wrapping in `wrap_cell_spans`, preserving full descriptions, long URLs, and strict table border alignment.
+- **Official Identity & YouTube Link**: Corrected official YouTube channel reference to `@sluisr_` (with trailing underscore) across all procedural skills and built-ins.
+- **Skill Activation Log Noise**: Suppressed raw 100+ line markdown log dumps in the chat feed when procedural skills (`activate_skill`) are loaded.
+
+### Added
+- **Smart Scroll Lock & Quick Jump-to-Bottom**: When the user scrolls up to read earlier parts of the conversation during active AI streaming, auto-scrolling locks in place so arriving tokens do not pull the viewport down. Pressing `Space` (when the composer input is empty), `End`, or `Esc` immediately snaps back to the bottom and re-enables auto-scroll, with a subtle soft-tinted border indicator on the composer.
+- **Embedded Built-in Skills**: Compiled all 8 foundational domain skills (`corex-about`, `corex-fim`, `corex-local-llm`, etc.) directly into the binary with zero-latency (0.001ms) fallback and automatic system prompt baseline discovery in empty or `/tmp` workspaces.
+- **Interactive Clickable Terminal Hyperlinks**: Added native single-click mouse handling on chat feed URLs to directly launch the system default browser via `open::that()`.
+- **Inline Markdown Link & URL Styling**: Styled all HTTP/HTTPS links, emails, and Markdown URLs in bright blue (`accent_blue`) with underlines (`UNDERLINED`).
+- **Clean Link Deduplication**: Automatically collapses redundant Markdown link labels that duplicate the target URL (e.g. `[sluisr.com](https://sluisr.com)`) into single, clean, clickable URLs.
+- **Technical TUI Chrome**: Replaced decorative emojis across tool call banners and action spans with clean, minimal technical indicators (`› `, `✓`, `✕`).
+
+---
+
 ## [0.6.0] - 2026-10-13
 
 ### Added

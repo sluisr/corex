@@ -62,7 +62,7 @@ LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
   LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4)
 fi
-VERSION="${LATEST_TAG:-v0.6.0}"
+VERSION="${LATEST_TAG:-v0.6.1}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"

@@ -67,6 +67,7 @@ pub struct LlmClient {
 
 impl LlmClient {
     pub fn new(config: Config) -> Self {
+        let _ = crate::engine_signature();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(10))

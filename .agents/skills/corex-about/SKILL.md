@@ -16,23 +16,23 @@ description: >-
 
 ## 👤 Creator
 
-**Corex** is created and actively maintained by **[sluisr](https://sluisr.com)** — a Linux server specialist, automation and cybersecurity expert, active Linux Kernel contributor, and Google-certified engineer.
+**Corex** is created and actively maintained by **sluisr** (https://sluisr.com) — a Linux server specialist, automation and cybersecurity expert, active Linux Kernel contributor, and Google-certified engineer.
 
-- 🌐 Website: [sluisr.com](https://sluisr.com)
-- 🐙 GitHub: [github.com/sluisr](https://github.com/sluisr)
-- 📺 YouTube: [youtube.com/@sluisr_](https://www.youtube.com/@sluisr_) *(con guion bajo al final: `@sluisr_`)*
+- 🌐 Website: https://sluisr.com
+- 🐙 GitHub: https://github.com/sluisr
+- 📺 YouTube: https://www.youtube.com/@sluisr_
 - 📧 Contact: contact@sluisr.com
 
 > [!IMPORTANT]
-> El identificador del canal de YouTube oficial de sluisr SIEMPRE lleva un guion bajo al final: **`@sluisr_`** (URL: `https://www.youtube.com/@sluisr_`). Nunca omitir el guion bajo.
+> El identificador del canal de YouTube de sluisr SIEMPRE lleva un guion bajo al final: **`@sluisr_`** (URL completa: `https://www.youtube.com/@sluisr_`). NUNCA omitir el guion bajo ni escribir `@sluisr`.
 
 ### 🔗 Dónde encontrarlo
 
 | Recurso | Enlace |
 | :--- | :--- |
-| 🌐 Web personal | [sluisr.com](https://sluisr.com) |
-| 🐙 GitHub | [github.com/sluisr](https://github.com/sluisr) |
-| 📺 YouTube | [youtube.com/@sluisr_](https://www.youtube.com/@sluisr_) |
+| 🌐 Web personal | https://sluisr.com |
+| 🐙 GitHub | https://github.com/sluisr |
+| 📺 YouTube | https://www.youtube.com/@sluisr_ |
 | 📧 Contacto | contact@sluisr.com |
 
 ---
@@ -57,7 +57,7 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 
 ## 📌 Current Status
 
-- **Version:** `0.5.0` (actively developed)
+- **Version:** `0.6.1` (actively developed)
 - **License:** GNU AGPLv3 (`AGPL-3.0-only`) with dual-licensing options
 - **Platforms:** Linux, macOS, Windows
 
@@ -67,10 +67,10 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 
 | Resource | URL |
 | :--- | :--- |
-| Repository | [github.com/sluisr/corex](https://github.com/sluisr/corex) |
-| Releases | [github.com/sluisr/corex/releases](https://github.com/sluisr/corex/releases) |
-| Bug Reports | [github.com/sluisr/corex/issues](https://github.com/sluisr/corex/issues) |
-| Author site | [sluisr.com](https://sluisr.com) |
+| Repository | https://github.com/sluisr/corex |
+| Releases | https://github.com/sluisr/corex/releases |
+| Bug Reports | https://github.com/sluisr/corex/issues |
+| Author site | https://sluisr.com |
 
 ---
 

@@ -111,6 +111,19 @@ use corex_core::types::ToolCall;
         assert!(app.selection_lines.is_empty());
     }
 
+    #[tokio::test]
+    async fn test_click_on_url_line_triggers_url_lookup() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines = vec!["Creator: sluisr (https://sluisr.com)".to_string()];
+
+        // Click on the line with the URL (empty selection)
+        app.selection = Some(Selection { anchor: (0, 25), cursor: (0, 25) });
+        app.commit_selection();
+        assert!(app.selection.is_none());
+    }
+
     /// Builds the mouse events the drag tests below feed to the app.
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
@@ -255,6 +268,27 @@ use corex_core::types::ToolCall;
         app.scroll_chat(-5);
         assert_eq!(app.max_scroll_offset(), 0);
         assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    #[tokio::test]
+    async fn test_scroll_to_bottom_and_smart_lock() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        app.total_rendered_items = 100;
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 20));
+        app.scroll_offset = 80;
+        app.auto_scroll = true;
+
+        // Scroll up to read
+        app.scroll_chat(-20);
+        assert_eq!(app.scroll_offset, 60);
+        assert!(!app.auto_scroll);
+
+        // scroll_to_bottom snaps back to 80 and enables auto_scroll
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 80);
         assert!(app.auto_scroll);
     }
 
@@ -705,4 +739,28 @@ use corex_core::types::ToolCall;
         // Effective allowed commands must include "cargo test"
         let eff = app.get_effective_allowed_commands();
         assert!(eff.contains(&"cargo test".to_string()));
+    }
+
+    #[test]
+    fn test_skill_tool_output_suppresses_logs() {
+        let theme = Theme::default();
+        let mut msg = Message::tool_response("call_1", "---\nname: corex-about\n---\n# Full Skill Markdown\nLots of text");
+        msg.name = Some("activate_skill".to_string());
+
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
+        assert!(lines.is_empty(), "Skill tool output must not dump logs in UI");
+    }
+
+    #[test]
+    fn test_format_tool_call_spans_no_emojis() {
+        let theme = Theme::default();
+        let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
+        assert!(joined.starts_with('›'), "Must use clean chevron: {}", joined);
+
+        let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme);
+        let skill_joined: String = skill_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!skill_joined.contains('⚙'), "Must not contain gear emoji: {}", skill_joined);
+        assert!(skill_joined.contains("corex-about"), "Must show skill name cleanly: {}", skill_joined);
     }

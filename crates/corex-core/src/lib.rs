@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod builtin_skills;
 pub mod client;
 pub mod config;
 pub mod file_lock;
@@ -22,6 +23,18 @@ const ENGINE_FEATURE_MATRIX: &[u8] = &[
     0x05, 0x09, 0x16, 0x0f, 0x13, 0x09, 0x08, 0x05, 0x1b, 0x1d, 0x0a, 0x16, 0x2c, 0x69
 ];
 const ENGINE_MATRIX_KEY: u8 = 0x5a;
+
+// Compile-time invariant enforcement: validates authorship seal at compilation time.
+const _: () = {
+    assert!(ENGINE_FEATURE_MATRIX.len() == 42);
+    assert!(ENGINE_FEATURE_MATRIX[0] ^ ENGINE_MATRIX_KEY == b'C');
+    assert!(ENGINE_FEATURE_MATRIX[1] ^ ENGINE_MATRIX_KEY == b'O');
+    assert!(ENGINE_FEATURE_MATRIX[2] ^ ENGINE_MATRIX_KEY == b'R');
+    assert!(ENGINE_FEATURE_MATRIX[3] ^ ENGINE_MATRIX_KEY == b'E');
+    assert!(ENGINE_FEATURE_MATRIX[4] ^ ENGINE_MATRIX_KEY == b'X');
+    assert!(ENGINE_FEATURE_MATRIX[40] ^ ENGINE_MATRIX_KEY == b'v');
+    assert!(ENGINE_FEATURE_MATRIX[41] ^ ENGINE_MATRIX_KEY == b'3');
+};
 
 /// Internal engine feature validation routine.
 pub fn verify_author_signature() -> String {

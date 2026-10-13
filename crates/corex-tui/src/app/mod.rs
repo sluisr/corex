@@ -122,7 +122,7 @@ impl App {
         app.trigger_local_health_check();
         app.trigger_update_check();
         if cfg.api_key.trim().is_empty() && cfg.endpoint().1.trim().is_empty() && !cfg.local_llm_enabled {
-            app.set_status("💡 No API key configured · Type /model to choose AI or /local");
+            app.set_status("No API key configured · Type /model to choose AI or /local");
         }
         app
     }
@@ -264,9 +264,20 @@ impl App {
 
         // Read the text before clearing: it is derived from the live selection.
         let text = self.selection_text();
+        if selection.is_empty() {
+            let (line_idx, char_idx) = selection.anchor;
+            if let Some(line) = self.selection_lines.get(line_idx) {
+                if let Some(url) = formatting::find_url_in_line(line, Some(char_idx as usize)) {
+                    let _ = open::that(&url);
+                }
+            }
+            self.clear_selection();
+            return;
+        }
+
         self.clear_selection();
 
-        if selection.is_empty() || text.trim().is_empty() {
+        if text.trim().is_empty() {
             return;
         }
 
@@ -443,6 +454,12 @@ impl App {
         self.auto_scroll = next >= max;
     }
 
+    /// Jumps the chat feed straight to the latest message and re-engages auto-scrolling.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = self.max_scroll_offset();
+        self.auto_scroll = true;
+    }
+
     pub fn get_effective_allowed_commands(&self) -> Vec<String> {
         let mut all = self.llm_client.get_config().allowed_commands.clone();
         for cmd in &self.session_allowed_commands {
@@ -564,7 +581,10 @@ impl App {
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
         self.active_status = Some("Generando...".to_string());
-        self.auto_scroll = true;
+        // Preserve user scroll: only follow stream if user has not scrolled up to read
+        if self.auto_scroll {
+            self.auto_scroll = true;
+        }
         self.last_turn_start = Some(Instant::now());
 
         let prompt_builder = PromptBuilder::new(&self.workspace_dir)
@@ -957,17 +977,17 @@ impl App {
                 let force = parts.get(1).map(|s| *s == "force" || *s == "--force").unwrap_or(false);
 
                 if apply_update {
-                    self.session.add_message(Message::system("🚀 Checking release and applying in-place update..."));
+                    self.session.add_message(Message::system("Checking release and applying in-place update..."));
                     match corex_core::update::perform_self_update(current, force, |_| {}).await {
                         Ok(summary) => {
                             self.session.add_message(Message::system(format!(
-                                "✨ Corex successfully updated to v{} (previous: v{})!\n📍 Binary: {}\n\nPlease restart Corex to run the updated version.",
+                                "✓ Corex successfully updated to v{} (previous: v{})!\nBinary: {}\n\nPlease restart Corex to run the updated version.",
                                 summary.updated_version, summary.previous_version, summary.binary_path.display()
                             )));
                         }
                         Err(e) => {
                             self.session.add_message(Message::system(format!(
-                                "⚠️ In-place update: {}\n\nManual update alternatives:\n• cx update (in terminal)\n• npm install -g @sluisr/corex\n• cargo install --git https://github.com/sluisr/corex.git --force",
+                                "✕ In-place update: {}\n\nManual update alternatives:\n• cx update (in terminal)\n• npm install -g @sluisr/corex\n• cargo install --git https://github.com/sluisr/corex.git --force",
                                 e
                             )));
                         }
@@ -1008,7 +1028,7 @@ impl App {
             }
             "/keyboard" => {
                 try_show_termux_soft_keyboard();
-                self.session.add_message(Message::system("📱 Virtual keyboard requested (Termux tap-to-type active on mobile vertical screens)."));
+                self.session.add_message(Message::system("Virtual keyboard requested (Termux tap-to-type active on mobile vertical screens)."));
                 true
             }
             "/prefix" => {
@@ -1067,7 +1087,7 @@ impl App {
                 match sub.as_str() {
                     "catalog" | "available" => {
                         let catalog = corex_tools::get_mcp_catalog();
-                        let mut msg = format!("📦 MCP Server Catalog ({} vetted servers):\n\n", catalog.len());
+                        let mut msg = format!("MCP Server Catalog ({} vetted servers):\n\n", catalog.len());
                         for item in catalog {
                             msg.push_str(&format!("• **{}** (`{}`)\n", item.name, item.id));
                             msg.push_str(&format!("  *{}*\n", item.description));

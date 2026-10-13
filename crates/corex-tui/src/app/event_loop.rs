@@ -282,7 +282,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     {
                         set_sudo_password(None);
                     }
-                    app.session.add_message(Message::tool_response(call_id, output));
+                    let tool_name = app.session.messages.iter().rev()
+                        .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id).map(|c| c.function.name.clone()));
+                    let mut tool_msg = Message::tool_response(call_id, output);
+                    tool_msg.name = tool_name;
+                    app.session.add_message(tool_msg);
                 }
                 StreamEvent::AllToolsDone => {
                     // ⚡ TRIGGER NEXT RECURSIVE TURN OF AGENT LOOP!
@@ -1202,10 +1206,27 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     app.user_dialog.text_input[cur].pop();
                                 }
                             }
+                            KeyCode::PageUp => {
+                                app.scroll_chat(-10);
+                            }
+                            KeyCode::PageDown => {
+                                app.scroll_chat(10);
+                            }
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
                                 let cur = app.user_dialog.current;
-                                if !app.user_dialog.questions[cur].has_options {
-                                    app.user_dialog.text_input[cur].push(c);
+                                if let Some(q) = app.user_dialog.current_question() {
+                                    if q.has_options {
+                                        if let Some(digit) = c.to_digit(10) {
+                                            if digit >= 1 {
+                                                let idx = (digit - 1) as usize;
+                                                if idx < q.options.len() {
+                                                    app.user_dialog.selected[cur] = idx;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        app.user_dialog.text_input[cur].push(c);
+                                    }
                                 }
                             }
                             KeyCode::Enter => {
@@ -1328,6 +1349,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }
                         KeyCode::End => {
                             app.cursor_idx = app.input_buffer.len();
+                            if !app.auto_scroll {
+                                app.scroll_to_bottom();
+                            }
                         }
                         KeyCode::Delete => {
                             app.clamp_cursor();
@@ -1381,6 +1405,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     _ => {}
                                 }
                             } else {
+                                if c == ' ' && app.input_buffer.is_empty() && !app.auto_scroll {
+                                    app.scroll_to_bottom();
+                                    needs_redraw = true;
+                                    continue;
+                                }
                                 app.clamp_cursor();
                                 app.input_buffer.insert(app.cursor_idx, c);
                                 app.cursor_idx += c.len_utf8();
@@ -1426,6 +1455,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.last_esc_press = None;
                         }
                         KeyCode::Esc => {
+                            if !app.auto_scroll && app.input_buffer.is_empty() && !is_slash_open {
+                                app.scroll_to_bottom();
+                                needs_redraw = true;
+                                continue;
+                            }
                             if is_slash_open {
                                 app.input_buffer.clear();
                                 app.cursor_idx = 0;
@@ -1609,6 +1643,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
 
                                 app.session.add_message(Message::user(user_prompt_clean));
+                                app.scroll_to_bottom();
 
                                 // ⚡ START TURN!
                                 app.start_stream_turn(event_tx.clone());

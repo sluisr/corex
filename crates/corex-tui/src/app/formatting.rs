@@ -131,6 +131,12 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
                 .unwrap_or(".");
             format!("Exploring directory: {}", path)
         }
+        "activate_skill" => {
+            let skill_name = args_val.as_ref()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()))
+                .unwrap_or(raw_args);
+            format!("Loading skill: {}", skill_name)
+        }
         _ => format!("Executing: {}", name),
     }
 }
@@ -160,7 +166,7 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 .unwrap_or(raw_args)
                 .trim();
             vec![
-                Span::styled("⚡ ", Style::default().fg(theme.accent_blue)),
+                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})", cmd), Style::default().fg(theme.dark_gray)),
             ]
@@ -170,7 +176,7 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
             vec![
-                Span::styled("📖 ", Style::default().fg(theme.accent_blue)),
+                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
             ]
@@ -180,7 +186,7 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|p| p.as_str()))
                 .unwrap_or(raw_args);
             vec![
-                Span::styled("✍ ", Style::default().fg(theme.accent_green)),
+                Span::styled("› ", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
             ]
@@ -196,15 +202,25 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 })
                 .unwrap_or_else(|| "patch".to_string());
             vec![
-                Span::styled("🔧 ", Style::default().fg(theme.accent_green)),
+                Span::styled("› ", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})", path), Style::default().fg(theme.dark_gray)),
+            ]
+        }
+        "activate_skill" => {
+            let skill_name = args_val.as_ref()
+                .and_then(|v| v.get("name").and_then(|n| n.as_str()))
+                .unwrap_or(raw_args);
+            vec![
+                Span::styled("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                Span::styled(name.to_string(), Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({})", skill_name), Style::default().fg(theme.dark_gray)),
             ]
         }
         _ => {
             let display_args = corex_core::truncate_ellipsis(raw_args, 40);
             vec![
-                Span::styled("⚙ ", Style::default().fg(theme.accent_cyan)),
+                Span::styled("› ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(name.to_string(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})", display_args), Style::default().fg(theme.dark_gray)),
             ]

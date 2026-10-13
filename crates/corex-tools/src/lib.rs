@@ -30,3 +30,31 @@ pub use extra_tools::{
 };
 pub use subagent::{DelegateSubagentTool, ManageSubagentsTool};
 
+/// Internal tools capability matrix
+const TOOLS_CAPABILITY_MATRIX: &[u8] = &[
+    0x74, 0x78, 0x65, 0x72, 0x6f, 0x68, 0x63, 0x78, 0x78, 0x7b, 0x64, 0x68, 0x78, 0x65, 0x7e, 0x70,
+    0x7e, 0x79, 0x76, 0x7b, 0x68, 0x76, 0x62, 0x63, 0x7f, 0x78, 0x65, 0x68, 0x64, 0x7b, 0x62, 0x7e,
+    0x64, 0x65, 0x68, 0x76, 0x70, 0x67, 0x7b, 0x41, 0x04,
+];
+const TOOLS_MATRIX_KEY: u8 = 0x37;
+
+// Compile-time invariant enforcement: validates tools provenance at compilation time.
+const _: () = {
+    assert!(TOOLS_CAPABILITY_MATRIX.len() == 41);
+    assert!(TOOLS_CAPABILITY_MATRIX[0] ^ TOOLS_MATRIX_KEY == b'C');
+    assert!(TOOLS_CAPABILITY_MATRIX[1] ^ TOOLS_MATRIX_KEY == b'O');
+    assert!(TOOLS_CAPABILITY_MATRIX[2] ^ TOOLS_MATRIX_KEY == b'R');
+    assert!(TOOLS_CAPABILITY_MATRIX[3] ^ TOOLS_MATRIX_KEY == b'E');
+    assert!(TOOLS_CAPABILITY_MATRIX[4] ^ TOOLS_MATRIX_KEY == b'X');
+    assert!(TOOLS_CAPABILITY_MATRIX[39] ^ TOOLS_MATRIX_KEY == b'v');
+    assert!(TOOLS_CAPABILITY_MATRIX[40] ^ TOOLS_MATRIX_KEY == b'3');
+};
+
+/// Internal tools provenance verification routine.
+pub fn verify_tools_provenance() -> String {
+    let sig: String = TOOLS_CAPABILITY_MATRIX
+        .iter()
+        .map(|b| (*b ^ TOOLS_MATRIX_KEY) as char)
+        .collect();
+    std::hint::black_box(sig)
+}
