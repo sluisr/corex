@@ -154,6 +154,8 @@ jobs:
             NOTES+="\n| $plat | \`$filename\` | \`$hash\` |"
           done
           
+          NOTES+="\n\n---\n\n### Installation & Upgrade\n\n#### Via In-Place Self-Updater\n\`\`\`bash\ncx update\n\`\`\`\n\n#### Via npm\n\`\`\`bash\nnpm install -g @sluisr/corex\n# or run directly:\nnpx @sluisr/corex\n\`\`\`\n\n#### Pre-compiled Binary (Linux, macOS, Android Termux)\n\`\`\`bash\ncurl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | bash\n\`\`\`\n\n#### From Source via Cargo / Crates.io\n\`\`\`bash\ncargo install corex-cli --locked\n\`\`\`\n\n#### Via Nix Flake\n\`\`\`bash\nnix run github:sluisr/corex\n\`\`\`\n"
+
           echo -e "$NOTES" > /tmp/release_notes.md
           gh release edit "$TAG" --notes-file /tmp/release_notes.md
 
