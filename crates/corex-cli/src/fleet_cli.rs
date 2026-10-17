@@ -323,6 +323,89 @@ async fn broadcast_cmd(workspace: &Path, targets: &str, command: &str, sudo: boo
     Ok(())
 }
 
+const DEFAULT_FLEET_TEMPLATE: &str = r#"# Corex Fleet Configuration Template
+# Place this at .corex/fleet.toml (per-project) or ~/.config/corex/fleet.toml (global)
+
+default_cluster = "production"
+timeout_secs = 25
+
+# Safe commands that execute without interactive confirmation prompt
+safe_commands = [
+    "uptime",
+    "uname",
+    "df",
+    "free",
+    "ps",
+    "cat",
+    "ls",
+    "pwd",
+    "whoami",
+    "docker ps",
+    "systemctl status",
+    "journalctl",
+    "ss",
+    "ip a",
+    "ip r"
+]
+
+# High-risk commands that require strict approval
+dangerous_commands = [
+    "rm -rf",
+    "reboot",
+    "shutdown",
+    "mkfs",
+    "dd if=",
+    "iptables -F"
+]
+
+# Standalone VPS nodes
+[[nodes]]
+id = "staging-vps"
+name = "Staging Environment"
+host = "staging.example.com"
+user = "deploy"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+tags = ["staging", "docker"]
+sudo = true
+
+# Clustered VPS nodes
+[clusters.production]
+name = "Production Web & DB Cluster"
+description = "Main production servers"
+
+[[clusters.production.nodes]]
+id = "prod-web-01"
+name = "Web Worker 1"
+host = "203.0.113.10"
+user = "deploy"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+tags = ["web", "nginx", "prod"]
+sudo = true
+
+[[clusters.production.nodes]]
+id = "prod-web-02"
+name = "Web Worker 2"
+host = "203.0.113.11"
+user = "deploy"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+tags = ["web", "nginx", "prod"]
+sudo = true
+
+[[clusters.production.nodes]]
+id = "prod-db-01"
+name = "PostgreSQL Primary"
+host = "10.0.1.15"
+user = "postgres"
+port = 22
+key_path = "~/.ssh/id_ed25519"
+proxy_jump = "deploy@203.0.113.10" # Bastion / Jump host support
+tags = ["db", "postgres", "prod"]
+sudo = false
+"#;
+
 async fn init_fleet_config(workspace: &Path) -> Result<()> {
     let dir = workspace.join(".corex");
     let target = dir.join("fleet.toml");
@@ -332,8 +415,7 @@ async fn init_fleet_config(workspace: &Path) -> Result<()> {
     }
 
     corex_core::ensure_private_dir(&dir)?;
-    let template = include_str!("../../../.corex/fleet.example.toml");
-    corex_core::write_private_atomic(&target, template)?;
+    corex_core::write_private_atomic(&target, DEFAULT_FLEET_TEMPLATE)?;
     println!("{} Created template configuration at: {}", "✓ Success:".green().bold(), target.display().to_string().cyan());
     println!("Edit this file to add your VPS IP addresses, SSH keys, and clusters.");
     Ok(())
