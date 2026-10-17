@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenSSH-Compliant Config Parser (`~/.ssh/config`)**: Supports `Key=Value` syntax, multiple host aliases, ignores non-host `Match` blocks, respects *first-match-wins*, expands `~/` paths, and enforces `0600` private file permissions.
 - **Multi-Distro Resilient Telemetry Probing**: Section-delimited parsing (`===CX_*===`) with `LC_ALL=C`, supporting Docker overlay, ZFS, and LVM root partitions with CPU core detection.
 
+#### DeepSeek Ecosystem & Native Search / Fetch Protocol
+- **DeepSeek Native Search & Fetch API Integration (`crates/corex-tools/src/web.rs`)**: Direct integration with DeepSeek's official `POST https://api.deepseek.com/v1/tools/search` and `POST https://api.deepseek.com/v1/tools/fetch` endpoints for autonomous web research, markdown scraping, and query operator filtering (`site:`, `lang:`, `after:`, `before:`, `-"..."`).
+- **DeepSeek-V4.1-Flash-1017 Model Engine Support**: Added first-class recognition, CLI parsing (`cx -m deepseek-v4.1-flash-1017`), and status display for DeepSeek's newly released model ("wish-driven programming", faster task completion, lower latency).
+
 #### Security & Sandbox Hardening
 - **Forensic Audit Logging & 7-Day Auto-Retention (`corex-core::forensic`)**: Integrated `ForensicLogger` recording structured audit trails to `~/.corex/logs/corex-forensic-YYYY-MM-DD.log` and `.corex/forensic.log`, capturing every tool call, shell command, file change, and LLM exchange with millisecond timestamps and 7-day retention cleanup.
 - **Per-Path Advisory Concurrency Locking (`corex-core::file_lock`)**: Implemented `PathGuard` and per-path advisory sidecar file locking (`~/.corex/locks/<hash>.lock`) using FNV-1a hashing to eliminate silent lost updates across concurrent Tokio background tasks and multiple Corex processes.
