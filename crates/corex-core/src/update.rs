@@ -205,7 +205,7 @@ pub fn verify_checksum_from_text(
     ))
 }
 
-/// Checks online (GitHub releases API, then GitHub tags fallback) for the latest Corex version in sluisr/corex.
+/// Checks online for the latest Corex version with multi-tier fallback (CDN, GitHub API with token, Web redirect).
 /// Sets a strict 3-second timeout so it never hangs or blocks the CLI/TUI.
 pub async fn check_for_update_online(current_version: &str) -> Option<String> {
     let client = reqwest::Client::builder()
@@ -214,42 +214,59 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         .build()
         .ok()?;
 
-    let repo_endpoints = [
-        "https://api.github.com/repos/sluisr/corex",
-    ];
-
-    for base in repo_endpoints {
-        // 1. Try GitHub Releases API
-        let github_url = format!("{}/releases/latest", base);
-        if let Ok(resp) = client.get(&github_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    if let Some(tag) = val.get("tag_name").and_then(|t| t.as_str()) {
-                        let clean_tag = tag.trim_start_matches('v').to_string();
-                        if is_newer_version(current_version, &clean_tag) {
-                            save_cache(&clean_tag);
-                            return Some(clean_tag);
-                        }
+    // 1. Try Official CDN endpoint first (fastest, zero rate limits)
+    if let Ok(resp) = client.get("https://corex.sluisr.com/release.json").send().await {
+        if resp.status().is_success() {
+            if let Ok(val) = resp.json::<serde_json::Value>().await {
+                if let Some(tag) = val.get("tag").or_else(|| val.get("version")).and_then(|t| t.as_str()) {
+                    let clean_tag = tag.trim_start_matches('v').to_string();
+                    if is_newer_version(current_version, &clean_tag) {
+                        save_cache(&clean_tag);
+                        return Some(clean_tag);
                     }
                 }
             }
         }
+    }
 
-        // 2. Try GitHub Tags API fallback
-        let tags_url = format!("{}/tags", base);
-        if let Ok(resp) = client.get(&tags_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    if let Some(tags_array) = val.as_array() {
-                        for item in tags_array {
-                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
-                                let clean_tag = name.trim_start_matches('v').to_string();
-                                if is_newer_version(current_version, &clean_tag) {
-                                    save_cache(&clean_tag);
-                                    return Some(clean_tag);
-                                }
-                                break;
-                            }
+    // 2. Try GitHub Releases API with optional auth token
+    let mut req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        let token = token.trim();
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+    }
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
+            if let Ok(val) = resp.json::<serde_json::Value>().await {
+                if let Some(tag) = val.get("tag_name").and_then(|t| t.as_str()) {
+                    let clean_tag = tag.trim_start_matches('v').to_string();
+                    if is_newer_version(current_version, &clean_tag) {
+                        save_cache(&clean_tag);
+                        return Some(clean_tag);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: GitHub Web redirect (zero REST rate limit)
+    let no_redir_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .user_agent(format!("corex/{}", current_version))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    if let Ok(resp) = no_redir_client.get("https://github.com/sluisr/corex/releases/latest").send().await {
+        if resp.status().is_redirection() {
+            if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+                if let Ok(loc_str) = loc.to_str() {
+                    if let Some(tag) = loc_str.split("/tag/").nth(1) {
+                        let clean_tag = tag.trim_matches('/').trim_start_matches('v').to_string();
+                        if is_newer_version(current_version, &clean_tag) {
+                            save_cache(&clean_tag);
+                            return Some(clean_tag);
                         }
                     }
                 }
@@ -260,7 +277,24 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
     None
 }
 
-/// Fetches full metadata of latest GitHub release.
+#[derive(Debug, Deserialize)]
+struct CdnReleasePayload {
+    tag: Option<String>,
+    version: Option<String>,
+    #[serde(default)]
+    binaries: Vec<CdnBinaryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdnBinaryEntry {
+    archive: String,
+    url: String,
+}
+
+/// Fetches full metadata of latest GitHub release with multi-tiered resilient fallback:
+/// 1. GitHub API (with GITHUB_TOKEN/GH_TOKEN if available)
+/// 2. Official High-Availability CDN (https://corex.sluisr.com/release.json)
+/// 3. GitHub Releases Web Redirect (https://github.com/sluisr/corex/releases/latest -> 302 Location header)
 pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseInfo, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -268,23 +302,84 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         .build()
         .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
 
-    let url = "https://api.github.com/repos/sluisr/corex/releases/latest";
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach GitHub Releases API: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API responded with status {}", resp.status()));
+    // Tier 1: Try GitHub REST API (attach token if available in env)
+    let mut api_req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+        let token = token.trim();
+        if !token.is_empty() {
+            api_req = api_req.bearer_auth(token);
+        }
     }
 
-    let release = resp
-        .json::<ReleaseInfo>()
-        .await
-        .map_err(|e| format!("Failed to parse release information: {}", e))?;
+    let mut last_api_err = None;
+    match api_req.send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Ok(release) = resp.json::<ReleaseInfo>().await {
+                    return Ok(release);
+                }
+            } else {
+                last_api_err = Some(format!("GitHub API responded with status {}", resp.status()));
+            }
+        }
+        Err(e) => {
+            last_api_err = Some(format!("Failed to reach GitHub Releases API: {}", e));
+        }
+    }
 
-    Ok(release)
+    // Tier 2: Try Official CDN endpoint (Cloudflare hosted, zero rate limits)
+    let cdn_url = "https://corex.sluisr.com/release.json";
+    if let Ok(resp) = client.get(cdn_url).send().await {
+        if resp.status().is_success() {
+            if let Ok(payload) = resp.json::<CdnReleasePayload>().await {
+                let tag = payload.tag.or(payload.version);
+                if let Some(tag_name) = tag {
+                    let assets = payload.binaries.into_iter().map(|b| ReleaseAsset {
+                        name: b.archive,
+                        browser_download_url: b.url,
+                        size: None,
+                    }).collect();
+                    return Ok(ReleaseInfo {
+                        tag_name,
+                        html_url: Some("https://corex.sluisr.com".to_string()),
+                        body: None,
+                        assets,
+                    });
+                }
+            }
+        }
+    }
+
+    // Tier 3: Follow GitHub web release redirect (no API quota restrictions)
+    let no_redirect_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(format!("corex/{}", current_version))
+        .redirect(reqwest::redirect::Policy::none())
+        .build();
+
+    if let Ok(client_nr) = no_redirect_client {
+        if let Ok(resp) = client_nr.get("https://github.com/sluisr/corex/releases/latest").send().await {
+            if resp.status().is_redirection() {
+                if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+                    if let Ok(loc_str) = loc.to_str() {
+                        if let Some(tag) = loc_str.split("/tag/").nth(1) {
+                            let tag = tag.trim_matches('/').to_string();
+                            return Ok(ReleaseInfo {
+                                tag_name: tag,
+                                html_url: Some(loc_str.to_string()),
+                                body: None,
+                                assets: vec![],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(last_api_err.unwrap_or_else(|| {
+        "Could not retrieve latest release information across GitHub API, CDN, and web mirrors. Check internet connectivity.".to_string()
+    }))
 }
 
 /// Maximum extracted binary size (200 MB) to guard against decompression bombs.
@@ -632,6 +727,14 @@ mod tests {
 
         let extracted = extract_binary_from_archive(&gz_bytes, false, "cx").unwrap();
         assert_eq!(extracted, payload);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_release_info_fallback() {
+        let release = fetch_latest_release_info("0.6.3").await;
+        assert!(release.is_ok(), "fetch_latest_release_info should succeed via CDN/fallback: {:?}", release.err());
+        let rel = release.unwrap();
+        assert!(rel.tag_name.starts_with('v'));
     }
 }
 
