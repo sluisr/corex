@@ -1,6 +1,6 @@
-# Corex (`cx`)
+# Corex (`cx` & `cxs`)
 
-> High-performance autonomous terminal agent for DeepSeek, Gemini, Claude, OpenAI, and local LLMs, written in native Rust.
+> High-performance autonomous terminal agent for software engineering & server infrastructure automation (DeepSeek, Gemini, Claude, OpenAI & Local LLMs), written in native Rust.
 
 [![Release](https://img.shields.io/github/v/release/sluisr/corex?style=flat-square&color=2563eb&label=release)](https://github.com/sluisr/corex/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/sluisr/corex/ci.yml?style=flat-square&label=ci)](https://github.com/sluisr/corex/actions)
@@ -12,9 +12,12 @@
 
 ## Overview
 
-**Corex** (invoked as `cx` or `corex`) is a native terminal coding agent architected for software engineers who require low latency, deterministic execution, and air-gapped privacy.
+**Corex** (invoked as `cx`, `corex`, or `cxs`) is a native terminal agent architected for software engineers and systems administrators who require low latency, deterministic execution, and air-gapped privacy:
 
-Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It delivers sub-10ms startup times, runs as a single self-contained static binary, and consumes negligible system memory.
+- **`cx` / `corex`**: Autonomous coding and full-stack software development assistant with multi-turn reasoning, subagents, and fuzzy patching.
+- **`cxs` / `cx --fleet`**: Dedicated SysAdmin & Fleet automation console for remote VPS nodes and server clusters, featuring live SSH telemetries (CPU, RAM, Disk) and embedded interactive PTY terminal multiplexing.
+
+Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It delivers sub-10ms startup times, runs as single self-contained static binaries, and consumes negligible system memory (~11.9 MB RSS).
 
 > [!NOTE]
 > **Release Status:** Active Development / Beta (`v0.7.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
@@ -23,16 +26,18 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 
 ## Key Highlights
 
+- **Server & Fleet Automation (`cxs`):** Built-in remote VPS cluster management and SysAdmin console (`cxs` or `cx --fleet`). Inspect remote CPU/RAM/Disk metrics, broadcast commands across node clusters, and launch interactive embedded SSH sessions with zero external dependencies.
 - **Native Systems Architecture:** Compiled static binary (~7.0 MB stripped) with zero external runtime dependencies. Instant startup (<10ms) and minimal RAM utilization (~11.9 MB RSS, with only ~2.2 MB anonymous heap).
 - **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash & 2.5 with Thought Signatures), Anthropic Claude (Claude 3.7 / 3.5 Sonnet via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq (500+ tok/s), GitHub Models, OpenRouter, and Mistral AI.
 - **Air-Gapped Offline Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1` for 100% private, zero-cost ($0.00) execution with 0 bytes network egress.
 - **Mobile Vertical / Termux Responsive UX:** Auto-detection for Android Termux portrait screens, native tap-to-keyboard, non-overlapping 2-column status bar, and stacked modals for narrow terminals.
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
-- **Enterprise Sandbox & Path Guards:** Path-level concurrency locking (`lock_path`) and strict protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
+- **Enterprise Sandbox & Concurrency Locks:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus strict protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
+- **Forensic Session Audit:** Cryptographic session logging with millisecond timestamps to `~/.corex/logs/corex-forensic-YYYY-MM-DD.log` with automatic 7-day retention.
+- **Global & Workspace Personality (`SYSTEM.md`):** Discovers and applies persistent behavioral rules from `~/.corex/SYSTEM.md` and workspace `COREX.md`.
 - **Native Clipboard Integration:** Seamless terminal text copying via OSC 52 sequences and platform clipboard integration.
 - **KV Cache Preservation:** Context management and tool compression maintain up to a 96%+ KV Cache hit rate across supported providers.
-- **Forensic Telemetry:** Real-time tracking of Time-To-First-Token (TTFT), tokens/sec throughput, cache hit percentage, and exact financial costs ($USD).
 - **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands, plus contextual non-intrusive provider auth.
 - **Model Context Protocol (MCP):** Compatible with standard MCP servers (database connectors, GitHub tools, Docker controllers).
 
@@ -71,20 +76,20 @@ Corex metrics are benchmarked on Linux x86_64 (Linux 6.x kernel, modern x86_64/A
 
 ## Operating Modes
 
-Corex supports two independent execution paradigms, selectable at runtime via `/model`:
+Corex supports three unified execution paradigms:
 
 ```text
                            ┌─────────────────────────────┐
                            │    Corex Operating Modes    │
                            └──────────────┬──────────────┘
                                           │
-                  ┌───────────────────────┴───────────────────────┐
-                  ▼                                               ▼
-       ┌──────────────────────┐                       ┌──────────────────────┐
-       │ 1. Frontier Cloud    │                       │  2. Sovereign Local  │
-       │ (DeepSeek / Gemini / │                       │ (llama-server/Ollama/│
-       │  Claude / OpenAI...) │                       │  Air-Gapped Privacy) │
-       └──────────────────────┘                       └──────────────────────┘
+                  ┌───────────────────────┼───────────────────────┐
+                  ▼                       ▼                       ▼
+       ┌──────────────────────┐┌──────────────────────┐┌──────────────────────┐
+       │ 1. Frontier Cloud    ││  2. Sovereign Local  ││ 3. Fleet & SysAdmin  │
+       │ (DeepSeek / Gemini / ││ (llama-server/Ollama/││ (cxs / Remote VPS /  │
+       │  Claude / OpenAI...) ││  Air-Gapped Privacy) ││  SSH Clusters)       │
+       └──────────────────────┘└──────────────────────┘└──────────────────────┘
 ```
 
 ### 1. Frontier Cloud Matrix
@@ -96,6 +101,11 @@ Corex supports two independent execution paradigms, selectable at runtime via `/
 - **Engines:** Any GGUF model served via `llama-server` (llama.cpp) or `Ollama` on `http://127.0.0.1:8080/v1`.
 - **Behavior:** 100% offline, air-gapped execution. Zero network calls, zero telemetry, null-routed egress, and $0.00 API cost.
 - **Best For:** Proprietary codebases, classified perimeters, air-gapped environments, and offline development.
+
+### 3. Fleet & SysAdmin Remote Infrastructure (`cxs`)
+- **Engine:** Built-in SSH client and multi-node orchestrator (`cxs` or `cx --fleet`).
+- **Behavior:** Dual-pane split-screen TUI with AI assistance on the left and a live remote server terminal + real-time CPU/RAM/Disk metrics on the right. Supports bastion/jump hosts, key-based auth, and automated diagnostic commands.
+- **Best For:** Server monitoring, incident response, cluster maintenance, and automated deployments.
 
 ---
 
@@ -229,6 +239,32 @@ cd my-project/
 cx
 ```
 
+### Fleet & SysAdmin Remote Infrastructure Mode (`cxs`)
+
+Launch the live interactive split-screen SysAdmin console or execute cluster commands:
+
+```bash
+# Launch interactive dual-pane Fleet console (AI Chat + Live SSH Server Terminal)
+cxs
+# or
+cx --fleet
+
+# Ping all nodes or a specific cluster
+cxs ping
+cxs ping --cluster production
+
+# View live top metrics (CPU, RAM, Disk, Load) across fleet
+cxs top
+cxs top --cluster production
+
+# Execute command on a specific node or broadcast across entire cluster
+cxs run prod-web-01 "systemctl status nginx"
+cxs broadcast production "uptime && free -h"
+
+# Initialize template fleet configuration in current workspace (.corex/fleet.toml)
+cxs init
+```
+
 ### Non-Interactive / Scripting Mode
 
 Execute automated one-shot tasks directly from your shell:
@@ -267,6 +303,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 
 | Command | Description |
 | :--- | :--- |
+| `/fleet` / `/sysadmin` | Open interactive Fleet dual-pane console: select remote VPS nodes, view metrics & attach PTY. |
 | `/model` | Master-detail catalog: select provider/model (DeepSeek, Gemini, Claude, OpenAI, Groq, Local) & tune CoT sliders. |
 | `/auth` | Configure API credentials securely. |
 | `/balance` | Check current account credits and token balance asynchronously (`/wallet`). |
@@ -312,11 +349,16 @@ Configuration and logs are stored globally in `~/.corex/` and can be overridden 
 
 | Path | Description |
 | :--- | :--- |
-| `~/.corex/settings.json` | Global settings, provider keys, base URLs, and allowed commands. |
-| `.corex/settings.json` | Project-level workspace overrides (checked into repo or local). |
+| `~/.corex/fleet.toml` | Global Fleet configuration: VPS nodes, clusters, SSH keys, jump hosts, and command whitelist. |
+| `.corex/fleet.toml` | Workspace-level Fleet overrides for project-specific infrastructure nodes. |
+| `~/.corex/system.md` | Global AI personality, operational rules, and behavioral guidelines injected into all sessions. |
+| `.corex/system.md` | Workspace-level AI instructions and coding constraints. |
+| `~/.corex/settings.json` | Global provider credentials, base URLs, default model, and allowed commands. |
+| `.corex/settings.json` | Project-level workspace settings overrides (secrets automatically stripped before git). |
 | `~/.corex/flash_settings.json` | CoT reasoning depth configuration for Flash. |
 | `~/.corex/pro_settings.json` | Deep reasoning configuration for Pro. |
-| `~/.corex/logs/` | Daily forensic audit logs (`corex-forensic-YYYY-MM-DD.log`). |
+| `~/.corex/logs/` | Daily forensic audit logs (`corex-forensic-YYYY-MM-DD.log`, 7-day retention). |
+| `~/.corex/locks/` | Advisory per-path concurrency file locks (`<hash>.lock`). |
 
 ---
 
