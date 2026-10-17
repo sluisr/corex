@@ -90,15 +90,17 @@ impl LocalLlmClient {
         };
 
         let msg_count = request_body.messages.len();
-        let body_serialized = serde_json::to_string_pretty(&request_body).unwrap_or_default();
-        crate::forensic::ForensicLogger::log_llm_request(
-            "Local LLM (llama-server)",
-            &self.model_name,
-            &url,
-            msg_count,
-            0,
-            &body_serialized
-        );
+        if crate::forensic::ForensicLogger::is_enabled() {
+            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
+            crate::forensic::ForensicLogger::log_llm_request(
+                "Local LLM (llama-server)",
+                &self.model_name,
+                &url,
+                msg_count,
+                0,
+                &body_serialized,
+            );
+        }
 
         debug!("[LOCAL_LLM] POST {} (streaming, model: {})", url, self.model_name);
 
@@ -340,13 +342,13 @@ Be concise, technical, and omit conversational filler."#;
 Classify the user's intent into EXACTLY one of three categories:
 
 [CHAT] (Reply 'CHAT'):
-- Greetings, farewells, conversational remarks ('hola', 'cómo estás', 'gracias').
-- Personal assistant questions, meta-questions ('quién eres?', 'qué sabes hacer?').
-- Pure theoretical/conceptual questions without requiring file modifications ('qué es async?', 'explica REST').
+- Greetings, farewells, conversational remarks ('hello', 'how are you', 'thanks').
+- Personal assistant questions, meta-questions ('who are you?', 'what can you do?').
+- Pure theoretical/conceptual questions without requiring file modifications ('what is async?', 'explain REST').
 
 [INSPECT] (Reply 'INSPECT'):
-- Inquiries about hardware, PC metrics, CPU, RAM, disk, network ('revisa mi pc', 'cuánta RAM tengo', 'lscpu').
-- Read-only workspace inspection, directory listing, searching ('qué archivos hay aquí?', 'busca dónde está x').
+- Inquiries about hardware, PC metrics, CPU, RAM, disk, network ('inspect my pc', 'how much RAM do I have', 'lscpu').
+- Read-only workspace inspection, directory listing, searching ('what files are here?', 'find where x is').
 
 [CODE] (Reply 'CODE'):
 - Code generation, bug fixing, refactoring, modifying files, executing builds, test suites, or implementing features.
@@ -424,12 +426,12 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
         return Some(IntentDecision::LocalChat);
     }
 
-    // Clean leading/trailing punctuation (including Spanish inverted ¿, ¡)
+    // Clean leading/trailing punctuation (including inverted marks ¿ and ¡)
     let clean = lower.trim_matches(|c: char| c.is_ascii_punctuation() || c == '¿' || c == '¡' || c == '…').trim();
 
-    // Strip common leading conversational filler/particles (e.g. "vale ", "ok ", "bueno ", "oye ")
+    // Strip common leading conversational filler/particles
     let mut core_text = clean;
-    let fillers = ["vale ", "ok ", "bueno ", "oye ", "hey ", "hola ", "hello ", "por favor "];
+    let fillers = ["please ", "por favor ", "ok ", "hey ", "hello ", "hi ", "hola ", "bueno ", "oye ", "vale "];
     for f in fillers {
         if core_text.starts_with(f) {
             core_text = core_text[f.len()..].trim();
@@ -439,7 +441,7 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
     // 1. Definite heavy coding & workspace modification/inspection indicators -> DeepSeek Cloud
     let code_keywords = [
         "refactor", "refactoriza", "corrige", "arregla", "fix ", "fix:", "bug",
-        "patch", "aplica el parche", "apply_patch", "implementa", "implement ",
+        "patch", "aplica el parche", "apply patch", "apply the patch", "apply_patch", "implementa", "implement ",
         "escribe una funcion", "escribe una función", "write a function", "write code",
         "crea un archivo", "create file", "modifica el archivo", "edit file",
         "crea una app", "haz una app", "build an app", "desarrolla",
@@ -455,11 +457,11 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
 
     // 2. Hardware / OS / System diagnostics -> Local Inspection
     let inspect_exact = [
-        "revisa mi pc", "revisa el pc", "que pc tengo", "qué pc tengo", "mi pc",
-        "specs", "hardware", "cpu", "gpu", "ram", "memoria", "cuanta ram", "cuánta ram",
-        "disco", "espacio en disco", "temperatura", "temperaturas", "neofetch", "fastfetch",
+        "inspect my pc", "check my pc", "my pc", "revisa mi pc", "revisa el pc", "que pc tengo", "qué pc tengo", "mi pc",
+        "specs", "hardware", "cpu", "gpu", "ram", "memoria", "how much ram", "cuanta ram", "cuánta ram",
+        "disco", "disk space", "espacio en disco", "temperatura", "temperaturas", "neofetch", "fastfetch",
         "lscpu", "free -h", "df -h", "uname -a", "hostnamectl", "uptime", "top", "htop",
-        "lista los archivos", "muestra los archivos", "que archivos hay", "qué archivos hay",
+        "list files", "show files", "lista los archivos", "muestra los archivos", "que archivos hay", "qué archivos hay",
         "ls", "tree", "pwd", "ip a", "ifconfig", "ping",
     ];
     if inspect_exact.iter().any(|&k| core_text == k || core_text.starts_with(k) || core_text.ends_with(k)) {
@@ -468,22 +470,25 @@ pub fn fast_heuristic_intent(user_prompt: &str) -> Option<IntentDecision> {
 
     // 3. Conversational greetings / meta questions / basic explanations -> Local Chat
     let chat_exact = [
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "who are you", "what can you do", "help", "thanks", "thx", "ok", "bye",
         "hola", "buenos dias", "buenos días", "buenas tardes", "buenas noches",
-        "hello", "hi", "hey", "que tal", "qué tal", "como estas", "cómo estás",
-        "quien eres", "quién eres", "who are you", "que puedes hacer", "qué puedes hacer",
-        "como te llamas", "cómo te llamas", "ayuda", "help", "gracias", "muchas gracias",
-        "thanks", "thx", "ok", "vale", "listo", "adios", "adiós", "bye", "chau", "hasta luego",
+        "que tal", "qué tal", "como estas", "cómo estás",
+        "quien eres", "quién eres", "que puedes hacer", "qué puedes hacer",
+        "como te llamas", "cómo te llamas", "ayuda", "gracias", "muchas gracias",
+        "vale", "listo", "adios", "adiós", "chau", "hasta luego",
     ];
     if chat_exact.iter().any(|&k| core_text == k || clean == k) {
         return Some(IntentDecision::LocalChat);
     }
 
     // Explanations of theoretical concepts without code modification
-    if (core_text.starts_with("que es ") || core_text.starts_with("qué es ") || core_text.starts_with("what is ")
-        || core_text.starts_with("explica ") || core_text.starts_with("explicame ") || core_text.starts_with("explícame ")
-        || core_text.starts_with("explain ") || core_text.starts_with("diferencia entre ") || core_text.starts_with("como funciona ")
-        || core_text.starts_with("cómo funciona "))
-        && !core_text.contains("crea") && !core_text.contains("haz") && !core_text.contains("escribe") && !core_text.contains("modifica")
+    if (core_text.starts_with("what is ") || core_text.starts_with("que es ") || core_text.starts_with("qué es ")
+        || core_text.starts_with("explain ") || core_text.starts_with("explica ") || core_text.starts_with("explicame ") || core_text.starts_with("explícame ")
+        || core_text.starts_with("difference between ") || core_text.starts_with("diferencia entre ")
+        || core_text.starts_with("how does ") || core_text.starts_with("how it works") || core_text.starts_with("como funciona ") || core_text.starts_with("cómo funciona "))
+        && !core_text.contains("crea") && !core_text.contains("create") && !core_text.contains("haz") && !core_text.contains("escribe") && !core_text.contains("write")
+        && !core_text.contains("modifica") && !core_text.contains("modify") && !core_text.contains("edit")
         && !core_text.contains("revisa") && !core_text.contains("optimiza")
     {
         return Some(IntentDecision::LocalChat);
@@ -498,26 +503,26 @@ mod tests {
 
     #[test]
     fn test_fast_heuristic_chat() {
-        assert_eq!(fast_heuristic_intent("hola"), Some(IntentDecision::LocalChat));
-        assert_eq!(fast_heuristic_intent("Buenos días!"), Some(IntentDecision::LocalChat));
-        assert_eq!(fast_heuristic_intent("¿Quién eres?"), Some(IntentDecision::LocalChat));
-        assert_eq!(fast_heuristic_intent("qué es un trait en Rust?"), Some(IntentDecision::LocalChat));
-        assert_eq!(fast_heuristic_intent("explica cómo funciona async"), Some(IntentDecision::LocalChat));
+        assert_eq!(fast_heuristic_intent("hello"), Some(IntentDecision::LocalChat));
+        assert_eq!(fast_heuristic_intent("Good morning!"), Some(IntentDecision::LocalChat));
+        assert_eq!(fast_heuristic_intent("Who are you?"), Some(IntentDecision::LocalChat));
+        assert_eq!(fast_heuristic_intent("what is a trait in Rust?"), Some(IntentDecision::LocalChat));
+        assert_eq!(fast_heuristic_intent("explain how async works"), Some(IntentDecision::LocalChat));
     }
 
     #[test]
     fn test_fast_heuristic_inspection() {
-        assert_eq!(fast_heuristic_intent("revisa mi pc"), Some(IntentDecision::LocalInspection));
-        assert_eq!(fast_heuristic_intent("cuánta ram tengo"), Some(IntentDecision::LocalInspection));
+        assert_eq!(fast_heuristic_intent("inspect my pc"), Some(IntentDecision::LocalInspection));
+        assert_eq!(fast_heuristic_intent("how much ram do i have"), Some(IntentDecision::LocalInspection));
         assert_eq!(fast_heuristic_intent("lscpu"), Some(IntentDecision::LocalInspection));
-        assert_eq!(fast_heuristic_intent("lista los archivos"), Some(IntentDecision::LocalInspection));
+        assert_eq!(fast_heuristic_intent("list files"), Some(IntentDecision::LocalInspection));
     }
 
     #[test]
     fn test_fast_heuristic_coding() {
-        assert_eq!(fast_heuristic_intent("refactoriza esta función"), Some(IntentDecision::HeavyCoding));
-        assert_eq!(fast_heuristic_intent("corrige el bug en el parser"), Some(IntentDecision::HeavyCoding));
-        assert_eq!(fast_heuristic_intent("aplica el parche al archivo main.rs"), Some(IntentDecision::HeavyCoding));
+        assert_eq!(fast_heuristic_intent("refactor this function"), Some(IntentDecision::HeavyCoding));
+        assert_eq!(fast_heuristic_intent("fix the bug in the parser"), Some(IntentDecision::HeavyCoding));
+        assert_eq!(fast_heuristic_intent("apply patch to file main.rs"), Some(IntentDecision::HeavyCoding));
         assert_eq!(fast_heuristic_intent("pub fn execute() -> Result<()>"), Some(IntentDecision::HeavyCoding));
     }
 }

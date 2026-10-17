@@ -125,8 +125,45 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
 ///
 /// Locks whose last holder has gone are pruned so the registry does not grow without bound over a
 /// long session.
+fn normalize_lock_key(path: &Path) -> PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut tail = Vec::new();
+    let mut cur: &Path = &abs;
+    while let Some(name) = cur.file_name() {
+        tail.push(name.to_os_string());
+        if let Some(parent) = cur.parent() {
+            if let Ok(canon_parent) = parent.canonicalize() {
+                let mut result = canon_parent;
+                for part in tail.into_iter().rev() {
+                    if part == "." {
+                        continue;
+                    } else if part == ".." {
+                        result.pop();
+                    } else {
+                        result.push(part);
+                    }
+                }
+                return result;
+            }
+            cur = parent;
+        } else {
+            break;
+        }
+    }
+    abs
+}
+
 pub async fn lock_path(path: &Path) -> PathGuard {
-    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let key = normalize_lock_key(path);
     let mutex = {
         let mut map = path_locks()
             .lock()

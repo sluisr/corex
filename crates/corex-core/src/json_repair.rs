@@ -31,7 +31,18 @@ pub fn parse_lenient_json(raw: &str) -> Result<Value, String> {
         if let Ok(v) = serde_json::from_str::<Value>(&extracted) {
             return normalize_parsed_value(v);
         }
-        // Try repairing the extracted section
+    }
+
+    // 4. Try repairing from the first '{' or '[' to the end (handles truncated JSON with inner braces)
+    let repair_source = extract_from_first_container(&stripped).unwrap_or_else(|| stripped.clone());
+    if let Ok(repaired) = repair_json_syntax(&repair_source) {
+        if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+            return normalize_parsed_value(v);
+        }
+    }
+
+    // 5. Fallback: try repairing the bounded extraction (handles trailing commentary after broken syntax)
+    if let Some(extracted) = extract_json_bounds(&stripped) {
         if let Ok(repaired) = repair_json_syntax(&extracted) {
             if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
                 return normalize_parsed_value(v);
@@ -39,16 +50,14 @@ pub fn parse_lenient_json(raw: &str) -> Result<Value, String> {
         }
     }
 
-    // 4. Try repairing the stripped text directly
-    if let Ok(repaired) = repair_json_syntax(&stripped) {
-        if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
-            return normalize_parsed_value(v);
-        }
-    }
-
+    let preview = if raw.len() > 120 {
+        format!("{}...", crate::types::safe_truncate_str(raw, 120))
+    } else {
+        raw.to_string()
+    };
     Err(format!(
         "Failed to parse or repair JSON arguments. Raw input: '{}'",
-        if raw.len() > 120 { format!("{}...", &raw[..120]) } else { raw.to_string() }
+        preview
     ))
 }
 
@@ -85,6 +94,19 @@ fn strip_markdown_fences(s: &str) -> String {
         text = text[..text.len() - 3].trim();
     }
     text.to_string()
+}
+
+/// Extracts content from the first opening brace/bracket to the end of the string.
+fn extract_from_first_container(s: &str) -> Option<String> {
+    let first_brace = s.find('{');
+    let first_bracket = s.find('[');
+    let start_idx = match (first_brace, first_bracket) {
+        (Some(b), Some(k)) => Some(b.min(k)),
+        (Some(b), None) => Some(b),
+        (None, Some(k)) => Some(k),
+        (None, None) => None,
+    }?;
+    Some(s[start_idx..].to_string())
 }
 
 /// Extracts content between the first opening brace/bracket and last closing brace/bracket.
@@ -130,7 +152,13 @@ fn repair_json_syntax(input: &str) -> Result<String, String> {
         if in_string {
             if escape_next {
                 escape_next = false;
-                out.push(ch);
+                if quote_char == '\'' && ch == '\'' {
+                    // `\'` inside single-quoted string becomes unescaped `'` inside double-quoted JSON string
+                    out.pop(); // remove preceding `\`
+                    out.push('\'');
+                } else {
+                    out.push(ch);
+                }
             } else if ch == '\\' {
                 escape_next = true;
                 out.push(ch);
@@ -181,8 +209,12 @@ fn repair_json_syntax(input: &str) -> Result<String, String> {
         i += 1;
     }
 
-    // If the stream ended while inside a string, close the string
+    // If the stream ended while inside a string, close the string.
+    // If the string ended with an unescaped trailing backslash, strip it so the closing quote is not escaped.
     if in_string {
+        if escape_next {
+            out.pop();
+        }
         out.push('"');
     }
 
@@ -268,4 +300,34 @@ mod tests {
         let v = parse_lenient_json("").unwrap();
         assert!(v.is_object());
     }
+
+    #[test]
+    fn test_truncated_nested_json_preserves_second_key() {
+        let raw = r#"{"a": {"x": 1}, "b": "hello"#;
+        let v = parse_lenient_json(raw).unwrap();
+        assert_eq!(v["a"]["x"], 1);
+        assert_eq!(v["b"], "hello");
+    }
+
+    #[test]
+    fn test_escaped_single_quote_in_single_quoted_json() {
+        let raw = r#"{'msg': 'it\'s working'}"#;
+        let v = parse_lenient_json(raw).unwrap();
+        assert_eq!(v["msg"], "it's working");
+    }
+
+    #[test]
+    fn test_multibyte_utf8_invalid_json_error_does_not_panic() {
+        let raw = "ñ".repeat(100);
+        let res = parse_lenient_json(&raw);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_truncated_string_ending_with_backslash() {
+        let raw = r#"{"a": "hello\"#;
+        let v = parse_lenient_json(raw).expect("truncated string ending with backslash must be repaired");
+        assert_eq!(v["a"], "hello");
+    }
 }
+

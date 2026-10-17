@@ -96,6 +96,36 @@ impl Session {
             .unwrap_or_else(|| PathBuf::from(".corex/sessions"))
     }
 
+    pub fn fleet_sessions_dir() -> PathBuf {
+        BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(".corex").join("fleet_sessions"))
+            .unwrap_or_else(|| PathBuf::from(".corex/fleet_sessions"))
+    }
+
+    pub fn is_fleet(&self) -> bool {
+        self.tag.as_deref() == Some("fleet") || self.title == "SysAdmin Fleet Console"
+    }
+
+    pub fn target_dir(&self) -> PathBuf {
+        if self.is_fleet() {
+            Self::fleet_sessions_dir()
+        } else {
+            Self::sessions_dir()
+        }
+    }
+
+    pub fn find_session_file(id: &str) -> Option<PathBuf> {
+        let f1 = Self::sessions_dir().join(format!("{}.json", id));
+        if f1.exists() {
+            return Some(f1);
+        }
+        let f2 = Self::fleet_sessions_dir().join(format!("{}.json", id));
+        if f2.exists() {
+            return Some(f2);
+        }
+        None
+    }
+
     pub fn add_message(&mut self, message: Message) {
         if self.messages.is_empty() && message.role == "user" {
             if let Some(text) = message.text_content() {
@@ -117,9 +147,17 @@ impl Session {
     }
 
     pub fn save(&self) -> Result<()> {
-        let dir = Self::sessions_dir();
+        let dir = self.target_dir();
         crate::secure_fs::ensure_private_dir(&dir)?;
-        let file = dir.join(format!("{}.json", self.id));
+        let safe_id: String = self
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if safe_id.is_empty() {
+            bail!("Invalid session identifier.");
+        }
+        let file = dir.join(format!("{}.json", safe_id));
         let serialized = serde_json::to_string_pretty(self)?;
         crate::secure_fs::write_private_atomic(&file, serialized.as_bytes())?;
         Ok(())
@@ -130,8 +168,15 @@ impl Session {
         self.save()
     }
 
+    fn is_safe_session_id(s: &str) -> bool {
+        !s.is_empty()
+            && !s.contains("..")
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+    }
+
     pub fn load_by_id_or_tag(id_or_tag: &str) -> Result<Self> {
-        let dir = Self::sessions_dir();
         let target = id_or_tag.trim();
 
         if target.is_empty() {
@@ -139,24 +184,31 @@ impl Session {
         }
 
         // 1. Direct file check with id.json
-        let direct_file = dir.join(format!("{}.json", target));
-        if direct_file.exists() {
-            let content = fs::read_to_string(&direct_file)?;
-            let session: Session = serde_json::from_str(&content)?;
-            return Ok(session);
+        if Self::is_safe_session_id(target) {
+            if let Some(direct_file) = Self::find_session_file(target) {
+                let content = fs::read_to_string(&direct_file)?;
+                let session: Session = serde_json::from_str(&content)?;
+                return Ok(session);
+            }
         }
 
-        let all_summaries = Self::list_all(None);
+        let mut all_summaries = Self::list_from_dir(&Self::sessions_dir(), None);
+        for s in Self::list_from_dir(&Self::fleet_sessions_dir(), None) {
+            if !all_summaries.iter().any(|item| item.id == s.id) {
+                all_summaries.push(s);
+            }
+        }
 
         // 2. Exact 1-based index
         if let Ok(idx) = target.parse::<usize>() {
             if idx > 0 && idx <= all_summaries.len() {
                 let target_id = &all_summaries[idx - 1].id;
-                let file = dir.join(format!("{}.json", target_id));
-                if file.exists() {
-                    let content = fs::read_to_string(&file)?;
-                    let session: Session = serde_json::from_str(&content)?;
-                    return Ok(session);
+                if Self::is_safe_session_id(target_id) {
+                    if let Some(file) = Self::find_session_file(target_id) {
+                        let content = fs::read_to_string(&file)?;
+                        let session: Session = serde_json::from_str(&content)?;
+                        return Ok(session);
+                    }
                 }
             }
         }
@@ -185,21 +237,25 @@ impl Session {
         // If there is an exact tag match, prioritize it if it's unique
         let exact_tag_matches: Vec<_> = matches.iter().filter(|(_, exact)| *exact).collect();
         if exact_tag_matches.len() == 1 {
-            let file = dir.join(format!("{}.json", exact_tag_matches[0].0.id));
-            if file.exists() {
-                let content = fs::read_to_string(&file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
+            let id = &exact_tag_matches[0].0.id;
+            if Self::is_safe_session_id(id) {
+                if let Some(file) = Self::find_session_file(id) {
+                    let content = fs::read_to_string(&file)?;
+                    let session: Session = serde_json::from_str(&content)?;
+                    return Ok(session);
+                }
             }
         }
 
         // Single unique match (either tag or prefix)
         if matches.len() == 1 {
-            let file = dir.join(format!("{}.json", matches[0].0.id));
-            if file.exists() {
-                let content = fs::read_to_string(&file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
+            let id = &matches[0].0.id;
+            if Self::is_safe_session_id(id) {
+                if let Some(file) = Self::find_session_file(id) {
+                    let content = fs::read_to_string(&file)?;
+                    let session: Session = serde_json::from_str(&content)?;
+                    return Ok(session);
+                }
             }
         }
 
@@ -210,7 +266,7 @@ impl Session {
             .map(|(s, _)| {
                 format!(
                     "{} (tag: {})",
-                    &s.id[..s.id.len().min(8)],
+                    crate::types::safe_truncate_str(&s.id, 8),
                     s.tag.as_deref().unwrap_or("none")
                 )
             })
@@ -225,52 +281,80 @@ impl Session {
 
     pub fn delete_by_id_or_tag(id_or_tag: &str) -> Result<String> {
         let session = Self::load_by_id_or_tag(id_or_tag)?;
-        let file = Self::sessions_dir().join(format!("{}.json", session.id));
-        if file.exists() {
-            fs::remove_file(&file)?;
+        if !Self::is_safe_session_id(&session.id) {
+            bail!("Refusing to delete session with unsafe ID '{}'.", session.id);
+        }
+        let f1 = Self::sessions_dir().join(format!("{}.json", session.id));
+        if f1.exists() {
+            let _ = fs::remove_file(&f1);
+        }
+        let f2 = Self::fleet_sessions_dir().join(format!("{}.json", session.id));
+        if f2.exists() {
+            let _ = fs::remove_file(&f2);
         }
         Ok(session.id)
     }
 
-    pub fn list_all(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
-        let dirs = vec![Self::sessions_dir()];
-
-        let mut seen_ids = std::collections::HashSet::new();
+    pub fn list_from_dir(dir: &Path, workspace_filter: Option<&str>) -> Vec<SessionSummary> {
         let mut list = Vec::new();
-        for dir in dirs {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            if let Ok(sess) = serde_json::from_str::<SessionSummaryDeserializer>(&content) {
-                                if !seen_ids.insert(sess.id.clone()) {
-                                    continue;
-                                }
-                                if let Some(ws) = workspace_filter {
-                                    if let Some(ref sess_ws) = sess.workspace_dir {
-                                        if sess_ws != ws {
-                                            continue;
-                                        }
+        let mut seen_ids = std::collections::HashSet::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        if let Ok(sess) = serde_json::from_str::<SessionSummaryDeserializer>(&content) {
+                            if !seen_ids.insert(sess.id.clone()) {
+                                continue;
+                            }
+                            if let Some(ws) = workspace_filter {
+                                if let Some(ref sess_ws) = sess.workspace_dir {
+                                    if sess_ws != ws {
+                                        continue;
                                     }
                                 }
-                                list.push(SessionSummary {
-                                    id: sess.id,
-                                    title: sess.title,
-                                    tag: sess.tag,
-                                    model: sess.model,
-                                    message_count: sess.messages.len(),
-                                    updated_at: sess.updated_at,
-                                    workspace_dir: sess.workspace_dir,
-                                });
                             }
+                            list.push(SessionSummary {
+                                id: sess.id,
+                                title: sess.title,
+                                tag: sess.tag,
+                                model: sess.model,
+                                message_count: sess.messages.len(),
+                                updated_at: sess.updated_at,
+                                workspace_dir: sess.workspace_dir,
+                            });
                         }
                     }
                 }
             }
         }
+        list
+    }
+
+    pub fn list_normal(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
+        let mut list: Vec<SessionSummary> = Self::list_from_dir(&Self::sessions_dir(), workspace_filter)
+            .into_iter()
+            .filter(|s| s.tag.as_deref() != Some("fleet") && s.title != "SysAdmin Fleet Console")
+            .collect();
         list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
         list
+    }
+
+    pub fn list_fleet(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
+        let mut list = Self::list_from_dir(&Self::fleet_sessions_dir(), workspace_filter);
+        for s in Self::list_from_dir(&Self::sessions_dir(), workspace_filter) {
+            if (s.tag.as_deref() == Some("fleet") || s.title == "SysAdmin Fleet Console")
+                && !list.iter().any(|item| item.id == s.id)
+            {
+                list.push(s);
+            }
+        }
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+        list
+    }
+
+    pub fn list_all(workspace_filter: Option<&str>) -> Vec<SessionSummary> {
+        Self::list_normal(workspace_filter)
     }
 
     pub fn format_relative_time(dt: DateTime<Utc>) -> String {
@@ -311,6 +395,20 @@ mod tests {
         let res = Session::load_by_id_or_tag("   ");
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_fleet_session_routing_and_isolation() {
+        let mut normal_sess = Session::new();
+        normal_sess.title = "Coding Rust kernel patch".to_string();
+        assert!(!normal_sess.is_fleet());
+        assert_eq!(normal_sess.target_dir(), Session::sessions_dir());
+
+        let mut fleet_sess = Session::new();
+        fleet_sess.tag = Some("fleet".to_string());
+        fleet_sess.title = "SysAdmin Fleet Console".to_string();
+        assert!(fleet_sess.is_fleet());
+        assert_eq!(fleet_sess.target_dir(), Session::fleet_sessions_dir());
     }
 }
 

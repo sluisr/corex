@@ -11,6 +11,7 @@ use crate::theme::Theme;
 #[derive(Debug, Default)]
 pub struct SessionDialogState {
     pub is_open: bool,
+    pub is_fleet: bool,
     pub selected_idx: usize,
     pub sessions: Vec<SessionSummary>,
     pub search_query: String,
@@ -23,8 +24,13 @@ impl SessionDialogState {
         Self::default()
     }
 
-    pub fn open(&mut self, workspace_dir: &str) {
-        self.sessions = Session::list_all(Some(workspace_dir));
+    pub fn open(&mut self, workspace_dir: &str, is_fleet: bool) {
+        self.is_fleet = is_fleet;
+        self.sessions = if is_fleet {
+            Session::list_fleet(None)
+        } else {
+            Session::list_normal(Some(workspace_dir))
+        };
         self.selected_idx = 0;
         self.search_query.clear();
         self.cached_preview_id = None;
@@ -87,7 +93,7 @@ pub fn render_session_dialog(
         return;
     }
 
-    // Actualizamos la preview del elemento seleccionado si ha cambiado
+    // Update the selected element's preview if it changed
     state.update_preview();
 
     let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
@@ -109,7 +115,7 @@ pub fn render_session_dialog(
     let y = (area.height.saturating_sub(dialog_height)) / 2;
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
 
-    // Fondo atenuado suave + respiración perimetral
+    // Soft dimmed background + perimeter breathing
     begin_modal(frame, area, dialog_area, 2, 1);
 
     let scroll_hint = if !state.sessions.is_empty() {
@@ -117,7 +123,11 @@ pub fn render_session_dialog(
     } else {
         String::new()
     };
-    let title = format!("  Session Explorer{} ", scroll_hint);
+    let title = if state.is_fleet {
+        format!("  Fleet / SysAdmin Sessions{} ", scroll_hint)
+    } else {
+        format!("  Session Explorer{} ", scroll_hint)
+    };
 
     let block = Block::default()
         .title(title)
@@ -358,7 +368,7 @@ fn render_session_preview(
     if let Some(s) = session {
         lines.push(Line::from(vec![
             Span::styled(" PREVIEW", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" · ID: {}", &s.id[..8.min(s.id.len())]), Style::default().fg(theme.dark_gray)),
+            Span::styled(format!(" · ID: {}", corex_core::types::safe_truncate_str(&s.id, 8)), Style::default().fg(theme.dark_gray)),
         ]));
         lines.push(Line::from(""));
 
@@ -380,7 +390,7 @@ fn render_session_preview(
         }
         lines.push(Line::from(""));
 
-        // Último mensaje (para contexto inmediato)
+        // Last message (for immediate context)
         lines.push(Line::from(Span::styled("  Latest Exchange:", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD))));
         
         let last_user = s.messages.iter().rev().find(|m| m.role == "user");

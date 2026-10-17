@@ -44,6 +44,14 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         name: "corex-yolo-mode",
         content: include_str!("../skills/corex-yolo-mode/SKILL.md"),
     },
+    BuiltinSkill {
+        name: "corex-fleet",
+        content: include_str!("../skills/corex-fleet/SKILL.md"),
+    },
+    BuiltinSkill {
+        name: "corex-config",
+        content: include_str!("../skills/corex-config/SKILL.md"),
+    },
 ];
 
 pub fn get_builtin_skill(name: &str) -> Option<&'static str> {
@@ -60,10 +68,12 @@ mod tests {
 
     #[test]
     fn test_builtin_skills_present_and_non_empty() {
-        assert_eq!(BUILTIN_SKILLS.len(), 8);
+        assert_eq!(BUILTIN_SKILLS.len(), 10);
         assert!(get_builtin_skill("corex-about").is_some());
         assert!(get_builtin_skill("corex-about").unwrap().contains("sluisr"));
         assert!(get_builtin_skill("corex-fim").is_some());
+        assert!(get_builtin_skill("corex-fleet").is_some());
+        assert!(get_builtin_skill("corex-config").is_some());
         assert!(get_builtin_skill("non-existent").is_none());
     }
 }

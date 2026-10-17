@@ -182,4 +182,4 @@ cx
 
 - **GitHub Issues:** [github.com/sluisr/corex/issues](https://github.com/sluisr/corex/issues)
   - Attach the relevant section of `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`
-- **Discord:** [discord.com/invite/q3wWh6NjEC](https://discord.com/invite/q3wWh6NjEC)
+- **Discord:** [discord.gg/MGMt6M6Yx](https://discord.gg/MGMt6M6Yx)

@@ -62,7 +62,7 @@ LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
   LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4)
 fi
-VERSION="${LATEST_TAG:-v0.6.3}"
+VERSION="${LATEST_TAG:-v0.7.0}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"
@@ -73,29 +73,38 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 echo "[corex] Downloading ${ARCHIVE_NAME}..."
 curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE_NAME"
 
-# Verify SHA-256 integrity signature if published alongside the release asset
-if curl -fsSL "${DOWNLOAD_URL}.sha256" -o "$TMP_DIR/${ARCHIVE_NAME}.sha256" 2>/dev/null; then
-  EXPECTED_SHA=$(cut -d ' ' -f 1 < "$TMP_DIR/${ARCHIVE_NAME}.sha256" | tr -d '\r\n')
-  if [ -n "$EXPECTED_SHA" ]; then
-    echo "[corex] Verifying SHA-256 signature..."
-    if command -v sha256sum >/dev/null 2>&1; then
-      ACTUAL_SHA=$(sha256sum "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
-    elif command -v shasum >/dev/null 2>&1; then
-      ACTUAL_SHA=$(shasum -a 256 "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
-    else
-      ACTUAL_SHA=""
-    fi
-    if [ -n "$ACTUAL_SHA" ]; then
-      if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
-        echo "Error: SHA-256 checksum verification failed!"
-        echo "Expected: $EXPECTED_SHA"
-        echo "Actual:   $ACTUAL_SHA"
-        exit 1
-      fi
-      echo "  ✓ SHA-256 signature verified."
-    fi
-  fi
+# Verify SHA-256 integrity signature (fail closed)
+echo "[corex] Downloading SHA-256 signature..."
+if ! curl -fsSL "${DOWNLOAD_URL}.sha256" -o "$TMP_DIR/${ARCHIVE_NAME}.sha256" 2>/dev/null; then
+  echo "Error: Could not download SHA-256 checksum from ${DOWNLOAD_URL}.sha256"
+  exit 1
 fi
+
+EXPECTED_SHA=$(cut -d ' ' -f 1 < "$TMP_DIR/${ARCHIVE_NAME}.sha256" | tr -d '\r\n')
+if [ -z "$EXPECTED_SHA" ] || [ "${#EXPECTED_SHA}" -ne 64 ]; then
+  echo "Error: Invalid or empty SHA-256 checksum file."
+  exit 1
+fi
+
+echo "[corex] Verifying SHA-256 signature..."
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA=$(sha256sum "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL_SHA=$(shasum -a 256 "$TMP_DIR/$ARCHIVE_NAME" | cut -d ' ' -f 1)
+elif command -v openssl >/dev/null 2>&1; then
+  ACTUAL_SHA=$(openssl dgst -sha256 "$TMP_DIR/$ARCHIVE_NAME" | awk '{print $NF}')
+else
+  echo "Error: No SHA-256 verification tool found (sha256sum, shasum, or openssl required)."
+  exit 1
+fi
+
+if [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+  echo "Error: SHA-256 checksum verification failed!"
+  echo "Expected: $EXPECTED_SHA"
+  echo "Actual:   $ACTUAL_SHA"
+  exit 1
+fi
+echo "  ✓ SHA-256 signature verified."
 
 echo "[corex] Extracting binary..."
 tar -xzf "$TMP_DIR/$ARCHIVE_NAME" -C "$TMP_DIR"
@@ -120,7 +129,10 @@ $SUDO chmod +x "$INSTALL_DIR/cx"
 if [ -f "$TMP_DIR/corex" ]; then
   $SUDO cp "$TMP_DIR/corex" "$INSTALL_DIR/corex"
   $SUDO chmod +x "$INSTALL_DIR/corex"
+else
+  $SUDO ln -sf "$INSTALL_DIR/cx" "$INSTALL_DIR/corex" 2>/dev/null || true
 fi
+$SUDO ln -sf "$INSTALL_DIR/cx" "$INSTALL_DIR/cxs" 2>/dev/null || true
 
 # Synchronize any other cx/corex binaries in PATH to prevent older versions from shadowing
 if command -v which >/dev/null 2>&1; then

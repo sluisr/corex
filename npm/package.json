@@ -1,10 +1,14 @@
 {
   "name": "@sluisr/corex",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "Corex — High-Performance Autonomous AI Terminal Coding Agent for DeepSeek, Gemini, Claude, OpenAI & Local LLMs",
   "bin": {
     "cx": "bin/cx.js",
-    "corex": "bin/cx.js"
+    "corex": "bin/cx.js",
+    "cxs": "bin/cx.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
   },
   "files": [
     "bin/",

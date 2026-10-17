@@ -45,15 +45,17 @@ impl BackgroundProcess {
 
     pub fn duration_str(&self) -> String {
         let end = self.get_finished_at().unwrap_or_else(Utc::now);
-        let secs = (end - self.started_at).num_seconds();
-        if secs < 0 {
-            "0s".to_string()
-        } else if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m {}s", secs / 60, secs % 60)
+        let millis = (end - self.started_at).num_milliseconds();
+        if millis <= 0 {
+            "0.0s".to_string()
+        } else if millis < 60_000 {
+            format!("{:.1}s", millis as f64 / 1000.0)
+        } else if millis < 3_600_000 {
+            let total_secs = millis / 1000;
+            format!("{}m {}s", total_secs / 60, total_secs % 60)
         } else {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            let total_secs = millis / 1000;
+            format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
         }
     }
 }
@@ -104,13 +106,20 @@ impl TaskManager {
         is_background: Arc<Mutex<bool>>,
         stdin_tx: Option<mpsc::Sender<String>>,
     ) {
-        if self.processes.len() > 50 {
-            let stopped_pids: Vec<u32> = self.processes
+        const MAX_TRACKED: usize = 50;
+        const EVICT_DOWN_TO: usize = 40;
+        if self.processes.len() >= MAX_TRACKED {
+            let mut stopped: Vec<(u32, DateTime<Utc>)> = self.processes
                 .iter()
                 .filter(|(_, p)| !p.is_active())
-                .map(|(pid, _)| *pid)
+                .map(|(pid, p)| {
+                    let ts = p.finished_at.lock().ok().and_then(|g| *g).unwrap_or(p.started_at);
+                    (*pid, ts)
+                })
                 .collect();
-            for p in stopped_pids.into_iter().take(20) {
+            stopped.sort_by_key(|(_, ts)| *ts);
+            let to_remove = self.processes.len().saturating_sub(EVICT_DOWN_TO);
+            for (p, _) in stopped.into_iter().take(to_remove) {
                 self.processes.remove(&p);
             }
         }
@@ -254,6 +263,7 @@ impl TaskManager {
             {
                 if pid > 1 && pid != std::process::id() {
                     let p = pid as i32;
+                    let running_clone = proc.is_running.clone();
                     // Ask the whole process group to exit first (-p) so children of the shell die too.
                     // SAFETY: libc::kill is safe for any pid > 1; the pid was validated above and is
                     // not our own. It never writes to stdout/stderr, so it cannot corrupt the TUI.
@@ -266,9 +276,13 @@ impl TaskManager {
                     std::thread::spawn(move || {
                         for _ in 0..GRACE_POLLS {
                             std::thread::sleep(GRACE_INTERVAL);
-                            if !process_alive(p as u32) {
+                            let still_tracked = running_clone.lock().map(|r| *r).unwrap_or(false);
+                            if !still_tracked || !process_alive(p as u32) {
                                 return;
                             }
+                        }
+                        if !running_clone.lock().map(|r| *r).unwrap_or(false) {
+                            return;
                         }
                         // SAFETY: same contract as above; the pid was validated and is not our own.
                         unsafe {

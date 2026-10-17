@@ -67,13 +67,32 @@ impl ForensicLogger {
     }
 
     fn raw_append(path: &Path, content: &str) {
+        // Prevent unbounded single-day log growth (cap at 20 MB per daily log file)
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() > 20 * 1024 * 1024 {
+                return;
+            }
+        }
         if let Ok(mut file) = crate::secure_fs::open_private(path, true) {
             let _ = file.write_all(content.as_bytes());
             let _ = file.flush();
         }
     }
 
+    /// Returns true if the forensic logger has been initialized for this process.
+    pub fn is_enabled() -> bool {
+        LOGGER.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     pub fn log_event(category: &str, title: &str, details: &str) {
+        let log_path = match LOGGER.lock() {
+            Ok(guard) => guard.as_ref().map(|l| l.log_file_path.clone()),
+            Err(_) => None,
+        };
+        let Some(path) = log_path else {
+            return;
+        };
+
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let formatted = format!(
             "\n[{}][{:<12}] ─── {} ───\n{}\n{}\n",
@@ -84,18 +103,26 @@ impl ForensicLogger {
             "─".repeat(95)
         );
 
-        if let Ok(guard) = LOGGER.lock() {
-            if let Some(ref logger) = *guard {
-                Self::raw_append(&logger.log_file_path, &formatted);
-            }
-        }
+        Self::raw_append(&path, &formatted);
     }
 
     /// Logs an outbound LLM Request (Cloud API or Local LLM)
     pub fn log_llm_request(engine: &str, model: &str, endpoint: &str, messages_count: usize, tools_count: usize, body: &str) {
+        if !Self::is_enabled() {
+            return;
+        }
+        let body_preview = if body.len() > 8_192 {
+            format!(
+                "{}\n... [{} bytes truncated in forensic log]",
+                crate::types::safe_truncate_str(body, 8_192),
+                body.len() - 8_192
+            )
+        } else {
+            body.to_string()
+        };
         let details = format!(
-            "Engine:     {}\nModel:      {}\nEndpoint:   {}\nMessages:   {}\nTools:      {}\nPayload (Raw JSON / Formatted):\n{}",
-            engine, model, endpoint, messages_count, tools_count, body
+            "Engine:     {}\nModel:      {}\nEndpoint:   {}\nMessages:   {}\nTools:      {}\nPayload (Preview):\n{}",
+            engine, model, endpoint, messages_count, tools_count, body_preview
         );
         Self::log_event("LLM_REQ", &format!("OUTBOUND -> {} ({})", engine, model), &details);
     }
@@ -197,12 +224,24 @@ impl ForensicLogger {
         Self::log_event("LLM_RESP", &format!("INBOUND <- {} ({}) [{} ms]", engine, model, duration_ms), &details);
     }
 
-    /// Logs a Tool Call Intent & Execution result with full stdout/stderr and duration
+    /// Logs a Tool Call Intent & Execution result with bounded stdout/stderr and duration
     pub fn log_tool_call(tool_name: &str, call_id: &str, arguments: &str, output: &str, duration_ms: u128, success: bool) {
+        if !Self::is_enabled() {
+            return;
+        }
         let status_str = if success { "SUCCESS" } else { "FAILED / ERROR" };
+        let capped_output = if output.len() > 4_096 {
+            format!(
+                "{}\n... [{} bytes truncated in forensic log]",
+                crate::types::safe_truncate_str(output, 4_096),
+                output.len() - 4_096
+            )
+        } else {
+            output.to_string()
+        };
         let details = format!(
             "Tool:       {}\nCall ID:    {}\nStatus:     {}\nDuration:   {} ms\nArguments:\n{}\n\nExecution Output:\n{}",
-            tool_name, call_id, status_str, duration_ms, arguments, output
+            tool_name, call_id, status_str, duration_ms, arguments, capped_output
         );
         Self::log_event("TOOL_EXEC", &format!("TOOL: {} [{}]", tool_name, status_str), &details);
     }
@@ -212,5 +251,82 @@ impl ForensicLogger {
     pub fn log_error(context: &str, error_msg: &str) {
         let details = format!("Context: {}\nError:   {}", context, error_msg);
         Self::log_event("ERROR", &format!("FAILURE: {}", context), &details);
+    }
+
+    /// Returns the dedicated directory for subagent execution forensic logs: `~/.corex/logs/subagents`
+    pub fn get_subagents_log_dir() -> PathBuf {
+        let base = if let Some(dirs) = BaseDirs::new() {
+            dirs.home_dir().join(".corex").join("logs").join("subagents")
+        } else {
+            PathBuf::from(".corex").join("logs").join("subagents")
+        };
+        let _ = crate::secure_fs::ensure_private_dir(&base);
+        base
+    }
+
+    /// Persists an exhaustive forensic execution log for a subagent task and logs to central session audit.
+    pub fn write_subagent_forensic_log(
+        task_id: &str,
+        role: &str,
+        status: &str,
+        started_at: &str,
+        finished_at: &str,
+        duration_str: &str,
+        workspace: &str,
+        prompt: &str,
+        steps: &[String],
+        final_output: &str,
+    ) -> PathBuf {
+        let dir = Self::get_subagents_log_dir();
+        let safe_task_id: String = task_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        let effective_id = if safe_task_id.is_empty() { "subagent" } else { &safe_task_id };
+        let log_file = dir.join(format!("{}.log", effective_id));
+
+        let mut content = String::new();
+        content.push_str("╔═══════════════════════════════════════════════════════════════════════════════════════════════════╗\n");
+        content.push_str("║  COREX SUBAGENT FORENSIC EXECUTION AUDIT                                                          ║\n");
+        content.push_str(&format!("║  Task ID:   {:<86} ║\n", task_id));
+        content.push_str(&format!("║  Role:      {:<86} ║\n", role.to_uppercase()));
+        content.push_str(&format!("║  Status:    {:<86} ║\n", status.to_uppercase()));
+        content.push_str(&format!("║  Workspace: {:<86} ║\n", workspace));
+        content.push_str(&format!("║  Started:   {:<86} ║\n", started_at));
+        content.push_str(&format!("║  Finished:  {:<86} ║\n", finished_at));
+        content.push_str(&format!("║  Duration:  {:<86} ║\n", duration_str));
+        content.push_str("╚═══════════════════════════════════════════════════════════════════════════════════════════════════╝\n\n");
+
+        content.push_str("─── [PROMPT INSTRUCTION] ─────────────────────────────────────────────────────────────────────────────\n");
+        content.push_str(prompt.trim());
+        content.push_str("\n\n");
+
+        content.push_str("─── [FORENSIC EXECUTION TRACE & STEPS] ───────────────────────────────────────────────────────────────\n");
+        if steps.is_empty() {
+            content.push_str("(No detailed execution steps recorded)\n");
+        } else {
+            for (idx, step) in steps.iter().enumerate() {
+                content.push_str(&format!("[Step {:02}] {}\n", idx + 1, step));
+            }
+        }
+        content.push_str("\n");
+
+        content.push_str("─── [DELIVERED OUTPUT TO ORCHESTRATOR] ───────────────────────────────────────────────────────────────\n");
+        content.push_str(final_output.trim());
+        content.push_str("\n");
+
+        if let Ok(mut file) = crate::secure_fs::open_private(&log_file, true) {
+            let _ = file.write_all(content.as_bytes());
+            let _ = file.flush();
+        }
+
+        // Also record in central session forensic log
+        let details = format!(
+            "Task ID:   {}\nRole:      {}\nStatus:    {}\nDuration:  {}\nLog File:  {}\nPrompt:    {}\nSteps Count: {}\nDelivered Output:\n{}",
+            task_id, role, status, duration_str, log_file.display(), prompt, steps.len(), final_output
+        );
+        Self::log_event("SUBAGENT", &format!("SUBAGENT: {} [{}] ({})", role, task_id, status), &details);
+
+        log_file
     }
 }

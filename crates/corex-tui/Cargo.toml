@@ -13,6 +13,7 @@ description = "High-performance Ratatui terminal user interface, mouse selection
 corex-core = { workspace = true }
 corex-tools = { workspace = true }
 corex-prompt = { workspace = true }
+corex-fleet = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 ratatui = { workspace = true }
@@ -20,12 +21,15 @@ crossterm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-pulldown-cmark = { workspace = true }
-textwrap = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
 unicode-width = "0.2"
 base64 = { workspace = true }
+vt100 = "0.15.2"
+portable-pty = "0.9.0"
+parking_lot = "0.12"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 

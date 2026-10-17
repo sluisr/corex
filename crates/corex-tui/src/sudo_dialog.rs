@@ -127,7 +127,7 @@ pub fn render_sudo_dialog(
             ]
         }
     } else {
-        let masked: String = "*".repeat(state.password_input.len());
+        let masked: String = "*".repeat(state.password_input.chars().count());
         vec![
             Span::styled("› ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
             Span::styled(masked, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),

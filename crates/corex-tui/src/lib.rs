@@ -3,6 +3,8 @@ pub mod ascii;
 pub mod auth_dialog;
 pub mod clipboard;
 pub mod diff_view;
+pub mod fleet_dialog;
+pub mod fleet_pty;
 pub mod markdown;
 pub mod model_dialog;
 pub mod overlay;
@@ -15,6 +17,7 @@ pub mod user_dialog;
 
 pub use app::{restore_terminal, run_tui, App, TerminalGuard};
 pub use auth_dialog::AuthDialogState;
+pub use fleet_dialog::{render_fleet_dialog, FleetDialogState};
 pub use markdown::{render_markdown, render_markdown_to_ansi};
 pub use model_dialog::ModelDialogState;
 pub use session_dialog::SessionDialogState;

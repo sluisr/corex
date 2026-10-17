@@ -19,3 +19,4 @@ npm/bin/corex.exe
 node_modules/
 tools/
 *.py
+AUDIT_NOTES.md

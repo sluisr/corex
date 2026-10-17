@@ -12,7 +12,9 @@ use corex_tools::registry::ToolRegistry;
 use corex_tools::types::ToolContext;
 use corex_tui::{run_tui, App};
 
-#[derive(Parser, Debug)]
+mod fleet_cli;
+
+#[derive(Parser, Debug, PartialEq)]
 #[command(
     name = "cx",
     version = env!("CARGO_PKG_VERSION"),
@@ -28,9 +30,13 @@ struct Cli {
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 
-    /// Perform live web search using DeepSeek native search engine (e.g. -w "query" or --web "query")
+    /// Perform live web search (e.g. -w "query" or --web "query")
     #[arg(short = 'w', long = "web")]
     web: Option<String>,
+
+    /// Fetch and summarize a web page URL as Markdown (e.g. --fetch "https://...")
+    #[arg(long = "fetch")]
+    fetch: Option<String>,
 
     /// Model name override (e.g. -m deepseek-flash, --model deepseek-v4-pro)
     #[arg(short = 'm', short_alias = 'M', long = "model")]
@@ -83,10 +89,19 @@ struct Cli {
     /// Generate shell autocompletion script (bash, zsh, fish, powershell, elvish)
     #[arg(long = "completions", value_enum)]
     completions: Option<clap_complete::Shell>,
+
+    /// Manage remote VPS servers and clusters (SysAdmin operations)
+    #[arg(long = "fleet", alias = "sysadmin")]
+    fleet: bool,
 }
 
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Some(arg0) = std::env::args().next() {
+        if (arg0.ends_with("cxs") || arg0.ends_with("cx-fleet")) && !cli.fleet {
+            cli.fleet = true;
+        }
+    }
 
     let workspace_dir = cli
         .directory
@@ -105,6 +120,8 @@ pub async fn run() -> Result<()> {
                 let tag_str = s.tag.as_ref().map(|t| format!(" [tag: {}]", t)).unwrap_or_default();
                 let model_display = if s.model == "deepseek-flash" || s.model == "deepseek-v4.1-flash" || s.model == "deepseek-v4-flash" || s.model == "deepseek-chat" {
                     "DeepSeek-V4.1-Flash"
+                } else if s.model == "deepseek-v4.1-flash-1017" {
+                    "DeepSeek-V4.1-Flash-1017"
                 } else if s.model == "deepseek-v4-pro" || s.model == "deepseek-reasoner" {
                     "DeepSeek-V4-Pro"
                 } else if s.model == "deepseek-v4-flash-vision-exp" {
@@ -137,6 +154,37 @@ pub async fn run() -> Result<()> {
     if cli.message.is_none() && !cli.query.is_empty() && cli.query[0] == "completions" && cli.query.len() == 1 {
         println!("Usage: cx --completions <bash|zsh|fish|powershell|elvish>");
         return Ok(());
+    }
+
+    // Handle "cx fleet ...", "cx sysadmin ...", "cxs ...", or "cx --fleet"
+    let is_fleet_cmd = cli.fleet
+        || (cli.message.is_none()
+            && !cli.query.is_empty()
+            && (cli.query[0] == "fleet" || cli.query[0] == "sysadmin"));
+
+    if is_fleet_cmd {
+        cli.fleet = true;
+        let fleet_args: Vec<String> = if !cli.query.is_empty() && (cli.query[0] == "fleet" || cli.query[0] == "sysadmin") {
+            cli.query[1..].to_vec()
+        } else {
+            cli.query.clone()
+        };
+
+        let is_headless_subcommand = fleet_args.first().map(|s| {
+            matches!(
+                s.as_str(),
+                "status" | "list" | "ls" | "nodes" | "ping" | "top" | "telemetry" | "metrics" | "init" | "run" | "broadcast" | "all" | "help" | "--help" | "-h"
+            )
+        }).unwrap_or(false);
+
+        if is_headless_subcommand {
+            return fleet_cli::handle_fleet_cli(&workspace_dir, &fleet_args).await;
+        }
+
+        // If the invocation was "cx fleet" or "cx sysadmin" without subcommands, consume the command word
+        if !cli.query.is_empty() && (cli.query[0] == "fleet" || cli.query[0] == "sysadmin") {
+            cli.query.remove(0);
+        }
     }
 
     // Handle in-place self-update: "cx update", "cx upgrade", "cx --upgrade", "cx --update"
@@ -177,15 +225,15 @@ pub async fn run() -> Result<()> {
 
     let mut config = Config::load_with_workspace(Some(&workspace_dir));
     let mut headless_prompt = cli.message.clone();
+    let mut explicit_model = false;
 
     if let Some(m) = cli.model {
-        // Smart fallback: If a sentence with spaces or question mark was passed to --model, treat as headless prompt!
-        if (m.contains(' ') || m.ends_with('?') || m.starts_with("arregla") || m.starts_with("que ") || m.starts_with("fix"))
-            && headless_prompt.is_none()
-        {
+        // Smart fallback: Only if a multi-word string with spaces was passed to --model, treat as headless prompt!
+        if m.contains(' ') && headless_prompt.is_none() {
             headless_prompt = Some(m);
         } else {
             config.model = m;
+            explicit_model = true;
         }
     }
     if let Some(u) = cli.base_url {
@@ -207,7 +255,43 @@ pub async fn run() -> Result<()> {
         config.yolo_mode = true;
     }
 
+    let mut resumed_session: Option<Session> = None;
+    if let Some(ref session_id) = cli.resume {
+        match Session::load_by_id_or_tag(session_id) {
+            Ok(loaded) => {
+                if !explicit_model {
+                    config.model = loaded.model.clone();
+                }
+                if let Some(t) = loaded.temperature {
+                    config.temperature = t;
+                }
+                if let Some(ref r) = loaded.reasoning_effort {
+                    config.reasoning_effort = r.clone();
+                }
+                resumed_session = Some(loaded);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Could not resume session {}: {}. Starting new session.",
+                    session_id, e
+                );
+            }
+        }
+    }
+
     let llm_client = LlmClient::new(config.clone());
+    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(llm_client.clone()));
+
+    let make_session = |resumed: Option<Session>| -> Session {
+        resumed.unwrap_or_else(|| {
+            Session::new_with_params(
+                &config.model,
+                config.temperature,
+                &config.reasoning_effort,
+                Some(&workspace_dir),
+            )
+        })
+    };
 
     // Handle standalone --web / -w or `cx web <query>` search query
     let web_search_query = cli.web.or_else(|| {
@@ -225,11 +309,37 @@ pub async fn run() -> Result<()> {
 
     if let Some(query) = web_search_query {
         let prompt = format!(
-            "Por favor busca en internet usando la herramienta web_search y responde de manera clara, directa y sintetizada con fuentes a: {}",
+            "Please search the web using the web_search tool and synthesize a clear, direct, and well-structured answer with source links for: {}",
             query
         );
         let display = format!("/web {}", query);
-        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode).await?;
+        let session = make_session(resumed_session);
+        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session).await?;
+        return Ok(());
+    }
+
+    // Handle standalone --fetch or `cx fetch <url>`
+    let web_fetch_url = cli.fetch.or_else(|| {
+        if cli.message.is_none() && !cli.query.is_empty() && (cli.query[0] == "fetch" || cli.query[0] == "/fetch") {
+            let u = cli.query[1..].join(" ");
+            if !u.is_empty() {
+                Some(u)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some(url) = web_fetch_url {
+        let prompt = format!(
+            "Please fetch the URL '{}' using the web_fetch tool and synthesize a clear, comprehensive summary and analysis of its content.",
+            url
+        );
+        let display = format!("/fetch {}", url);
+        let session = make_session(resumed_session);
+        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session).await?;
         return Ok(());
     }
 
@@ -239,31 +349,20 @@ pub async fn run() -> Result<()> {
     }
 
     if let Some(prompt_text) = headless_prompt {
-        run_headless(llm_client, workspace_dir, prompt_text, None, config.yolo_mode).await?;
+        let session = make_session(resumed_session);
+        run_headless(llm_client, workspace_dir, prompt_text, None, config.yolo_mode, session).await?;
         return Ok(());
     }
 
     // Launch interactive TUI
     let mut app = App::new(llm_client, workspace_dir.clone(), cli.yolo);
     let _ = app.reload_mcp_servers().await;
-    if let Some(session_id) = cli.resume {
-        match Session::load_by_id_or_tag(&session_id) {
-            Ok(loaded) => {
-                let mut cfg = app.llm_client.get_config();
-                cfg.model = loaded.model.clone();
-                if let Some(t) = loaded.temperature {
-                    cfg.temperature = t;
-                }
-                if let Some(ref r) = loaded.reasoning_effort {
-                    cfg.reasoning_effort = r.clone();
-                }
-                app.llm_client.update_config(cfg);
-                app.session = loaded;
-            }
-            Err(e) => {
-                eprintln!("Warning: Could not resume session {}: {}. Starting new session.", session_id, e);
-            }
-        }
+    if cli.fleet {
+        app.enter_fleet_mode();
+        app.fleet_dialog.open_async(&workspace_dir).await;
+    }
+    if let Some(loaded) = resumed_session {
+        app.session = loaded;
     }
 
     run_tui(app).await?;
@@ -276,8 +375,10 @@ async fn run_headless(
     user_prompt: String,
     display_prompt: Option<String>,
     yolo: bool,
+    mut session: Session,
 ) -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
+    corex_fleet::register_fleet_tools(&mut tool_registry);
     let (mcp_tools, _) = corex_tools::load_mcp_servers(&client.get_config().mcp_servers).await;
     for t in mcp_tools {
         tool_registry.register(t);
@@ -285,12 +386,24 @@ async fn run_headless(
     let prompt_builder = PromptBuilder::new(&workspace_dir)
         .with_sudo_password(get_sudo_password().is_some());
 
-    let mut messages = vec![
-        Message::system(prompt_builder.build()),
-        Message::user(user_prompt.clone()),
-    ];
+    session.add_message(Message::user(user_prompt.clone()));
 
-    println!("You: {}", display_prompt.as_deref().unwrap_or(&user_prompt));
+    let mut messages = Vec::with_capacity(session.messages.len() + 1);
+    messages.push(Message::system(prompt_builder.build()));
+    for m in &session.messages {
+        if m.role != "system" {
+            messages.push(m.clone());
+        }
+    }
+
+    use colored::Colorize;
+    let you_badge = format!(
+        "{}{}{}",
+        "[".truecolor(95, 95, 95),
+        "You".bold().truecolor(130, 215, 160),
+        "]".truecolor(95, 95, 95),
+    );
+    println!("{} {}", you_badge, display_prompt.as_deref().unwrap_or(&user_prompt));
 
     let tools = tool_registry.list_definitions();
     let context = ToolContext {
@@ -404,6 +517,9 @@ async fn run_headless(
                     }
                 }
                 StreamEvent::ToolCallDelta { index, id, name, arguments, extra_content } => {
+                    if index > 64 {
+                        continue;
+                    }
                     while current_tool_calls.len() <= index {
                         current_tool_calls.push(ToolCall {
                             id: String::new(),
@@ -437,11 +553,15 @@ async fn run_headless(
                     }
                     println!("\n[INFO] {}\n", msg);
                 }
-                StreamEvent::ContextCompacted { notice, .. } => {
+                StreamEvent::ContextCompacted { compacted_messages, notice } => {
                     if let Some(mut s) = active_spinner.take() {
                         s.stop().await;
                     }
+                    session.messages = compacted_messages;
                     println!("\n[INFO] {}\n", notice);
+                }
+                StreamEvent::UsageUpdate(usage) => {
+                    session.update_usage(&usage);
                 }
                 StreamEvent::Completed { .. } => {}
                 StreamEvent::Error(err) => {
@@ -449,6 +569,7 @@ async fn run_headless(
                         s.stop().await;
                     }
                     eprintln!("\nError: {}", err);
+                    let _ = session.save();
                     return Ok(());
                 }
                 _ => {}
@@ -457,6 +578,11 @@ async fn run_headless(
 
         if let Some(mut s) = active_spinner.take() {
             s.stop().await;
+        }
+
+        let user_cjk = corex_core::language::user_has_requested_cjk(&messages);
+        if corex_core::language::is_unwanted_cjk_drift(&assistant_text, user_cjk) {
+            assistant_text = corex_core::language::clean_cjk_drift_from_text(&assistant_text);
         }
 
         if !assistant_text.trim().is_empty() {
@@ -479,11 +605,13 @@ async fn run_headless(
                 }
             }
 
-            messages.push(Message::assistant_with_tools(
+            let assistant_msg = Message::assistant_with_tools(
                 text_opt,
                 cot_opt,
                 current_tool_calls.clone(),
-            ));
+            );
+            messages.push(assistant_msg.clone());
+            session.add_message(assistant_msg);
 
             for call in &current_tool_calls {
                 let args_json = corex_core::parse_lenient_json(&call.function.arguments)
@@ -543,7 +671,9 @@ async fn run_headless(
                             let trimmed = input.trim().to_lowercase();
                             if trimmed != "y" && trimmed != "yes" {
                                 println!("Execution cancelled by user.");
-                                messages.push(Message::tool_response(call.id.clone(), "Execution denied by user."));
+                                let denied_msg = Message::tool_response(call.id.clone(), "Execution denied by user.");
+                                messages.push(denied_msg.clone());
+                                session.add_message(denied_msg);
                                 continue;
                             }
                         }
@@ -578,16 +708,169 @@ async fn run_headless(
                         msg
                     }
                 };
-                messages.push(Message::tool_response(call.id.clone(), output));
+                let tool_msg = Message::tool_response(call.id.clone(), output);
+                messages.push(tool_msg.clone());
+                session.add_message(tool_msg);
             }
 
             // Feed the tool results back and continue the agent loop
             continue;
         }
 
-        // No tool calls: the assistant's final answer has been fully streamed
+        // No tool calls: record final assistant turn in session and finish
+        if !assistant_text.is_empty() || !reasoning_text.is_empty() {
+            let cot_opt = if reasoning_text.is_empty() { None } else { Some(reasoning_text) };
+            let final_msg = Message::assistant(assistant_text, cot_opt);
+            session.add_message(final_msg);
+        }
         break;
     }
 
+    let _ = session.save();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_command_factory_debug_assert() {
+        // Validates clap internal consistency, non-colliding flags, and value parsers.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_cli_default_args() {
+        let cli = Cli::try_parse_from(["cx"]).expect("Should parse empty invocation");
+        assert_eq!(cli.message, None);
+        assert!(cli.query.is_empty());
+        assert_eq!(cli.model, None);
+        assert_eq!(cli.web, None);
+        assert_eq!(cli.fetch, None);
+        assert!(!cli.yolo);
+        assert!(!cli.fleet);
+        assert!(!cli.list_sessions);
+        assert_eq!(cli.resume, None);
+        assert_eq!(cli.local, None);
+    }
+
+    #[test]
+    fn test_cli_prompt_flags() {
+        let short = Cli::try_parse_from(["cx", "-p", "Refactor main.rs"]).unwrap();
+        assert_eq!(short.message.as_deref(), Some("Refactor main.rs"));
+
+        let long = Cli::try_parse_from(["cx", "--prompt", "Explain this"]).unwrap();
+        assert_eq!(long.message.as_deref(), Some("Explain this"));
+
+        let alias = Cli::try_parse_from(["cx", "--message", "Alias test"]).unwrap();
+        assert_eq!(alias.message.as_deref(), Some("Alias test"));
+    }
+
+    #[test]
+    fn test_cli_model_selection_flags() {
+        let short = Cli::try_parse_from(["cx", "-m", "gemini-3.8-flash"]).unwrap();
+        assert_eq!(short.model.as_deref(), Some("gemini-3.8-flash"));
+
+        let long = Cli::try_parse_from(["cx", "--model", "claude-3-7-sonnet"]).unwrap();
+        assert_eq!(long.model.as_deref(), Some("claude-3-7-sonnet"));
+
+        let short_alias = Cli::try_parse_from(["cx", "-M", "o3-mini"]).unwrap();
+        assert_eq!(short_alias.model.as_deref(), Some("o3-mini"));
+    }
+
+    #[test]
+    fn test_cli_yolo_mode_flags() {
+        let short = Cli::try_parse_from(["cx", "-y"]).unwrap();
+        assert!(short.yolo);
+
+        let long = Cli::try_parse_from(["cx", "--yolo"]).unwrap();
+        assert!(long.yolo);
+    }
+
+    #[test]
+    fn test_cli_web_and_fetch_flags() {
+        let web_short = Cli::try_parse_from(["cx", "-w", "tokio select"]).unwrap();
+        assert_eq!(web_short.web.as_deref(), Some("tokio select"));
+
+        let web_long = Cli::try_parse_from(["cx", "--web", "rust 2024 edition"]).unwrap();
+        assert_eq!(web_long.web.as_deref(), Some("rust 2024 edition"));
+
+        let fetch = Cli::try_parse_from(["cx", "--fetch", "https://docs.rs"]).unwrap();
+        assert_eq!(fetch.fetch.as_deref(), Some("https://docs.rs"));
+    }
+
+    #[test]
+    fn test_cli_session_management_flags() {
+        let list_short = Cli::try_parse_from(["cx", "-l"]).unwrap();
+        assert!(list_short.list_sessions);
+
+        let list_long = Cli::try_parse_from(["cx", "--list-sessions"]).unwrap();
+        assert!(list_long.list_sessions);
+
+        let resume_short = Cli::try_parse_from(["cx", "-r", "sess_abc123"]).unwrap();
+        assert_eq!(resume_short.resume.as_deref(), Some("sess_abc123"));
+
+        let resume_long = Cli::try_parse_from(["cx", "--resume", "tag-refactor"]).unwrap();
+        assert_eq!(resume_long.resume.as_deref(), Some("tag-refactor"));
+    }
+
+    #[test]
+    fn test_cli_local_llm_flags() {
+        let local_flag = Cli::try_parse_from(["cx", "--local"]).unwrap();
+        assert_eq!(local_flag.local, Some(true));
+
+        let local_config = Cli::try_parse_from([
+            "cx",
+            "--local",
+            "--local-url", "http://127.0.0.1:11434/v1",
+            "--local-model", "qwen2.5-coder:32b"
+        ]).unwrap();
+        assert_eq!(local_config.local, Some(true));
+        assert_eq!(local_config.local_url.as_deref(), Some("http://127.0.0.1:11434/v1"));
+        assert_eq!(local_config.local_model.as_deref(), Some("qwen2.5-coder:32b"));
+    }
+
+    #[test]
+    fn test_cli_directory_override() {
+        let short = Cli::try_parse_from(["cx", "-C", "/tmp/test-project"]).unwrap();
+        assert_eq!(short.directory, Some(PathBuf::from("/tmp/test-project")));
+
+        let long = Cli::try_parse_from(["cx", "--directory", "/home/user/code"]).unwrap();
+        assert_eq!(long.directory, Some(PathBuf::from("/home/user/code")));
+    }
+
+    #[test]
+    fn test_cli_fleet_flags() {
+        let fleet = Cli::try_parse_from(["cx", "--fleet"]).unwrap();
+        assert!(fleet.fleet);
+
+        let sysadmin = Cli::try_parse_from(["cx", "--sysadmin"]).unwrap();
+        assert!(sysadmin.fleet);
+    }
+
+    #[test]
+    fn test_cli_positional_query() {
+        let query = Cli::try_parse_from(["cx", "inspect", "src/lib.rs", "--verbose-details"]).unwrap();
+        assert_eq!(query.query, vec!["inspect", "src/lib.rs", "--verbose-details"]);
+    }
+
+    #[test]
+    fn test_cli_completions_flag() {
+        let bash = Cli::try_parse_from(["cx", "--completions", "bash"]).unwrap();
+        assert_eq!(bash.completions, Some(clap_complete::Shell::Bash));
+
+        let zsh = Cli::try_parse_from(["cx", "--completions", "zsh"]).unwrap();
+        assert_eq!(zsh.completions, Some(clap_complete::Shell::Zsh));
+    }
+
+    #[test]
+    fn test_cli_upgrade_flags() {
+        let upgrade = Cli::try_parse_from(["cx", "--upgrade"]).unwrap();
+        assert!(upgrade.upgrade);
+
+        let update_alias = Cli::try_parse_from(["cx", "--update", "-f"]).unwrap();
+        assert!(update_alias.upgrade);
+        assert!(update_alias.force);
+    }
 }

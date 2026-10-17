@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +18,7 @@ use corex_tools::registry::ToolRegistry;
 
 use crate::auth_dialog::AuthDialogState;
 use crate::clipboard;
+use crate::fleet_dialog::FleetDialogState;
 use crate::model_dialog::{DialogAction, ModelDialogState};
 use crate::session_dialog::SessionDialogState;
 use crate::slash_commands::ALL_COMMANDS;
@@ -42,6 +42,7 @@ pub use event_loop::*;
 
 impl App {
     pub fn new(llm_client: LlmClient, workspace_dir: PathBuf, yolo: bool) -> Self {
+        corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(llm_client.clone()));
         let branch = Self::detect_git_branch(&workspace_dir);
         let cfg = llm_client.get_config();
         let persistent_history = corex_core::HistoryStore::load();
@@ -78,9 +79,13 @@ impl App {
             session_dialog: SessionDialogState::new(),
             auth_dialog,
             sudo_dialog: SudoDialogState::new(),
+            fleet_dialog: FleetDialogState::new(),
+            fleet_session: None,
+            normal_session_stash: None,
             cancel_token: None,
+            in_flight_tool_calls: 0,
+            response_prefix: None,
 
-            list_state: ListState::default(),
             scroll_offset: 0,
             auto_scroll: true,
             total_rendered_items: 0,
@@ -88,7 +93,7 @@ impl App {
             always_allow_tools: yolo,
             mouse_capture: mouse_capture_enabled(),
             selection: None,
-            selection_lines: Vec::new(),
+            selection_lines: SelectionLines::default(),
             drag_point: None,
             app_start_time: Instant::now(),
             last_focus_gained: None,
@@ -106,10 +111,14 @@ impl App {
             local_llm_online: is_online,
             last_local_check: None,
             cached_message_lines: Vec::new(),
+            cached_message_line_offsets: Vec::new(),
             cached_message_count: 0,
             cached_render_width: 0,
             cached_session_id: String::new(),
             cached_logs_expanded: false,
+            streaming_md_cache: Vec::new(),
+            streaming_md_cache_len: 0,
+            streaming_md_cache_width: 0,
             active_background_pids: std::collections::HashSet::new(),
             current_generation_id: 0,
             update_available: Arc::new(std::sync::Mutex::new(corex_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
@@ -124,6 +133,7 @@ impl App {
             start_time: Instant::now(),
             last_interaction: Instant::now(),
         };
+        corex_fleet::register_fleet_tools(&mut app.tool_registry);
         app.trigger_local_health_check();
         app.trigger_update_check();
         if cfg.api_key.trim().is_empty() && cfg.endpoint().1.trim().is_empty() && !cfg.local_llm_enabled {
@@ -161,6 +171,7 @@ impl App {
     /// mouse reporting on mobile vertical screens unless COREX_MOUSE is pinned.
     pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.cached_message_lines.clear();
+        self.cached_message_line_offsets.clear();
         self.cached_render_width = 0;
         self.last_chat_rect = None;
         if std::env::var("COREX_MOUSE").is_err() {
@@ -486,6 +497,7 @@ impl App {
 
     pub fn invalidate_message_cache(&mut self) {
         self.cached_message_lines.clear();
+        self.cached_message_line_offsets.clear();
         self.cached_message_count = 0;
         self.cached_render_width = 0;
         self.cached_session_id.clear();
@@ -608,6 +620,12 @@ impl App {
             if cur < self.user_dialog.questions.len() && !self.user_dialog.questions[cur].has_options {
                 self.user_dialog.text_input[cur].push_str(&pasted);
             }
+        } else if self.fleet_dialog.is_open && self.fleet_dialog.command_mode {
+            if let Some(ref pty) = self.fleet_dialog.pty_session {
+                pty.write_bytes(pasted.as_bytes());
+            } else {
+                self.fleet_dialog.command_input.push_str(&pasted);
+            }
         } else if self.pending_confirmation.is_none() {
             self.clamp_cursor();
             let line_count = pasted.lines().count();
@@ -656,11 +674,35 @@ impl App {
 
         let llm_cfg = self.llm_client.get_config();
         let is_local = llm_cfg.local_llm_enabled || llm_cfg.model.starts_with("local");
-        let system_prompt = if is_local && llm_cfg.local_prompt_lite {
+        let mut system_prompt = if self.fleet_dialog.is_open {
+            let active_node = self.fleet_dialog.active_session.as_ref()
+                .filter(|s| s.is_connected)
+                .map(|s| (s.node.id.as_str(), s.node.user.as_str(), s.node.host.as_str()))
+                .or_else(|| {
+                    self.fleet_dialog.pty_session.as_ref()
+                        .filter(|p| p.is_alive())
+                        .and_then(|p| {
+                            self.fleet_dialog.items.iter()
+                                .find(|it| it.config.id == p.node_id)
+                                .map(|it| (it.config.id.as_str(), it.config.user.as_str(), it.config.host.as_str()))
+                        })
+                });
+            let available_nodes: Vec<(&str, &str, &str)> = self.fleet_dialog.items.iter()
+                .map(|it| (it.config.id.as_str(), it.config.user.as_str(), it.config.host.as_str()))
+                .collect();
+            prompt_builder.build_fleet(active_node, &available_nodes)
+        } else if is_local && llm_cfg.local_prompt_lite {
             prompt_builder.build_lite()
         } else {
             prompt_builder.build()
         };
+
+        if let Some(ref pfx) = self.response_prefix {
+            system_prompt.push_str(&format!(
+                "\n\n[RESPONSE PREFIX REQUIREMENT]: You MUST begin your final text response immediately with the exact prefix: {}",
+                pfx
+            ));
+        }
 
         let mut messages = vec![Message::system(system_prompt)];
         messages.extend(self.session.messages.clone());
@@ -711,10 +753,26 @@ impl App {
             "/stats" => {
                 let u = &self.session.total_usage;
                 let ratio = u.cache_hit_percentage();
-                let msg = format!(
+                let cfg = self.llm_client.get_config();
+                let mut msg = format!(
                     "Session Usage Metrics:\n- Prompt Tokens: {}\n- Cached Prompt Tokens: {} ({:.1}% KV Cache Hit)\n- Completion Tokens: {}\n- Total Tokens: {}",
                     u.prompt_tokens, u.prompt_cache_hit_tokens, ratio, u.completion_tokens, u.total_tokens
                 );
+                if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled && u.total_tokens > 0 {
+                    let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
+                    let (cached_rate, miss_rate, comp_rate) = if is_pro {
+                        (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
+                    } else {
+                        (0.014 / 1_000_000.0, 0.14 / 1_000_000.0, 0.28 / 1_000_000.0)
+                    };
+                    let miss = u.prompt_tokens.saturating_sub(u.prompt_cache_hit_tokens);
+                    let actual_cost = (u.prompt_cache_hit_tokens as f64 * cached_rate)
+                        + (miss as f64 * miss_rate)
+                        + (u.completion_tokens as f64 * comp_rate);
+                    let un_cached = (u.prompt_tokens as f64 * miss_rate) + (u.completion_tokens as f64 * comp_rate);
+                    let saved = (un_cached - actual_cost).max(0.0);
+                    msg.push_str(&format!("\n- Estimated DeepSeek Cost: ${:.6} USD (Saved ${:.6} with KV Cache)", actual_cost, saved));
+                }
                 self.session.add_message(Message::system(msg));
                 true
             }
@@ -763,7 +821,16 @@ impl App {
                     // Handled by streaming chat loop so the AI invokes web_search and synthesizes the answer
                     false
                 } else {
-                    self.session.add_message(Message::system("Uso: /web <consulta> (Busca en la web con DeepSeek y sintetiza la respuesta)"));
+                    self.session.add_message(Message::system("Usage: /web <query> (Search the web with DeepSeek and synthesize the answer)"));
+                    true
+                }
+            }
+            "/fetch" => {
+                if parts.len() > 1 {
+                    // Handled by streaming chat loop so the AI invokes web_fetch and summarizes the page
+                    false
+                } else {
+                    self.session.add_message(Message::system("Usage: /fetch <url> (Fetch a webpage into Markdown using DeepSeek Fetch)"));
                     true
                 }
             }
@@ -789,10 +856,11 @@ impl App {
                 true
             }
             "/chat" | "/sessions" => {
+                let is_fleet = self.fleet_dialog.is_open || self.normal_session_stash.is_some() || self.session.is_fleet();
                 let subcmd = parts.get(1).copied().unwrap_or("list");
                 match subcmd {
                     "list" => {
-                        self.session_dialog.open(&self.workspace_dir.display().to_string());
+                        self.session_dialog.open(&self.workspace_dir.display().to_string(), is_fleet);
                     }
                     "save" => {
                         if parts.len() > 2 {
@@ -820,9 +888,14 @@ impl App {
                                         cfg.reasoning_effort = r.clone();
                                     }
                                     self.llm_client.update_config(cfg);
+                                    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                                     let title = loaded.title.clone();
                                     let model = loaded.model.clone();
                                     self.session = loaded;
+                                    self.cached_session_id.clear();
+                                    self.invalidate_message_cache();
+                                    self.clear_selection();
+                                    self.scroll_to_bottom();
                                     self.session.add_message(Message::system(format!("Resumed session '{}' (Model: {}).", title, model)));
                                 }
                                 Err(e) => {
@@ -854,6 +927,11 @@ impl App {
                         self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir));
                         self.streaming_text.clear();
                         self.thinking_state.reset();
+                        self.cached_session_id.clear();
+                        self.invalidate_message_cache();
+                        self.clear_selection();
+                        self.scroll_to_bottom();
+                        corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                         self.session.add_message(Message::system(format!("Started new chat session (Model: {}).", cfg.model)));
                     }
                     _ => {
@@ -863,10 +941,11 @@ impl App {
                 true
             }
             "/resume" => {
+                let is_fleet = self.fleet_dialog.is_open || self.normal_session_stash.is_some() || self.session.is_fleet();
                 if parts.len() > 1 {
                     let target = parts[1..].join(" ");
                     match Session::load_by_id_or_tag(&target) {
-                        Ok(loaded) => {
+                        Ok(mut loaded) => {
                             let mut cfg = self.llm_client.get_config();
                             cfg.model = loaded.model.clone();
                             if let Some(t) = loaded.temperature {
@@ -876,10 +955,19 @@ impl App {
                                 cfg.reasoning_effort = r.clone();
                             }
                             self.llm_client.update_config(cfg);
+                            corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                             let title = loaded.title.clone();
                             let model = loaded.model.clone();
+                            if is_fleet {
+                                loaded.tag = Some("fleet".to_string());
+                            }
                             self.session = loaded;
-                            self.session.add_message(Message::system(format!("Resumed session '{}' (Model: {}).", title, model)));
+                            self.cached_session_id.clear();
+                            self.invalidate_message_cache();
+                            self.clear_selection();
+                            self.scroll_to_bottom();
+                            let label = if is_fleet { "Fleet session" } else { "session" };
+                            self.session.add_message(Message::system(format!("Resumed {} '{}' (Model: {}).", label, title, model)));
                         }
                         Err(e) => {
                             self.session.add_message(Message::system(format!("Error: {}", e)));
@@ -887,7 +975,7 @@ impl App {
                     }
                 } else {
                     self.slash_popup_height_current = 0.0;
-                    self.session_dialog.open(&self.workspace_dir.display().to_string());
+                    self.session_dialog.open(&self.workspace_dir.display().to_string(), is_fleet);
                 }
                 true
             }
@@ -910,6 +998,11 @@ impl App {
                 self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir));
                 self.streaming_text.clear();
                 self.thinking_state.reset();
+                self.cached_session_id.clear();
+                self.invalidate_message_cache();
+                self.clear_selection();
+                self.scroll_to_bottom();
+                corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                 self.session.add_message(Message::system(format!("Started new chat session (Model: {}).", cfg.model)));
                 true
             }
@@ -923,6 +1016,7 @@ impl App {
                     }
                     let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg.clone());
+                    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                     self.session.model = new_model.to_string();
                     self.session.temperature = Some(cfg.temperature);
                     self.session.reasoning_effort = Some(cfg.reasoning_effort);
@@ -955,15 +1049,20 @@ impl App {
 
                 if parts.len() > 1 {
                     let key_str = parts[1..].join(" ").trim().to_string();
-                    if !env_var.is_empty() {
-                        std::env::set_var(&env_var, &key_str);
-                    }
                     let mut new_cfg = cfg.clone();
                     if prov == "deepseek" {
                         new_cfg.api_key = key_str.clone();
+                    } else {
+                        new_cfg.provider_api_keys.insert(prov.clone(), key_str.clone());
                     }
                     let _ = new_cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(new_cfg);
+                    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
+                    if let Some(pos) = self.model_dialog.providers.iter().position(|p| p.name == prov) {
+                        if pos < self.model_dialog.ready.len() {
+                            self.model_dialog.ready[pos] = true;
+                        }
+                    }
                     self.session.add_message(Message::system(format!(
                         "API key updated and saved for {} (${})!",
                         label, env_var
@@ -1097,12 +1196,19 @@ impl App {
             "/prefix" => {
                 if parts.len() > 1 {
                     let prefix_text = parts[1..].join(" ");
-                    self.session.add_message(Message::system(format!(
-                        "Response formatting prefix configured: '{}'. DeepSeek will direct its next output with this prefix.",
-                        prefix_text
-                    )));
+                    let trimmed = prefix_text.trim();
+                    if matches!(trimmed.to_ascii_lowercase().as_str(), "off" | "clear" | "none") {
+                        self.response_prefix = None;
+                        self.session.add_message(Message::system("Response formatting prefix cleared."));
+                    } else {
+                        self.response_prefix = Some(prefix_text.clone());
+                        self.session.add_message(Message::system(format!(
+                            "Response formatting prefix configured: '{}'. DeepSeek will direct its next output with this prefix.",
+                            prefix_text
+                        )));
+                    }
                 } else {
-                    self.session.add_message(Message::system("Usage: /prefix <text> (e.g. /prefix Output: or /prefix ```json)"));
+                    self.session.add_message(Message::system("Usage: /prefix <text> (e.g. /prefix Output: or /prefix ```json, or /prefix off to clear)"));
                 }
                 true
             }
@@ -1115,19 +1221,39 @@ impl App {
                         self.workspace_dir.join(file_arg)
                     };
 
+                    if !corex_tools::fs_tools::is_within_workspace(&file_path, &self.workspace_dir)
+                        || corex_tools::fs_tools::is_sensitive_system_path(&file_path)
+                    {
+                        self.session.add_message(Message::system(format!(
+                            "Refused to load '{}': path is outside the active workspace or points to a sensitive file.",
+                            file_arg
+                        )));
+                        return true;
+                    }
+
+                    const FIM_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+                    const FIM_WINDOW_BYTES: usize = 24_000;
+
+                    let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
                     if !file_path.exists() {
                         self.session.add_message(Message::system(format!("File '{}' not found.", file_arg)));
+                    } else if file_size > FIM_MAX_FILE_BYTES {
+                        self.session.add_message(Message::system(format!(
+                            "File '{}' is too large for FIM ({} bytes, max {}).",
+                            file_arg, file_size, FIM_MAX_FILE_BYTES
+                        )));
                     } else {
                         match std::fs::read_to_string(&file_path) {
                             Ok(content) => {
-                                if content.contains("<FIM_HOLE>") {
+                                if let Some(hole_idx) = content.find("<FIM_HOLE>") {
+                                    let snippet = fim_context_window(&content, hole_idx, FIM_WINDOW_BYTES);
                                     let prompt = format!(
                                         "Please perform Fill-in-the-Middle (FIM) code completion for `{}`. Complete the exact code that belongs strictly inside `<FIM_HOLE>`:\n\n```\n{}\n```",
                                         file_arg,
-                                        content
+                                        snippet
                                     );
+                                    self.session.add_message(Message::system("FIM prompt loaded. Streaming completion..."));
                                     self.session.add_message(Message::user(prompt));
-                                    self.session.add_message(Message::system("FIM prompt loaded. Ready to stream completion."));
                                 } else {
                                     self.session.add_message(Message::system(format!(
                                         "FIM for '{}': Insert `<FIM_HOLE>` at the exact position in `{}` where code should be filled, then run `/fim {}` again.",
@@ -1420,6 +1546,67 @@ impl App {
                 }
                 true
             }
+
+            "/fleet" | "/sysadmin" | "/vps" => {
+                let cfg = corex_fleet::FleetConfig::load(Some(&self.workspace_dir)).unwrap_or_default();
+                let nodes = cfg.all_nodes();
+                if parts.len() > 1 && parts[1] == "wide" {
+                    self.fleet_dialog.wide_layout = !self.fleet_dialog.wide_layout;
+                    if !self.fleet_dialog.is_open {
+                        self.enter_fleet_mode();
+                        self.fleet_dialog.open_async(&self.workspace_dir).await;
+                    }
+                } else if parts.len() > 1 && matches!(parts[1], "off" | "close" | "exit" | "quit") {
+                    self.exit_fleet_mode();
+                } else if parts.len() > 1 && (parts[1] == "resume" || parts[1] == "sessions" || parts[1] == "history") {
+                    self.enter_fleet_mode();
+                    self.session_dialog.open(&self.workspace_dir.display().to_string(), true);
+                } else if parts.len() == 1 || (parts.len() > 1 && (parts[1] == "nodes" || parts[1] == "list" || parts[1] == "dashboard" || parts[1] == "console")) {
+                    self.enter_fleet_mode();
+                    self.fleet_dialog.open_async(&self.workspace_dir).await;
+                } else if parts.len() > 2 && (parts[1] == "connect" || parts[1] == "select") {
+                    let target_id = parts[2];
+                    self.enter_fleet_mode();
+                    self.fleet_dialog.open_async(&self.workspace_dir).await;
+                    if let Some(pos) = self.fleet_dialog.items.iter().position(|it| it.config.id == target_id) {
+                        self.fleet_dialog.selected_idx = pos;
+                        let node = self.fleet_dialog.items[pos].config.clone();
+                        let mut session = corex_fleet::RemoteSession::new(node.clone());
+                        match session.connect(8).await {
+                            Ok(lat) => {
+                                corex_fleet::global_session_manager().set_session(node.id.clone(), session.clone()).await;
+                                corex_fleet::global_session_manager().set_active_node(Some(node.id.clone())).await;
+                                self.fleet_dialog.active_session = Some(session);
+                                if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                                    self.fleet_dialog.pty_session = Some(pty);
+                                }
+                                self.fleet_dialog.status_msg = Some(format!("Connected to {} in {}ms", node.id, lat));
+                                self.session.add_message(Message::system(format!(
+                                    "Connected to remote server: {} ({}@{}) · Active and ready.",
+                                    node.id, node.user, node.host
+                                )));
+                                self.scroll_to_bottom();
+                            }
+                            Err(e) => {
+                                self.fleet_dialog.status_msg = Some(format!("Could not connect to {}: {}", node.id, e));
+                            }
+                        }
+                    } else {
+                        self.fleet_dialog.status_msg = Some(format!("Server '{}' not found in inventory", target_id));
+                    }
+                } else if parts.len() > 1 && parts[1] == "status" {
+                    let mut msg = format!("🌐 Fleet Nodes ({} servers):\n", nodes.len());
+                    for n in &nodes {
+                        msg.push_str(&format!("• [{}] {}\n", n.id, n.target_string()));
+                    }
+                    msg.push_str("\n(For full real-time telemetry run `cx fleet telemetry` or ask the assistant: 'check server status')");
+                    self.session.add_message(Message::system(msg));
+                } else {
+                    self.enter_fleet_mode();
+                    self.fleet_dialog.open_async(&self.workspace_dir).await;
+                }
+                true
+            }
             "/help" => {
                 let mut help = "Available Commands:\n".to_string();
                 let mut last_group = "";
@@ -1595,38 +1782,132 @@ impl App {
         self.model_dialog.mark_active(provider_idx, model_idx);
         self.model_dialog.close();
     }
+
+    /// Clears rendered message line cache to force fresh render of messages.
+    pub fn clear_render_cache(&mut self) {
+        self.invalidate_message_cache();
+        self.selection_lines = SelectionLines::default();
+    }
+
+    /// Transitions into Fleet / SysAdmin mode with its own isolated conversation session.
+    pub fn enter_fleet_mode(&mut self) {
+        if self.normal_session_stash.is_none() {
+            let _ = self.session.save();
+            self.normal_session_stash = Some(self.session.clone());
+
+            if let Some(fs) = self.fleet_session.take() {
+                self.session = fs;
+            } else {
+                let mut new_fs = Session::new_with_params(
+                    &self.session.model,
+                    self.session.temperature.unwrap_or(0.7),
+                    self.session.reasoning_effort.as_deref().unwrap_or("medium"),
+                    Some(&self.workspace_dir),
+                );
+                new_fs.title = "SysAdmin Fleet Console".to_string();
+                new_fs.tag = Some("fleet".to_string());
+                new_fs.add_message(Message::system(
+                    "SysAdmin Fleet Mode active. You are supervising and orchestrating remote servers via SSH (fleet tools). All commands and telemetry are isolated to this session."
+                ));
+                self.session = new_fs;
+            }
+            self.clear_render_cache();
+            self.scroll_to_bottom();
+        }
+    }
+
+    /// Exits Fleet / SysAdmin mode, saving the fleet session and restoring the normal conversation.
+    pub fn exit_fleet_mode(&mut self) {
+        if let Some(normal) = self.normal_session_stash.take() {
+            let _ = self.session.save();
+            self.fleet_session = Some(self.session.clone());
+            self.session = normal;
+            self.clear_render_cache();
+            self.scroll_to_bottom();
+        }
+        self.fleet_dialog.close();
+    }
 }
 
 /// Opens a URL in the user's default browser completely detached in the background.
 /// Never blocks the event loop, never inherits terminal stdio, never interferes with raw mode.
 pub fn open_url_detached(url: &str) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
+    if cfg!(test) {
+        return;
+    }
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://") || trimmed.starts_with("mailto:")) {
+        return;
+    }
+    let url_owned = trimmed.to_string();
+    std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
+        let child = std::process::Command::new("xdg-open")
+            .arg(&url_owned)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(url)
+
+        #[cfg(target_os = "macos")]
+        let child = std::process::Command::new("open")
+            .arg(&url_owned)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+
+        #[cfg(target_os = "windows")]
+        let child = std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", &url_owned])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        if let Ok(mut c) = child {
+            let _ = c.wait();
+        }
+    });
+}
+
+/// Returns at most `window` bytes before and after `hole_idx`, snapped to UTF-8 char and line
+/// boundaries, with an elision marker when the file was clipped. Keeps /fim prompts bounded.
+pub(crate) fn fim_context_window(content: &str, hole_idx: usize, window: usize) -> String {
+    if content.len() <= window * 2 {
+        return content.to_string();
     }
+
+    let mut start = hole_idx.saturating_sub(window);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    if start > 0 {
+        if let Some(nl) = content[start..hole_idx].find('\n') {
+            start += nl + 1;
+        }
+    }
+
+    let mut end = (hole_idx + window).min(content.len());
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
+    if end < content.len() {
+        if let Some(nl) = content[hole_idx..end].rfind('\n') {
+            end = hole_idx + nl;
+        }
+    }
+
+    let mut out = String::with_capacity(end - start + 64);
+    if start > 0 {
+        out.push_str("// ... (earlier lines omitted) ...\n");
+    }
+    out.push_str(&content[start..end]);
+    if end < content.len() {
+        out.push_str("\n// ... (later lines omitted) ...");
+    }
+    out
 }
 
 #[cfg(test)]

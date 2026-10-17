@@ -200,6 +200,7 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             models: vec![
                 model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["dynamic", "low", "medium", "high"], ModelFamily::Flash),
                 model("deepseek-pro", "DeepSeek-V4-Pro", &["thinking"], &["max", "high", "medium", "low"], ModelFamily::Pro),
+                model("deepseek-v4.1-flash-1017", "DeepSeek-V4.1-Flash-1017", &["latest", "wish-driven", "fast", "tools"], &["dynamic", "low", "medium", "high"], ModelFamily::Flash),
             ],
         },
         ProviderConfig {

@@ -49,20 +49,36 @@ This makes YOLO permanent across all sessions until changed.
 ## 🛡️ What Requires Confirmation (without YOLO)
 
 Corex asks before:
-- **Writing files** (`write_file`, `edit`, `apply_patch`)
-- **Running shell commands** (`run_shell_command` / `bash`)
+- **Writing files** (`write_file`, `edit_file`, `apply_patch`)
+- **Running shell commands** (`run_shell_command`)
+- **Remote fleet mutating/dangerous commands** (`fleet_run_command`, `fleet_broadcast_command`, `fleet_manage`)
 - **Deleting or overwriting** files
 
 Corex does NOT ask before:
-- Reading files (`read_file`, `glob`, `grep`, `list_directory`)
+- Reading files (`read_file`, `glob_files`, `grep_search`, `list_dir`)
 - Web searches (`web_search`, `web_fetch`)
-- Background task inspection (`manage_task` with `list` or `status`)
+- Background task inspection (`manage_background_process` with `list` or `status`)
+
+When a tool requires approval, Corex presents a **5-option confirmation selector**:
+1. **`1` / `y`** — Allow this execution once
+2. **`2` / `s`** — Allow for the rest of this session (enables YOLO for the session)
+3. **`3` / `n`** — Deny execution
+4. **`4` / `p`** — Always allow & save rule to `~/.corex/settings.json`
+5. **`5` / `w`** — Deny and type custom instructions for the agent
+*(Use `Ctrl+O` to expand/collapse full diff previews in the confirmation dialog.)*
 
 ---
 
 ## ✅ Allowed Commands (Granular Whitelist)
 
-Instead of full YOLO, you can whitelist specific commands that never require confirmation:
+Instead of full YOLO, you can whitelist specific commands that never require confirmation using `/allow` (or `/whitelist`) inside the TUI:
+```
+/allow
+/allow add cargo test
+/allow remove cargo test
+```
+
+Or in `~/.corex/settings.json`:
 
 ```json
 // ~/.corex/settings.json
@@ -79,7 +95,7 @@ Instead of full YOLO, you can whitelist specific commands that never require con
 ```
 
 - Entries can be a **binary name** (`cargo`) — matches any `cargo ...` command
-- Or a **prefix** (`git status`) — matches exactly `git status` and nothing else
+- Or a **prefix** (`git status`) — matches `git status` commands
 - Everything else still prompts for confirmation
 
 ---

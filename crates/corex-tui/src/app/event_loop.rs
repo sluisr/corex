@@ -26,6 +26,51 @@ use super::state::{App, PendingToolBatch};
 use super::terminal::{restore_terminal, TerminalGuard, MOUSE_REPORTING_OFF, MOUSE_REPORTING_ON};
 use crate::user_dialog::parse_questions;
 
+pub fn format_call_preview(call: &ToolCall, registry: &corex_tools::ToolRegistry, workspace_dir: &std::path::Path) -> String {
+    let args_json = corex_core::parse_lenient_json(&call.function.arguments)
+        .unwrap_or(serde_json::Value::Null);
+    let tool = registry.get(&call.function.name);
+    if call.function.name == "run_shell_command" {
+        if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
+            return cmd.to_string();
+        }
+    } else if call.function.name == "delegate_subagent" {
+        let role = args_json.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
+        let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+        let first_line = prompt.lines().next().unwrap_or(prompt).trim();
+        return format!("Subagent [{}] {}", role.to_uppercase(), first_line);
+    } else if let Some(t) = tool {
+        if let Some(diff) = t.format_diff(&args_json, workspace_dir) {
+            return diff;
+        }
+    }
+    let summary = if let Some(obj) = args_json.as_object() {
+        obj.iter()
+            .take(2)
+            .map(|(k, v)| {
+                let val_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                let truncated = if val_str.len() > 60 {
+                    format!("{}...", corex_core::types::safe_truncate_str(&val_str, 60))
+                } else {
+                    val_str
+                };
+                format!("{}: {}", k, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    };
+    if summary.is_empty() {
+        format!("{}(...)", call.function.name)
+    } else {
+        format!("{}({})", call.function.name, summary)
+    }
+}
+
 pub async fn run_tui(mut app: App) -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -40,22 +85,78 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
     let _guard = TerminalGuard;
 
-    // Closing the terminal window (SIGHUP) or `kill` (SIGTERM) skips Drop; restore explicitly.
+    let resumed_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Closing the terminal window (SIGHUP), `kill` (SIGTERM), or quit (SIGQUIT) skips Drop; restore explicitly.
     #[cfg(unix)]
-    tokio::spawn(async {
+    {
         use tokio::signal::unix::{signal, SignalKind};
-        let (Ok(mut hup), Ok(mut term)) =
-            (signal(SignalKind::hangup()), signal(SignalKind::terminate()))
-        else {
-            return;
-        };
-        tokio::select! {
-            _ = hup.recv() => {}
-            _ = term.recv() => {}
-        }
-        restore_terminal();
-        std::process::exit(130);
-    });
+
+        tokio::spawn(async {
+            let (Ok(mut hup), Ok(mut term), Ok(mut quit)) = (
+                signal(SignalKind::hangup()),
+                signal(SignalKind::terminate()),
+                signal(SignalKind::quit()),
+            ) else {
+                return;
+            };
+            tokio::select! {
+                _ = hup.recv() => {}
+                _ = term.recv() => {}
+                _ = quit.recv() => {}
+            }
+            restore_terminal();
+            std::process::exit(130);
+        });
+
+        // Suspend signals (SIGTSTP, SIGTTIN, SIGTTOU):
+        // Clean up terminal modes so mouse escape codes don't leak into the shell,
+        // then pause via SIGSTOP. On resume (SIGCONT), restore TUI terminal state.
+        let resumed_clone = resumed_flag.clone();
+        tokio::spawn(async move {
+            let (Ok(mut tstp), Ok(mut ttin), Ok(mut ttou)) = (
+                signal(SignalKind::from_raw(libc::SIGTSTP)),
+                signal(SignalKind::from_raw(libc::SIGTTIN)),
+                signal(SignalKind::from_raw(libc::SIGTTOU)),
+            ) else {
+                return;
+            };
+
+            loop {
+                tokio::select! {
+                    _ = tstp.recv() => {}
+                    _ = ttin.recv() => {}
+                    _ = ttou.recv() => {}
+                }
+
+                // 1. Cleanly restore terminal to cooked/clean state before suspending
+                restore_terminal();
+
+                // 2. Suspend process via SIGSTOP so the shell regains control cleanly
+                // SAFETY: `libc::raise(SIGSTOP)` sends the stop signal strictly to the calling
+                // process/thread itself. It has no memory-safety preconditions and cleanly yields
+                // execution to the parent shell process group after terminal attributes have been restored.
+                unsafe {
+                    libc::raise(libc::SIGSTOP);
+                }
+
+                // 3. Execution resumes here when shell sends SIGCONT (e.g. via `fg`)
+                let _ = crossterm::terminal::enable_raw_mode();
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+                let _ = crossterm::execute!(
+                    stdout,
+                    EnterAlternateScreen,
+                    EnableBracketedPaste,
+                    EnableFocusChange
+                );
+                let _ = stdout.write_all(MOUSE_REPORTING_ON.as_bytes());
+                let _ = stdout.flush();
+
+                resumed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -71,6 +172,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let mut needs_redraw = true;
 
     loop {
+        #[cfg(unix)]
+        if resumed_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let _ = terminal.clear();
+            mouse_capture_applied = false;
+            needs_redraw = true;
+        }
+
         app.poll_local_health_check();
 
         // Reconcile terminal mouse reporting with the app state (COREX_MOUSE or F2).
@@ -120,6 +228,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         };
 
+        const TASK_DONE_TAIL_BYTES: usize = 12_000;
+        const SUBAGENT_DONE_MAX_BYTES: usize = 16_000;
+
         let mut has_finished_tasks = false;
         for (pid, exit_code, dur, output) in newly_finished {
             let code_str = match exit_code {
@@ -127,7 +238,17 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 None => "stopped".to_string(),
             };
             let mut msg_text = format!("TASK_DONE|{}|{}|{}\n", pid, code_str, dur);
-            msg_text.push_str(output.trim_end());
+            let trimmed = output.trim_end();
+            if trimmed.len() > TASK_DONE_TAIL_BYTES {
+                let mut cut = trimmed.len() - TASK_DONE_TAIL_BYTES;
+                while !trimmed.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                msg_text.push_str(&format!("[... {} earlier bytes omitted; use manage_task status for more ...]\n", cut));
+                msg_text.push_str(&trimmed[cut..]);
+            } else {
+                msg_text.push_str(trimmed);
+            }
             app.session.add_message(Message::system(msg_text));
             app.invalidate_message_cache();
             needs_redraw = true;
@@ -136,7 +257,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         }
 
-        // Check for finished subagents (reactive wakeup)
+        // Check for finished subagents (reactive wakeup with isolated, clean IPC)
         let newly_finished_subagents = {
             if let Ok(mut mgr) = corex_core::subagent::get_subagent_manager().lock() {
                 mgr.drain_unacknowledged()
@@ -147,7 +268,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
         for (sub_id, role, dur, output) in newly_finished_subagents {
             let mut msg_text = format!("SUBAGENT_DONE|{}|{}|{}\n", sub_id, role.as_str().to_uppercase(), dur);
-            msg_text.push_str(output.trim_end());
+            let trimmed = output.trim_end();
+            if trimmed.len() > SUBAGENT_DONE_MAX_BYTES {
+                msg_text.push_str(corex_core::safe_truncate_str(trimmed, SUBAGENT_DONE_MAX_BYTES));
+                msg_text.push_str("\n[... report truncated; use manage_subagents status/log for the full output ...]");
+            } else {
+                msg_text.push_str(trimmed);
+            }
             app.session.add_message(Message::system(msg_text));
             app.invalidate_message_cache();
             needs_redraw = true;
@@ -219,7 +346,31 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         let is_header_animating = app.scroll_offset <= 4 && !app.is_streaming && app.last_interaction.elapsed() < Duration::from_secs(4);
         let is_animating = app.is_slash_animating() || app.status_transition.is_animating() || is_header_animating;
 
-        if needs_redraw || app.is_streaming || app.is_checking_balance || has_active_tasks || is_animating {
+        if app.fleet_dialog.poll_telemetry() {
+            needs_redraw = true;
+        }
+
+        while let Ok((node_id, sess)) = app.fleet_dialog.cmd_done_rx.try_recv() {
+            corex_fleet::global_session_manager().set_session(node_id.clone(), sess.clone()).await;
+            app.fleet_dialog.active_session = Some(sess);
+            app.fleet_dialog.status_msg = None;
+            needs_redraw = true;
+        }
+
+        if app.fleet_dialog.is_open && app.fleet_dialog.auto_connect_pending {
+            app.fleet_dialog.auto_connect_pending = false;
+            if let Some(id) = app.fleet_dialog.selected_node().map(|n| n.id.clone()) {
+                app.fleet_dialog.status_msg = Some(format!("Connecting to {}...", id));
+                terminal.draw(|f| {
+                    render_ui(f, &mut app);
+                })?;
+                fleet_ensure_session(&mut app).await;
+                needs_redraw = true;
+            }
+        }
+
+        let pty_dirty = app.fleet_dialog.is_open && app.fleet_dialog.pty_session.as_ref().map(|p| p.is_alive() && p.take_dirty()).unwrap_or(false);
+        if needs_redraw || app.is_streaming || app.is_checking_balance || has_active_tasks || is_animating || pty_dirty {
             terminal.draw(|f| {
                 render_ui(f, &mut app);
             })?;
@@ -242,6 +393,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.set_status("Generating response...");
                 }
                 StreamEvent::ToolCallDelta { index, id, name, arguments, extra_content } => {
+                    if index > 64 {
+                        continue;
+                    }
                     while app.streaming_tool_calls.len() <= index {
                         app.streaming_tool_calls.push(ToolCall {
                             id: String::new(),
@@ -272,10 +426,22 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 StreamEvent::UsageUpdate(usage) => {
                     app.session.update_usage(&usage);
                 }
-                StreamEvent::ToolExecutionStarting { summary, .. } => {
+                StreamEvent::ToolExecutionStarting { summary, name, .. } => {
                     app.set_status(&summary);
+                    if app.fleet_dialog.is_open {
+                        app.fleet_dialog.status_msg = Some(summary.clone());
+                        if let Some(ref pty) = app.fleet_dialog.pty_session {
+                            if name == "fleet_run_command" {
+                                let cmd = summary
+                                    .strip_prefix("fleet_run_command ")
+                                    .unwrap_or(&summary);
+                                pty.feed_text(&format!("\r\n\x1b[1;33m› [corex] $ {}\x1b[0m\r\n", cmd));
+                            }
+                        }
+                    }
                 }
                 StreamEvent::ToolExecutionDone { call_id, output } => {
+                    app.in_flight_tool_calls = app.in_flight_tool_calls.saturating_sub(1);
                     if output.contains("incorrect password attempt")
                         || output.contains("sudo: a password is required")
                         || output.contains("sudo: PAM authentication")
@@ -284,13 +450,66 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     }
                     let tool_name = app.session.messages.iter().rev()
                         .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id).map(|c| c.function.name.clone()));
-                    let mut tool_msg = Message::tool_response(call_id, output);
-                    tool_msg.name = tool_name;
+                    let mut tool_msg = Message::tool_response(call_id, output.clone());
+                    tool_msg.name = tool_name.clone();
                     app.session.add_message(tool_msg);
+
+                    if app.fleet_dialog.is_open {
+                        let target_node = app.fleet_dialog.active_session.as_ref().map(|s| s.node.id.clone())
+                            .or_else(|| app.fleet_dialog.selected_node().map(|n| n.id.clone()));
+                        if let Some(ref nid) = target_node {
+                            if let Some(sess) = corex_fleet::global_session_manager().get_session(nid).await {
+                                app.fleet_dialog.active_session = Some(sess);
+                                app.fleet_dialog.terminal_scroll = 0;
+                            }
+                        }
+                        if let Some(ref pty) = app.fleet_dialog.pty_session {
+                            if tool_name.as_deref() == Some("fleet_run_command") {
+                                let display_out = if let Some(idx) = output.find("--- STDOUT ---\n") {
+                                    let rest = &output[idx + "--- STDOUT ---\n".len()..];
+                                    if let Some(err_idx) = rest.find("--- STDERR ---\n") {
+                                        &rest[..err_idx]
+                                    } else {
+                                        rest
+                                    }
+                                } else {
+                                    &output
+                                };
+                                let formatted = display_out
+                                    .replace("\r\n", "\n")
+                                    .replace('\n', "\r\n");
+                                let trimmed = formatted.trim_end();
+                                if !trimmed.is_empty() {
+                                    pty.feed_text(&format!("{}\r\n", trimmed));
+                                }
+                            }
+                        }
+                        app.fleet_dialog.status_msg = None;
+                    }
+                    if app.pending_confirmation.is_some()
+                        || app.sudo_dialog.is_open
+                        || app.user_dialog.is_open
+                        || app.fleet_dialog.pending_approval.is_some()
+                    {
+                        if app.in_flight_tool_calls == 0 {
+                            app.is_streaming = false;
+                            app.clear_status();
+                        }
+                        needs_redraw = true;
+                    } else if app.in_flight_tool_calls == 0 {
+                        app.start_stream_turn(event_tx.clone());
+                    }
                 }
                 StreamEvent::AllToolsDone => {
-                    // ⚡ TRIGGER NEXT RECURSIVE TURN OF AGENT LOOP!
-                    app.start_stream_turn(event_tx.clone());
+                    // Trigger next recursive turn of agent loop only when all in-flight tools and dialogs are complete
+                    if app.in_flight_tool_calls == 0
+                        && app.pending_confirmation.is_none()
+                        && !app.sudo_dialog.is_open
+                        && !app.user_dialog.is_open
+                        && app.fleet_dialog.pending_approval.is_none()
+                    {
+                        app.start_stream_turn(event_tx.clone());
+                    }
                 }
                 StreamEvent::Completed { .. } => {
                     let assistant_text = if app.streaming_text.is_empty() {
@@ -363,6 +582,37 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     }
                                 } else if let Some(diff) = t.format_diff(&args_json, &app.workspace_dir) {
                                     previews.push(diff);
+                                } else if call.function.name == "delegate_subagent" {
+                                    let role = args_json.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
+                                    let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                                    let first_line = prompt.lines().next().unwrap_or(prompt).trim();
+                                    previews.push(format!("Subagent [{}] {}", role.to_uppercase(), first_line));
+                                } else {
+                                    let summary = if let Some(obj) = args_json.as_object() {
+                                        obj.iter()
+                                            .take(2)
+                                            .map(|(k, v)| {
+                                                let val_str = match v {
+                                                    serde_json::Value::String(s) => s.clone(),
+                                                    _ => v.to_string(),
+                                                };
+                                                let truncated = if val_str.len() > 60 {
+                                                    format!("{}...", corex_core::types::safe_truncate_str(&val_str, 60))
+                                                } else {
+                                                    val_str
+                                                };
+                                                format!("{}: {}", k, truncated)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    } else {
+                                        String::new()
+                                    };
+                                    if summary.is_empty() {
+                                        previews.push(format!("{}(...)", call.function.name));
+                                    } else {
+                                        previews.push(format!("{}({})", call.function.name, summary));
+                                    }
                                 }
                             }
                         }
@@ -394,31 +644,34 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.thinking_state.reset();
                             app.clear_status();
                             app.user_dialog.open(questions, calls.clone(), ask_call.id.clone());
-                        } else if let Some(sudo_cmd) = sudo_needed_cmd {
-                            app.is_streaming = false;
-                            app.thinking_state.reset();
-                            app.clear_status();
-                            app.sudo_dialog.open_batch(calls.clone(), sudo_cmd);
                         } else if requires_confirmation {
-                            let combined_preview = if previews.is_empty() {
-                                None
-                            } else {
-                                Some(previews.join("\n"))
-                            };
+                            let total_count = calls.len();
+                            let first_preview = calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
 
                             app.is_streaming = false;
                             app.thinking_state.reset();
                             app.clear_status();
+                            if app.fleet_dialog.is_open {
+                                app.fleet_dialog.command_mode = false;
+                            }
                             app.pending_confirmation = Some(PendingToolBatch {
                                 calls: calls.clone(),
-                                diff_preview: combined_preview,
+                                total_count,
+                                current_idx: 1,
+                                diff_preview: first_preview,
                                 selected_option: 0,
                                 diff_expanded: false,
                                 input_mode: false,
                                 feedback_text: String::new(),
                             });
+                        } else if let Some(sudo_cmd) = sudo_needed_cmd {
+                            app.is_streaming = false;
+                            app.thinking_state.reset();
+                            app.clear_status();
+                            app.sudo_dialog.open_batch(calls.clone(), sudo_cmd);
                         } else {
                             // Execute all tools concurrently in parallel without blocking UI!
+                            app.in_flight_tool_calls += calls.len();
                             let tx = event_tx.clone();
                             let registry = app.tool_registry.clone();
                             let context = confirmation_context;
@@ -449,14 +702,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let args_str = call.function.arguments.clone();
 
                                     handles.push(tokio::spawn(async move {
-                                        if calls_count == 1 {
-                                            let summary = format_tool_call_summary(&tool_name, &args_str);
-                                            let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
-                                                call_id: call_id.clone(),
-                                                name: tool_name.clone(),
-                                                summary,
-                                            })).await;
-                                        }
+                                        let summary = format_tool_call_summary(&tool_name, &args_str);
+                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
+                                            call_id: call_id.clone(),
+                                            name: tool_name.clone(),
+                                            summary,
+                                        })).await;
                                         let start_tool = std::time::Instant::now();
                                         let (output, success) = match corex_core::parse_lenient_json(&args_str) {
                                             Ok(args_json) => {
@@ -535,6 +786,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 }
                 StreamEvent::Error(err) => {
                     app.is_streaming = false;
+                    app.in_flight_tool_calls = 0;
                     app.thinking_state.reset();
                     app.clear_status();
                     app.session.add_message(Message::system(format!("Error: {}", err)));
@@ -557,7 +809,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         }
 
-        let is_fast_animating = app.is_streaming || app.is_slash_animating() || app.status_transition.is_animating();
+        let is_fast_animating = app.is_streaming || app.is_slash_animating() || app.status_transition.is_animating() || pty_dirty;
         let tick_rate = if is_fast_animating {
             Duration::from_millis(16)
         } else if is_header_animating {
@@ -571,11 +823,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             app.last_interaction = Instant::now();
             match event::read()? {
                 Event::Paste(pasted) => {
-                    corex_core::forensic::ForensicLogger::log_event(
-                        "TUI_PASTE",
-                        &format!("Paste event ({} chars)", pasted.len()),
-                        &format!("Content:\n{}", pasted),
-                    );
+                    if app.sudo_dialog.is_open || app.auth_dialog.is_open {
+                        corex_core::forensic::ForensicLogger::log_event(
+                            "TUI_PASTE",
+                            &format!("Paste event ({} chars, redacted in credential dialog)", pasted.len()),
+                            "Content: [REDACTED]",
+                        );
+                    } else {
+                        corex_core::forensic::ForensicLogger::log_event(
+                            "TUI_PASTE",
+                            &format!("Paste event ({} chars)", pasted.len()),
+                            &format!("Content:\n{}", pasted),
+                        );
+                    }
                     app.handle_paste(pasted);
                 }
                 // A resize or regaining focus can leave ghost cells the diff renderer believes
@@ -597,6 +857,63 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     app.clear_selection();
                 }
                 Event::Mouse(mouse) => {
+                    if app.fleet_dialog.is_open {
+                        let (w, h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                        let is_wide = app.fleet_dialog.wide_layout && w >= crate::fleet_dialog::FLEET_WIDE_MIN_WIDTH;
+                        let is_horizontal = w >= 110;
+                        let split_col = if is_wide {
+                            (w * 40) / 100
+                        } else if is_horizontal {
+                            (w * 55) / 100
+                        } else {
+                            w
+                        };
+                        let is_on_server = if is_horizontal {
+                            mouse.column >= split_col
+                        } else {
+                            mouse.row >= (h * 50) / 100
+                        };
+
+                        if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+                            if is_on_server {
+                                if !app.fleet_dialog.command_mode {
+                                    app.fleet_dialog.command_mode = true;
+                                    needs_redraw = true;
+                                }
+                            } else {
+                                if app.fleet_dialog.command_mode {
+                                    app.fleet_dialog.command_mode = false;
+                                    needs_redraw = true;
+                                }
+                            }
+                        } else if is_on_server {
+                            match mouse.kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                        pty.scroll_up(3);
+                                        app.fleet_dialog.terminal_scroll = pty.scrollback();
+                                    } else {
+                                        let total = app.fleet_dialog.total_output_lines();
+                                        let view_h = h.saturating_sub(8) as usize;
+                                        app.fleet_dialog.scroll_up(3, total, view_h);
+                                    }
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                        pty.scroll_down(3);
+                                        app.fleet_dialog.terminal_scroll = pty.scrollback();
+                                    } else {
+                                        app.fleet_dialog.scroll_down(3);
+                                    }
+                                    needs_redraw = true;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     app.handle_mouse(mouse);
                     let (w, h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
                     if is_mobile_portrait(w, h) {
@@ -647,6 +964,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 token.cancel();
                             }
                             app.current_generation_id = app.current_generation_id.wrapping_add(1);
+                            app.in_flight_tool_calls = 0;
                             app.is_streaming = false;
                             app.thinking_state.is_streaming = false;
                             app.clear_status();
@@ -706,8 +1024,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         "Sudo authentication cancelled by user.",
                                     ));
                                 }
-                                app.start_stream_turn(event_tx.clone());
                                 app.sudo_dialog.close();
+                                if app.pending_confirmation.is_none() && app.in_flight_tool_calls == 0 {
+                                    app.start_stream_turn(event_tx.clone());
+                                }
                             }
                             KeyCode::Backspace => {
                                 app.sudo_dialog.password_input.pop();
@@ -730,6 +1050,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         Vec::new()
                                     };
                                     if !calls.is_empty() {
+                                        app.in_flight_tool_calls += calls.len();
                                         let tx = event_tx.clone();
                                         let registry = app.tool_registry.clone();
                                         let gen = app.current_generation_id;
@@ -822,10 +1143,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let prov_label = app.auth_dialog.provider_label.clone();
                                     let pending = app.auth_dialog.pending_activation;
 
-                                    if !env_var.is_empty() {
-                                        std::env::set_var(&env_var, &key_str);
-                                    }
-
                                     let mut cfg = app.llm_client.get_config();
                                     if prov_name == "deepseek" {
                                         cfg.api_key = key_str.clone();
@@ -834,6 +1151,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     }
                                     let _ = cfg.save_with_workspace(Some(&app.workspace_dir));
                                     app.llm_client.update_config(cfg);
+                                    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(app.llm_client.clone()));
                                     if let Some(pos) = app.model_dialog.providers.iter().position(|p| p.name == prov_name) {
                                         if pos < app.model_dialog.ready.len() {
                                             app.model_dialog.ready[pos] = true;
@@ -886,7 +1204,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     let session_id = selected_session.id.clone();
                                     let _ = Session::delete_by_id_or_tag(&session_id);
                                     // Refresh list
-                                    app.session_dialog.open(&app.workspace_dir.display().to_string());
+                                    app.session_dialog.open(&app.workspace_dir.display().to_string(), app.session_dialog.is_fleet);
                                 }
                             }
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -897,7 +1215,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 if let Some(selected_session) = app.session_dialog.selected_session().cloned() {
                                     let session_id = selected_session.id.clone();
                                     match Session::load_by_id_or_tag(&session_id) {
-                                        Ok(loaded) => {
+                                        Ok(mut loaded) => {
                                             let mut cfg = app.llm_client.get_config();
                                             cfg.model = loaded.model.clone();
                                             if let Some(t) = loaded.temperature {
@@ -907,11 +1225,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                 cfg.reasoning_effort = r.clone();
                                             }
                                             app.llm_client.update_config(cfg);
+                                            corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(app.llm_client.clone()));
+                                            let is_fleet = app.session_dialog.is_fleet;
+                                            if is_fleet {
+                                                loaded.tag = Some("fleet".to_string());
+                                            }
                                             app.session = loaded;
+                                            app.cached_session_id.clear();
                                             app.invalidate_message_cache();
+                                            app.clear_selection();
+                                            app.scroll_to_bottom();
+                                            let label = if is_fleet { "Fleet session" } else { "session" };
                                             app.session.add_message(Message::system(format!(
-                                                "Resumed session '{}' (Model: {}).",
-                                                app.session.title, app.session.model
+                                                "Resumed {} '{}' (Model: {}).",
+                                                label, app.session.title, app.session.model
                                             )));
                                         }
                                         Err(e) => {
@@ -924,6 +1251,448 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             _ => {}
                         }
                         continue;
+                    }
+
+                    // --- 1.6. Fleet Operations Dialog Active ---
+                    // --- 1.6. Fleet Operations & SysAdmin Console Active ---
+                    let mut fleet_chat_passthrough = false;
+                    if app.fleet_dialog.is_open && app.pending_confirmation.is_none() {
+                        // A. Handling when there is a pending AI Remote Command Approval
+                        if let Some(mut pending) = app.fleet_dialog.pending_approval.take() {
+                            if pending.edit_mode {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        pending.edit_mode = false;
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    KeyCode::Enter => {
+                                        let edited = pending.edited_command.trim().to_string();
+                                        let call_id = pending.call_id.clone();
+                                        let node_id = pending.node_id.clone();
+                                        let sudo = pending.sudo;
+                                        let mut session = match app.fleet_dialog.active_session.clone() {
+                                            Some(s) if s.node.id == node_id => s,
+                                            _ => {
+                                                if let Some(node) = app.fleet_dialog.items.iter().find(|i| i.config.id == node_id).map(|i| i.config.clone()) {
+                                                    let mut s = corex_fleet::RemoteSession::new(node);
+                                                    let _ = s.connect(8).await;
+                                                    s
+                                                } else {
+                                                    let mut tool_msg = Message::tool_response(call_id, format!("Error: Node {} not found", node_id));
+                                                    tool_msg.name = Some("fleet_run_command".to_string());
+                                                    app.session.add_message(tool_msg);
+                                                    continue;
+                                                }
+                                            }
+                                        };
+
+                                        match session.execute_command(&edited, corex_fleet::CommandInitiator::AI, sudo, 15).await {
+                                            Ok(rec) => {
+                                                corex_fleet::global_session_manager().set_session(node_id.clone(), session.clone()).await;
+                                                app.fleet_dialog.active_session = Some(session);
+                                                if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                                    pty.feed_text(&format!("\r\n\x1b[1;33m› [corex] $ {}\x1b[0m\r\n", edited));
+                                                    let clean = rec.stdout.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    let trimmed = clean.trim_end();
+                                                    if !trimmed.is_empty() {
+                                                        pty.feed_text(&format!("{}\r\n", trimmed));
+                                                    }
+                                                    let clean_err = rec.stderr.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    let trimmed_err = clean_err.trim_end();
+                                                    if !trimmed_err.is_empty() {
+                                                        pty.feed_text(&format!("\x1b[31m{}\x1b[0m\r\n", trimmed_err));
+                                                    }
+                                                }
+                                                let output = if rec.stderr.trim().is_empty() {
+                                                    format!("[{}] (edited by SysAdmin) Exit code: {} | CWD: {}\n{}", node_id, rec.exit_code, rec.cwd_after, rec.stdout)
+                                                } else {
+                                                    format!("[{}] (edited by SysAdmin) Exit code: {} | CWD: {}\n{}\n--- STDERR ---\n{}", node_id, rec.exit_code, rec.cwd_after, rec.stdout, rec.stderr)
+                                                };
+                                                let mut tool_msg = Message::tool_response(call_id, output);
+                                                tool_msg.name = Some("fleet_run_command".to_string());
+                                                app.session.add_message(tool_msg);
+                                                let _ = app.session.save();
+                                            }
+                                            Err(e) => {
+                                                if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                                    pty.feed_text(&format!("\r\n\x1b[1;31m! Error: {}\x1b[0m\r\n", e));
+                                                }
+                                                let mut tool_msg = Message::tool_response(call_id, format!("Remote execution error: {}", e));
+                                                tool_msg.name = Some("fleet_run_command".to_string());
+                                                app.session.add_message(tool_msg);
+                                            }
+                                        }
+                                        app.start_stream_turn(event_tx.clone());
+                                    }
+                                    KeyCode::Backspace => {
+                                        pending.edited_command.pop();
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    KeyCode::Char(c) => {
+                                        pending.edited_command.push(c);
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    _ => {
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            } else if pending.instructions_mode {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        pending.instructions_mode = false;
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    KeyCode::Enter => {
+                                        let text = pending.instructions_text.trim().to_string();
+                                        let call_id = pending.call_id.clone();
+                                        if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                            pty.feed_text(&format!("\r\n\x1b[1;35m! Instructions: {}\x1b[0m\r\n", text));
+                                        }
+                                        let mut tool_msg = Message::tool_response(
+                                            call_id,
+                                            format!("Command denied by SysAdmin with instructions: {}", text)
+                                        );
+                                        tool_msg.name = Some("fleet_run_command".to_string());
+                                        app.session.add_message(tool_msg);
+                                        let _ = app.session.save();
+                                        app.start_stream_turn(event_tx.clone());
+                                    }
+                                    KeyCode::Backspace => {
+                                        pending.instructions_text.pop();
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    KeyCode::Char(c) => {
+                                        pending.instructions_text.push(c);
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                    _ => {
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                    }
+                                }
+                                needs_redraw = true;
+                                continue;
+                            } else {
+                                // Direct approval actions: [y] Allow, [e] Edit, [w] Instructions, [n] Deny
+                                match key.code {
+                                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                        let cmd = pending.command.clone();
+                                        let call_id = pending.call_id.clone();
+                                        let node_id = pending.node_id.clone();
+                                        let sudo = pending.sudo;
+
+                                        let mut session = match app.fleet_dialog.active_session.clone() {
+                                            Some(s) if s.node.id == node_id => s,
+                                            _ => {
+                                                if let Some(node) = app.fleet_dialog.items.iter().find(|i| i.config.id == node_id).map(|i| i.config.clone()) {
+                                                    let mut s = corex_fleet::RemoteSession::new(node);
+                                                    let _ = s.connect(8).await;
+                                                    s
+                                                } else {
+                                                    let mut tool_msg = Message::tool_response(call_id, format!("Error: Node {} not found", node_id));
+                                                    tool_msg.name = Some("fleet_run_command".to_string());
+                                                    app.session.add_message(tool_msg);
+                                                    continue;
+                                                }
+                                            }
+                                        };
+
+                                        match session.execute_command(&cmd, corex_fleet::CommandInitiator::AI, sudo, 15).await {
+                                            Ok(rec) => {
+                                                corex_fleet::global_session_manager().set_session(node_id.clone(), session.clone()).await;
+                                                app.fleet_dialog.active_session = Some(session);
+                                                if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                                    pty.feed_text(&format!("\r\n\x1b[1;33m› [corex] $ {}\x1b[0m\r\n", cmd));
+                                                    let clean = rec.stdout.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    let trimmed = clean.trim_end();
+                                                    if !trimmed.is_empty() {
+                                                        pty.feed_text(&format!("{}\r\n", trimmed));
+                                                    }
+                                                    let clean_err = rec.stderr.replace("\r\n", "\n").replace('\n', "\r\n");
+                                                    let trimmed_err = clean_err.trim_end();
+                                                    if !trimmed_err.is_empty() {
+                                                        pty.feed_text(&format!("\x1b[31m{}\x1b[0m\r\n", trimmed_err));
+                                                    }
+                                                }
+                                                let output = if rec.stderr.trim().is_empty() {
+                                                    format!("[{}] Exit code: {} | CWD: {}\n{}", node_id, rec.exit_code, rec.cwd_after, rec.stdout)
+                                                } else {
+                                                    format!("[{}] Exit code: {} | CWD: {}\n{}\n--- STDERR ---\n{}", node_id, rec.exit_code, rec.cwd_after, rec.stdout, rec.stderr)
+                                                };
+                                                let mut tool_msg = Message::tool_response(call_id, output);
+                                                tool_msg.name = Some("fleet_run_command".to_string());
+                                                app.session.add_message(tool_msg);
+                                                let _ = app.session.save();
+                                            }
+                                            Err(e) => {
+                                                if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                                    pty.feed_text(&format!("\r\n\x1b[1;31m! Error: {}\x1b[0m\r\n", e));
+                                                }
+                                                let mut tool_msg = Message::tool_response(call_id, format!("Remote execution error: {}", e));
+                                                tool_msg.name = Some("fleet_run_command".to_string());
+                                                app.session.add_message(tool_msg);
+                                            }
+                                        }
+                                        app.start_stream_turn(event_tx.clone());
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                                        pending.edit_mode = true;
+                                        pending.edited_command = pending.command.clone();
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Char('w') | KeyCode::Char('W') => {
+                                        pending.instructions_mode = true;
+                                        pending.instructions_text.clear();
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                        let call_id = pending.call_id.clone();
+                                        if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                            pty.feed_text(&format!("\r\n\x1b[1;31m✕ [declined] $ {}\x1b[0m\r\n", pending.command));
+                                        }
+                                        let mut tool_msg = Message::tool_response(call_id, "Remote command execution denied by SysAdmin.".to_string());
+                                        tool_msg.name = Some("fleet_run_command".to_string());
+                                        app.session.add_message(tool_msg);
+                                        let _ = app.session.save();
+                                        app.start_stream_turn(event_tx.clone());
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    _ => {
+                                        app.fleet_dialog.pending_approval = Some(pending);
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // B. Split view: chat (left) and VPS terminal (right).
+                        //    Tab swaps keyboard focus; F1-F9 / Alt+1-9 pick a server; Ctrl+R probes metrics.
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let alt = key.modifiers.contains(KeyModifiers::ALT);
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        let term_focus = app.fleet_dialog.command_mode;
+
+                        let is_pane_toggle = key.code == KeyCode::F(6)
+                            || (ctrl && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')))
+                            || key.code == KeyCode::BackTab
+                            || (alt && key.code == KeyCode::Tab)
+                            || (alt && shift)
+                            || (alt && key.code == KeyCode::Left && term_focus)
+                            || (alt && key.code == KeyCode::Right && !term_focus)
+                            || (!term_focus && key.code == KeyCode::Tab && app.input_buffer.is_empty());
+
+                        let pick_server: Option<usize> = match key.code {
+                            KeyCode::F(n) if (1..=9).contains(&n) => Some((n - 1) as usize),
+                            KeyCode::Char(d) if alt && d.is_ascii_digit() && d != '0' => Some((d as usize) - ('1' as usize)),
+                            _ => None,
+                        };
+
+                        if let Some(idx) = pick_server {
+                            if idx < app.fleet_dialog.items.len() {
+                                app.fleet_dialog.selected_idx = idx;
+                                fleet_ensure_session(&mut app).await;
+                            }
+                        } else if key.code == KeyCode::Char('r') && ctrl {
+                            app.fleet_dialog.status_msg = Some("Probing telemetry...".to_string());
+                            let nodes: Vec<corex_fleet::NodeConfig> = app.fleet_dialog.items.iter().map(|i| i.config.clone()).collect();
+                            let tx = app.fleet_dialog.telemetry_tx.clone();
+                            for n in nodes {
+                                let tx_clone = tx.clone();
+                                tokio::spawn(async move {
+                                    let id = n.id.clone();
+                                    let t = corex_fleet::TelemetryCollector::fetch(&n, 4).await;
+                                    let _ = tx_clone.send((id, t));
+                                });
+                            }
+                        } else if is_pane_toggle {
+                            app.fleet_dialog.command_mode = !term_focus;
+                            needs_redraw = true;
+                            continue;
+                        } else if term_focus {
+                            let is_connected = app.fleet_dialog.is_selected_connected();
+                            if !is_connected {
+                                // Server Selector mode: Up/Down to navigate, Enter to launch session, digits 1-9 direct select.
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.exit_fleet_mode();
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        app.fleet_dialog.select_prev();
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        app.fleet_dialog.select_next();
+                                    }
+                                    KeyCode::Char(d) if d.is_ascii_digit() && d != '0' => {
+                                        let idx = (d as usize) - ('1' as usize);
+                                        if idx < app.fleet_dialog.items.len() {
+                                            app.fleet_dialog.selected_idx = idx;
+                                            fleet_ensure_session(&mut app).await;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        fleet_ensure_session(&mut app).await;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Active Terminal mode: if native PTY is active, send all keys directly to remote bash!
+                                if let Some(ref pty) = app.fleet_dialog.pty_session {
+                                    if !pty.is_alive() {
+                                        app.fleet_dialog.pty_session = None;
+                                        app.fleet_dialog.active_session = None;
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+
+                                    // Keyboard terminal scrolling with PageUp / PageDown:
+                                    if key.code == KeyCode::PageUp {
+                                        pty.scroll_up(15);
+                                        app.fleet_dialog.terminal_scroll = pty.scrollback();
+                                        needs_redraw = true;
+                                        continue;
+                                    } else if key.code == KeyCode::PageDown {
+                                        pty.scroll_down(15);
+                                        app.fleet_dialog.terminal_scroll = pty.scrollback();
+                                        needs_redraw = true;
+                                        continue;
+                                    } else if pty.scrollback() > 0 && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace) {
+                                        pty.scroll_reset();
+                                        app.fleet_dialog.terminal_scroll = 0;
+                                    }
+
+                                    if let Some(bytes) = crate::fleet_pty::key_event_to_bytes(key) {
+                                        pty.write_bytes(&bytes);
+                                    }
+                                    needs_redraw = true;
+                                    continue;
+                                }
+
+                                // Fallback simulated terminal mode: command input, remote completion and scrolling
+                                match key.code {
+                                    KeyCode::Tab => {
+                                        let input = app.fleet_dialog.command_input.clone();
+                                        if !input.trim().is_empty() {
+                                            if let Some(sess) = fleet_ensure_session(&mut app).await {
+                                                app.fleet_dialog.status_msg = Some("…".to_string());
+                                                terminal.draw(|f| {
+                                                    render_ui(f, &mut app);
+                                                })?;
+                                                let result = sess.complete_line(&input).await;
+                                                if result.candidates.is_empty() {
+                                                    app.fleet_dialog.status_msg = Some("no completions".to_string());
+                                                } else if result.candidates.len() == 1 {
+                                                    app.fleet_dialog.command_input = result.new_input;
+                                                    app.fleet_dialog.status_msg = None;
+                                                    app.fleet_dialog.last_tab_input = None;
+                                                } else {
+                                                    if result.advanced {
+                                                        app.fleet_dialog.command_input = result.new_input;
+                                                        app.fleet_dialog.status_msg = None;
+                                                        app.fleet_dialog.last_tab_input = Some(app.fleet_dialog.command_input.clone());
+                                                    } else {
+                                                        let is_double_tab = input.ends_with(char::is_whitespace)
+                                                            || input.ends_with('/')
+                                                            || app.fleet_dialog.last_tab_input.as_deref() == Some(&input);
+                                                        if is_double_tab {
+                                                            app.fleet_dialog.last_tab_input = None;
+                                                            let preview = if result.candidates.len() > 8 {
+                                                                format!("{}  … (+{} more)", result.candidates[..8].join("  "), result.candidates.len() - 8)
+                                                            } else {
+                                                                result.candidates.join("  ")
+                                                            };
+                                                            app.fleet_dialog.status_msg = Some(preview);
+                                                        } else {
+                                                            app.fleet_dialog.last_tab_input = Some(input.clone());
+                                                            app.fleet_dialog.status_msg = None;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        app.fleet_dialog.last_tab_input = None;
+                                        if app.fleet_dialog.command_input.is_empty() {
+                                            // Return to server selector
+                                            app.fleet_dialog.active_session = None;
+                                        } else {
+                                            app.fleet_dialog.command_input.clear();
+                                            app.fleet_dialog.status_msg = None;
+                                        }
+                                    }
+                                    KeyCode::Up => {
+                                        let total = app.fleet_dialog.total_output_lines();
+                                        app.fleet_dialog.scroll_up(1, total, 15);
+                                    }
+                                    KeyCode::Down => app.fleet_dialog.scroll_down(1),
+                                    KeyCode::PageUp => {
+                                        let total = app.fleet_dialog.total_output_lines();
+                                        app.fleet_dialog.scroll_up(10, total, 15);
+                                    }
+                                    KeyCode::PageDown => app.fleet_dialog.scroll_down(10),
+                                    KeyCode::Home => {
+                                        let total = app.fleet_dialog.total_output_lines();
+                                        app.fleet_dialog.scroll_up(total, total, 15);
+                                    }
+                                    KeyCode::End => app.fleet_dialog.terminal_scroll = 0,
+                                    KeyCode::Enter => {
+                                        app.fleet_dialog.last_tab_input = None;
+                                        let cmd = app.fleet_dialog.command_input.trim().to_string();
+                                        if !cmd.is_empty() {
+                                            if let Some(mut sess) = fleet_ensure_session(&mut app).await {
+                                                app.fleet_dialog.command_input.clear();
+                                                app.fleet_dialog.terminal_scroll = 0;
+                                                if cmd == "clear" || cmd == "cls" {
+                                                    sess.clear_history();
+                                                    corex_fleet::global_session_manager().set_session(sess.node.id.clone(), sess.clone()).await;
+                                                    app.fleet_dialog.active_session = Some(sess);
+                                                    app.fleet_dialog.status_msg = None;
+                                                } else {
+                                                    app.fleet_dialog.status_msg = Some(format!("$ {}", cmd));
+                                                    let tx = app.fleet_dialog.cmd_done_tx.clone();
+                                                    let nid = sess.node.id.clone();
+                                                    tokio::spawn(async move {
+                                                        let _ = sess.execute_command(&cmd, corex_fleet::CommandInitiator::User, false, 20).await;
+                                                        let _ = tx.send((nid, sess));
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        app.fleet_dialog.command_input.pop();
+                                        app.fleet_dialog.status_msg = None;
+                                        app.fleet_dialog.last_tab_input = None;
+                                    }
+                                    KeyCode::Char(c) if !ctrl && !alt => {
+                                        app.fleet_dialog.command_input.push(c);
+                                        app.fleet_dialog.status_msg = None;
+                                        app.fleet_dialog.last_tab_input = None;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        } else {
+                            // Chat focus: fall through to the normal chat key handling below.
+                            // (Chat PageUp/PageDown scroll the conversation; terminal scroll needs Tab.)
+                            fleet_chat_passthrough = true;
+                        }
+
+                        if !fleet_chat_passthrough {
+                            needs_redraw = true;
+                            continue;
+                        }
                     }
 
                     // --- 2. Model Dialog Active ---
@@ -982,7 +1751,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                             reason.clone(),
                                         ));
                                     }
-                                    app.start_stream_turn(event_tx.clone());
+                                    if app.in_flight_tool_calls == 0 && !app.sudo_dialog.is_open {
+                                        app.start_stream_turn(event_tx.clone());
+                                    }
                                     continue;
                                 }
                                 _ => {
@@ -1005,26 +1776,52 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             _ => {}
                         }
 
-                        let should_allow_once = key.code == KeyCode::Char('1')
+                        let is_multi = pending.total_count > 1;
+
+                        let should_allow_single = key.code == KeyCode::Char('1')
                             || key.code == KeyCode::Char('y')
                             || key.code == KeyCode::Char('Y')
                             || (key.code == KeyCode::Enter && pending.selected_option == 0);
 
-                        let should_allow_session = key.code == KeyCode::Char('2')
-                            || key.code == KeyCode::Char('s')
-                            || key.code == KeyCode::Char('S')
-                            || (key.code == KeyCode::Enter && pending.selected_option == 1);
+                        let should_allow_all = is_multi && (
+                            key.code == KeyCode::Char('2')
+                            || key.code == KeyCode::Char('a')
+                            || key.code == KeyCode::Char('A')
+                            || (key.code == KeyCode::Enter && pending.selected_option == 1)
+                        );
 
-                        let should_deny = key.code == KeyCode::Char('3')
-                            || key.code == KeyCode::Char('n')
-                            || key.code == KeyCode::Char('N')
-                            || key.code == KeyCode::Esc
-                            || (key.code == KeyCode::Enter && pending.selected_option == 2);
+                        let should_allow_session = if is_multi {
+                            key.code == KeyCode::Char('3')
+                                || key.code == KeyCode::Char('s')
+                                || key.code == KeyCode::Char('S')
+                                || (key.code == KeyCode::Enter && pending.selected_option == 2)
+                        } else {
+                            key.code == KeyCode::Char('2')
+                                || key.code == KeyCode::Char('s')
+                                || key.code == KeyCode::Char('S')
+                                || (key.code == KeyCode::Enter && pending.selected_option == 1)
+                        };
 
-                        let should_allow_always = key.code == KeyCode::Char('4')
-                            || key.code == KeyCode::Char('p')
-                            || key.code == KeyCode::Char('P')
-                            || (key.code == KeyCode::Enter && pending.selected_option == 3);
+                        let should_deny = if is_multi {
+                            key.code == KeyCode::Char('4')
+                                || key.code == KeyCode::Char('n')
+                                || key.code == KeyCode::Char('N')
+                                || key.code == KeyCode::Esc
+                                || (key.code == KeyCode::Enter && pending.selected_option == 3)
+                        } else {
+                            key.code == KeyCode::Char('3')
+                                || key.code == KeyCode::Char('n')
+                                || key.code == KeyCode::Char('N')
+                                || key.code == KeyCode::Esc
+                                || (key.code == KeyCode::Enter && pending.selected_option == 2)
+                        };
+
+                        let should_allow_always = !is_multi && (
+                            key.code == KeyCode::Char('4')
+                                || key.code == KeyCode::Char('p')
+                                || key.code == KeyCode::Char('P')
+                                || (key.code == KeyCode::Enter && pending.selected_option == 3)
+                        );
 
                         let should_prompt_feedback = key.code == KeyCode::Char('5')
                             || key.code == KeyCode::Char('w')
@@ -1038,19 +1835,57 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             continue;
                         }
 
+                        if should_deny {
+                            let Some(mut pending_batch) = app.pending_confirmation.take() else {
+                                continue;
+                            };
+                            if pending_batch.calls.is_empty() {
+                                continue;
+                            }
+                            let call = pending_batch.calls.remove(0);
+                            let mut tool_msg = Message::tool_response(call.id, "Tool execution denied by user.".to_string());
+                            tool_msg.name = Some(call.function.name);
+                            app.session.add_message(tool_msg);
+                            let _ = app.session.save();
+
+                            if pending_batch.calls.is_empty() {
+                                app.pending_confirmation = None;
+                                if app.in_flight_tool_calls == 0 && !app.sudo_dialog.is_open {
+                                    app.start_stream_turn(event_tx.clone());
+                                }
+                            } else {
+                                pending_batch.current_idx += 1;
+                                let next_preview = pending_batch.calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                                pending_batch.diff_preview = next_preview;
+                                pending_batch.selected_option = 0;
+                                pending_batch.diff_expanded = false;
+                                app.pending_confirmation = Some(pending_batch);
+                                needs_redraw = true;
+                            }
+                            continue;
+                        }
+
                         if should_allow_session {
                             let mut added_rules = Vec::new();
-                            for call in &pending.calls {
-                                let rule = extract_tool_allow_rule(call);
-                                if !rule.is_empty() && !app.session_allowed_commands.contains(&rule) {
-                                    app.session_allowed_commands.push(rule.clone());
-                                    added_rules.push(rule);
+                            if let Some(ref pb) = app.pending_confirmation {
+                                for call in &pb.calls {
+                                    for rule in extract_tool_allow_rules(call) {
+                                        if !rule.is_empty() && !app.session_allowed_commands.contains(&rule) {
+                                            app.session_allowed_commands.push(rule.clone());
+                                            added_rules.push(rule);
+                                        }
+                                    }
                                 }
                             }
                             if !added_rules.is_empty() {
+                                let display = if added_rules.contains(&"apply_patch".to_string()) && added_rules.contains(&"edit".to_string()) {
+                                    "file modifications (apply_patch, edit, write_file)".to_string()
+                                } else {
+                                    added_rules.join(", ")
+                                };
                                 app.session.add_message(Message::system(format!(
                                     "Allowed for this session: {}",
-                                    added_rules.join(", ")
+                                    display
                                 )));
                             }
                         }
@@ -1059,11 +1894,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let mut cfg = app.llm_client.get_config();
                             let mut added_rules = Vec::new();
 
-                            for call in &pending.calls {
-                                let rule = extract_tool_allow_rule(call);
-                                if !rule.is_empty() && !cfg.allowed_commands.contains(&rule) {
-                                    cfg.allowed_commands.push(rule.clone());
-                                    added_rules.push(rule);
+                            if let Some(ref pb) = app.pending_confirmation {
+                                for call in &pb.calls {
+                                    for rule in extract_tool_allow_rules(call) {
+                                        if !rule.is_empty() && !cfg.allowed_commands.contains(&rule) {
+                                            cfg.allowed_commands.push(rule.clone());
+                                            added_rules.push(rule);
+                                        }
+                                    }
                                 }
                             }
 
@@ -1073,15 +1911,95 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     e
                                 )));
                             } else if !added_rules.is_empty() {
+                                let display = if added_rules.contains(&"apply_patch".to_string()) && added_rules.contains(&"edit".to_string()) {
+                                    "file modifications (apply_patch, edit, write_file)".to_string()
+                                } else {
+                                    added_rules.join(", ")
+                                };
                                 app.session.add_message(Message::system(format!(
                                     "Added to ~/.corex/settings.json allowed_commands: {}",
-                                    added_rules.join(", ")
+                                    display
                                 )));
                             }
                             app.llm_client.update_config(cfg);
                         }
 
-                        if should_allow_once || should_allow_session || should_allow_always {
+                        if should_allow_single {
+                            let Some(mut pending_batch) = app.pending_confirmation.take() else {
+                                continue;
+                            };
+                            if pending_batch.calls.len() > 1 {
+                                let call = pending_batch.calls.remove(0);
+
+                                let sudo_needed = if call.function.name == "run_shell_command" {
+                                    corex_core::parse_lenient_json(&call.function.arguments)
+                                        .ok()
+                                        .and_then(|a| a.get("command")?.as_str().map(str::to_string))
+                                        .filter(|cmd| command_requires_sudo(cmd))
+                                        .map(|cmd| extract_first_sudo_command(&cmd).unwrap_or(cmd))
+                                } else {
+                                    None
+                                };
+
+                                if let Some(sudo_cmd) = sudo_needed {
+                                    pending_batch.current_idx += 1;
+                                    let next_preview = pending_batch.calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                                    pending_batch.diff_preview = next_preview;
+                                    app.pending_confirmation = Some(pending_batch);
+                                    app.sudo_dialog.open_batch(vec![call], sudo_cmd);
+                                    continue;
+                                }
+
+                                app.in_flight_tool_calls += 1;
+                                let reg = app.tool_registry.clone();
+                                let ctx = ToolContext {
+                                    workspace_dir: app.workspace_dir.clone(),
+                                    yolo_mode: app.always_allow_tools,
+                                    sudo_password: get_sudo_password(),
+                                    allowed_commands: app.get_effective_allowed_commands(),
+                                };
+                                let call_id = call.id.clone();
+                                let tool_name = call.function.name.clone();
+                                let args_str = call.function.arguments.clone();
+                                let tx = event_tx.clone();
+                                let gen = app.current_generation_id;
+                                app.is_streaming = true;
+                                app.last_turn_start = Some(Instant::now());
+
+                                pending_batch.current_idx += 1;
+                                let next_preview = pending_batch.calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                                pending_batch.diff_preview = next_preview;
+                                pending_batch.selected_option = 0;
+                                pending_batch.diff_expanded = false;
+                                app.pending_confirmation = Some(pending_batch);
+
+                                tokio::spawn(async move {
+                                    let summary = format_tool_call_summary(&tool_name, &args_str);
+                                    let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
+                                        call_id: call_id.clone(),
+                                        name: tool_name.clone(),
+                                        summary,
+                                    })).await;
+                                    let start_tool = std::time::Instant::now();
+                                    let (output, success) = match corex_core::parse_lenient_json(&args_str) {
+                                        Ok(args_json) => match reg.execute(&tool_name, args_json, &ctx).await {
+                                            Ok(o) => (o.output, true),
+                                            Err(e) => (format!("Error executing {}: {}", tool_name, e), false),
+                                        },
+                                        Err(e) => (format!("Error executing {}: invalid tool arguments JSON: {}", tool_name, e), false),
+                                    };
+                                    let duration_ms = start_tool.elapsed().as_millis();
+                                    corex_core::ForensicLogger::log_tool_call(&tool_name, &call_id, &args_str, &output, duration_ms, success);
+                                    let _ = tx.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
+                                });
+                                needs_redraw = true;
+                                continue;
+                            } else {
+                                app.pending_confirmation = Some(pending_batch);
+                            }
+                        }
+
+                        if should_allow_single || should_allow_all || should_allow_session || should_allow_always {
                             let Some(pending_batch) = app.pending_confirmation.take() else {
                                 continue;
                             };
@@ -1112,6 +2030,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 allowed_commands: app.get_effective_allowed_commands(),
                             };
 
+                            app.in_flight_tool_calls += calls.len();
                             let tx = event_tx.clone();
                             let registry = app.tool_registry.clone();
                             let gen = app.current_generation_id;
@@ -1179,7 +2098,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             }
 
                             // ⚡ TRIGGER NEXT RECURSIVE TURN OF AGENT LOOP!
-                            app.start_stream_turn(event_tx.clone());
+                            if app.in_flight_tool_calls == 0 && !app.sudo_dialog.is_open {
+                                app.start_stream_turn(event_tx.clone());
+                            }
                             continue;
                         }
                     }
@@ -1286,6 +2207,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             }
                             KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('\x14') => {
                                 app.thinking_state.is_expanded = !app.thinking_state.is_expanded;
+                                app.invalidate_message_cache();
                                 needs_redraw = true;
                                 continue;
                             }
@@ -1472,6 +2394,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.pastes.clear();
                                 app.slash_selected_idx = 0;
                                 app.last_esc_press = None;
+                            } else if app.fleet_dialog.is_open && !app.fleet_dialog.command_mode {
+                                app.exit_fleet_mode();
+                                needs_redraw = true;
+                                continue;
                             } else if !app.auto_scroll {
                                 // 1st ESC when scrolled up -> jump straight to bottom without modifying input buffer!
                                 app.scroll_to_bottom();
@@ -1624,16 +2550,26 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                                 if user_prompt_clean.starts_with('/')
                                     && app.handle_slash_command(&user_prompt_clean).await {
+                                        // Slash commands never expand paste tags; release the buffers.
+                                        app.pastes.clear();
+                                        if user_prompt_clean.starts_with("/fim")
+                                            && app.session.messages.last().map(|m| m.role == "user").unwrap_or(false)
+                                        {
+                                            app.scroll_to_bottom();
+                                            app.start_stream_turn(event_tx.clone());
+                                        }
                                         continue;
                                     }
 
                                 if user_prompt_clean.is_empty() {
+                                    app.pastes.clear();
                                     continue;
                                 }
 
                                 // Expand pasted tags safely without re-scanning newly inserted text (prevents recursive OOM)
                                 for (id, pasted_content) in &app.pastes {
-                                    let prefix = format!("[Pasted text #{}", id);
+                                    // Trailing space anchors the id so `#1` never matches `#10`, `#11`, ...
+                                    let prefix = format!("[Pasted text #{} ", id);
                                     let mut search_from = 0;
                                     while let Some(rel_idx) = user_prompt_clean[search_from..].find(&prefix) {
                                         let start_idx = search_from + rel_idx;
@@ -1699,8 +2635,12 @@ fn print_session_summary(app: &App) {
         } else {
             "Local Offline Assistant (Air-gapped SLM)".to_string()
         }
-    } else if is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat") {
-        "DeepSeek-V4.1-Flash".to_string()
+    } else if is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat") {
+        if cfg.model == "deepseek-v4.1-flash-1017" {
+            "DeepSeek-V4.1-Flash-1017".to_string()
+        } else {
+            "DeepSeek-V4.1-Flash".to_string()
+        }
     } else if is_deepseek && (cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner") {
         "DeepSeek-V4-Pro".to_string()
     } else {
@@ -1727,7 +2667,7 @@ fn print_session_summary(app: &App) {
             format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
             None,
         )
-    } else if u.total_tokens > 0 {
+    } else if u.total_tokens > 0 && is_deepseek {
         let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
         let (cached_rate, miss_rate, comp_rate) = if is_pro {
             (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
@@ -1756,6 +2696,18 @@ fn print_session_summary(app: &App) {
 
         (
             cost_text,
+            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
+            cache_info,
+        )
+    } else if u.total_tokens > 0 {
+        let hit_rate = u.cache_hit_percentage();
+        let cache_info = if u.prompt_tokens > 0 && u.prompt_cache_hit_tokens > 0 {
+            Some(format!("{:.1}% Hit Rate ({} cached / {} in)", hit_rate, u.prompt_cache_hit_tokens, u.prompt_tokens))
+        } else {
+            None
+        };
+        (
+            "\x1b[90mBilled by active provider\x1b[0m".to_string(),
             format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
             cache_info,
         )
@@ -1799,6 +2751,74 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
     let ask_call_id = app.user_dialog.call_id.clone();
     let cancelled = app.user_dialog.cancelled;
     app.user_dialog.close();
+
+    if !cancelled {
+        let remaining_calls: Vec<ToolCall> = calls
+            .iter()
+            .filter(|c| c.id != ask_call_id)
+            .cloned()
+            .collect();
+
+        if !remaining_calls.is_empty() {
+            let mut requires_confirmation = false;
+            let mut previews = Vec::new();
+            for call in &remaining_calls {
+                let tool = app.tool_registry.get(&call.function.name);
+                let args_json = corex_core::parse_lenient_json(&call.function.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(t) = tool {
+                    if t.needs_confirmation(&args_json, &context) && !app.always_allow_tools {
+                        requires_confirmation = true;
+                    }
+                    if call.function.name == "run_shell_command" {
+                        if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
+                            previews.push(cmd.to_string());
+                        }
+                    } else if let Some(diff) = t.format_diff(&args_json, &app.workspace_dir) {
+                        previews.push(diff);
+                    }
+                }
+            }
+
+            let sudo_needed_cmd = remaining_calls.iter().find_map(|c| {
+                if c.function.name == "run_shell_command" {
+                    let args_json = corex_core::parse_lenient_json(&c.function.arguments).ok()?;
+                    let cmd = args_json.get("command")?.as_str()?;
+                    if command_requires_sudo(cmd) {
+                        let extracted = extract_first_sudo_command(cmd).unwrap_or_else(|| cmd.to_string());
+                        return Some(extracted);
+                    }
+                }
+                None
+            });
+
+            if requires_confirmation || sudo_needed_cmd.is_some() {
+                let mut ask_msg = Message::tool_response(ask_call_id, output);
+                ask_msg.name = Some("ask_user".to_string());
+                app.session.add_message(ask_msg);
+
+                if requires_confirmation {
+                    let total_count = remaining_calls.len();
+                    let first_preview = remaining_calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                    app.pending_confirmation = Some(PendingToolBatch {
+                        calls: remaining_calls,
+                        total_count,
+                        current_idx: 1,
+                        diff_preview: first_preview,
+                        selected_option: 0,
+                        diff_expanded: false,
+                        input_mode: false,
+                        feedback_text: String::new(),
+                    });
+                } else if let Some(sudo_cmd) = sudo_needed_cmd {
+                    app.sudo_dialog.open_batch(remaining_calls, sudo_cmd);
+                }
+                return;
+            }
+        }
+    }
+
+    app.in_flight_tool_calls += calls.len();
     app.is_streaming = true;
 
     tokio::spawn(async move {
@@ -1819,6 +2839,15 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
                     }))
                     .await;
             } else {
+                let summary = format_tool_call_summary(&call.function.name, &call.function.arguments);
+                let _ = tx
+                    .send((gen, StreamEvent::ToolExecutionStarting {
+                        call_id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        summary,
+                    }))
+                    .await;
+
                 let out = match corex_core::parse_lenient_json(&call.function.arguments) {
                     Ok(args_json) => match registry.execute(&call.function.name, args_json, &context).await {
                         Ok(o) => o.output,
@@ -1835,3 +2864,49 @@ fn finish_ask_user(app: &mut App, event_tx: mpsc::Sender<(u64, StreamEvent)>) {
     });
 }
 
+
+/// Returns a live SSH session for the selected fleet node, connecting (and
+/// probing telemetry) when the current one is missing or belongs to another node.
+async fn fleet_ensure_session(app: &mut App) -> Option<corex_fleet::RemoteSession> {
+    let node = app.fleet_dialog.selected_node().cloned()?;
+    if let Some(sess) = app.fleet_dialog.active_session.clone() {
+        if sess.is_connected && sess.node.id == node.id {
+            if app.fleet_dialog.pty_session.as_ref().map(|p| !p.is_alive() || p.node_id != node.id).unwrap_or(true) {
+                if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                    app.fleet_dialog.pty_session = Some(pty);
+                }
+            }
+            return Some(sess);
+        }
+    }
+    app.fleet_dialog.status_msg = Some(format!("Connecting to {}...", node.id));
+    let mut session = corex_fleet::RemoteSession::new(node.clone());
+    match session.connect(8).await {
+        Ok(_) => {
+            corex_fleet::global_session_manager().set_session(node.id.clone(), session.clone()).await;
+            corex_fleet::global_session_manager().set_active_node(Some(node.id.clone())).await;
+            app.fleet_dialog.active_session = Some(session.clone());
+            app.fleet_dialog.terminal_scroll = 0;
+            app.fleet_dialog.status_msg = None;
+            if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                app.fleet_dialog.pty_session = Some(pty);
+            }
+            app.session.add_message(Message::system(format!(
+                "Connected to remote server: {} ({}@{}) · Active and ready.",
+                node.id, node.user, node.host
+            )));
+            app.scroll_to_bottom();
+            let tx = app.fleet_dialog.telemetry_tx.clone();
+            let n_clone = node.clone();
+            tokio::spawn(async move {
+                let tel = corex_fleet::TelemetryCollector::fetch(&n_clone, 4).await;
+                let _ = tx.send((n_clone.id, tel));
+            });
+            Some(session)
+        }
+        Err(e) => {
+            app.fleet_dialog.status_msg = Some(format!("Connection failed: {}", e));
+            None
+        }
+    }
+}

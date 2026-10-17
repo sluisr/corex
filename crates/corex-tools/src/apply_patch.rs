@@ -74,34 +74,59 @@ impl ApplyPatchTool {
     }
 
     fn extract_file_path(hunk_header: &str) -> Option<String> {
+        let clean_path = |file: &str| -> Option<String> {
+            let trimmed = file.trim().trim_matches('"').trim();
+            let mut f = trimmed;
+            if f.starts_with("b/") || f.starts_with("a/") {
+                f = &f[2..];
+            }
+            // Strip any multiple leading slashes (e.g. from `a//home/...`)
+            while f.starts_with("//") {
+                f = &f[1..];
+            }
+            if f != "/dev/null" && !f.is_empty() {
+                Some(f.to_string())
+            } else {
+                None
+            }
+        };
+
         // Priority 1: +++ b/path (post-image target)
         for line in hunk_header.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("+++ ") {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let mut file = parts[1].trim();
-                    if file.starts_with("b/") || file.starts_with("a/") {
-                        file = &file[2..];
-                    }
-                    if file != "/dev/null" && !file.is_empty() {
-                        return Some(file.to_string());
-                    }
+            if trimmed.starts_with("+++") && !trimmed.starts_with("++++") {
+                let rest = trimmed.strip_prefix("+++").unwrap_or("").trim_start();
+                let path_part = rest.split('\t').next().unwrap_or("").trim();
+                if let Some(res) = clean_path(path_part) {
+                    return Some(res);
                 }
             }
         }
         // Priority 2: --- a/path (pre-image fallback)
         for line in hunk_header.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("--- ") {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let mut file = parts[1].trim();
-                    if file.starts_with("a/") || file.starts_with("b/") {
-                        file = &file[2..];
+            if trimmed.starts_with("---") && !trimmed.starts_with("----") {
+                let rest = trimmed.strip_prefix("---").unwrap_or("").trim_start();
+                let path_part = rest.split('\t').next().unwrap_or("").trim();
+                if let Some(res) = clean_path(path_part) {
+                    return Some(res);
+                }
+            }
+        }
+        // Priority 3: diff --git a/path b/path
+        for line in hunk_header.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("diff --git ") {
+                if let Some((_, b_part)) = rest.rsplit_once(" b/") {
+                    if let Some(res) = clean_path(b_part) {
+                        return Some(res);
                     }
-                    if file != "/dev/null" && !file.is_empty() {
-                        return Some(file.to_string());
+                } else {
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        if let Some(res) = clean_path(parts[3]) {
+                            return Some(res);
+                        }
                     }
                 }
             }
@@ -138,17 +163,19 @@ fn parse_hunk_starts(header: &str) -> Option<(usize, usize)> {
 /// - Strips prose preambles before the diff
 /// - Adds missing leading space to context lines
 /// - Recomputes exact hunk line counts in @@ headers so diffy never rejects count mismatches
-fn sanitize_and_repair_patch(raw: &str) -> (String, Vec<ParsedHunk>) {
-    let mut s = raw.trim();
-    if s.starts_with("```") {
+fn sanitize_and_repair_patch(raw: &str) -> Result<(String, Vec<ParsedHunk>), String> {
+    let mut s = raw.trim_matches(|c| c == '\n' || c == '\r');
+    if s.trim_start().starts_with("```") {
+        s = s.trim_start();
         if let Some(pos) = s.find('\n') {
             s = &s[pos + 1..];
         }
+        let trimmed_tail = s.trim_end();
+        if let Some(stripped) = trimmed_tail.strip_suffix("```") {
+            s = stripped;
+        }
     }
-    if let Some(pos) = s.rfind("```") {
-        s = &s[..pos];
-    }
-    let s = s.trim();
+    let s = s.trim_matches(|c| c == '\n' || c == '\r');
 
     let raw_lines: Vec<&str> = s.lines().collect();
     let start_idx = raw_lines
@@ -164,18 +191,30 @@ fn sanitize_and_repair_patch(raw: &str) -> (String, Vec<ParsedHunk>) {
     let mut current_hunk: Option<ParsedHunk> = None;
     let mut has_unsupported_hunk = false;
 
-    for line in &raw_lines[start_idx..] {
-        let trimmed_end = line.trim_end();
-        let trimmed_start = trimmed_end.trim_start();
+    for (rel_idx, line) in raw_lines[start_idx..].iter().enumerate() {
+        let line_no_cr = line.trim_end_matches('\r');
+        let trimmed_start = line_no_cr.trim_start();
 
-        if trimmed_start.starts_with("--- ") || trimmed_start.starts_with("+++ ") {
-            if current_hunk.is_none() {
-                header_lines.push(trimmed_start.to_string());
+        if trimmed_start.starts_with("--- ") || trimmed_start.starts_with("+++ ") || trimmed_start.starts_with("diff --git ") {
+            if current_hunk.is_some() || !hunks.is_empty() {
+                return Err(
+                    "Multi-file patches are not supported in a single apply_patch call; please patch one file at a time.".to_string(),
+                );
+            }
+            if trimmed_start.starts_with("--- ") || trimmed_start.starts_with("+++ ") {
+                header_lines.push(trimmed_start.trim_end().to_string());
             }
             continue;
         }
 
-        if trimmed_start.starts_with("@@") {
+        // Only treat `@@` as a hunk header if it starts at column 0 (or before any hunk has started)
+        let is_hunk_header = if current_hunk.is_none() {
+            trimmed_start.starts_with("@@")
+        } else {
+            line_no_cr.starts_with("@@")
+        };
+
+        if is_hunk_header {
             if let Some(h) = current_hunk.take() {
                 hunks.push(h);
             }
@@ -195,24 +234,27 @@ fn sanitize_and_repair_patch(raw: &str) -> (String, Vec<ParsedHunk>) {
         }
 
         if let Some(ref mut hunk) = current_hunk {
-            if trimmed_start.starts_with("```") {
+            let has_remaining_diff_lines = raw_lines[start_idx + rel_idx + 1..]
+                .iter()
+                .any(|l| l.starts_with('+') || l.starts_with('-') || l.starts_with("@@"));
+            if trimmed_start.trim_end() == "```" && !has_remaining_diff_lines {
                 break;
             }
-            if trimmed_end.is_empty() {
+            if line_no_cr.is_empty() {
                 hunk.lines.push((' ', String::new()));
                 continue;
             }
-            let first_char = trimmed_end.chars().next().unwrap_or(' ');
+            let first_char = line_no_cr.chars().next().unwrap_or(' ');
             match first_char {
                 '+' | '-' | ' ' => {
-                    hunk.lines.push((first_char, trimmed_end[1..].to_string()));
+                    hunk.lines.push((first_char, line_no_cr[1..].to_string()));
                 }
                 '\\' => {
                     // Ignore "\ No newline at end of file"
                 }
                 _ => {
                     // Model forgot leading space for context line
-                    hunk.lines.push((' ', trimmed_end.to_string()));
+                    hunk.lines.push((' ', line_no_cr.to_string()));
                 }
             }
         }
@@ -224,7 +266,7 @@ fn sanitize_and_repair_patch(raw: &str) -> (String, Vec<ParsedHunk>) {
 
     if has_unsupported_hunk && hunks.is_empty() {
         // Return raw patch untouched so diffy's no-op behavior applies and rejection triggers
-        return (raw.to_string(), Vec::new());
+        return Ok((raw.to_string(), Vec::new()));
     }
 
     let mut repaired_diff = String::new();
@@ -248,7 +290,7 @@ fn sanitize_and_repair_patch(raw: &str) -> (String, Vec<ParsedHunk>) {
         }
     }
 
-    (repaired_diff, hunks)
+    Ok((repaired_diff, hunks))
 }
 
 
@@ -288,8 +330,15 @@ fn apply_fuzzy_hunks(original: &str, hunks: &[ParsedHunk]) -> Result<String, Str
         }
 
         let match_range = find_hunk_match(&file_lines, &old_lines, hunk.old_start);
-        if let Some((start_idx, end_idx)) = match_range {
-            file_lines.splice(start_idx..end_idx, new_lines);
+        if let Some((start_idx, end_idx, inner_only)) = match_range {
+            let first_is_ctx = hunk.lines.first().map(|(c, _)| *c == ' ').unwrap_or(false);
+            let last_is_ctx = hunk.lines.last().map(|(c, _)| *c == ' ').unwrap_or(false);
+            if inner_only && first_is_ctx && last_is_ctx && new_lines.len() >= 2 && end_idx >= start_idx + 2 {
+                let inner_new = new_lines[1..new_lines.len() - 1].to_vec();
+                file_lines.splice(start_idx + 1..end_idx - 1, inner_new);
+            } else {
+                file_lines.splice(start_idx..end_idx, new_lines);
+            }
             any_applied = true;
         } else {
             return Err(format!(
@@ -316,7 +365,7 @@ fn apply_fuzzy_hunks(original: &str, hunks: &[ParsedHunk]) -> Result<String, Str
     Ok(result)
 }
 
-fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) -> Option<(usize, usize)> {
+fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) -> Option<(usize, usize, bool)> {
     if old_lines.is_empty() || old_lines.len() > file_lines.len() {
         return None;
     }
@@ -346,7 +395,7 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
             .zip(old_lines.iter())
             .all(|(f, o)| f == *o)
         {
-            return Some((i, i + target_len));
+            return Some((i, i + target_len, false));
         }
     }
 
@@ -357,7 +406,7 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
             .zip(old_lines.iter())
             .all(|(f, o)| f.trim_end() == o.trim_end())
         {
-            return Some((i, i + target_len));
+            return Some((i, i + target_len, false));
         }
     }
 
@@ -368,7 +417,7 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
             .zip(old_lines.iter())
             .all(|(f, o)| f.trim() == o.trim())
         {
-            return Some((i, i + target_len));
+            return Some((i, i + target_len, false));
         }
     }
 
@@ -383,7 +432,7 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
                     .zip(sub_old.iter())
                     .all(|(f, o)| f.trim() == o.trim())
             {
-                return Some((i, i + target_len));
+                return Some((i, i + target_len, true));
             }
         }
     }
@@ -418,8 +467,31 @@ impl Tool for ApplyPatchTool {
         })
     }
 
-    fn needs_confirmation(&self, _args: &serde_json::Value, context: &ToolContext) -> bool {
-        !context.allowed_commands.iter().any(|cmd| cmd == "apply_patch")
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        let patch_opt = args.get("patch")
+            .or_else(|| args.get("input"))
+            .or_else(|| args.get("diff"))
+            .and_then(|v| v.as_str())
+            .or_else(|| args.as_str());
+        let file_opt = patch_opt
+            .and_then(Self::extract_file_path)
+            .or_else(|| {
+                args.get("file_path")
+                    .or_else(|| args.get("path"))
+                    .or_else(|| args.get("file"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        if let Some(rel) = file_opt {
+            let path = resolve_path(&context.workspace_dir, &rel);
+            if !crate::fs_tools::is_within_workspace(&path, &context.workspace_dir)
+                || crate::fs_tools::is_sensitive_system_path(&path)
+                || crate::fs_tools::is_protected_write_path(&path)
+            {
+                return true;
+            }
+        }
+        !crate::fs_tools::is_file_edit_allowed(&context.allowed_commands)
     }
 
     fn format_diff(&self, args: &serde_json::Value, _workspace: &Path) -> Option<String> {
@@ -460,6 +532,19 @@ impl Tool for ApplyPatchTool {
         };
 
         let target_path = resolve_path(&context.workspace_dir, &target_file);
+        if crate::fs_tools::is_sensitive_system_path(&target_path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: patching sensitive credential or authentication file '{}' is forbidden.",
+                target_file
+            )));
+        }
+        if crate::fs_tools::is_protected_write_path(&target_path) {
+            return Ok(ToolOutput::error(format!(
+                "Refusing to patch protected path '{}': shell startup files, git hooks and cron \
+                 entries can execute arbitrary code. Edit it manually if this is intentional.",
+                target_file
+            )));
+        }
 
         // Hold the per-path lock across the whole read-modify-write
         let _guard = lock_path(&target_path).await;
@@ -474,7 +559,10 @@ impl Tool for ApplyPatchTool {
         };
 
         // 1. Sanitize, unwrap markdown fences, normalize context lines, and repair hunk counts
-        let (repaired_patch, hunks) = sanitize_and_repair_patch(patch_str);
+        let (repaired_patch, hunks) = match sanitize_and_repair_patch(patch_str) {
+            Ok(res) => res,
+            Err(err) => return Ok(ToolOutput::error(err)),
+        };
         let normalized_patch = Self::normalize_patch(&repaired_patch);
 
         // 2. Attempt primary application via diffy
@@ -845,6 +933,100 @@ Hope this helps!
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn test_extract_file_path_handles_double_slash_and_git_headers() {
+        let diff_with_double_slash = "--- a//home/sluisr/Juegos/Projects/cx/crates/corex-tools/src/subagent.rs\n+++ b//home/sluisr/Juegos/Projects/cx/crates/corex-tools/src/subagent.rs\n@@ -1,1 +1,1 @@";
+        let path = ApplyPatchTool::extract_file_path(diff_with_double_slash);
+        assert_eq!(path.as_deref(), Some("/home/sluisr/Juegos/Projects/cx/crates/corex-tools/src/subagent.rs"));
+
+        let diff_git = "diff --git a/foo.rs b/foo.rs\n--- /dev/null\n+++ b/foo.rs\n";
+        let path = ApplyPatchTool::extract_file_path(diff_git);
+        assert_eq!(path.as_deref(), Some("foo.rs"));
+    }
+
+    #[test]
+    fn test_extract_file_path_handles_spaces_in_path() {
+        let diff_with_spaces = "--- a/path with spaces/file.rs\n+++ b/path with spaces/file.rs\t2026-01-01 00:00:00\n@@ -1,1 +1,1 @@";
+        let path = ApplyPatchTool::extract_file_path(diff_with_spaces);
+        assert_eq!(path.as_deref(), Some("path with spaces/file.rs"));
+
+        let diff_git_spaces = "diff --git a/path with spaces/file.rs b/path with spaces/file.rs\n@@ -1,1 +1,1 @@";
+        let path = ApplyPatchTool::extract_file_path(diff_git_spaces);
+        assert_eq!(path.as_deref(), Some("path with spaces/file.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_rejects_multi_file_patches() {
+        let dir = unique_temp_dir("multi_file");
+        let target = dir.join("first.txt");
+        fs::write(&target, "alpha\nbeta\n").unwrap();
+
+        let multi_patch = "--- a/first.txt\n+++ b/first.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n--- a/second.txt\n+++ b/second.txt\n@@ -1,1 +1,1 @@\n-foo\n+bar\n";
+
+        let context = ToolContext {
+            workspace_dir: dir.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let out = ApplyPatchTool
+            .execute(json!({ "patch": multi_patch, "file_path": "first.txt" }), &context)
+            .await
+            .expect("execute must return ToolOutput");
+
+        assert!(out.is_error, "multi-file patch must be rejected");
+        assert!(out.output.contains("Multi-file patches are not supported"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nbeta\n");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_execute_preserves_trailing_spaces_in_patch_lines() {
+        let dir = unique_temp_dir("trailing_spaces");
+        let target = dir.join("trail.txt");
+        fs::write(&target, "ctx  \nold\n").unwrap();
+
+        let patch = "--- a/trail.txt\n+++ b/trail.txt\n@@ -1,2 +1,2 @@\n ctx  \n-old\n+new   \n";
+
+        let context = ToolContext {
+            workspace_dir: dir.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let out = ApplyPatchTool
+            .execute(json!({ "patch": patch, "file_path": "trail.txt" }), &context)
+            .await
+            .expect("execute must succeed");
+
+        assert!(!out.is_error, "patch should apply cleanly: {}", out.output);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "ctx  \nnew   \n");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_apply_patch_needs_confirmation_respects_session_allowed_commands() {
+        let patch = "--- a/test.rs\n+++ b/test.rs\n@@ -1,1 +1,1 @@";
+        let mut context = ToolContext {
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec!["edit".to_string()],
+        };
+
+        // When "edit" is allowed, apply_patch must NOT require confirmation
+        assert!(!ApplyPatchTool.needs_confirmation(&json!({ "patch": patch }), &context));
+
+        // When allowed_commands is empty, it MUST require confirmation
+        context.allowed_commands.clear();
+        assert!(ApplyPatchTool.needs_confirmation(&json!({ "patch": patch }), &context));
+    }
 }
+
 
 

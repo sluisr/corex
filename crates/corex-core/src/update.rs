@@ -77,15 +77,18 @@ pub fn current_target_triple() -> Option<&'static str> {
     }
 }
 
-/// Parses semver string like "v0.2.1" or "0.2.0" into (major, minor, patch).
+/// Parses semver string like "v0.2.1" or "0.2.0-rc1" into (major, minor, patch).
 pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     let clean = v.trim().trim_start_matches('v');
     let mut parts = clean.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    let patch_str = parts.next().unwrap_or("0");
-    let patch_clean = patch_str.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("0");
-    let patch: u32 = patch_clean.parse().ok()?;
+    let parse_seg = |p: &str| -> Option<u32> {
+        let num_part = p.split('-').next().unwrap_or(p);
+        let digits = num_part.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("");
+        digits.parse::<u32>().ok()
+    };
+    let major: u32 = parse_seg(parts.next()?)?;
+    let minor: u32 = parse_seg(parts.next()?)?;
+    let patch: u32 = parse_seg(parts.next().unwrap_or("0"))?;
     Some((major, minor, patch))
 }
 
@@ -139,8 +142,8 @@ pub fn verify_sha256(data: &[u8], expected_checksum: &str) -> Result<String, Str
         .unwrap_or("")
         .to_lowercase();
 
-    if clean_expected.is_empty() {
-        return Ok(computed_hex);
+    if clean_expected.len() != 64 || !clean_expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Missing or malformed SHA-256 checksum signature.".to_string());
     }
 
     if computed_hex.eq_ignore_ascii_case(&clean_expected) {
@@ -151,6 +154,55 @@ pub fn verify_sha256(data: &[u8], expected_checksum: &str) -> Result<String, Str
             clean_expected, computed_hex
         ))
     }
+}
+
+/// Verifies the SHA-256 checksum of `data` against `checksum_text` for a specific `asset_name`.
+/// Supports single-hash files, `<hash>  <filename>` lines, and multi-line checksum manifests.
+/// Fails if `checksum_text` is a multi-line manifest (or names a different asset) without a matching entry for `asset_name`.
+pub fn verify_checksum_from_text(
+    data: &[u8],
+    checksum_text: &str,
+    asset_name: &str,
+) -> Result<String, String> {
+    let non_empty_lines: Vec<&str> = checksum_text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    if non_empty_lines.is_empty() {
+        return Err("Missing or empty SHA-256 checksum text.".to_string());
+    }
+
+    // Look for a line explicitly matching `asset_name`
+    for line in &non_empty_lines {
+        let mut parts = line.split_whitespace();
+        if let (Some(hash), Some(file_tok)) = (parts.next(), parts.next()) {
+            let clean_file = file_tok.trim_start_matches('*');
+            let base_file = Path::new(clean_file)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(clean_file);
+            if base_file == asset_name || clean_file == asset_name {
+                return verify_sha256(data, hash);
+            }
+        }
+    }
+
+    // Only allow a bare single-line hash when there is a single line with no conflicting filename
+    if non_empty_lines.len() == 1 {
+        let mut parts = non_empty_lines[0].split_whitespace();
+        if let Some(hash) = parts.next() {
+            if parts.next().is_none() {
+                return verify_sha256(data, hash);
+            }
+        }
+    }
+
+    Err(format!(
+        "No matching SHA-256 checksum entry found for asset '{}' in checksum manifest.",
+        asset_name
+    ))
 }
 
 /// Checks online (GitHub releases API, then GitHub tags fallback) for the latest Corex version in sluisr/corex.
@@ -235,18 +287,29 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
     Ok(release)
 }
 
+/// Maximum extracted binary size (200 MB) to guard against decompression bombs.
+const MAX_EXTRACTED_BINARY_BYTES: u64 = 200 * 1024 * 1024;
+
 /// Extracts the target binary bytes from a tar.gz or zip archive in memory.
 pub fn extract_binary_from_archive(archive_bytes: &[u8], is_zip: bool, bin_name: &str) -> Result<Vec<u8>, String> {
     if is_zip {
         let cursor = std::io::Cursor::new(archive_bytes);
         let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("Failed to read zip archive: {}", e))?;
         for i in 0..zip.len() {
-            let mut file = zip.by_index(i).map_err(|e| format!("Zip entry error: {}", e))?;
+            let file = zip.by_index(i).map_err(|e| format!("Zip entry error: {}", e))?;
             let name = file.name().to_string();
             let file_base = Path::new(&name).file_name().and_then(|f| f.to_str()).unwrap_or("");
             if file_base == bin_name || file_base == format!("{}.exe", bin_name) {
+                if file.size() > MAX_EXTRACTED_BINARY_BYTES {
+                    return Err("Archive entry exceeds maximum allowed binary size (200 MB)".to_string());
+                }
                 let mut buf = Vec::new();
-                file.read_to_end(&mut buf).map_err(|e| format!("Failed to extract file: {}", e))?;
+                file.take(MAX_EXTRACTED_BINARY_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if buf.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
+                    return Err("Extracted binary exceeds maximum allowed size (200 MB)".to_string());
+                }
                 return Ok(buf);
             }
         }
@@ -257,12 +320,17 @@ pub fn extract_binary_from_archive(archive_bytes: &[u8], is_zip: bool, bin_name:
         let mut tar = tar::Archive::new(gz);
         let entries = tar.entries().map_err(|e| format!("Failed to read tar archive: {}", e))?;
         for entry in entries {
-            let mut file = entry.map_err(|e| format!("Tar entry error: {}", e))?;
+            let file = entry.map_err(|e| format!("Tar entry error: {}", e))?;
             let path = file.path().map_err(|e| format!("Tar path error: {}", e))?;
             let file_base = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
             if file_base == bin_name || file_base == format!("{}.exe", bin_name) {
                 let mut buf = Vec::new();
-                file.read_to_end(&mut buf).map_err(|e| format!("Failed to extract file: {}", e))?;
+                file.take(MAX_EXTRACTED_BINARY_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| format!("Failed to extract file: {}", e))?;
+                if buf.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
+                    return Err("Extracted binary exceeds maximum allowed size (200 MB)".to_string());
+                }
                 return Ok(buf);
             }
         }
@@ -274,24 +342,43 @@ pub fn extract_binary_from_archive(archive_bytes: &[u8], is_zip: bool, bin_name:
 /// On Unix, uses `fs::rename` within the same directory to avoid ETXTBSY.
 /// On Windows, renames the existing file to .old before moving the new one.
 pub fn replace_executable_in_place(target_path: &Path, new_binary_bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
     let canonical = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let parent = canonical
         .parent()
         .ok_or_else(|| "Unable to locate binary parent directory".to_string())?;
 
-    let tmp_path = parent.join(format!(".cx-upgrade-{}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".cx-upgrade-{}-{:x}.tmp", std::process::id(), nonce));
 
-    // Write new binary to temp file next to target binary
-    fs::write(&tmp_path, new_binary_bytes).map_err(|e| {
+    // Exclusively create new temp file next to target binary (prevents symlink attacks)
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.mode(0o755);
+    }
+
+    let mut tmp_file = open_opts.open(&tmp_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
             format!(
                 "Permission denied writing to '{}'. Run with elevated permissions (e.g. 'sudo cx update').",
                 parent.display()
             )
         } else {
-            format!("Failed to write temporary binary: {}", e)
+            format!("Failed to create temporary binary: {}", e)
         }
     })?;
+
+    if let Err(e) = tmp_file.write_all(new_binary_bytes).and_then(|_| tmp_file.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("Failed to write temporary binary: {}", e));
+    }
+    drop(tmp_file);
 
     #[cfg(unix)]
     {
@@ -368,12 +455,16 @@ where
         a.name.contains(target_triple) && a.name.ends_with(archive_ext)
     });
 
+    let asset_name = matching_asset
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| format!("corex-{}-{}{}", release.tag_name, target_triple, archive_ext));
+
     let download_url = if let Some(asset) = matching_asset {
         asset.browser_download_url.clone()
     } else {
         format!(
-            "https://github.com/sluisr/corex/releases/download/{}/corex-{}-{}{}",
-            release.tag_name, release.tag_name, target_triple, archive_ext
+            "https://github.com/sluisr/corex/releases/download/{}/{}",
+            release.tag_name, asset_name
         )
     };
 
@@ -409,7 +500,7 @@ where
         archive_bytes.len() / 1024
     ));
 
-    // Fetch matching .sha256 file if available
+    // Fetch matching .sha256 file (required for cryptographic integrity verification)
     let sha_asset = release.assets.iter().find(|a| {
         a.name.contains(target_triple) && a.name.ends_with(&format!("{}.sha256", archive_ext))
     });
@@ -418,14 +509,26 @@ where
         .map(|a| a.browser_download_url.clone())
         .unwrap_or_else(|| format!("{}.sha256", download_url));
 
-    if let Ok(sha_resp) = client.get(&sha_url).send().await {
-        if sha_resp.status().is_success() {
-            if let Ok(expected_sha) = sha_resp.text().await {
-                let computed = verify_sha256(&archive_bytes, &expected_sha)?;
-                progress(&format!("SHA-256 signature verified: {}", &computed[..16]));
-            }
-        }
+    let sha_resp = client
+        .get(&sha_url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to download SHA-256 checksum ({}): {}", sha_url, e))?;
+
+    if !sha_resp.status().is_success() {
+        return Err(format!(
+            "Refusing to install unverified binary: SHA-256 checksum download returned HTTP {} ({})",
+            sha_resp.status(),
+            sha_url
+        ));
     }
+
+    let expected_sha = sha_resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read SHA-256 checksum response: {}", e))?;
+    let computed = verify_checksum_from_text(&archive_bytes, &expected_sha, &asset_name)?;
+    progress(&format!("SHA-256 signature verified: {}", &computed[..16]));
 
     progress("Extracting binary from release archive...");
     let bin_name = if is_windows { "cx.exe" } else { "cx" };
@@ -469,6 +572,7 @@ mod tests {
         assert_eq!(parse_semver("0.2.0"), Some((0, 2, 0)));
         assert_eq!(parse_semver("v0.2.1"), Some((0, 2, 1)));
         assert_eq!(parse_semver("1.0.0-rc1"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("0.6.4-rc1"), Some((0, 6, 4)));
     }
 
     #[test]
@@ -499,6 +603,13 @@ mod tests {
         assert!(verify_sha256(data, &expected).is_ok());
         assert!(verify_sha256(data, &format!("{}  corex.tar.gz", expected)).is_ok());
         assert!(verify_sha256(data, "0000000000000000000000000000000000000000000000000000000000000000").is_err());
+
+        let multi = format!(
+            "1111111111111111111111111111111111111111111111111111111111111111  other.tar.gz\n{}  corex.tar.gz\n",
+            expected
+        );
+        assert!(verify_checksum_from_text(data, &multi, "corex.tar.gz").is_ok());
+        assert!(verify_checksum_from_text(data, &multi, "missing.tar.gz").is_err());
     }
 
     #[test]
@@ -523,3 +634,4 @@ mod tests {
         assert_eq!(extracted, payload);
     }
 }
+

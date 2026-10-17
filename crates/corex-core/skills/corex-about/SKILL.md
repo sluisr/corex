@@ -39,13 +39,14 @@ description: >-
 
 ## ⚡ What is Corex?
 
-**Corex** (invoked as **`cx`**) is the ultra-fast, native Rust autonomous AI terminal agent for the **DeepSeek API** and local LLMs.
+**Corex** (invoked as **`cx`**) is the ultra-fast, native Rust autonomous AI terminal agent for **DeepSeek, Gemini, Claude, OpenAI, Groq, Mistral & Local LLMs**.
 
 It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalone static binary with:
 
 - 🦀 **100% pure Rust** — single binary, <10ms startup, ~11.9MB RAM idle (~2.2MB Heap)
+- 🌐 **Multi-Provider Support** — DeepSeek V4.1, Gemini 3.x/2.5, Claude 3.7/3.5, OpenAI, Groq, Mistral, OpenRouter
 - 🔒 **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
-- 🧠 **DeepSeek V4.1** — Flash (1M context, native vision) + Pro (CoT reasoning)
+- 🧠 **DeepSeek V4.1 & Multi-Model CoT** — Flash + Pro with reasoning depth tuning
 - ⚡ **Adaptive CoT** — automatic reasoning depth per task complexity
 - 🛡️ **96%+ KV cache hit rate** — up to 90% API cost reduction
 - 📝 **`apply_patch`** — atomic unified-diff patching with fuzzy whitespace tolerance
@@ -57,7 +58,7 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 
 ## 📌 Current Status
 
-- **Version:** `0.6.3` (actively developed)
+- **Version:** `0.7.0` (actively developed)
 - **License:** GNU AGPLv3 (`AGPL-3.0-only`) with dual-licensing options
 - **Platforms:** Linux, macOS, Windows
 
@@ -96,7 +97,7 @@ cargo install --git https://github.com/sluisr/corex.git --force
 curl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | sh
 
 # Via npm
-npx corex-cli
+npx @sluisr/corex
 ```
 
 Set your API key:
@@ -164,7 +165,7 @@ Include:
 
 Join the sluisr community Discord for questions, ideas, and general chat:
 
-👾 **[discord.com/invite/q3wWh6NjEC](https://discord.com/invite/q3wWh6NjEC)**
+👾 **[discord.gg/MGMt6M6Yx](https://discord.gg/MGMt6M6Yx)**
 
 Also linked from [sluisr.com](https://sluisr.com) → Community section.
 

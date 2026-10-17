@@ -131,6 +131,38 @@ impl LlmClient {
             Output ONLY the translation with no preamble or commentary:\n\n{}",
             text
         );
+        if cfg.provider_kind() == crate::providers::ProviderKind::Anthropic {
+            let trimmed_base = base_url.trim_end_matches('/');
+            let url = if trimmed_base.ends_with("/v1") {
+                format!("{}/messages", trimmed_base)
+            } else {
+                format!("{}/v1/messages", trimmed_base)
+            };
+            let request_body = serde_json::json!({
+                "model": cfg.model,
+                "max_tokens": 2048,
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ]
+            });
+            let resp = self.http
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await?;
+            let val: serde_json::Value = resp.json().await?;
+            let translated = val.get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.iter().find_map(|item| item.get("text").and_then(|t| t.as_str())))
+                .map(|s| s.trim().to_string())
+                .ok_or_else(|| anyhow::anyhow!("Empty Anthropic translation response"))?;
+            return Ok(translated);
+        }
         let request_body = serde_json::json!({
             "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
             "messages": [
@@ -305,39 +337,50 @@ impl LlmClient {
         tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
     }
 
-    /// Truncates tool response messages that are excessively long.
+    /// Truncates tool response messages and background task / subagent dumps that are excessively long.
     /// Large shell outputs (recursive ls, grep dumps, logs) get re-sent every turn
     /// and are the single biggest source of unexpected token growth in agentic loops.
-    /// Cap at 8 000 chars (~2 400 tokens) — enough for the model to understand the
-    /// result, but not enough to break the bank.
+    /// Cap at 8 000 chars (~2 600 tokens) — enough for the model to understand the
+    /// result, while keeping the prefix deterministic across turns for KV cache hits.
     const TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
 
     pub fn truncate_tool_outputs(messages: &mut [Message]) {
-        let first_active_tool_idx = match messages.iter().rposition(|m| m.role == "assistant") {
-            Some(pos) => pos + 1,
-            None => 0,
-        };
+        for msg in messages.iter_mut() {
+            let is_truncatable = if msg.role == "tool" {
+                true
+            } else if msg.role == "system" {
+                msg.text_content()
+                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
 
-        // Safety truncation for active tool output exceeding TOOL_OUTPUT_MAX_CHARS
-        for msg in messages[first_active_tool_idx..].iter_mut() {
-            if msg.role == "tool" {
+            if is_truncatable {
                 if let Some(content) = msg.text_content().map(|s| s.to_string()) {
-                    if content.len() > Self::TOOL_OUTPUT_MAX_CHARS && !content.contains("chars truncated to save tokens") {
-                        let truncated = crate::types::safe_truncate_str(&content, Self::TOOL_OUTPUT_MAX_CHARS);
+                    if content.len() > Self::TOOL_OUTPUT_MAX_CHARS
+                        && !content.contains("chars truncated to save tokens")
+                    {
+                        let truncated =
+                            crate::types::safe_truncate_str(&content, Self::TOOL_OUTPUT_MAX_CHARS);
                         let omitted = content.len() - truncated.len();
-                        msg.content = Some(format!(
-                            "{}\n\n[... {} chars truncated to save tokens ...]",
-                            truncated, omitted
-                        ).into());
+                        msg.content = Some(
+                            format!(
+                                "{}\n\n[... {} chars truncated to save tokens ...]",
+                                truncated, omitted
+                            )
+                            .into(),
+                        );
                     }
                 }
             }
         }
     }
 
-    /// Estimates token count of a string using a conservative 4 chars/token ratio.
+    /// Estimates token count of a string using a conservative ~3 bytes/token ratio
+    /// that accurately reflects source code, JSON, diffs, and multi-byte UTF-8 text.
     fn estimate_tokens(s: &str) -> usize {
-        s.len() / 4
+        s.len().div_ceil(3)
     }
 
     /// Rough total token estimate for a message list (prompt side only).
@@ -353,7 +396,12 @@ impl LlmClient {
                 None => 0,
             };
             let reasoning_toks = m.reasoning_content.as_deref().map(Self::estimate_tokens).unwrap_or(0);
-            content_toks + reasoning_toks + 4 // per-message overhead
+            let tool_call_toks = m.tool_calls.as_ref().map(|calls| {
+                calls.iter().map(|c| {
+                    Self::estimate_tokens(&c.function.name) + Self::estimate_tokens(&c.function.arguments) + 8
+                }).sum::<usize>()
+            }).unwrap_or(0);
+            content_toks + reasoning_toks + tool_call_toks + 4 // per-message overhead
         }).sum()
     }
 
@@ -429,45 +477,90 @@ impl LlmClient {
         }
 
         let mut summary_opt: Option<String> = None;
+        let digest = format!(
+            "User Requests:\n{}\n\nTool Actions:\n{}",
+            user_requests.join("\n"),
+            tool_actions.join("\n")
+        );
 
+        // 1. If local SLM is enabled, try local compaction first
+        if cfg.local_llm_enabled {
+            if let Ok(local_summary) = self.local_client().compact_conversation(&digest).await {
+                if !local_summary.trim().is_empty() {
+                    summary_opt = Some(local_summary.trim().to_string());
+                }
+            }
+        }
 
         // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
         let (ep_base_url, ep_api_key) = cfg.endpoint();
         if summary_opt.is_none() && !ep_api_key.trim().is_empty() {
             let summary_system = "You are the Context Compactor for Corex. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
-            let digest = format!(
-                "User Requests:\n{}\n\nTool Actions:\n{}",
-                user_requests.join("\n"),
-                tool_actions.join("\n")
-            );
-            let request_body = serde_json::json!({
-                "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
-                "messages": [
-                    {"role": "system", "content": summary_system},
-                    {"role": "user", "content": digest}
-                ],
-                "max_tokens": 600,
-                "temperature": 0.3
-            });
+            if cfg.provider_kind() == crate::providers::ProviderKind::Anthropic {
+                let trimmed_base = ep_base_url.trim_end_matches('/');
+                let url = if trimmed_base.ends_with("/v1") {
+                    format!("{}/messages", trimmed_base)
+                } else {
+                    format!("{}/v1/messages", trimmed_base)
+                };
+                let request_body = serde_json::json!({
+                    "model": cfg.model,
+                    "max_tokens": 600,
+                    "temperature": 0.3,
+                    "system": summary_system,
+                    "messages": [
+                        {"role": "user", "content": digest}
+                    ]
+                });
+                if let Ok(resp) = self.http
+                    .post(&url)
+                    .header("x-api-key", &ep_api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Content-Type", "application/json")
+                    .json(&request_body)
+                    .send()
+                    .await
+                {
+                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                        if let Some(text) = json_resp
+                            .get("content")
+                            .and_then(|c| c.as_array())
+                            .and_then(|arr| arr.iter().find_map(|item| item.get("text").and_then(|t| t.as_str())))
+                        {
+                            summary_opt = Some(text.trim().to_string());
+                        }
+                    }
+                }
+            } else {
+                let request_body = serde_json::json!({
+                    "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
+                    "messages": [
+                        {"role": "system", "content": summary_system},
+                        {"role": "user", "content": digest}
+                    ],
+                    "max_tokens": 600,
+                    "temperature": 0.3
+                });
 
-            let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
-            if let Ok(resp) = self.http
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", ep_api_key))
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-                .send()
-                .await
-            {
-                if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                    if let Some(text) = json_resp
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|t| t.as_str())
-                    {
-                        summary_opt = Some(text.trim().to_string());
+                let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
+                if let Ok(resp) = self.http
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", ep_api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&request_body)
+                    .send()
+                    .await
+                {
+                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                        if let Some(text) = json_resp
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|t| t.as_str())
+                        {
+                            summary_opt = Some(text.trim().to_string());
+                        }
                     }
                 }
             }
@@ -519,28 +612,47 @@ impl LlmClient {
     }
 
     /// If the estimated prompt token count is above the threshold, drop the oldest
-    /// non-system messages (in message pairs to preserve tool call integrity) until
-    /// we are back under the limit or only the system + last turn remains.
-    /// DeepSeek-V4.1-Flash features a 1M token context window (1,048,576 tokens).
-    const HISTORY_TOKEN_LIMIT: usize = 256_000;
+    /// intermediate messages (preserving system prompt, root user prompt when possible,
+    /// and atomic tool-call groups) until we are back under the limit.
+    const HISTORY_TOKEN_LIMIT: usize = 120_000;
+    const LOCAL_HISTORY_TOKEN_LIMIT: usize = 24_000;
 
     pub fn cap_history_if_needed(messages: &mut Vec<Message>) {
-        if Self::estimate_messages_tokens(messages) <= Self::HISTORY_TOKEN_LIMIT {
+        Self::cap_history_with_limit(messages, Self::HISTORY_TOKEN_LIMIT);
+    }
+
+    pub fn cap_history_with_limit(messages: &mut Vec<Message>, token_limit: usize) {
+        if Self::estimate_messages_tokens(messages) <= token_limit {
             return;
         }
 
-        // Find the first non-system message index
-        let first_non_system = messages.iter().position(|m| m.role != "system").unwrap_or(messages.len());
+        let first_non_system = messages
+            .iter()
+            .position(|m| m.role != "system")
+            .unwrap_or(messages.len());
 
-        // Drop oldest messages one at a time (skip the system prompt at index 0)
+        // Prefer dropping after the root user anchor (first_non_system + 1) while there are enough turns;
+        // fall back to first_non_system only if the anchor itself makes history exceed the limit.
         while messages.len() > first_non_system + 2
-            && Self::estimate_messages_tokens(messages) > Self::HISTORY_TOKEN_LIMIT
+            && Self::estimate_messages_tokens(messages) > token_limit
         {
-            messages.remove(first_non_system);
+            let drop_idx = if messages.len() > first_non_system + 3 {
+                first_non_system + 1
+            } else {
+                first_non_system
+            };
+            let removed = messages.remove(drop_idx);
+            // If we removed an assistant message with tool calls, also remove its immediate tool responses
+            if removed.role == "assistant" && removed.tool_calls.is_some() {
+                while drop_idx < messages.len() && messages[drop_idx].role == "tool" {
+                    messages.remove(drop_idx);
+                }
+            }
         }
 
         debug!(
-            "[HISTORY] Capped history. Estimated tokens now: {}",
+            "[HISTORY] Capped history to limit {}. Estimated tokens now: {}",
+            token_limit,
             Self::estimate_messages_tokens(messages)
         );
     }
@@ -552,19 +664,55 @@ impl LlmClient {
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
         let cfg = self.get_config();
+        let is_local_model = cfg.model.starts_with("local");
 
         // ⚡ 100% STANDALONE OFFLINE LOCAL MODEL (Zero Cloud, 100% Local):
-        if cfg.model.starts_with("local") {
+        if is_local_model {
             let local_client = self.local_client();
             if local_client.health_check().await {
+                let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
+                let auto_compact_event = compact_notice.map(|notice| {
+                    let compacted_session_messages = if messages.len() > 1 {
+                        messages[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    (compacted_session_messages, notice)
+                });
+                Self::cap_history_with_limit(&mut messages, Self::LOCAL_HISTORY_TOKEN_LIMIT);
+                Self::sanitize_tool_call_sequences(&mut messages);
+                Self::truncate_tool_outputs(&mut messages);
+                crate::language::sanitize_messages_cjk_drift(&mut messages);
+
                 crate::forensic::ForensicLogger::log_event(
                     "LOCAL_LLM",
                     "STANDALONE_OFFLINE",
-                    "Running 100% offline on Local LLM (zero Cloud dependency, $0.00)."
+                    "Running 100% offline on Local LLM (zero Cloud dependency, $0.00).",
                 );
-                return local_client.stream_chat(messages, tools, cancel_token).await;
+                let mut inner_rx = local_client.stream_chat(messages, tools, cancel_token).await?;
+                if let Some((compacted_messages, notice)) = auto_compact_event {
+                    let (tx, rx) = mpsc::channel::<StreamEvent>(100);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(StreamEvent::ContextCompacted {
+                                compacted_messages,
+                                notice,
+                            })
+                            .await;
+                        while let Some(evt) = inner_rx.recv().await {
+                            if tx.send(evt).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    return Ok(rx);
+                }
+                return Ok(inner_rx);
             } else {
-                let err_msg = format!("Local LLM not reachable at {}. Start your llama-server/Ollama or switch model with /model.", cfg.local_llm_url);
+                let err_msg = format!(
+                    "Local LLM not reachable at {}. Start your llama-server/Ollama or switch model with /model.",
+                    cfg.local_llm_url
+                );
                 let (tx, rx) = mpsc::channel::<StreamEvent>(1);
                 tokio::spawn(async move {
                     let _ = tx.send(StreamEvent::Error(err_msg)).await;
@@ -590,17 +738,17 @@ impl LlmClient {
 
         // ⚡ ORDER OF INTEGRITY:
         // 1. Auto-compact conversation turns if threshold is reached (Gemini CLI / Antigravity spec)
-        let auto_compact_event = match self.compact_messages(&mut messages, false).await {
-            Ok(Some(notice)) => {
-                let compacted_session_messages = if messages.len() > 1 {
-                    messages[1..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                Some((compacted_session_messages, notice))
-            }
-            _ => None,
-        };
+        let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
+        // Capture compacted session messages immediately after compact_messages, before wire-only
+        // mutations (cap_history_if_needed, sanitize_tool_call_sequences, sanitize_for_google_tool_calls, truncate_tool_outputs)
+        let auto_compact_event = compact_notice.map(|notice| {
+            let compacted_session_messages = if messages.len() > 1 {
+                messages[1..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (compacted_session_messages, notice)
+        });
         // 2. Cap history limit as emergency fallback
         Self::cap_history_if_needed(&mut messages);
         // 3. Sanitize tool call sequences so no orphaned messages exist
@@ -695,6 +843,7 @@ impl LlmClient {
             "deepseek-v4-pro".to_string()
         } else if cfg.model == "deepseek-flash"
             || cfg.model == "deepseek-v4.1-flash"
+            || cfg.model == "deepseek-v4.1-flash-1017"
             || cfg.model == "deepseek-v4-flash"
             || cfg.model == "deepseek-v4-flash-vision-exp"
             || cfg.model == "deepseek-chat"
@@ -703,7 +852,11 @@ impl LlmClient {
             || cfg.model.contains("vision")
             || cfg.model.contains("Vision")
         {
-            "deepseek-flash".to_string()
+            if cfg.model == "deepseek-v4.1-flash-1017" {
+                "deepseek-v4.1-flash-1017".to_string()
+            } else {
+                "deepseek-flash".to_string()
+            }
         } else {
             cfg.model.clone()
         };
@@ -816,15 +969,17 @@ impl LlmClient {
             crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
         };
 
-        let body_serialized = serde_json::to_string_pretty(&request_body).unwrap_or_default();
-        crate::forensic::ForensicLogger::log_llm_request(
-            provider_label,
-            &api_model,
-            &url,
-            messages_count,
-            tools_count,
-            &body_serialized
-        );
+        if crate::forensic::ForensicLogger::is_enabled() {
+            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
+            crate::forensic::ForensicLogger::log_llm_request(
+                provider_label,
+                &api_model,
+                &url,
+                messages_count,
+                tools_count,
+                &body_serialized,
+            );
+        }
 
         debug!("[REQUEST] POST {} (api_model: {})", url, api_model);
 
@@ -850,7 +1005,7 @@ impl LlmClient {
             let mut total_content_chars = 0;
             let mut total_reasoning_chars = 0;
             let mut final_usage: Option<Usage> = None;
-            let final_reason: Option<String> = None;
+            let mut final_reason: Option<String> = None;
 
             loop {
                 tokio::select! {
@@ -877,6 +1032,21 @@ impl LlmClient {
                                             StreamEvent::UsageUpdate(ref u) => {
                                                 final_usage = Some(u.clone());
                                                 let _ = tx.send(ev).await;
+                                                if final_reason.is_some() {
+                                                    let duration_ms = start_time.elapsed().as_millis();
+                                                    crate::forensic::ForensicLogger::log_llm_response(
+                                                        &provider_label_clone,
+                                                        &api_model_clone,
+                                                        total_content_chars,
+                                                        total_reasoning_chars,
+                                                        duration_ms,
+                                                        first_token_time,
+                                                        final_reason.as_deref(),
+                                                        final_usage.as_ref(),
+                                                    );
+                                                    let _ = tx.send(StreamEvent::Completed { finish_reason: final_reason.clone() }).await;
+                                                    should_break = true;
+                                                }
                                             }
                                             StreamEvent::ReasoningDelta(ref cot) => {
                                                 if first_token_time.is_none() {
@@ -902,19 +1072,28 @@ impl LlmClient {
                                                 let _ = tx.send(ev).await;
                                             }
                                             StreamEvent::Completed { ref finish_reason } => {
-                                                let duration_ms = start_time.elapsed().as_millis();
-                                                crate::forensic::ForensicLogger::log_llm_response(
-                                                    &provider_label_clone,
-                                                    &api_model_clone,
-                                                    total_content_chars,
-                                                    total_reasoning_chars,
-                                                    duration_ms,
-                                                    first_token_time,
-                                                    finish_reason.as_deref().or(final_reason.as_deref()),
-                                                    final_usage.as_ref(),
-                                                );
-                                                let _ = tx.send(ev).await;
-                                                should_break = true;
+                                                if finish_reason.is_some() {
+                                                    final_reason = finish_reason.clone();
+                                                }
+                                                // If usage has already arrived or this is the terminal [DONE] marker
+                                                // (finish_reason is None), complete the stream immediately.
+                                                // Otherwise wait for the trailing usage chunk / [DONE] sent by
+                                                // OpenAI-compatible servers when `stream_options.include_usage` is true.
+                                                if final_usage.is_some() || finish_reason.is_none() {
+                                                    let duration_ms = start_time.elapsed().as_millis();
+                                                    crate::forensic::ForensicLogger::log_llm_response(
+                                                        &provider_label_clone,
+                                                        &api_model_clone,
+                                                        total_content_chars,
+                                                        total_reasoning_chars,
+                                                        duration_ms,
+                                                        first_token_time,
+                                                        final_reason.as_deref(),
+                                                        final_usage.as_ref(),
+                                                    );
+                                                    let _ = tx.send(StreamEvent::Completed { finish_reason: final_reason.clone() }).await;
+                                                    should_break = true;
+                                                }
                                             }
                                             other => {
                                                 let _ = tx.send(other).await;
@@ -925,6 +1104,21 @@ impl LlmClient {
                                         break;
                                     }
                                 }
+                            }
+                            Some(Err(reqwest_eventsource::Error::StreamEnded)) if final_reason.is_some() => {
+                                let duration_ms = start_time.elapsed().as_millis();
+                                crate::forensic::ForensicLogger::log_llm_response(
+                                    &provider_label_clone,
+                                    &api_model_clone,
+                                    total_content_chars,
+                                    total_reasoning_chars,
+                                    duration_ms,
+                                    first_token_time,
+                                    final_reason.as_deref(),
+                                    final_usage.as_ref(),
+                                );
+                                let _ = tx.send(StreamEvent::Completed { finish_reason: final_reason }).await;
+                                break;
                             }
                             Some(Err(err)) => {
                                 error!("[SSE] Error: {}", err);
@@ -960,7 +1154,7 @@ impl LlmClient {
                                     final_reason.as_deref(),
                                     final_usage.as_ref(),
                                 );
-                                let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
+                                let _ = tx.send(StreamEvent::Completed { finish_reason: final_reason }).await;
                                 break;
                             }
                         }
@@ -1012,7 +1206,7 @@ impl LlmClient {
             None
         };
 
-        let temperature = if is_thinking {
+        let temperature = if is_thinking || !(0.0..=1.0).contains(&cfg.temperature) {
             None
         } else {
             Some(cfg.temperature)
@@ -1029,15 +1223,17 @@ impl LlmClient {
             thinking: thinking_config,
         };
 
-        let body_serialized = serde_json::to_string_pretty(&request_body).unwrap_or_default();
-        crate::forensic::ForensicLogger::log_llm_request(
-            "Anthropic Claude",
-            model,
-            &url,
-            messages.len(),
-            tools.as_ref().map(|t| t.len()).unwrap_or(0),
-            &body_serialized,
-        );
+        if crate::forensic::ForensicLogger::is_enabled() {
+            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
+            crate::forensic::ForensicLogger::log_llm_request(
+                "Anthropic Claude",
+                model,
+                &url,
+                messages.len(),
+                tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                &body_serialized,
+            );
+        }
 
         let req_builder = self
             .http
@@ -1167,7 +1363,7 @@ impl LlmClient {
             bail!("API key is missing.");
         }
 
-        let base_url = cfg.base_url.trim_end_matches('/');
+        let base_url = cfg.base_url.trim_end_matches('/').trim_end_matches("/v1");
         let url = format!("{}/user/balance", base_url);
 
         let resp = self

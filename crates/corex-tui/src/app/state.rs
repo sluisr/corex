@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -17,12 +16,46 @@ use corex_core::types::ToolCall;
 use corex_tools::registry::ToolRegistry;
 
 use crate::auth_dialog::AuthDialogState;
+use crate::fleet_dialog::FleetDialogState;
 use crate::model_dialog::ModelDialogState;
 use crate::session_dialog::SessionDialogState;
 use crate::sudo_dialog::SudoDialogState;
 use crate::theme::Theme;
 use crate::thinking_view::ThinkingState;
 use crate::user_dialog::UserDialogState;
+
+/// Plain text of every rendered chat line, split into segments so the (large) history segment
+/// can be maintained incrementally instead of being re-allocated on every frame.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionLines {
+    /// Header banner lines (rebuilt each frame, small).
+    pub head: Vec<String>,
+    /// Plain text of `App::cached_message_lines`, extended incrementally.
+    pub cached: Vec<String>,
+    /// Live content after the cached history (pending message, streaming text, queue).
+    pub tail: Vec<String>,
+}
+
+impl SelectionLines {
+    pub fn get(&self, idx: usize) -> Option<&String> {
+        if idx < self.head.len() {
+            return self.head.get(idx);
+        }
+        let idx = idx - self.head.len();
+        if idx < self.cached.len() {
+            return self.cached.get(idx);
+        }
+        self.tail.get(idx - self.cached.len())
+    }
+
+    pub fn len(&self) -> usize {
+        self.head.len() + self.cached.len() + self.tail.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StatusTransition {
@@ -169,6 +202,8 @@ impl Default for StatusTransition {
 
 pub struct PendingToolBatch {
     pub calls: Vec<ToolCall>,
+    pub total_count: usize,
+    pub current_idx: usize,
     pub diff_preview: Option<String>,
     pub selected_option: usize,
     pub diff_expanded: bool,
@@ -234,9 +269,13 @@ pub struct App {
     pub session_dialog: SessionDialogState,
     pub auth_dialog: AuthDialogState,
     pub sudo_dialog: SudoDialogState,
+    pub fleet_dialog: FleetDialogState,
+    pub fleet_session: Option<Session>,
+    pub normal_session_stash: Option<Session>,
     pub cancel_token: Option<CancellationToken>,
+    pub in_flight_tool_calls: usize,
+    pub response_prefix: Option<String>,
 
-    pub list_state: ListState,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
     pub total_rendered_items: usize,
@@ -244,7 +283,7 @@ pub struct App {
     pub always_allow_tools: bool,
     pub mouse_capture: bool,
     pub selection: Option<Selection>,
-    pub selection_lines: Vec<String>,
+    pub selection_lines: SelectionLines,
     /// Last cell the pointer was seen at while the left button is down.
     pub drag_point: Option<(u16, u16)>,
     pub app_start_time: Instant,
@@ -263,10 +302,15 @@ pub struct App {
     pub local_llm_online: Arc<AtomicBool>,
     pub last_local_check: Option<Instant>,
     pub cached_message_lines: Vec<Line<'static>>,
+    pub cached_message_line_offsets: Vec<usize>,
     pub cached_message_count: usize,
     pub cached_render_width: usize,
     pub cached_session_id: String,
     pub cached_logs_expanded: bool,
+    /// Parsed markdown of `streaming_text`, reused across frames until the text grows.
+    pub streaming_md_cache: Vec<Line<'static>>,
+    pub streaming_md_cache_len: usize,
+    pub streaming_md_cache_width: usize,
     pub active_background_pids: HashSet<u32>,
     pub current_generation_id: u64,
     pub update_available: Arc<std::sync::Mutex<Option<String>>>,

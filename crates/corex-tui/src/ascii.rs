@@ -51,7 +51,7 @@ pub fn shorten_model_for_mobile(model: &str) -> String {
     } else if model.contains("codestral") {
         "Codestral".to_string()
     } else if model.len() > 18 {
-        format!("{}…", &model[..16])
+        format!("{}…", corex_core::types::safe_truncate_str(model, 16))
     } else {
         model.to_string()
     }

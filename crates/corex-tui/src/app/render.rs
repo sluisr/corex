@@ -13,6 +13,7 @@ use corex_core::types::Message;
 use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive};
 use crate::auth_dialog::render_auth_dialog;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
+use crate::fleet_dialog::render_fleet_dialog;
 use crate::markdown::render_markdown;
 use crate::model_dialog::render_model_dialog;
 use crate::session_dialog::render_session_dialog;
@@ -23,7 +24,7 @@ use crate::user_dialog::render_user_dialog;
 
 use super::formatting::*;
 use super::mobile::is_mobile_portrait;
-use super::state::{App, PendingToolBatch, Selection};
+use super::state::{App, PendingToolBatch, Selection, SelectionLines};
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_about_card(
@@ -260,6 +261,86 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         return lines;
     }
 
+    // 1b. Subagent Done / Subagent Task Finished (One-Liner Badge + compact tail or full log)
+    if first_line.starts_with("SUBAGENT_DONE|") || first_line.starts_with("SUBAGENTDONE|") {
+        let parts: Vec<&str> = first_line.split('|').collect();
+        let sub_id = parts.get(1).copied().unwrap_or("?");
+        let role_str = parts.get(2).copied().unwrap_or("SUBAGENT");
+        let dur = parts.get(3).copied().unwrap_or("");
+
+        let (icon, role_label) = match role_str.to_uppercase().as_str() {
+            "SCOUT" => ("  🔭 ", "scout"),
+            "TESTER" => ("  🧪 ", "tester"),
+            "RESEARCHER" => ("  📚 ", "researcher"),
+            "WORKER" => ("  ⚙️ ", "worker"),
+            _ => ("  🤖 ", "subagent"),
+        };
+
+        // Output lines
+        let output_lines: Vec<&str> = raw_lines[1..]
+            .iter()
+            .copied()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let total = output_lines.len();
+        let max_lines = 5;
+
+        let is_err = output_lines.first().map(|l| l.starts_with("Exit code ") || l.starts_with("Failed")).unwrap_or(false);
+
+        let (status_text, status_color) = if is_err {
+            ("failed".to_string(), Color::Rgb(220, 110, 110))
+        } else {
+            ("completed".to_string(), Color::Rgb(105, 185, 135))
+        };
+
+        let mut badge_spans = vec![
+            Span::styled(icon, Style::default().fg(Color::Rgb(105, 185, 135))),
+            Span::styled(format!("[{}:{}] ", role_label, sub_id), Style::default().fg(muted_tag)),
+            Span::styled(status_text, Style::default().fg(status_color)),
+        ];
+        if !dur.trim().is_empty() {
+            badge_spans.push(Span::styled(format!(" ({})", dur.trim()), Style::default().fg(muted_dim)));
+        }
+        if logs_expanded && total > max_lines {
+            badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(muted_dim)));
+        } else if !logs_expanded && total > max_lines {
+            badge_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(muted_dim)));
+        }
+        lines.push(Line::from(badge_spans));
+
+        if !output_lines.is_empty() {
+            if logs_expanded {
+                for line_str in &output_lines {
+                    let clean = line_str.replace('\t', "    ");
+                    let spans = vec![
+                        Span::styled(clean, Style::default().fg(muted_text)),
+                    ];
+                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                }
+            } else {
+                if total > max_lines {
+                    let omitted = total - max_lines;
+                    let om_spans = vec![
+                        Span::styled("    │ ", Style::default().fg(muted_dim)),
+                        Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(muted_dim)),
+                    ];
+                    lines.push(Line::from(om_spans));
+                }
+
+                let start_idx = total.saturating_sub(max_lines);
+                for line_str in &output_lines[start_idx..] {
+                    let clean = line_str.replace('\t', "    ");
+                    let spans = vec![
+                        Span::styled(clean, Style::default().fg(muted_text)),
+                    ];
+                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                }
+            }
+        }
+
+        return lines;
+    }
+
     // 2. Model Activation Message
     if first_line.starts_with("Activated ") || first_line.starts_with("Switched ") {
         let title = first_line.trim_start_matches("Activated ").trim_start_matches("Switched ");
@@ -369,6 +450,27 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
 }
 
 pub fn render_single_message_with_pending(
+    msg_idx: usize,
+    msg: &Message,
+    next_msg: Option<&Message>,
+    theme: &Theme,
+    content_max_width: usize,
+    pending_conf: Option<&PendingToolBatch>,
+    logs_expanded: bool,
+) -> Vec<Line<'static>> {
+    render_single_message_with_pending_and_thinking(
+        msg_idx,
+        msg,
+        next_msg,
+        theme,
+        content_max_width,
+        pending_conf,
+        logs_expanded,
+        logs_expanded,
+    )
+}
+
+pub fn render_single_message_with_pending_and_thinking(
     _msg_idx: usize,
     msg: &Message,
     next_msg: Option<&Message>,
@@ -376,6 +478,7 @@ pub fn render_single_message_with_pending(
     content_max_width: usize,
     pending_conf: Option<&PendingToolBatch>,
     logs_expanded: bool,
+    thinking_expanded: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match msg.role.as_str() {
@@ -385,7 +488,9 @@ pub fn render_single_message_with_pending(
                 let (spans, first_indent) = if idx == 0 {
                     (
                         vec![
-                            Span::styled("You: ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+                            Span::styled("[", Style::default().fg(theme.dark_gray)),
+                            Span::styled("You", Style::default().fg(Color::Rgb(130, 215, 160)).add_modifier(Modifier::BOLD)),
+                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
                             Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                         ],
                         "  ",
@@ -395,15 +500,43 @@ pub fn render_single_message_with_pending(
                         vec![
                             Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                         ],
-                        "       ",
+                        "        ",
                     )
                 };
-                let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, "       ");
+                let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, "        ");
                 lines.extend(wrapped);
             }
             lines.push(Line::from(""));
         }
         "assistant" => {
+            if let Some(ref cot) = msg.reasoning_content {
+                let trimmed_cot = cot.trim();
+                if !trimmed_cot.is_empty() {
+                    if thinking_expanded {
+                        lines.push(Line::from(vec![
+                            Span::styled("  [", Style::default().fg(theme.dark_gray)),
+                            Span::styled("• Thought", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
+                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
+                            Span::styled("(Ctrl+T to collapse)", Style::default().fg(theme.dark_gray)),
+                        ]));
+                        for cot_line in trimmed_cot.lines() {
+                            let clean = cot_line.replace('\t', "    ");
+                            let spans = vec![Span::styled(clean, Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC))];
+                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                        }
+                        lines.push(Line::from(""));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled("  [", Style::default().fg(theme.dark_gray)),
+                            Span::styled("• Thought", Style::default().fg(theme.accent_purple)),
+                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
+                            Span::styled("(Ctrl+T to expand)", Style::default().fg(theme.dark_gray)),
+                        ]));
+                        lines.push(Line::from(""));
+                    }
+                }
+            }
+
             if let Some(text) = msg.text_content() {
                 let mut md_lines = render_markdown(text, theme, content_max_width);
                 md_lines.push(Line::from(""));
@@ -514,6 +647,71 @@ pub fn render_single_message_with_pending(
                 ];
                 let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
                 lines.extend(wrapped);
+            } else if content.starts_with("Task ID: sub_") {
+                let sub_id = content.lines().find(|l| l.starts_with("Task ID:")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim()).unwrap_or("?");
+                let role = content.lines().find(|l| l.starts_with("Role:")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim()).unwrap_or("subagent");
+                let line_spans = vec![
+                    Span::styled("    · ", Style::default().fg(theme.accent_purple)),
+                    Span::styled(format!("[{}:{}] ", role, sub_id), Style::default().fg(theme.accent_purple)),
+                    Span::styled("running in background...", Style::default().fg(theme.gray)),
+                ];
+                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                lines.extend(wrapped);
+            } else if content.starts_with("Subagent '") && (content.contains("' completed:") || content.contains("' failed:")) {
+                let is_err = content.contains("' failed:");
+                let first_line = content.lines().next().unwrap_or("");
+                let sub_id = first_line.split('\'').nth(1).unwrap_or("?");
+                let (status_icon, status_color, status_text) = if is_err {
+                    ("✕ ", Color::Red, "failed")
+                } else {
+                    ("✓ ", Color::Green, "completed")
+                };
+
+                let report_body = content.split_once(":\n\n")
+                    .map(|(_, b)| b)
+                    .or_else(|| content.split_once(":\n").map(|(_, b)| b))
+                    .unwrap_or(content);
+
+                let raw_lines: Vec<&str> = report_body.lines().filter(|l| !l.trim().is_empty()).collect();
+                let total = raw_lines.len();
+                let max_lines = 5;
+
+                let mut badge_spans = vec![
+                    Span::styled(format!("    {}", status_icon), Style::default().fg(status_color)),
+                    Span::styled(format!("[agent:{}] ", sub_id), Style::default().fg(theme.accent_purple)),
+                    Span::styled(status_text, Style::default().fg(status_color)),
+                ];
+                if logs_expanded && total > max_lines {
+                    badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(theme.dark_gray)));
+                } else if !logs_expanded && total > max_lines {
+                    badge_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(theme.dark_gray)));
+                }
+                lines.push(Line::from(badge_spans));
+
+                if !raw_lines.is_empty() {
+                    if logs_expanded {
+                        for line_str in &raw_lines {
+                            let clean = line_str.replace('\t', "    ");
+                            let spans = vec![Span::styled(clean, Style::default().fg(theme.gray))];
+                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
+                        }
+                    } else {
+                        if total > max_lines {
+                            let omitted = total - max_lines;
+                            let om_spans = vec![
+                                Span::styled("        │ ", Style::default().fg(theme.dark_gray)),
+                                Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(theme.dark_gray)),
+                            ];
+                            lines.push(Line::from(om_spans));
+                        }
+                        let start_idx = total.saturating_sub(max_lines);
+                        for line_str in &raw_lines[start_idx..] {
+                            let clean = line_str.replace('\t', "    ");
+                            let spans = vec![Span::styled(clean, Style::default().fg(theme.gray))];
+                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
+                        }
+                    }
+                }
             } else {
                 let raw_output_lines: Vec<&str> = content
                     .lines()
@@ -602,10 +800,10 @@ pub fn render_single_message_with_pending(
         "system" => {
             if let Some(text) = msg.text_content() {
                 lines.extend(format_system_message(text, theme, content_max_width, logs_expanded));
-                let is_task_done = text.starts_with("TASK_DONE|") || text.starts_with("[TASK FINISHED]");
+                let is_task_done = text.starts_with("TASK_DONE|") || text.starts_with("[TASK FINISHED]") || text.starts_with("SUBAGENT_DONE|");
                 let next_is_task_done = next_msg
                     .and_then(|m| if m.role.as_str() == "system" { m.text_content() } else { None })
-                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("[TASK FINISHED]"))
+                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("[TASK FINISHED]") || t.starts_with("SUBAGENT_DONE|"))
                     .unwrap_or(false);
 
                 if !is_task_done || !next_is_task_done {
@@ -621,6 +819,60 @@ pub fn render_single_message_with_pending(
 pub fn render_ui(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
+    // Fleet / SysAdmin mode: normal AI chat on one side, live VPS terminal on the other.
+    if app.fleet_dialog.is_open {
+        let border = Style::default().fg(Color::Rgb(50, 60, 75));
+
+        // Wide terminals: chat | live output | fleet-wide telemetry.
+        if app.fleet_dialog.wide_layout && size.width >= crate::fleet_dialog::FLEET_WIDE_MIN_WIDTH {
+            let cols = Layout::horizontal([
+                Constraint::Percentage(40),
+                Constraint::Percentage(35),
+                Constraint::Percentage(25),
+            ])
+            .split(size);
+            render_chat_ui(frame, app, cols[0]);
+
+            let out_block = Block::default().borders(Borders::LEFT).border_style(border);
+            let out_inner = out_block.inner(cols[1]);
+            frame.render_widget(out_block, cols[1]);
+            crate::fleet_dialog::render_fleet_output(frame, out_inner, &app.fleet_dialog, &app.theme);
+
+            let fleet_block = Block::default().borders(Borders::LEFT).border_style(border);
+            let fleet_inner = fleet_block.inner(cols[2]);
+            frame.render_widget(fleet_block, cols[2]);
+            crate::fleet_dialog::render_fleet_column(frame, fleet_inner, &app.fleet_dialog, &app.theme);
+            return;
+        }
+
+        let (chat_area, term_area) = if size.width >= 110 {
+            let h = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(size);
+            (h[0], h[1])
+        } else {
+            let v = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(size);
+            (v[0], v[1])
+        };
+
+        render_chat_ui(frame, app, chat_area);
+
+        let border_color = if app.fleet_dialog.command_mode {
+            app.theme.accent_cyan
+        } else {
+            Color::Rgb(40, 50, 65)
+        };
+        let term_block = Block::default()
+            .borders(if size.width >= 110 { Borders::LEFT } else { Borders::TOP })
+            .border_style(Style::default().fg(border_color));
+        let inner = term_block.inner(term_area);
+        frame.render_widget(term_block, term_area);
+        render_fleet_dialog(frame, inner, &app.fleet_dialog, &app.theme);
+        return;
+    }
+
+    render_chat_ui(frame, app, size);
+}
+
+fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     if app.input_buffer.starts_with('/') {
         app.last_slash_filter = app.input_buffer.clone();
     }
@@ -709,15 +961,15 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     };
 
     let content_max_width = (chat_chunk.width as usize).saturating_sub(4).max(20);
-    let mut all_lines = Vec::with_capacity(app.cached_message_lines.len() + 128);
 
     // 1. Header Banner (First item in scrollable feed!)
+    // Config is snapshotted once per frame and reused by the status footer below.
     let cfg = app.llm_client.get_config();
     let is_auth = !cfg.api_key.trim().is_empty();
     let is_local = cfg.local_llm_enabled;
     let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
     let elapsed = app.start_time.elapsed().as_secs_f32();
-    let header_lines = if is_mobile_portrait(size.width, size.height) {
+    let header_lines: Vec<Line<'static>> = if is_mobile_portrait(size.width, size.height) {
         render_gradient_logo_adaptive(
             env!("CARGO_PKG_VERSION"),
             &cfg.model,
@@ -737,7 +989,6 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             elapsed,
         )
     };
-    all_lines.extend(header_lines);
 
     // 2. Cached Messages & Tool Executions List
     if app.cached_render_width != content_max_width
@@ -745,6 +996,8 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
         || app.cached_logs_expanded != app.logs_expanded
     {
         app.cached_message_lines.clear();
+        app.cached_message_line_offsets.clear();
+        app.selection_lines.cached.clear();
         app.cached_message_count = 0;
         app.cached_render_width = content_max_width;
         app.cached_session_id = app.session.id.clone();
@@ -758,16 +1011,26 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     };
 
     if app.cached_message_count > target_cache_count {
-        app.cached_message_lines.clear();
-        app.cached_message_count = 0;
+        let keep_lines = if target_cache_count < app.cached_message_line_offsets.len() {
+            app.cached_message_line_offsets[target_cache_count]
+        } else {
+            0
+        };
+        app.cached_message_lines.truncate(keep_lines);
+        app.cached_message_line_offsets.truncate(target_cache_count + 1);
+        app.selection_lines.cached.truncate(keep_lines);
+        app.cached_message_count = target_cache_count;
     }
 
     if app.cached_message_count < target_cache_count {
+        if app.cached_message_line_offsets.is_empty() {
+            app.cached_message_line_offsets.push(0);
+        }
         let start_idx = app.cached_message_count;
         for msg_idx in start_idx..target_cache_count {
             let msg = &app.session.messages[msg_idx];
             let next_msg = app.session.messages[..target_cache_count].get(msg_idx + 1);
-            let rendered = render_single_message_with_pending(
+            let rendered = render_single_message_with_pending_and_thinking(
                 msg_idx,
                 msg,
                 next_msg,
@@ -775,19 +1038,35 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
                 content_max_width,
                 None,
                 app.logs_expanded,
+                app.thinking_state.is_expanded,
             );
             app.cached_message_lines.extend(rendered);
+            app.cached_message_line_offsets.push(app.cached_message_lines.len());
         }
         app.cached_message_count = target_cache_count;
     }
 
-    all_lines.extend(app.cached_message_lines.iter().cloned());
+    // Keep the plain-text mirror of the cached history in sync (incremental, never per-frame full rebuild).
+    if app.selection_lines.cached.len() > app.cached_message_lines.len() {
+        app.selection_lines.cached.clear();
+    }
+    if app.selection_lines.cached.len() < app.cached_message_lines.len() {
+        let from = app.selection_lines.cached.len();
+        let new_plain: Vec<String> = app.cached_message_lines[from..]
+            .iter()
+            .map(line_plain_text)
+            .collect();
+        app.selection_lines.cached.extend(new_plain);
+    }
+
+    // 3. Live tail (uncached pending message, confirmation dialog, streaming output, queue)
+    let mut tail_lines: Vec<Line<'static>> = Vec::new();
 
     if target_cache_count < app.session.messages.len() {
         let msg_idx = target_cache_count;
         let msg = &app.session.messages[msg_idx];
         let next_msg = app.session.messages.get(msg_idx + 1);
-        let rendered = render_single_message_with_pending(
+        let rendered = render_single_message_with_pending_and_thinking(
             msg_idx,
             msg,
             next_msg,
@@ -795,8 +1074,9 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             content_max_width,
             app.pending_confirmation.as_ref(),
             app.logs_expanded,
+            app.thinking_state.is_expanded,
         );
-        all_lines.extend(rendered);
+        tail_lines.extend(rendered);
     }
 
     // Render Tool Confirmation Dialog inline directly in the chat stream!
@@ -808,22 +1088,62 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             diff_str,
             pending.selected_option,
             pending.calls.len(),
+            pending.current_idx,
+            pending.total_count,
             content_max_width,
             &app.theme,
             pending.diff_expanded,
             pending.input_mode,
             &pending.feedback_text,
         );
-        all_lines.extend(conf_lines);
+        tail_lines.extend(conf_lines);
     }
 
     if app.is_streaming {
         let elapsed = app.last_turn_start.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
 
+        if !app.thinking_state.content.trim().is_empty() {
+            if app.thinking_state.is_expanded {
+                tail_lines.push(Line::from(vec![
+                    Span::styled("  [", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("• Thought", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" · {:.1}s", elapsed), Style::default().fg(app.theme.gray)),
+                    Span::styled("] ", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("(Ctrl+T to collapse)", Style::default().fg(app.theme.dark_gray)),
+                ]));
+                for cot_line in app.thinking_state.content.trim().lines() {
+                    let clean = cot_line.replace('\t', "    ");
+                    let spans = vec![Span::styled(clean, Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC))];
+                    tail_lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                }
+                tail_lines.push(Line::from(""));
+            } else {
+                tail_lines.push(Line::from(vec![
+                    Span::styled("  [", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("• Thought", Style::default().fg(app.theme.accent_purple)),
+                    Span::styled(format!(" · {:.1}s", elapsed), Style::default().fg(app.theme.gray)),
+                    Span::styled("] ", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("(Ctrl+T to expand)", Style::default().fg(app.theme.dark_gray)),
+                ]));
+                tail_lines.push(Line::from(""));
+            }
+        }
+
         if !app.streaming_text.is_empty() {
-            let mut stream_lines = render_markdown(&app.streaming_text, &app.theme, content_max_width);
-            stream_lines.push(Line::from(""));
-            all_lines.extend(stream_lines);
+            // Re-parse markdown only when the streamed text or width actually changed.
+            let cache_valid = app.streaming_md_cache_len == app.streaming_text.len()
+                && app.streaming_md_cache_width == content_max_width
+                && !app.streaming_md_cache.is_empty();
+            if !cache_valid {
+                app.streaming_md_cache = render_markdown(&app.streaming_text, &app.theme, content_max_width);
+                app.streaming_md_cache_len = app.streaming_text.len();
+                app.streaming_md_cache_width = content_max_width;
+            }
+            tail_lines.extend(app.streaming_md_cache.iter().cloned());
+            tail_lines.push(Line::from(""));
+        } else if !app.streaming_md_cache.is_empty() {
+            app.streaming_md_cache = Vec::new();
+            app.streaming_md_cache_len = 0;
         }
 
         if !app.streaming_tool_calls.is_empty() {
@@ -833,29 +1153,32 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
                 content_max_width,
                 &app.theme,
             );
-            all_lines.extend(preview_lines);
+            tail_lines.extend(preview_lines);
         }
+    } else if !app.streaming_md_cache.is_empty() {
+        app.streaming_md_cache = Vec::new();
+        app.streaming_md_cache_len = 0;
     }
 
     if !app.message_queue.is_empty() {
-        all_lines.push(Line::from(""));
+        tail_lines.push(Line::from(""));
         for (i, queued_msg) in app.message_queue.iter().enumerate() {
             let label = if app.message_queue.len() == 1 {
                 "[queued] ".to_string()
             } else {
                 format!("[queued #{}] ", i + 1)
             };
-            all_lines.push(Line::from(vec![
+            tail_lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(label, Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(queued_msg.clone(), Style::default().fg(app.theme.foreground)),
                 Span::styled(" (pending)", Style::default().fg(app.theme.dark_gray)),
             ]));
         }
-        all_lines.push(Line::from(""));
+        tail_lines.push(Line::from(""));
     }
 
-    let total_lines = all_lines.len();
+    let total_lines = header_lines.len() + app.cached_message_lines.len() + tail_lines.len();
     app.total_rendered_items = total_lines;
 
     let visible_height = (chat_chunk.height as usize).max(1);
@@ -870,11 +1193,22 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     app.last_chat_rect = Some(chat_chunk);
 
     // Resolving drag columns into characters and finding clicked URLs needs the plain text of every rendered line.
-    app.selection_lines = all_lines.iter().map(|line| line_plain_text(line)).collect();
+    // Only the small header/tail segments are rebuilt per frame; history plain text is maintained incrementally above.
+    app.selection_lines.head = header_lines.iter().map(line_plain_text).collect();
+    app.selection_lines.tail = tail_lines.iter().map(line_plain_text).collect();
 
-    let message_paragraph = Paragraph::new(all_lines)
-        .block(Block::default().borders(Borders::NONE))
-        .scroll((app.scroll_offset, 0));
+    // Clone only the lines that are actually visible in the viewport (O(viewport) instead of O(history)).
+    let visible_lines: Vec<Line<'static>> = header_lines
+        .iter()
+        .chain(app.cached_message_lines.iter())
+        .chain(tail_lines.iter())
+        .skip(app.scroll_offset as usize)
+        .take(visible_height)
+        .cloned()
+        .collect();
+
+    let message_paragraph = Paragraph::new(visible_lines)
+        .block(Block::default().borders(Borders::NONE));
     frame.render_widget(message_paragraph, chat_chunk);
 
     // Painted straight onto the rendered cells: the feed is built from generated lines, so this
@@ -926,9 +1260,9 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 
         let mut right_spans = Vec::new();
         if queue_count > 0 {
-            right_spans.push(Span::styled("(Esc para descolar) ", Style::default().fg(app.theme.dark_gray)));
+            right_spans.push(Span::styled("(Esc to dequeue) ", Style::default().fg(app.theme.dark_gray)));
         } else {
-            right_spans.push(Span::styled("(Esc para cancelar) ", Style::default().fg(app.theme.dark_gray)));
+            right_spans.push(Span::styled("(Esc to cancel) ", Style::default().fg(app.theme.dark_gray)));
         }
 
         let left_len: usize = left_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
@@ -1044,7 +1378,6 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     }
 
     // 4. Status Footer Bar (Left: Workspace Path | Right: Model Info)
-    let cfg = app.llm_client.get_config();
 
     // Left spans: ONLY the workspace directory (and git branch)
     let mut left_spans = vec![
@@ -1068,7 +1401,7 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
     let is_deepseek = cfg.is_deepseek_endpoint();
-    let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4-Flash");
+    let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4.1-Flash-1017" || cfg.model == "DeepSeek-V4-Flash");
     let is_pro = is_deepseek && (cfg.model == "deepseek-pro" || cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro");
 
     let model_style = Style::default().fg(Color::Rgb(120, 125, 138));
@@ -1172,18 +1505,40 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             .unwrap_or(0)
     };
 
+    let active_subagents = corex_core::subagent::get_subagent_manager()
+        .lock()
+        .map(|m| m.active_count())
+        .unwrap_or(0);
+
     if active_tasks > 0 {
         if !center_spans.is_empty() {
             center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
         }
         let task_badge = if active_tasks == 1 {
-            "[1 Task Running]".to_string()
+            "1 task".to_string()
         } else {
-            format!("[{} Tasks Running]", active_tasks)
+            format!("{} tasks", active_tasks)
         };
         center_spans.push(Span::styled(
             task_badge,
-            Style::default().fg(app.theme.gray),
+            Style::default().fg(app.theme.accent_yellow),
+        ));
+    }
+
+    if active_subagents > 0 {
+        if !center_spans.is_empty() {
+            center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
+        }
+        let subagent_badge = if active_subagents == 1 {
+            "1 agent".to_string()
+        } else {
+            format!("{} agents", active_subagents)
+        };
+        center_spans.push(Span::styled(
+            subagent_badge,
+            Style::default()
+                .fg(Color::Rgb(185, 160, 225))
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1210,7 +1565,7 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             .split(status_chunk);
 
         frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
-        let mobile_right = if active_tasks > 0 {
+        let mobile_right = if active_tasks > 0 || active_subagents > 0 {
             center_spans
         } else {
             right_spans
@@ -1263,7 +1618,7 @@ pub fn paint_selection(
     chat: Rect,
     scroll_offset: u16,
     selection: &Selection,
-    lines: &[String],
+    lines: &SelectionLines,
     theme: &Theme,
 ) {
     use unicode_width::UnicodeWidthStr;

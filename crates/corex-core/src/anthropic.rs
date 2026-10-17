@@ -153,7 +153,7 @@ pub fn convert_messages_and_tools(
                     }
                 }
                 if blocks.is_empty() {
-                    blocks.push(AnthropicBlock::Text { text: String::new() });
+                    blocks.push(AnthropicBlock::Text { text: "...".to_string() });
                 }
                 if let Some(last) = anthropic_messages.last_mut() {
                     if last.role == "assistant" {

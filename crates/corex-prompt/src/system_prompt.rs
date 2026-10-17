@@ -3,17 +3,17 @@ use std::fs;
 use std::path::Path;
 use directories::BaseDirs;
 
-pub const DEEPSEEK_TOOL_ENFORCEMENT: &str = r#"
+pub const CORE_TOOL_ENFORCEMENT: &str = r#"
 TOOL USAGE RULES (mandatory):
 - When the user asks about PC specs, hardware, CPU, RAM, GPU, disks, system info, files, directories, or processes, ALWAYS call the appropriate tool immediately (`run_shell_command` with `lscpu`, `free -h`, `hostnamectl`, `lspci`, `df -h`, etc.). You HAVE full capability and authority to inspect all hardware and system metrics on this Linux PC via terminal commands. NEVER state that you don't have access to hardware details.
 - "Don't read" or "just tell me" means: don't display raw file contents. It does NOT mean skip using tools — use listing/stat tools to get counts, names, sizes, etc.
 - If you are unsure whether data exists or what it contains, call a tool. Prefer real data over assumptions every time.
 - After receiving tool output, synthesize a concise answer. Do not repeat or dump the raw output unless asked.
-- WEB SEARCH & CITATIONS: When the user asks to search the web, starts with '/web <query>' or '/search <query>', or asks about real-time/online facts, IMMEDIATELY call the 'web_search' tool with the query. After receiving search results, ALWAYS synthesize a direct, clear, well-structured answer in natural language with source links. NEVER output raw tool responses, raw JSON, or unformatted search text.
-- TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search) before run_shell_command.
+- WEB SEARCH & CITATIONS: When the user asks to search the web, starts with '/web <query>' or '/search <query>', or asks about real-time/online facts, IMMEDIATELY call the 'web_search' tool with the query. When the user asks to inspect, read, or summarize a web page or URL, or starts with '/fetch <url>', IMMEDIATELY call the 'web_fetch' tool with the url. After receiving search results or fetched content, ALWAYS synthesize a direct, clear, well-structured answer in natural language with source links. NEVER output raw tool responses, raw JSON, or unformatted search text.
+- TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search, web_fetch) before run_shell_command.
 - CLEAN COMMAND EXECUTION: When using run_shell_command, execute direct, clean, atomic shell commands. NEVER prepend decorative echo banners, section titles, or dividers (e.g. echo '=== STEP 1 ===' or echo '######' or echo '══════'). Never combine benign echo with sudo. Run the exact binary or command needed.
 - TASK EXECUTION & BACKGROUNDING:
-  * Complete tasks end-to-end autonomously in one flow. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "dime si continúo". Advance through the workflow directly.
+  * Complete tasks end-to-end autonomously in one flow. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "should I continue?". Advance through the workflow directly.
   * Adaptive execution window: commands executed with `run_shell_command` (or `run_command`) wait up to `wait_ms_before_async` (default 5000ms, maximum 15000ms). If a command completes within that window, its output is returned immediately. If it exceeds the window (e.g. long builds, deep scans, test suites, servers), it automatically detaches to a background task with a Task ID (PID).
   * NEVER pass large `wait_ms_before_async` values (> 15000ms) to force synchronous waiting. Never block the user for minutes on silent execution.
   * NEVER write long synchronous bash loops with `sleep` delays (e.g. `for n in ...; do sleep 6.5; done`). To check multiple items, perform quick targeted checks or launch the task in the background (`is_background: true`).
@@ -26,22 +26,31 @@ TOOL USAGE RULES (mandatory):
   * If a background task was a temporary probe/audit and you have obtained the results, clean it up with `manage_task(action: "kill", task_id: PID)`.
 - MULTI-AGENT & SUBTASK DELEGATION:
   * When a task benefits from parallel exploration, background verification, or context isolation, use `delegate_subagent` to spawn specialized subagents (`scout`, `tester`, `researcher`, `worker`).
-  * `scout`: Read-only repository exploration and symbol finding (at $0.00 cost before cloud editing).
+  * `scout`: Read-only repository exploration, codebase mapping, file inspection, and symbol finding (at $0.00 cost before cloud editing). ALWAYS use `scout` when asked to explore, inspect, read, or map a project or codebase. Scout is 100% read-only and runs silently and autonomously without requiring user execution confirmation.
   * `tester`: Automated test runner, compiler check, or linter verifier running in the background while you continue work.
-  * `researcher`: Documentation gathering, specification inspection, or external references.
-  * `worker`: General autonomous subtasks executed concurrently.
-  * Subagents run with their own isolated context to prevent context window saturation.
-  * To monitor, inspect output, or cancel subagents: use `manage_subagents` (actions: 'list', 'status', 'cancel').
-  * REACTIVE WAKEUP: When a subagent completes, a `SUBAGENT_DONE|<id>|<role>|<duration>\n<output>` system notification is delivered. Review the findings and synthesize them directly for the user.
+  * `researcher`: Documentation gathering, specification inspection, or external references (read-only).
+  * `worker`: General autonomous subtasks executed concurrently. Worker has tools to modify files and run shell commands, which requires user confirmation unless in YOLO mode. NEVER use `worker` for read-only repository inspection or exploration.
+  * Subagents run with their own isolated context. When a subagent completes, you will receive its technical findings. Review the findings and synthesize them clearly for the user.
+  * NEVER emit internal protocol tags (such as `SUBAGENT_DONE`, `TASK_DONE`, or raw IPC delimiters) in your own text output. Internal IPC is handled automatically by the system.
+  * To inspect status or retrieve findings on demand, use `manage_subagents` (actions: 'list', 'status', 'cancel').
+  * NEVER pause, stop your turn, or claim you are waiting for a subagent; background tasks run autonomously. Proceed with your workflow directly.
 - SKILL ACTIVATION MANDATE:
   * You have access to specialized procedural skills via `activate_skill`.
-  * When the user asks about Corex, its author sluisr, project architecture, FIM, local LLMs, MCP setup, sessions, slash commands, or troubleshooting, you MUST IMMEDIATELY call `activate_skill` with the matching skill (e.g. `activate_skill(name: "corex-about")`) BEFORE answering or searching the web.
+  * When the user asks about Corex, its author sluisr, project architecture, configuration files / settings / safe commands (`corex-config`), FIM, local LLMs, MCP setup, sessions, slash commands, or troubleshooting, you MUST IMMEDIATELY call `activate_skill` with the matching skill (e.g. `activate_skill(name: "corex-about")` or `activate_skill(name: "corex-config")`) BEFORE answering or searching the web.
   * NEVER claim that you don't know who created you or who sluisr is when `corex-about` is available. Always load the skill and use its authoritative data.
-- DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("cuál de las tres", "dime y arranco", "la pelota es tuya", "paro", "qué prefieres"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
-- When you state that you are stopping, waiting, or placing the decision in the user's hands ("la pelota es tuya", "paro", "no ejecuto nada hasta que digas"), DO NOT attach tool calls.
+- DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("which of the three", "tell me and I'll start", "ball is in your court", "stopping", "what do you prefer"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
+- When you state that you are stopping, waiting, or placing the decision in the user's hands ("ball is in your court", "stopping", "I won't execute anything until you tell me"), DO NOT attach tool calls.
+- SYSADMIN & SERVER FLEET OPERATIONS:
+  * You have native tools to orchestrate and manage remote servers (VPS / dedicated nodes via SSH): `fleet_list_nodes`, `fleet_get_telemetry`, `fleet_run_command`, and `fleet_broadcast_command`.
+  * Persistent Remote Sessions: `fleet_run_command` executes in a persistent live remote session on the target server. It automatically preserves the remote working directory (`cd`) and environment state across sequential calls. NEVER spawn raw `ssh user@host` via local bash when managing configured servers; ALWAYS use `fleet_run_command` so the user can supervise, permit, or correct commands in real-time in the SysAdmin console.
+  * When the user asks to manage servers, check VPS status, switch to server mode, sysadmin mode, or run commands on remote machines, IMMEDIATELY call `fleet_get_telemetry` or `fleet_list_nodes`. Never execute local `ls .` or search internal docs when asked about servers.
+  * If the user says "server mode", "switch to server mode", or similar, immediately query `fleet_get_telemetry` (or `fleet_list_nodes`), present the active VPS status and metrics clearly, and confirm you are operating in SysAdmin Mode ready for infrastructure commands.
 - LANGUAGE FIDELITY: Maintain strict language consistency with the user. All tool summaries, answers, and technical deep-dives must match the user's conversation language. Never drift into Chinese or unprompted languages.
 - Be proactive and decisive during tasks: execute necessary discovery and implementation steps directly without asking timid rhetorical permission.
 "#;
+
+/// Backward-compatible alias for `CORE_TOOL_ENFORCEMENT`.
+pub const DEEPSEEK_TOOL_ENFORCEMENT: &str = CORE_TOOL_ENFORCEMENT;
 
 pub const CORE_ENGINEERING_MANDATES: &str = r#"
 # Core Mandates
@@ -77,7 +86,7 @@ Be strategic in your use of the available tools to minimize unnecessary context 
 pub const SUDO_RULE: &str = r#"
 - SUDO & ROOT PRIVILEGES: `sudo` is fully supported and enabled in this environment via AskPass. When commands require root/admin privileges (smartctl, nmap -sS, iptables, tcpdump, systemctl, disk inspection, package management, etc.), ALWAYS use `sudo <command>` directly. NEVER use `sudo -n` or `--non-interactive`, and NEVER avoid sudo or fall back to unprivileged alternatives when root is needed.
 - When escalating with `sudo`, execute the sudo command directly without decorative prefixes (NEVER do `echo "..." && sudo <cmd>`).
-- If the user asks to test or execute a sudo command without specifying one (e.g. "ejecuta un comando sudo"), do NOT call `ask_user` to ask which command. Immediately run a benign root inspection command such as `sudo whoami` directly via `run_shell_command`.
+- If the user asks to test or execute a sudo command without specifying one (e.g. "run a sudo command"), do NOT call `ask_user` to ask which command. Immediately run a benign root inspection command such as `sudo whoami` directly via `run_shell_command`.
 "#;
 
 pub const SUDO_SILENT_RULE: &str = r#"
@@ -122,32 +131,45 @@ impl PromptBuilder {
         let mut memory = String::new();
 
         if let Some(dirs) = BaseDirs::new() {
-            let corex_global = dirs.home_dir().join(".corex").join("COREX.md");
-            let legacy_global = dirs.home_dir().join(".deepseek").join("DEEPSEEK.md");
-            if corex_global.exists() {
-                if let Ok(c) = fs::read_to_string(&corex_global) {
-                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                    memory.push_str(&format!("\n--- User Global Memory (~/.corex/COREX.md) ---\n{}\n", bounded));
-                }
-            } else if legacy_global.exists() {
-                if let Ok(c) = fs::read_to_string(&legacy_global) {
-                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                    memory.push_str(&format!("\n--- User Global Memory (~/.deepseek/DEEPSEEK.md) ---\n{}\n", bounded));
+            let global_candidates = [
+                dirs.home_dir().join(".corex").join("SYSTEM.md"),
+                dirs.home_dir().join(".corex").join("COREX.md"),
+                dirs.home_dir().join(".deepseek").join("DEEPSEEK.md"),
+            ];
+            for path in &global_candidates {
+                if path.exists() {
+                    if let Ok(c) = fs::read_to_string(path) {
+                        let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("SYSTEM.md");
+                        memory.push_str(&format!(
+                            "\n# USER GLOBAL PERSONALITY & INSTRUCTIONS (~/.corex/{})\nThe following guidelines and personality instructions were configured globally by the user. You MUST adhere to them across all sessions and projects:\n{}\n",
+                            name, bounded
+                        ));
+                        break;
+                    }
                 }
             }
         }
 
-        let corex_local = self.workspace_dir.join("COREX.md");
-        let legacy_local = self.workspace_dir.join("DEEPSEEK.md");
-        if corex_local.exists() {
-            if let Ok(c) = fs::read_to_string(&corex_local) {
-                let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                memory.push_str(&format!("\n--- Project Memory (./COREX.md) ---\n{}\n", bounded));
-            }
-        } else if legacy_local.exists() {
-            if let Ok(c) = fs::read_to_string(&legacy_local) {
-                let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                memory.push_str(&format!("\n--- Project Memory (./DEEPSEEK.md) ---\n{}\n", bounded));
+        let local_candidates = [
+            self.workspace_dir.join(".corex").join("SYSTEM.md"),
+            self.workspace_dir.join("COREX.md"),
+            self.workspace_dir.join("AGENTS.md"),
+            self.workspace_dir.join("DEEPSEEK.md"),
+        ];
+        for path in &local_candidates {
+            if path.exists() {
+                if let Ok(c) = fs::read_to_string(path) {
+                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
+                    let rel_display = path.strip_prefix(&self.workspace_dir)
+                        .map(|p| format!("./{}", p.display()))
+                        .unwrap_or_else(|_| path.display().to_string());
+                    memory.push_str(&format!(
+                        "\n# PROJECT INSTRUCTIONS & CONTEXT ({})\n{}\n",
+                        rel_display, bounded
+                    ));
+                    break;
+                }
             }
         }
 
@@ -211,7 +233,7 @@ impl PromptBuilder {
     }
 
     pub fn build(&self) -> String {
-        let mut prompt = String::new();
+        let mut prompt = String::with_capacity(16_384);
 
         let mode_str = if self.is_plan_mode { "Plan" } else { "Default" };
         prompt.push_str(&format!(
@@ -228,7 +250,7 @@ impl PromptBuilder {
 
         prompt.push_str(CORE_ENGINEERING_MANDATES);
         prompt.push('\n');
-        prompt.push_str(DEEPSEEK_TOOL_ENFORCEMENT);
+        prompt.push_str(CORE_TOOL_ENFORCEMENT);
         prompt.push('\n');
         prompt.push_str(SUDO_RULE);
         if self.has_sudo_password {
@@ -241,17 +263,50 @@ impl PromptBuilder {
             prompt.push_str("- Propose clear step-by-step plans before making any destructive edits.\n");
         }
 
-        let skills = self.discover_skills();
+        let (skills, memory) = self.cached_skills_and_memory();
         if !skills.is_empty() {
             prompt.push_str(&skills);
         }
-
-        let memory = self.read_memory();
         if !memory.is_empty() {
             prompt.push_str(&memory);
         }
 
         prompt
+    }
+
+    fn cached_skills_and_memory(&self) -> (String, String) {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        type CacheMap = HashMap<PathBuf, (Instant, String, String)>;
+        static PROMPT_FS_CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
+        const CACHE_TTL: Duration = Duration::from_secs(15);
+
+        let cache_mutex = PROMPT_FS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some((ts, skills, memory)) = guard.get(&self.workspace_dir) {
+                if ts.elapsed() < CACHE_TTL {
+                    return (skills.clone(), memory.clone());
+                }
+            }
+        }
+
+        let skills = self.discover_skills();
+        let memory = self.read_memory();
+
+        if let Ok(mut guard) = cache_mutex.lock() {
+            if guard.len() >= 8 {
+                guard.clear();
+            }
+            guard.insert(
+                self.workspace_dir.clone(),
+                (Instant::now(), skills.clone(), memory.clone()),
+            );
+        }
+
+        (skills, memory)
     }
 
     /// Lite system prompt for small local models (Gemma 4 E2B, Llama 7B, etc.).
@@ -296,6 +351,103 @@ impl PromptBuilder {
         }
 
         let memory = self.read_memory();
+        if !memory.is_empty() {
+            prompt.push_str(&memory);
+        }
+
+        prompt
+    }
+
+    /// Dedicated SysAdmin & Fleet SRE system prompt.
+    /// Activated when the user is in `/fleet` mode managing remote VPS infrastructure.
+    pub fn build_fleet(
+        &self,
+        active_target: Option<(&str, &str, &str)>,
+        available_nodes: &[(&str, &str, &str)],
+    ) -> String {
+        let mut prompt = String::with_capacity(16_384);
+
+        let nodes_str = if available_nodes.is_empty() {
+            "No remote servers configured".to_string()
+        } else {
+            available_nodes
+                .iter()
+                .enumerate()
+                .map(|(i, (id, u, h))| format!("[{}] {} ({}@{})", i + 1, id, u, h))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let target_desc = match active_target {
+            Some((id, user, host)) => format!("Active Target Server: **{}** ({}@{}) [CONNECTED & ONLINE]", id, user, host),
+            None => format!("NO SERVER CURRENTLY CONNECTED! Available inventory nodes: [{}]", nodes_str),
+        };
+
+        let target_node_id = active_target.map(|(id, _, _)| id).unwrap_or("none");
+
+        let connection_rule = if let Some((id, user, host)) = active_target {
+            format!(
+                r#"1. **ACTIVE & CONNECTED REMOTE SERVER: `{id}` ({user}@{host})**:
+   - The remote server `{id}` is **CURRENTLY CONNECTED, LIVE, AND ACTIVE** in the SSH console.
+   - Any previous conversation turn where no server was connected is now **COMPLETELY SUPERSEDED**. The server is connected right now!
+   - **MANDATORY**: Whenever the user asks to inspect, audit, or check the server (e.g. "revisa", "audita", "mira", "qué cpu tiene", "cómo está el vps", "cómo está la memoria", "disco"):
+     **YOU MUST IMMEDIATELY CALL `fleet_run_command` with `node_id: "{id}"`**.
+   - **STRICT PROHIBITION**: DO NOT reply saying that no server is connected or that you cannot run commands. Server `{id}` IS connected and awaiting your commands!
+   - User queries refer strictly to this active remote server `{id}`, NEVER to local files or PC.
+   - For diagnostics / "revisa", start immediately by executing: `fleet_run_command` (node_id: "{id}", command: "uptime && free -h && df -h /")"#,
+                id = id,
+                user = user,
+                host = host
+            )
+        } else {
+            format!(
+                r#"1. **CRITICAL: NO SERVER IS CURRENTLY CONNECTED OR ACTIVE**:
+   - There is currently **NO active or connected remote server**.
+   - Available servers in inventory: [{nodes}].
+   - **MANDATORY AI BEHAVIOR**:
+     - **DO NOT attempt to call `fleet_run_command` blindly or guess a server when no server is connected.**
+     - If the user asks a question about the server or requests a command (e.g. "qué cpu tiene", "revisa el vps", "cómo está la memoria", "mira los discos", "cómo está el server"):
+       **DO NOT call any tool.**
+       Immediately answer the user in Spanish explaining that no server is currently connected, and ask them which server they want to connect to:
+       "No has seleccionado ni conectado ningún servidor activo en la consola Fleet. Por favor selecciona y conecta uno en el panel de la derecha (o indícame si deseas conectar a uno de los servidores disponibles: {nodes})."
+     - Only if the user explicitly asks to connect or inspect the inventory, assist them with that."#,
+                nodes = nodes_str
+            )
+        };
+
+        prompt.push_str(&format!(
+            r#"# Role: Corex SysAdmin & Fleet SRE Mode (created by sluisr)
+You are Corex operating in **SysAdmin / Fleet Infrastructure Mode**.
+You are managing remote Linux servers and VPS nodes directly through persistent SSH sessions.
+
+## ACTIVE INFRASTRUCTURE TARGET
+- {target_desc}
+- Date: {date}
+- Communication Language: STRICTLY match the user's conversation language (Spanish, English, etc.). Never drift into other languages.
+
+## CRITICAL SYSADMIN OPERATIONAL RULES (MANDATORY)
+{connection_rule}
+3. **STRICT PROHIBITION ON LOCAL GIT / COMPILER TOOLS**: NEVER run `git status`, `git branch`, `git diff`, `cargo check`, or search local project code when in Fleet Mode. You are an infrastructure administrator managing a remote server, NOT editing local code.
+4. **TOOL MANDATE — USE `fleet_run_command`**: When a server is connected, execute commands on the remote server using the `fleet_run_command` tool with `node_id: "{target_node_id}"`. The SSH session is persistent, so working directory (`cd`) and environment state are automatically preserved.
+5. **DIAGNOSTICS & SYSTEM AUDIT WORKFLOW**: When the user asks to "revisa", "audita", or check the server:
+   - Check system health: `uptime && free -h && df -h /`
+   - Check failed systemd units: `systemctl --failed`
+   - Check critical recent logs: `journalctl -p 3 -xb -n 30` or `journalctl -u <service> -n 50`
+   - Check listening ports and network: `ss -tulpn`
+   - Check top resource-consuming processes: `ps aux --sort=-%mem | head -10` or `ps aux --sort=-%cpu | head -10`
+6. **ELEVATION & PRIVILEGES**: When root permissions are required (e.g. systemctl restart, editing /etc, iptables, viewing protected logs), set `sudo: true` in `fleet_run_command`. The user supervises and approves sensitive actions in real time in the console.
+7. **HIGH-SIGNAL REPORTING**: Present your findings clearly and concisely with bold indicators for any issues found (e.g. high RAM, disk full, crashed services). Always suggest the exact remediation command.
+"#,
+            target_desc = target_desc,
+            date = chrono::Utc::now().format("%Y-%m-%d"),
+            target_node_id = target_node_id,
+            connection_rule = connection_rule,
+        ));
+
+        let (skills, memory) = self.cached_skills_and_memory();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+        }
         if !memory.is_empty() {
             prompt.push_str(&memory);
         }
@@ -424,5 +576,46 @@ description: >-
         assert!(prompt.contains("corex-about"));
         assert!(prompt.contains("corex-fim"));
         assert!(prompt.contains("corex-local-llm"));
+    }
+
+    #[test]
+    fn test_build_fleet_prompt_with_active_target() {
+        let builder = PromptBuilder::new("/tmp/test-workspace");
+        let active = Some(("triade-ipv4", "ubuntu", "51.195.20.53"));
+        let nodes = [("triade", "ubuntu", "2001:41d0:701:1100::c58b"), ("triade-ipv4", "ubuntu", "51.195.20.53")];
+        let prompt = builder.build_fleet(active, &nodes);
+
+        assert!(prompt.contains("Active Target Server: **triade-ipv4** (ubuntu@51.195.20.53) [CONNECTED & ONLINE]"));
+        assert!(prompt.contains("ACTIVE & CONNECTED REMOTE SERVER: `triade-ipv4` (ubuntu@51.195.20.53)"));
+        assert!(prompt.contains("COMPLETELY SUPERSEDED"));
+        assert!(prompt.contains("fleet_run_command"));
+        assert!(!prompt.contains("NO SERVER CURRENTLY CONNECTED"));
+    }
+
+    #[test]
+    fn test_build_fleet_prompt_no_target() {
+        let builder = PromptBuilder::new("/tmp/test-workspace");
+        let nodes = [("triade", "ubuntu", "2001:41d0:701:1100::c58b")];
+        let prompt = builder.build_fleet(None, &nodes);
+
+        assert!(prompt.contains("NO SERVER CURRENTLY CONNECTED"));
+        assert!(prompt.contains("CRITICAL: NO SERVER IS CURRENTLY CONNECTED OR ACTIVE"));
+        assert!(prompt.contains("No has seleccionado ni conectado ningún servidor activo"));
+    }
+
+    #[test]
+    fn test_system_prompt_reads_local_system_md() {
+        let temp_dir = std::env::temp_dir().join(format!("corex_test_system_md_{}", std::process::id()));
+        let system_md = temp_dir.join(".corex").join("SYSTEM.md");
+        let _ = std::fs::create_dir_all(system_md.parent().unwrap());
+        let _ = std::fs::write(&system_md, "# Test Rules\n- Respond always like a Senior SRE");
+
+        let builder = PromptBuilder::new(&temp_dir);
+        let prompt = builder.build();
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(prompt.contains("PROJECT INSTRUCTIONS & CONTEXT"));
+        assert!(prompt.contains("Respond always like a Senior SRE"));
     }
 }

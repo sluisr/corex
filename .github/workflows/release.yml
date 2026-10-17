@@ -104,7 +104,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.6.3' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.7.0' }}
           files: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.ARCHIVE_NAME }}.sha256
@@ -176,6 +176,8 @@ jobs:
           sleep 15
           cargo publish -p corex-tools --locked || true
           cargo publish -p corex-prompt --locked || true
+          sleep 15
+          cargo publish -p corex-fleet --locked || true
           sleep 15
           cargo publish -p corex-tui --locked || true
           sleep 15

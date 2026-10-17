@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use directories::BaseDirs;
 
@@ -53,9 +53,18 @@ impl HistoryStore {
             return;
         }
 
-        let path = Self::history_file_path();
-        if let Ok(mut file) = crate::secure_fs::open_private(&path, true) {
-            let _ = writeln!(file, "{}", trimmed);
+        let mut lines = Self::load();
+        if lines.last().map(|s| s.as_str()) != Some(trimmed) {
+            lines.push(trimmed.to_string());
         }
+        if lines.len() > 1000 {
+            lines = lines[lines.len() - 1000..].to_vec();
+        }
+        let mut content = lines.join("\n");
+        content.push('\n');
+
+        let path = Self::history_file_path();
+        let _ = crate::secure_fs::write_private_atomic(&path, content.as_bytes());
     }
 }
+

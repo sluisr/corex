@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.6.3';
+const VERSION = 'v0.7.0';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
@@ -76,7 +76,7 @@ function getBinaryInfo() {
   const target = PLATFORM_MAP[platform] && PLATFORM_MAP[platform][arch];
   if (!target) {
     throw new Error(
-      `Unsupported operating system / architecture: ${platform}-${arch}. Supported: Linux (x64), macOS (arm64, x64), Windows (x64).`
+      `Unsupported operating system / architecture: ${platform}-${arch}. Supported: Linux (x64, arm64), macOS (arm64, x64), Windows (x64).`
     );
   }
   return target;
@@ -184,11 +184,17 @@ async function install() {
 
   if (fs.existsSync(targetBinPath)) {
     try {
-      if (target.sha256 && target.sha256 !== 'auto') {
-        verifyChecksum(targetBinPath, target.sha256);
-      }
       if (process.platform !== 'win32') {
         fs.chmodSync(targetBinPath, 0o755);
+      }
+      const expectedVer = VERSION.replace(/^v/, '');
+      const verOut = execFileSync(targetBinPath, ['--version'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 5000
+      });
+      if (!verOut.includes(expectedVer)) {
+        throw new Error(`Version mismatch: expected ${expectedVer}, got ${verOut.trim()}`);
       }
       return;
     } catch (err) {
@@ -202,28 +208,30 @@ async function install() {
   console.log(`[corex] Downloading native binary for ${process.platform}-${process.arch} from GitHub...`);
   await downloadFile(url, archivePath);
 
-  // Cryptographic integrity verification of the freshly downloaded archive.
-  // 1. Automatically fetch the published .sha256 from GitHub Release if available
-  // 2. Or fallback to hardcoded target.sha256
+  // Cryptographic integrity verification of the freshly downloaded archive (fail closed).
   let expectedSha = target.sha256;
+  const shaUrl = `${url}.sha256`;
+  const shaPath = path.join(binDir, `${target.archive}.sha256`);
   try {
-    const shaUrl = `${url}.sha256`;
-    const shaPath = path.join(binDir, `${target.archive}.sha256`);
     await downloadFile(shaUrl, shaPath);
     const publishedSha = fs.readFileSync(shaPath, 'utf8').trim().split(/\s+/)[0];
     if (publishedSha && /^[a-fA-F0-9]{64}$/.test(publishedSha)) {
       expectedSha = publishedSha;
     }
-    try { fs.unlinkSync(shaPath); } catch (_) {}
-  } catch (_) {
-    // If .sha256 file is not yet available, fallback gracefully
+  } finally {
+    try {
+      if (fs.existsSync(shaPath)) fs.unlinkSync(shaPath);
+    } catch (_) {}
   }
 
-  if (expectedSha && expectedSha !== 'auto') {
-    console.log(`[corex] Verifying SHA-256 checksum (${expectedSha.slice(0, 16)}...)...`);
-    verifyChecksum(archivePath, expectedSha);
-    console.log('[corex] SHA-256 checksum verified successfully.');
+  if (!expectedSha || expectedSha === 'auto' || !/^[a-fA-F0-9]{64}$/.test(expectedSha)) {
+    try { fs.unlinkSync(archivePath); } catch (_) {}
+    throw new Error(`Could not obtain a valid 64-character SHA-256 checksum from ${shaUrl}`);
   }
+
+  console.log(`[corex] Verifying SHA-256 checksum (${expectedSha.slice(0, 16)}...)...`);
+  verifyChecksum(archivePath, expectedSha);
+  console.log('[corex] SHA-256 checksum verified successfully.');
 
   console.log('[corex] Extracting binary...');
   try {
@@ -267,6 +275,7 @@ async function install() {
   console.log('   ⭐ GitHub:   https://github.com/sluisr/corex (Star the repo!)');
   console.log('   💬 Discord:  https://discord.gg/MGMt6M6Yx (Join the community)');
   console.log('   🌍 Website:  https://corex.sluisr.com\n');
+}
 
 if (require.main === module) {
   install().catch((err) => {

@@ -243,7 +243,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
             let remaining = q.options.len() - (window_start + max_opts);
             if remaining > 0 {
                 lines.push(Line::from(Span::styled(
-                    format!("     ... ({} más abajo)", remaining),
+                    format!("     ... ({} more below)", remaining),
                     Style::default().fg(theme.dark_gray),
                 )));
             }
@@ -260,7 +260,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
             || h_lower.contains("contra");
 
         let display_text = if is_secret {
-            "*".repeat(input.len())
+            "*".repeat(input.chars().count())
         } else {
             input.clone()
         };
@@ -275,12 +275,12 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     // 3. Hint footer
     let hint = if q.has_options {
         if q.options.len() <= 9 {
-            format!("  ↑↓ o 1-{} · enter confirmar · esc cancelar", q.options.len())
+            format!("  ↑↓ or 1-{} · enter confirm · esc cancel", q.options.len())
         } else {
-            "  ↑↓ navegar · enter confirmar · esc cancelar".to_string()
+            "  ↑↓ navigate · enter confirm · esc cancel".to_string()
         }
     } else {
-        "  enter confirmar · esc cancelar".to_string()
+        "  enter confirm · esc cancel".to_string()
     };
     lines.push(Line::from(Span::styled(
         hint,
@@ -301,14 +301,14 @@ mod tests {
 
     #[test]
     fn test_parse_questions() {
-        let raw = r#"{"questions":[{"header":"H","question":"¿Qué?","options":["A","B"]},{"question":"Texto","type":"text"}]}"#;
+        let raw = r#"{"questions":[{"header":"H","question":"What?","options":["A","B"]},{"question":"Text","type":"text"}]}"#;
         let qs = parse_questions(raw).expect("should parse");
         assert_eq!(qs.len(), 2);
         assert!(qs[0].has_options);
         assert_eq!(qs[0].options, vec!["A", "B"]);
         assert_eq!(qs[0].header.as_deref(), Some("H"));
         assert!(!qs[1].has_options);
-        assert_eq!(qs[1].question, "Texto");
+        assert_eq!(qs[1].question, "Text");
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_format_output_selected_option() {
-        let raw = r#"{"questions":[{"header":"H","question":"¿Qué?","options":["A","B"]}]}"#;
+        let raw = r#"{"questions":[{"header":"H","question":"What?","options":["A","B"]}]}"#;
         let qs = parse_questions(raw).unwrap();
         let mut state = UserDialogState::new();
         state.open(qs, Vec::new(), "call-1".to_string());
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_format_output_cancelled() {
-        let raw = r#"{"questions":[{"question":"¿Qué?","options":["A"]}]}"#;
+        let raw = r#"{"questions":[{"question":"What?","options":["A"]}]}"#;
         let qs = parse_questions(raw).unwrap();
         let mut state = UserDialogState::new();
         state.open(qs, Vec::new(), "call-1".to_string());
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_calculate_dialog_height() {
-        let raw = r#"{"questions":[{"question":"¿Qué proyecto?","options":["A","B","C"]}]}"#;
+        let raw = r#"{"questions":[{"question":"Which project?","options":["A","B","C"]}]}"#;
         let qs = parse_questions(raw).unwrap();
         let mut state = UserDialogState::new();
         state.open(qs, Vec::new(), "call-1".to_string());

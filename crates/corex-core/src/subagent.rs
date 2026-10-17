@@ -86,20 +86,25 @@ pub struct SubagentTask {
     pub status: SubagentStatus,
     pub output: String,
     pub acknowledged: bool,
+    pub log_file: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl SubagentTask {
     pub fn duration_str(&self) -> String {
         let end = self.finished_at.unwrap_or_else(Utc::now);
-        let secs = (end - self.started_at).num_seconds();
-        if secs < 0 {
-            "0s".to_string()
-        } else if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m {}s", secs / 60, secs % 60)
+        let millis = (end - self.started_at).num_milliseconds();
+        if millis <= 0 {
+            "0.0s".to_string()
+        } else if millis < 60_000 {
+            format!("{:.1}s", millis as f64 / 1000.0)
+        } else if millis < 3_600_000 {
+            let total_secs = millis / 1000;
+            format!("{}m {}s", total_secs / 60, total_secs % 60)
         } else {
-            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            let total_secs = millis / 1000;
+            format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
         }
     }
 }
@@ -115,15 +120,45 @@ impl Default for SubagentManager {
 }
 
 impl SubagentManager {
+    const MAX_RETAINED_TASKS: usize = 30;
+    const MAX_TASK_OUTPUT_BYTES: usize = 64_000;
+
     pub fn new() -> Self {
         Self {
             tasks: HashMap::new(),
         }
     }
 
+    fn cap_output(s: String) -> String {
+        if s.len() > Self::MAX_TASK_OUTPUT_BYTES {
+            let truncated = crate::types::safe_truncate_str(&s, Self::MAX_TASK_OUTPUT_BYTES);
+            format!("{}\n\n[... {} bytes truncated in memory (full output in forensic log) ...]", truncated, s.len() - truncated.len())
+        } else {
+            s
+        }
+    }
+
     /// Spawns or registers a new subagent task.
     pub fn register(&mut self, role: SubagentRole, prompt: String) -> String {
+        if self.tasks.len() >= Self::MAX_RETAINED_TASKS {
+            // Evict oldest completed & acknowledged tasks first
+            let mut candidates: Vec<(String, DateTime<Utc>)> = self
+                .tasks
+                .iter()
+                .filter(|(_, t)| !t.status.is_active() && t.acknowledged)
+                .map(|(id, t)| (id.clone(), t.finished_at.unwrap_or(t.started_at)))
+                .collect();
+            candidates.sort_by_key(|(_, ts)| *ts);
+            let to_remove = (self.tasks.len() + 1).saturating_sub(Self::MAX_RETAINED_TASKS);
+            for (id, _) in candidates.into_iter().take(to_remove) {
+                self.tasks.remove(&id);
+            }
+        }
+
         let task_id = format!("sub_{:08x}", rand_u32());
+        let log_dir = crate::forensic::ForensicLogger::get_subagents_log_dir();
+        let log_file = log_dir.join(format!("{}.log", task_id));
+
         let task = SubagentTask {
             id: task_id.clone(),
             role,
@@ -133,29 +168,58 @@ impl SubagentManager {
             status: SubagentStatus::Running,
             output: String::new(),
             acknowledged: false,
+            log_file: Some(log_file),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         };
         self.tasks.insert(task_id.clone(), task);
         task_id
+    }
+
+    pub fn set_log_file(&mut self, id: &str, path: std::path::PathBuf) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            task.log_file = Some(path);
+        }
     }
 
     pub fn complete(&mut self, id: &str, output: String) {
         if let Some(task) = self.tasks.get_mut(id) {
             task.finished_at = Some(Utc::now());
             task.status = SubagentStatus::Completed;
-            task.output = output;
+            task.output = Self::cap_output(output);
+        }
+    }
+
+    pub fn complete_sync(&mut self, id: &str, output: String) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            task.finished_at = Some(Utc::now());
+            task.status = SubagentStatus::Completed;
+            task.output = Self::cap_output(output);
+            task.acknowledged = true;
         }
     }
 
     pub fn fail(&mut self, id: &str, error: String) {
+        let capped = Self::cap_output(error);
         if let Some(task) = self.tasks.get_mut(id) {
             task.finished_at = Some(Utc::now());
-            task.status = SubagentStatus::Failed(error.clone());
-            task.output = error;
+            task.status = SubagentStatus::Failed(capped.clone());
+            task.output = capped;
+        }
+    }
+
+    pub fn fail_sync(&mut self, id: &str, error: String) {
+        let capped = Self::cap_output(error);
+        if let Some(task) = self.tasks.get_mut(id) {
+            task.finished_at = Some(Utc::now());
+            task.status = SubagentStatus::Failed(capped.clone());
+            task.output = capped;
+            task.acknowledged = true;
         }
     }
 
     pub fn cancel(&mut self, id: &str) -> bool {
         if let Some(task) = self.tasks.get_mut(id) {
+            task.cancel_token.cancel();
             if task.status.is_active() {
                 task.finished_at = Some(Utc::now());
                 task.status = SubagentStatus::Cancelled;
@@ -163,6 +227,10 @@ impl SubagentManager {
             }
         }
         false
+    }
+
+    pub fn get_cancel_token(&self, id: &str) -> Option<tokio_util::sync::CancellationToken> {
+        self.tasks.get(id).map(|t| t.cancel_token.clone())
     }
 
     pub fn get_task(&self, id: &str) -> Option<&SubagentTask> {
@@ -203,12 +271,15 @@ pub fn get_subagent_manager() -> &'static Mutex<SubagentManager> {
 }
 
 fn rand_u32() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u128;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id() as u128;
-    ((now ^ (pid << 32)) & 0xFFFF_FFFF) as u32
+    ((now ^ (now >> 32) ^ (pid << 16) ^ (seq.wrapping_mul(0x9E37_79B9))) & 0xFFFF_FFFF) as u32
 }
 
 #[cfg(test)]

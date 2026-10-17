@@ -57,12 +57,143 @@ fn format_boxed_row(
     Line::from(spans)
 }
 
+/// Formats a content row, wrapping across multiple boxed lines if it exceeds the available width,
+/// ensuring that commands and parameters are never truncated with '...'.
+fn format_boxed_wrapped(
+    prefix: &str,
+    prefix_style: Style,
+    content: &str,
+    content_style: Style,
+    inner_width: usize,
+    left_border_color: Color,
+    right_border_color: Color,
+) -> Vec<Line<'static>> {
+    let prefix_w = unicode_width::UnicodeWidthStr::width(prefix);
+    let avail_first = inner_width.saturating_sub(prefix_w);
+    if avail_first == 0 || content.is_empty() {
+        return vec![format_boxed_row(
+            prefix,
+            prefix_style,
+            content,
+            content_style,
+            None,
+            inner_width,
+            left_border_color,
+            right_border_color,
+        )];
+    }
+
+    if unicode_width::UnicodeWidthStr::width(content) <= avail_first {
+        return vec![format_boxed_row(
+            prefix,
+            prefix_style,
+            content,
+            content_style,
+            None,
+            inner_width,
+            left_border_color,
+            right_border_color,
+        )];
+    }
+
+    let continuation_prefix = " ".repeat(prefix_w);
+    let mut lines = Vec::new();
+    let mut remaining = content;
+    let mut is_first = true;
+
+    while !remaining.is_empty() {
+        let current_prefix = if is_first { prefix } else { &continuation_prefix };
+        let current_style = if is_first { prefix_style } else { Style::default() };
+        let current_avail = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix));
+
+        if current_avail == 0 {
+            break;
+        }
+
+        if unicode_width::UnicodeWidthStr::width(remaining) <= current_avail {
+            let chunk_w = unicode_width::UnicodeWidthStr::width(remaining);
+            let pad = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix) + chunk_w);
+            let spans = vec![
+                Span::styled("  │ ", Style::default().fg(left_border_color)),
+                Span::styled(current_prefix.to_string(), current_style),
+                Span::styled(remaining.to_string(), content_style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(" │", Style::default().fg(right_border_color)),
+            ];
+            lines.push(Line::from(spans));
+            break;
+        }
+
+        // Search for the best split point within `current_avail` width
+        let mut take_bytes = 0;
+        let mut cur_w = 0;
+        let mut last_space_bytes = None;
+
+        for (idx, ch) in remaining.char_indices() {
+            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cur_w + ch_w > current_avail {
+                break;
+            }
+            cur_w += ch_w;
+            take_bytes = idx + ch.len_utf8();
+            if ch.is_whitespace() {
+                last_space_bytes = Some(take_bytes);
+            }
+        }
+
+        let split_at = if let Some(sp) = last_space_bytes {
+            if sp > current_avail / 3 {
+                sp
+            } else {
+                take_bytes
+            }
+        } else {
+            take_bytes
+        };
+
+        if split_at == 0 {
+            break;
+        }
+
+        let chunk = remaining[..split_at].trim_end();
+        remaining = remaining[split_at..].trim_start();
+        let chunk_w = unicode_width::UnicodeWidthStr::width(chunk);
+        let pad = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix) + chunk_w);
+        let spans = vec![
+            Span::styled("  │ ", Style::default().fg(left_border_color)),
+            Span::styled(current_prefix.to_string(), current_style),
+            Span::styled(chunk.to_string(), content_style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(" │", Style::default().fg(right_border_color)),
+        ];
+        lines.push(Line::from(spans));
+        is_first = false;
+    }
+
+    if lines.is_empty() {
+        lines.push(format_boxed_row(
+            prefix,
+            prefix_style,
+            content,
+            content_style,
+            None,
+            inner_width,
+            left_border_color,
+            right_border_color,
+        ));
+    }
+
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_tool_confirmation_lines(
     tool_name: &str,
     diff_or_cmd: &str,
     selected_option: usize,
     batch_count: usize,
+    current_idx: usize,
+    total_count: usize,
     max_width: usize,
     theme: &Theme,
     expanded: bool,
@@ -71,6 +202,7 @@ pub fn build_tool_confirmation_lines(
 ) -> Vec<Line<'static>> {
     let is_shell = tool_name == "run_shell_command" || tool_name == "shell";
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
+    let is_subagent = tool_name == "delegate_subagent";
 
     let border_color = Color::Rgb(70, 80, 100);
     let box_width = max_width.clamp(30, 105);
@@ -91,10 +223,17 @@ pub fn build_tool_confirmation_lines(
         all_diff_lines.into_iter().take(12).collect()
     };
     if shown_diff_lines.is_empty() {
+        let (prefix, body, color) = if is_subagent {
+            ("🤖 ", "(subagent delegation)", theme.accent_cyan)
+        } else if is_shell {
+            ("$ ", "(no arguments provided)", theme.accent_yellow)
+        } else {
+            ("⚙ ", "(no arguments provided)", theme.accent_purple)
+        };
         result.push(format_boxed_row(
-            "$ ",
-            Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD),
-            "(no arguments provided)",
+            prefix,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            body,
             Style::default().fg(theme.gray),
             None,
             inner_width,
@@ -161,18 +300,25 @@ pub fn build_tool_confirmation_lines(
                 ));
             }
         } else {
-            let (prefix, body) = if line.trim_start().starts_with('$') {
-                ("$ ", line.trim_start()[1..].trim_start())
+            let is_sub = is_subagent || line.starts_with("Subagent");
+            let (prefix, prefix_style, body) = if is_sub {
+                ("🤖 ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), line.trim_start())
+            } else if is_shell || line.trim_start().starts_with('$') {
+                let b = if line.trim_start().starts_with('$') {
+                    line.trim_start()[1..].trim_start()
+                } else {
+                    line.trim_start()
+                };
+                ("$ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD), b)
             } else {
-                ("$ ", line.trim_start())
+                ("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), line.trim_start())
             };
 
-            result.push(format_boxed_row(
+            result.extend(format_boxed_wrapped(
                 prefix,
-                Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD),
+                prefix_style,
                 body,
                 Style::default().fg(Color::Rgb(230, 238, 248)),
-                None,
                 inner_width,
                 border_color,
                 border_color,
@@ -188,9 +334,9 @@ pub fn build_tool_confirmation_lines(
     // 3.5 Hint when the diff was truncated (or is fully expanded)
     if total_diff_lines > 12 {
         let hint = if expanded {
-            format!("(Ctrl+O para colapsar — {} líneas)", total_diff_lines)
+            format!("(Ctrl+O to collapse — {} lines)", total_diff_lines)
         } else {
-            format!("({} líneas más — Ctrl+O para ver todo)", total_diff_lines - 12)
+            format!("({} more lines — Ctrl+O to view all)", total_diff_lines - 12)
         };
         result.push(Line::from(Span::styled(
             format!("  {}", hint),
@@ -199,28 +345,38 @@ pub fn build_tool_confirmation_lines(
     }
 
     // 4. Question line
-    let question_line = if is_shell {
-        let label = if batch_count > 1 {
-            format!("[{} Shell Commands]", batch_count)
-        } else {
-            "[Shell]".to_string()
-        };
+    let step_label = if total_count > 1 {
+        format!("[{} of {}] ", current_idx, total_count)
+    } else {
+        String::new()
+    };
+
+    let question_line = if is_subagent {
+        let label = format!("{}Subagent", step_label);
+        Line::from(vec![
+            Span::raw("  Allow execution of "),
+            Span::styled(label, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("?"),
+        ])
+    } else if is_shell {
+        let label = format!("{}Shell Command", step_label);
         Line::from(vec![
             Span::raw("  Allow execution of "),
             Span::styled(label, Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
             Span::raw("?"),
         ])
     } else if is_edit {
+        let label = if total_count > 1 {
+            format!("Apply change [{} of {}]?", current_idx, total_count)
+        } else {
+            "Apply this change?".to_string()
+        };
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("Apply this change?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
         ])
     } else {
-        let label = if batch_count > 1 {
-            format!("[{} Tools]", batch_count)
-        } else {
-            format!("[{}]", tool_name)
-        };
+        let label = format!("{}{}", step_label, tool_name);
         Line::from(vec![
             Span::raw("  Allow execution of "),
             Span::styled(label, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
@@ -230,13 +386,24 @@ pub fn build_tool_confirmation_lines(
     result.push(question_line);
 
     // 5. Options (Modern CLI style without emojis)
-    let options: [(&str, &str); 5] = [
-        ("Allow once", "[y]"),
-        ("Allow for this session", "[s]"),
-        ("Deny execution", "[n / esc]"),
-        ("Always allow & save to config", "[p]"),
-        ("Deny and provide instructions...", "[w]"),
-    ];
+    let remaining_all_str = format!("Allow all remaining ({})", batch_count);
+    let options: [(&str, &str); 5] = if total_count > 1 {
+        [
+            ("Allow this change", "[y]"),
+            (&remaining_all_str, "[a]"),
+            ("Allow for this session", "[s]"),
+            ("Deny this change", "[n / esc]"),
+            ("Deny and provide instructions...", "[w]"),
+        ]
+    } else {
+        [
+            ("Allow once", "[y]"),
+            ("Allow for this session", "[s]"),
+            ("Deny execution", "[n / esc]"),
+            ("Always allow & save to config", "[p]"),
+            ("Deny and provide instructions...", "[w]"),
+        ]
+    };
 
     for (i, (opt, shortcut)) in options.iter().enumerate() {
         let is_selected = i == selected_option;
@@ -351,7 +518,7 @@ pub fn build_streaming_tool_preview_lines(
         let raw_args = &call.function.arguments;
 
         let (action_label, display_arg) = match tool_name.as_str() {
-            "run_shell_command" | "shell" | "" => {
+            "run_shell_command" | "shell" | "run_command" | "" => {
                 let parsed_cmd = serde_json::from_str::<serde_json::Value>(raw_args)
                     .ok()
                     .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()).map(|s| s.to_string()));
@@ -366,26 +533,26 @@ pub fn build_streaming_tool_preview_lines(
                         raw_args.to_string()
                     }
                 });
-                ("Bash", cmd)
+                ("$ ", cmd)
             }
             "read_file" => {
                 let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
                     .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
                     .unwrap_or_else(|| raw_args.to_string());
-                ("Read", crate::app::formatting::format_relative_path(&path))
+                ("read ", crate::app::formatting::format_relative_path(&path))
             }
             "write_file" => {
                 let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
                     .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
                     .unwrap_or_else(|| raw_args.to_string());
-                ("Write", crate::app::formatting::format_relative_path(&path))
+                ("write ", crate::app::formatting::format_relative_path(&path))
             }
             "edit" | "apply_patch" => {
                 let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
                     .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
                     .or_else(|| crate::app::formatting::patch_target(raw_args))
                     .unwrap_or_else(|| "patch".to_string());
-                ("Edit", crate::app::formatting::format_relative_path(&path))
+                ("edit ", crate::app::formatting::format_relative_path(&path))
             }
             "list_directory" | "ls" => {
                 let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
@@ -395,24 +562,58 @@ pub fn build_streaming_tool_preview_lines(
                 if !rel.ends_with('/') && rel != "." {
                     rel.push('/');
                 }
-                ("List", rel)
+                ("ls ", rel)
             }
             "web_search" => {
                 let q = serde_json::from_str::<serde_json::Value>(raw_args).ok()
                     .and_then(|v| v.get("query").and_then(|s| s.as_str()).map(|s| s.to_string()))
                     .unwrap_or_else(|| raw_args.to_string());
-                ("Web", format!("\"{}\"", q))
+                ("web ", format!("\"{}\"", q))
+            }
+            "web_fetch" => {
+                let url = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("url").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| raw_args.to_string());
+                ("fetch ", url)
             }
             "grep_search" | "grep" => {
                 let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-                let q = parsed.as_ref().and_then(|v| v.get("query").and_then(|s| s.as_str())).unwrap_or("");
-                let path = parsed.as_ref().and_then(|v| v.get("path").and_then(|s| s.as_str())).unwrap_or("");
+                let q = parsed.as_ref().and_then(|v| v.get("pattern").or_else(|| v.get("query")).and_then(|s| s.as_str())).unwrap_or("");
+                let path = parsed.as_ref().and_then(|v| v.get("path").or_else(|| v.get("dir_path")).and_then(|s| s.as_str())).unwrap_or("");
                 let text = if !path.is_empty() && path != "." {
-                    format!("\"{}\" in {}", q, crate::app::formatting::format_relative_path(path))
-                } else {
+                    let rel = crate::app::formatting::format_relative_path(path);
+                    if q.is_empty() {
+                        format!("in {}", rel)
+                    } else {
+                        format!("\"{}\" in {}", q, rel)
+                    }
+                } else if !q.is_empty() {
                     format!("\"{}\"", q)
+                } else {
+                    raw_args.to_string()
                 };
-                ("Grep", text)
+                ("grep ", text)
+            }
+            "activate_skill" => {
+                let name = serde_json::from_str::<serde_json::Value>(raw_args).ok()
+                    .and_then(|v| v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| raw_args.to_string());
+                ("skill ", name)
+            }
+            "delegate_subagent" => {
+                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
+                let role = parsed.as_ref().and_then(|v| v.get("role").and_then(|s| s.as_str())).unwrap_or("worker");
+                let prompt = parsed.as_ref()
+                    .and_then(|v| v.get("prompt").or_else(|| v.get("task")).and_then(|s| s.as_str()))
+                    .unwrap_or("")
+                    .trim();
+                let first_line = prompt.lines().next().unwrap_or(prompt);
+                let display = if first_line.is_empty() {
+                    role.to_string()
+                } else {
+                    format!("{} {}", role, corex_core::truncate_ellipsis(first_line, 50))
+                };
+                ("agent ", display)
             }
             other => {
                 let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
@@ -424,17 +625,22 @@ pub fn build_streaming_tool_preview_lines(
                         .or_else(|| v.get("pattern"))
                         .and_then(|s| s.as_str())
                 });
-                if let Some(arg) = primary_arg {
-                    (other, crate::app::formatting::format_relative_path(arg))
+                let arg = if let Some(arg) = primary_arg {
+                    crate::app::formatting::format_relative_path(arg)
                 } else if !raw_args.trim().is_empty() {
-                    (other, raw_args.to_string())
+                    raw_args.to_string()
                 } else {
-                    (other, "...".to_string())
-                }
+                    "...".to_string()
+                };
+                (other, arg)
             }
         };
 
-        let formatted = format!("{} › {}", action_label, display_arg);
+        let formatted = if action_label.ends_with(' ') {
+            format!("{}{}", action_label, display_arg)
+        } else {
+            format!("{} {}", action_label, display_arg)
+        };
         let unescaped_cmd = formatted.replace("\\\"", "\"").replace("\\\\", "\\");
         let (prefix, clean_body) = ("", unescaped_cmd.as_str());
 
@@ -482,4 +688,62 @@ pub fn build_streaming_tool_preview_lines(
     result.push(Line::from(""));
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_boxed_wrapped_preserves_full_long_command() {
+        let long_cmd = "uptime && echo \"---\" && free -h && echo \"---\" && df -h / /home 2>/dev/null";
+        let inner_width = 40;
+        let lines = format_boxed_wrapped(
+            "$ ",
+            Style::default(),
+            long_cmd,
+            Style::default(),
+            inner_width,
+            Color::White,
+            Color::White,
+        );
+
+        assert!(lines.len() > 1, "Long command must wrap into multiple rows");
+        let combined_text: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(!combined_text.contains("..."), "Wrapped command must never be truncated with '...'");
+        assert!(combined_text.contains("uptime"));
+        assert!(combined_text.contains("free -h"));
+        assert!(combined_text.contains("df -h / /home"));
+        assert!(combined_text.contains("2>/dev/null"));
+    }
+
+    #[test]
+    fn test_format_boxed_wrapped_short_command() {
+        let short_cmd = "whoami";
+        let inner_width = 40;
+        let lines = format_boxed_wrapped(
+            "$ ",
+            Style::default(),
+            short_cmd,
+            Style::default(),
+            inner_width,
+            Color::White,
+            Color::White,
+        );
+
+        assert_eq!(lines.len(), 1);
+        let text = lines[0].spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.contains("whoami"));
+        assert!(!text.contains("..."));
+    }
 }

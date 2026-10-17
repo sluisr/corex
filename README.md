@@ -16,6 +16,9 @@
 
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It delivers sub-10ms startup times, runs as a single self-contained static binary, and consumes negligible system memory.
 
+> [!NOTE]
+> **Release Status:** Active Development / Beta (`v0.7.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+
 ---
 
 ## Key Highlights
@@ -60,6 +63,9 @@ Corex is compiled with Link-Time Optimization (`lto = "fat"`), single codegen un
 | **Cold Startup Latency** | **< 10 ms** | ~600 – 1,400 ms | ~2,000 – 4,000 ms |
 | **Idle CPU Utilization** | **< 0.1%** | ~1 – 3% | ~3 – 8% |
 | **External Dependencies** | **None** | Node.js >= 18, npm | Node, Chromium |
+
+*Benchmark Methodology & Reproduction:*
+Corex metrics are benchmarked on Linux x86_64 (Linux 6.x kernel, modern x86_64/ARM64) and can be independently reproduced using [`scripts/benchmark.sh`](scripts/benchmark.sh). Comparative Node.js and Electron ranges reflect typical idle and streaming memory/latency profiles of popular terminal assistants running on Node.js v20+ and Chromium/Electron bundles under identical terminal emulator conditions.
 
 ---
 
@@ -266,7 +272,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/balance` | Check current account credits and token balance asynchronously (`/wallet`). |
 | `/fim <file>` | Fill-in-the-Middle code completion at cursor location. |
 | `/local <prompt>` | Query local offline LLM directly ($0.00 cost) or check status (`/local status`). |
-| `/web <query>` | Query the internet using DeepSeek native search engine (`/search`). |
+| `/web <query>` | Query the live internet via autonomous web search engine (`/search`). |
 | `/yolo` | Toggle automatic tool approval (`/yolo [on \| off]`). |
 | `/plan` | Enter read-only architectural planning mode. |
 | `/prefix <text>` | Enforce specific response prefixes for strict formatting. |

@@ -136,17 +136,22 @@ impl Tool for ReadManyFilesTool {
         }
 
         let mut concatenated = String::new();
-        let max_total_bytes = 1_000_000; // 1 MB total limit
-        let max_file_bytes = 200_000; // 200 KB per file limit
+        let max_total_bytes = 256_000; // 256 KB total limit (tool outputs are truncated before reaching the LLM anyway)
+        let max_file_bytes = 64_000; // 64 KB per file limit
 
         for file in matched_files.iter().take(20) { // Limit to 20 files to avoid context blowout
             if concatenated.len() >= max_total_bytes {
-                concatenated.push_str("\n[Output capped: Reached 1MB multi-file content limit]\n");
+                concatenated.push_str("\n[Output capped: Reached 256KB multi-file content limit]\n");
                 break;
             }
 
             let rel = file.strip_prefix(&context.workspace_dir).unwrap_or(file);
             concatenated.push_str(&format!("=== FILE: {} ===\n", rel.display()));
+
+            if crate::fs_tools::is_sensitive_system_path(file) {
+                concatenated.push_str("(Skipped sensitive system/credential file)\n\n");
+                continue;
+            }
 
             if crate::fs_tools::is_binary_file(file) {
                 concatenated.push_str("(Skipped binary file)\n\n");
@@ -327,9 +332,18 @@ impl Tool for ActivateSkillTool {
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let name = match args.get("name").and_then(|v| v.as_str()) {
-            Some(n) => n,
+            Some(n) => n.trim(),
             None => return Ok(ToolOutput::error("Missing 'name' argument.")),
         };
+
+        if name.is_empty()
+            || name.contains("..")
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
+            return Ok(ToolOutput::error(format!("Invalid skill name '{}'.", name)));
+        }
 
         // Search precedence: 1. Workspace .agents/skills 2. Workspace .corex/skills 3. Global ~/.agents/skills 4. Global ~/.corex/skills 5. Fallback .gemini/skills
         let candidates = [
@@ -345,7 +359,7 @@ impl Tool for ActivateSkillTool {
         ];
 
         for path in &candidates {
-            if path.exists() {
+            if path.exists() && !crate::fs_tools::is_sensitive_system_path(path) {
                 match fs::read_to_string(path) {
                     Ok(content) => return Ok(ToolOutput::success(content)),
                     Err(e) => return Ok(ToolOutput::error(format!("Failed to read skill {}: {}", name, e))),

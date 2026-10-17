@@ -129,6 +129,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         group: TOOLS,
     },
     CommandItem {
+        name: "/fetch",
+        args: "<url>",
+        description: "Fetch web page content as Markdown",
+        aliases: &[],
+        group: TOOLS,
+    },
+    CommandItem {
         name: "/fim",
         args: "<file>",
         description: "Fill-in-the-Middle code completion for a file",
@@ -154,6 +161,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         args: "[on|off]",
         description: "Toggle auto-approval of all tool executions",
         aliases: &[],
+        group: TOOLS,
+    },
+    CommandItem {
+        name: "/fleet",
+        args: "[connect <node>|status]",
+        description: "SysAdmin console: interactive live SSH session, server dashboard & AI supervisor",
+        aliases: &["/sysadmin", "/vps"],
         group: TOOLS,
     },
     // --- App ---

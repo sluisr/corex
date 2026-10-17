@@ -14,7 +14,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "corex";
-          version = "0.6.3";
+          version = "0.7.0";
 
           src = ./.;
 
@@ -35,6 +35,7 @@
 
           postInstall = ''
             ln -s $out/bin/cx $out/bin/corex 2>/dev/null || true
+            ln -s $out/bin/cx $out/bin/cxs 2>/dev/null || true
           '';
 
           meta = with pkgs.lib; {

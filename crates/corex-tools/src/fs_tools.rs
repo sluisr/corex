@@ -20,21 +20,39 @@ pub(crate) use corex_core::lock_path;
 /// would otherwise leak secrets without ever prompting the user), so it is the single source of
 /// truth for "this path holds credentials". Callers should pass a canonicalized path when the
 /// file may be reached through a symlink.
-pub fn is_sensitive_system_path(path: &Path) -> bool {
+fn is_sensitive_system_path_raw(path: &Path) -> bool {
     let p_str = path.to_string_lossy();
 
-    // A bare credential directory (e.g. `~/.ssh`, `/home/x/.gnupg`).
+    // A bare credential directory (e.g. `~/.ssh`, `/home/x/.gnupg`, `~/.corex`, `~/.deepseek`).
     if p_str.ends_with("/.ssh")
         || p_str.ends_with(".ssh")
         || p_str.ends_with("/.gnupg")
         || p_str.ends_with(".gnupg")
+        || p_str.ends_with("/.corex")
+        || p_str == ".corex"
+        || p_str.ends_with("/.deepseek")
+        || p_str == ".deepseek"
     {
         return true;
+    }
+
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let lower_name = name.to_ascii_lowercase();
+        if (lower_name == ".env" || lower_name.starts_with(".env."))
+            && !matches!(
+                lower_name.as_str(),
+                ".env.example" | ".env.sample" | ".env.template"
+            )
+        {
+            return true;
+        }
     }
 
     const SENSITIVE_FRAGMENTS: &[&str] = &[
         ".ssh/",
         ".gnupg/",
+        ".corex/",
+        ".deepseek/",
         ".askpass_cred",
         ".aws/credentials",
         ".docker/config.json",
@@ -60,10 +78,19 @@ pub fn is_sensitive_system_path(path: &Path) -> bool {
     false
 }
 
-/// Paths whose modification would grant code execution or credential persistence to the user's
-/// shell/tooling. Unlike [`is_sensitive_system_path`], these are *refused outright* — even in
-/// YOLO mode — because writing them turns a normal file edit into persistent code execution.
-pub fn is_protected_write_path(path: &Path) -> bool {
+pub fn is_sensitive_system_path(path: &Path) -> bool {
+    if is_sensitive_system_path_raw(path) {
+        return true;
+    }
+    if let Ok(canon) = path.canonicalize() {
+        if is_sensitive_system_path_raw(&canon) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_protected_write_path_raw(path: &Path) -> bool {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         const PROTECTED_NAMES: &[&str] = &[
             ".bashrc",
@@ -83,6 +110,14 @@ pub fn is_protected_write_path(path: &Path) -> bool {
 
     let p_str = path.to_string_lossy();
     p_str.contains("/.git/hooks/")
+        || p_str.contains("/.corex/")
+        || p_str.starts_with(".corex/")
+        || p_str.ends_with("/.corex")
+        || p_str == ".corex"
+        || p_str.contains("/.deepseek/")
+        || p_str.starts_with(".deepseek/")
+        || p_str.ends_with("/.deepseek")
+        || p_str == ".deepseek"
         || p_str.ends_with("/.ssh/authorized_keys")
         || p_str.contains("/authorized_keys")
         || p_str.contains("/.config/fish/config.fish")
@@ -91,20 +126,104 @@ pub fn is_protected_write_path(path: &Path) -> bool {
         || p_str.contains("/etc/crontab")
 }
 
-/// Resolves a file path: expands `~/` to the user home directory,
-/// preserves absolute paths, and joins relative paths with the workspace directory.
-pub fn resolve_path(workspace: &Path, rel: &str) -> PathBuf {
-    if let Some(stripped) = rel.strip_prefix("~/") {
-        if let Some(base) = directories::BaseDirs::new() {
-            return base.home_dir().join(stripped);
+/// Paths whose modification would grant code execution or credential persistence to the user's
+/// shell/tooling. Unlike [`is_sensitive_system_path`], these are *refused outright* — even in
+/// YOLO mode — because writing them turns a normal file edit into persistent code execution.
+pub fn is_protected_write_path(path: &Path) -> bool {
+    if is_protected_write_path_raw(path) {
+        return true;
+    }
+    if let Ok(canon) = path.canonicalize() {
+        if is_protected_write_path_raw(&canon) {
+            return true;
         }
     }
-    let p = Path::new(rel);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        workspace.join(p)
+    false
+}
+
+/// Lexically normalizes `.` and `..` components in a path so `workspace.join("../../etc")`
+/// cannot masquerade as starting with `workspace`.
+pub fn clean_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if ! matches!(out.components().next_back(), Some(Component::RootDir | Component::Prefix(_)) | None) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
     }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Checks if `path` resides inside `workspace`, accounting for both `..` traversal and symlinks.
+pub fn is_within_workspace(path: &Path, workspace: &Path) -> bool {
+    use std::path::Component;
+
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+
+    if let Ok(canonical_ws) = workspace.canonicalize() {
+        if let Ok(canonical_path) = resolved.canonicalize() {
+            return canonical_path.starts_with(&canonical_ws);
+        }
+
+        // Target does not exist yet: walk up ancestors to find the deepest existing ancestor.
+        for ancestor in resolved.ancestors() {
+            if let Ok(meta) = fs::symlink_metadata(ancestor) {
+                let Ok(canon_ancestor) = ancestor.canonicalize() else {
+                    // Broken symlink: refuse rather than falling back to lexical check.
+                    return false;
+                };
+                if meta.file_type().is_symlink() && !canon_ancestor.starts_with(&canonical_ws) {
+                    return false;
+                }
+                if let Ok(rem) = resolved.strip_prefix(ancestor) {
+                    if rem.components().any(|c| matches!(c, Component::ParentDir)) {
+                        return false;
+                    }
+                }
+                return canon_ancestor.starts_with(&canonical_ws);
+            }
+        }
+        return false;
+    }
+
+    let clean_ws = clean_lexical_path(workspace);
+    let clean_target = clean_lexical_path(&resolved);
+    clean_target.starts_with(&clean_ws)
+}
+
+/// Resolves a file path: expands `~/` to the user home directory,
+/// preserves absolute paths, joins relative paths with the workspace directory,
+/// and normalizes `.` / `..` components.
+pub fn resolve_path(workspace: &Path, rel: &str) -> PathBuf {
+    let raw = if let Some(stripped) = rel.strip_prefix("~/") {
+        if let Some(base) = directories::BaseDirs::new() {
+            base.home_dir().join(stripped)
+        } else {
+            PathBuf::from(rel)
+        }
+    } else {
+        let p = Path::new(rel);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            workspace.join(p)
+        }
+    };
+    clean_lexical_path(&raw)
 }
 
 /// Detects if a file is binary by inspecting the first 1024 bytes for null bytes.
@@ -121,6 +240,7 @@ pub fn is_binary_file(path: &Path) -> bool {
 /// Writes content to a file atomically via a temporary file in the same directory,
 /// preventing corruption if the process is interrupted.
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
     let target_path = match path.canonicalize() {
         Ok(canonical) => canonical,
         Err(_) => path.to_path_buf(),
@@ -128,14 +248,30 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let existing_perms = fs::metadata(&target_path).ok().map(|m| m.permissions());
     let pid = std::process::id();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp_path = target_path.with_extension(format!("tmp.{}.{}", pid, ts));
-    fs::write(&tmp_path, content)?;
-    fs::rename(&tmp_path, &target_path)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(e) = file.write_all(content.as_bytes()).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(file);
+    if let Some(perms) = existing_perms {
+        let _ = fs::set_permissions(&tmp_path, perms);
+    }
+    if let Err(e) = fs::rename(&tmp_path, &target_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Formats byte counts into clean human-readable representations.
@@ -149,7 +285,21 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Checks whether any file-editing permission is present in `allowed_commands`.
+/// This unifies permissions across `edit`, `apply_patch`, `write_file`, and legacy aliases.
+pub fn is_file_edit_allowed(allowed_commands: &[String]) -> bool {
+    allowed_commands.iter().any(|cmd| {
+        cmd == "edit"
+            || cmd == "edit_file"
+            || cmd == "apply_patch"
+            || cmd == "write_file"
+            || cmd == "replace"
+            || cmd == "file_edit"
+    })
+}
+
 // ─── 1. ReadFileTool ────────────────────────────────────────────────────────
+
 
 pub struct ReadFileTool;
 
@@ -325,11 +475,14 @@ impl Tool for WriteFileTool {
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
         if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = resolve_path(&context.workspace_dir, rel);
-            if !path.starts_with(&context.workspace_dir) {
+            if !is_within_workspace(&path, &context.workspace_dir)
+                || is_sensitive_system_path(&path)
+                || is_protected_write_path(&path)
+            {
                 return true;
             }
         }
-        !context.allowed_commands.iter().any(|cmd| cmd == "write_file")
+        !is_file_edit_allowed(&context.allowed_commands)
     }
 
     fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
@@ -524,11 +677,14 @@ impl Tool for EditTool {
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
         if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = resolve_path(&context.workspace_dir, rel);
-            if !path.starts_with(&context.workspace_dir) {
+            if !is_within_workspace(&path, &context.workspace_dir)
+                || is_sensitive_system_path(&path)
+                || is_protected_write_path(&path)
+            {
                 return true;
             }
         }
-        !context.allowed_commands.iter().any(|cmd| cmd == "edit_file")
+        !is_file_edit_allowed(&context.allowed_commands)
     }
 
     fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
@@ -669,22 +825,23 @@ impl Tool for EditTool {
                     }
                 }
 
-                if matching_indices.len() == 1 {
-                    let start_idx = matching_indices[0];
-                    let end_idx = start_idx + old_trimmed.len();
-                    let mut new_lines = Vec::new();
-                    new_lines.extend_from_slice(&content_lines[..start_idx]);
-                    for nl in new_string.lines() {
-                        new_lines.push(nl);
+                if matching_indices.len() == 1 || (matching_indices.len() > 1 && allow_multiple) {
+                    let mut current_lines: Vec<String> = content_lines.iter().map(|s| s.to_string()).collect();
+                    let replacement_vec: Vec<String> = new_string.lines().map(|s| s.to_string()).collect();
+                    // Apply in reverse order so earlier indices remain valid
+                    for &start_idx in matching_indices.iter().rev() {
+                        let end_idx = start_idx + old_trimmed.len();
+                        if end_idx <= current_lines.len() {
+                            current_lines.splice(start_idx..end_idx, replacement_vec.clone());
+                        }
                     }
-                    new_lines.extend_from_slice(&content_lines[end_idx..]);
                     let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
-                    let mut res = new_lines.join(line_ending);
+                    let mut res = current_lines.join(line_ending);
                     if content.ends_with('\n') || content.ends_with("\r\n") {
                         res.push_str(line_ending);
                     }
-                    let start_line = start_idx + 1;
-                    let replaced_lines = new_string.lines().count().max(1);
+                    let start_line = matching_indices[0] + 1;
+                    let replaced_lines = replacement_vec.len().max(1);
                     let end_line = start_line + replaced_lines - 1;
                     (res, start_line, end_line)
                 } else if matching_indices.len() > 1 && !allow_multiple {
@@ -962,7 +1119,15 @@ mod tests {
         assert!(is_sensitive_system_path(Path::new("/home/x/.aws/credentials")));
         assert!(is_sensitive_system_path(Path::new("/proc/self/environ")));
         assert!(is_sensitive_system_path(Path::new("/home/x/.corex/.askpass_cred")));
-        // Ordinary files are not sensitive.
+        assert!(is_sensitive_system_path(Path::new("/home/x/.corex/settings.json")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/.deepseek/settings.json")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/project/.env")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/project/.env.local")));
+        assert!(is_sensitive_system_path(Path::new("/home/x/project/.env.production")));
+        // Template/example env files and ordinary files are not sensitive.
+        assert!(!is_sensitive_system_path(Path::new("/home/x/project/.env.example")));
+        assert!(!is_sensitive_system_path(Path::new("/home/x/project/.env.sample")));
+        assert!(!is_sensitive_system_path(Path::new("/home/x/project/.env.template")));
         assert!(!is_sensitive_system_path(Path::new("/home/x/project/src/main.rs")));
         assert!(!is_sensitive_system_path(Path::new("/etc/hosts")));
 
@@ -970,7 +1135,45 @@ mod tests {
         assert!(is_protected_write_path(Path::new("/home/x/.bashrc")));
         assert!(is_protected_write_path(Path::new("/home/x/.git/hooks/pre-commit")));
         assert!(is_protected_write_path(Path::new("/home/x/.ssh/authorized_keys")));
+        assert!(is_protected_write_path(Path::new("/home/x/.corex/settings.json")));
+        assert!(is_protected_write_path(Path::new("/home/x/.corex/mcp.json")));
+        assert!(is_protected_write_path(Path::new(".corex/settings.json")));
+        assert!(is_protected_write_path(Path::new("/home/x/.deepseek/settings.json")));
         assert!(!is_protected_write_path(Path::new("/home/x/project/build.rs")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_rejected_by_is_within_workspace() {
+        let base = std::env::temp_dir().join(format!("corex_symlink_escape_{}", std::process::id()));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, "secret").unwrap();
+
+        let link_file = ws.join("escape_file.txt");
+        std::os::unix::fs::symlink(&outside_file, &link_file).unwrap();
+        assert!(
+            !is_within_workspace(&link_file, &ws),
+            "symlink to file outside workspace must be rejected"
+        );
+
+        let link_dir = ws.join("escape_dir");
+        std::os::unix::fs::symlink(&outside, &link_dir).unwrap();
+        assert!(
+            !is_within_workspace(&link_dir.join("new_file.txt"), &ws),
+            "nonexistent file inside symlinked external directory must be rejected"
+        );
+
+        let inside_file = ws.join("inside.txt");
+        fs::write(&inside_file, "ok").unwrap();
+        assert!(is_within_workspace(&inside_file, &ws));
+        assert!(is_within_workspace(&ws.join("new_subdir/new_file.txt"), &ws));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
@@ -1348,5 +1551,31 @@ mod tests {
         assert!(acquired.load(Ordering::SeqCst));
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn test_fs_tools_needs_confirmation_respects_session_allowed_commands() {
+        let temp_dir = std::env::temp_dir().join(format!("fs_confirm_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let file = temp_dir.join("test.txt");
+        let _ = fs::write(&file, "hello world\n");
+
+        let mut context = ToolContext {
+            workspace_dir: temp_dir.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec!["apply_patch".to_string()],
+        };
+
+        // When "apply_patch" is allowed, edit & write_file must NOT require confirmation
+        assert!(!EditTool.needs_confirmation(&json!({ "file_path": "test.txt", "old_string": "hello", "new_string": "hi" }), &context));
+        assert!(!WriteFileTool.needs_confirmation(&json!({ "file_path": "test.txt", "content": "hi" }), &context));
+
+        // When allowed_commands is empty, both must require confirmation
+        context.allowed_commands.clear();
+        assert!(EditTool.needs_confirmation(&json!({ "file_path": "test.txt", "old_string": "hello", "new_string": "hi" }), &context));
+        assert!(WriteFileTool.needs_confirmation(&json!({ "file_path": "test.txt", "content": "hi" }), &context));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

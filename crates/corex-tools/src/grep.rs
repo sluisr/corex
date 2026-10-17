@@ -79,6 +79,13 @@ impl Tool for GrepTool {
             .map(|p| resolve_path(&context.workspace_dir, p))
             .unwrap_or_else(|| context.workspace_dir.clone());
 
+        if crate::fs_tools::is_sensitive_system_path(&root_dir) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: searching sensitive credential directory '{}' is forbidden.",
+                root_dir.display()
+            )));
+        }
+
         let include_filter = args
             .get("include_pattern")
             .and_then(|v| v.as_str())
@@ -106,7 +113,7 @@ impl Tool for GrepTool {
 
         for entry in walker.flatten() {
             let path = entry.path();
-            if !path.is_file() || is_binary_file(path) {
+            if !path.is_file() || crate::fs_tools::is_sensitive_system_path(path) || is_binary_file(path) {
                 continue;
             }
 

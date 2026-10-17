@@ -28,11 +28,17 @@ pub fn is_mobile_portrait(width: u16, height: u16) -> bool {
 /// Attempts to trigger Termux soft keyboard via termux-api if installed.
 pub fn try_show_termux_soft_keyboard() {
     if is_android_or_termux() {
-        let _ = std::process::Command::new("termux-keyboard")
-            .arg("-s")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        std::thread::spawn(|| {
+            if let Ok(mut child) = std::process::Command::new("termux-keyboard")
+                .arg("-s")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                let _ = child.wait();
+            }
+        });
     }
 }
 

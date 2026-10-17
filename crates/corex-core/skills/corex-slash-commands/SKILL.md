@@ -37,21 +37,42 @@ cx -l                          # Short alias for --list-sessions
 
 ---
 
-## 🧠 Model & Mode Control
+## 🧠 Model, Auth & Mode Control
 
 | Command | Description |
 | :--- | :--- |
-| `/model` | Open the interactive model selector (Cloud / Local) |
+| `/model` | Open the interactive model selector (Cloud / Local across 15 providers) |
+| `/key [api_key]` | Configure or update API key for the active provider (saved to `~/.corex/settings.json`) |
+| `/auth [api_key]` | Alias for `/key` |
 
-Available models inside `/model`:
+Available flagship DeepSeek models inside `/model`:
 - **`deepseek-flash`** — DeepSeek V4.1 Flash (522B MoE, 1M context, native vision, default)
+- **`deepseek-v4.1-flash-1017`** — DeepSeek V4.1 Flash-1017 (wish-driven programming, faster task completion)
 - **`deepseek-v4-pro`** — DeepSeek V4 Pro (deep CoT reasoning / Thinking mode)
 
 Switch model from CLI:
 ```bash
 cx -m deepseek-v4-pro -p "Refactor this function..."
+cx --model deepseek-v4.1-flash-1017
 cx --model deepseek-flash
 ```
+
+---
+
+## 🖥️ Fleet & Remote SSH Control Plane
+
+| Command | Description |
+| :--- | :--- |
+| `/fleet` | Toggle the interactive SSH Fleet & VPS terminal pane (aliases: `/sysadmin`, `/vps`) |
+| `/fleet wide` | Open the 3-column wide Fleet layout (Nodes + Output/PTY + Chat) |
+| `/fleet list` | List all configured SSH fleet servers |
+| `/fleet connect <id>` | Connect directly to a fleet server and open an interactive SSH PTY |
+| `/fleet add <id> <user@host[:port]> [key]` | Add a server to `.corex/fleet.toml` |
+| `/fleet remove <id>` | Remove a server from `.corex/fleet.toml` |
+| `/fleet exec <id\|all> <cmd>` | Execute a remote command on one or all servers |
+| `/fleet reload` | Reload `.corex/fleet.toml` and `~/.ssh/config` |
+
+You can also launch directly into Fleet mode from the CLI via `cxs` (or `cx fleet`).
 
 ---
 
@@ -80,13 +101,16 @@ Corex also auto-compacts at **95,000 tokens** by default (configurable via `comp
 
 | Command | Description |
 | :--- | :--- |
-| `/web <query>` | Live internet search via DeepSeek native search |
+| `/web <query>` | Live internet search (`web_search` via DuckDuckGo HTML scraping & instant answers) |
 | `/search <query>` | Alias for `/web` |
+| `/fetch <url>` | Fetch web page content and convert HTML to clean Markdown (`web_fetch`) |
 
 Also available directly from CLI (no TUI needed):
 ```bash
 cx -w "latest Rust async news"
 cx web what is the current Bitcoin price
+cx --fetch "https://api-docs.deepseek.com/guides/search"
+cx fetch "https://news.ycombinator.com"
 ```
 
 ---
@@ -120,6 +144,8 @@ cx web what is the current Bitcoin price
 | `/yolo` | Toggle YOLO mode — auto-approves ALL tool executions |
 | `/yolo on` | Enable YOLO mode |
 | `/yolo off` | Disable YOLO mode |
+| `/allow [add\|remove <rule>]` | View or manage permanently allowed commands (`allowed_commands` whitelist; alias: `/whitelist`) |
+| `/sudo [clear]` | Configure or clear ephemeral in-memory sudo password for privileged commands |
 | `/tasks` | List all running background tasks |
 | `/tasks status <pid>` | Show status of a specific background task |
 | `/tasks kill <pid>` | Kill a background task |
@@ -141,7 +167,7 @@ cx --yolo
 | :--- | :--- |
 | `/fim <file>` | Fill-in-the-Middle code autocompletion for a specific file |
 | `/plan` | Toggle architectural plan mode (read-only discovery, no file writes) |
-| `/prefix <text>` | Force the model to start its response with exact text |
+| `/prefix <text\|off>` | Force the model to start its response with exact text (or `off` to clear) |
 
 ---
 
@@ -151,6 +177,7 @@ cx --yolo
 | :--- | :--- |
 | `/info` | Version, author credits, official links, and session telemetry |
 | `/update` | Check for updates, or apply in-place atomically (`/update apply` / `/update force`) |
+| `/mouse` | Toggle terminal mouse capture (enable/disable native terminal text selection; alias: `/keyboard`) |
 | `/help` | Show keyboard shortcuts and command list |
 | `/clear` | Clear the terminal conversation view |
 | `/quit` | Exit the session (saves state for later resumption) |
@@ -163,8 +190,13 @@ cx --yolo
 | Key | Action |
 | :--- | :--- |
 | `Enter` | Send message / confirm |
+| `Alt+Enter` / `Shift+Enter` | Insert newline in composer |
 | `Ctrl+C` | Cancel current generation |
+| `Ctrl+T` | Expand / collapse Chain-of-Thought reasoning blocks |
+| `Ctrl+O` | Expand / collapse full tool output & diff previews |
+| `F2` / `Ctrl+S` | Toggle Fleet SSH server pane |
+| `Ctrl+Z` | Undo last edit in composer |
 | `Ctrl+L` | Clear screen |
 | `↑ / ↓` | Navigate command autocomplete / history |
-| `Tab` | Select highlighted autocomplete suggestion |
-| `Esc` | Close popup / cancel |
+| `Tab` | Select highlighted autocomplete suggestion / switch Fleet focus |
+| `Esc` | Close popup / snap scroll to bottom / cancel |

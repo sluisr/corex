@@ -298,13 +298,24 @@ impl Config {
                 });
         }
         // Fallback 1: Match by model ID
-        if let Some(p) = all.iter().find(|p| !p.is_deepseek() && !p.is_local() && p.models.iter().any(|m| m.id == self.model)) {
+        if let Some(p) = all.iter().find(|p| {
+            !p.is_deepseek()
+                && !p.is_local()
+                && validate_base_url(&p.base_url).is_ok()
+                && p.models.iter().any(|m| m.id == self.model)
+        }) {
             return Some(p.clone());
         }
         // Fallback 2: Match by base_url
         let host = url_host(&self.base_url).unwrap_or_default();
         if !is_deepseek_base_url(&self.base_url) && !is_loopback_host(&host) {
-            if let Some(p) = all.iter().find(|p| !p.is_deepseek() && !p.is_local() && !p.base_url.is_empty() && self.base_url.starts_with(&p.base_url)) {
+            if let Some(p) = all.iter().find(|p| {
+                !p.is_deepseek()
+                    && !p.is_local()
+                    && !p.base_url.is_empty()
+                    && validate_base_url(&p.base_url).is_ok()
+                    && self.base_url.starts_with(&p.base_url)
+            }) {
                 return Some(p.clone());
             }
         }
@@ -316,12 +327,18 @@ impl Config {
     pub fn endpoint(&self) -> (String, String) {
         match self.external_provider() {
             Some(p) => {
-                let key = self.provider_api_keys.get(&p.name).cloned()
+                let key = self
+                    .provider_api_keys
+                    .get(&p.name)
+                    .cloned()
                     .filter(|k| !k.trim().is_empty())
                     .unwrap_or_else(|| p.api_key());
                 let effective_key = if !key.trim().is_empty() {
                     key
-                } else if !self.api_key.trim().is_empty() {
+                } else if !self.api_key.trim().is_empty()
+                    && !is_deepseek_base_url(&self.base_url)
+                    && self.base_url.starts_with(&p.base_url)
+                {
                     self.api_key.clone()
                 } else {
                     String::new()
@@ -436,12 +453,14 @@ impl Config {
         Ok(())
     }
 
-    /// Removes `api_key` from a serialized settings document.
+    /// Removes credentials and secret-bearing maps from a serialized workspace settings document.
     fn strip_secrets(content: &str) -> String {
         match serde_json::from_str::<serde_json::Value>(content) {
             Ok(mut v) => {
                 if let Some(obj) = v.as_object_mut() {
                     obj.remove("api_key");
+                    obj.remove("provider_api_keys");
+                    obj.remove("mcp_servers");
                 }
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| content.to_string())
             }
@@ -617,16 +636,6 @@ impl Config {
             config.model = "gemini-3.5-flash-lite".to_string();
         }
 
-        // Export persisted provider API keys to environment if not already set
-        for (prov, key) in &config.provider_api_keys {
-            if !key.trim().is_empty() {
-                if let Some(p) = config.all_providers().iter().find(|p| p.name == *prov) {
-                    if !p.api_key_env.is_empty() && std::env::var(&p.api_key_env).unwrap_or_default().is_empty() {
-                        std::env::set_var(&p.api_key_env, key);
-                    }
-                }
-            }
-        }
         if let Ok(m) = std::env::var("COREX_MODEL")
             .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
         {

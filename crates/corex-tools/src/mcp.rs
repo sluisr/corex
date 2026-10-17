@@ -22,10 +22,53 @@ pub struct McpServerStatus {
     pub error: Option<String>,
 }
 
+const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+struct McpTransport {
+    stdin: ChildStdin,
+    stdout_reader: BufReader<ChildStdout>,
+    read_buf: Vec<u8>,
+}
+
+impl McpTransport {
+    async fn read_next_line(&mut self) -> Result<Option<String>> {
+        loop {
+            let available = self.stdout_reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.read_buf.is_empty() {
+                    return Ok(None);
+                }
+                let line_bytes = std::mem::take(&mut self.read_buf);
+                return Ok(Some(String::from_utf8_lossy(&line_bytes).into_owned()));
+            }
+            if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+                let to_copy = &available[..nl_pos];
+                if self.read_buf.len() + to_copy.len() > MAX_MCP_LINE_BYTES {
+                    self.stdout_reader.consume(nl_pos + 1);
+                    self.read_buf.clear();
+                    bail!("MCP server response line exceeded maximum allowed size (16 MiB)");
+                }
+                self.read_buf.extend_from_slice(to_copy);
+                self.stdout_reader.consume(nl_pos + 1);
+                let line_bytes = std::mem::take(&mut self.read_buf);
+                return Ok(Some(String::from_utf8_lossy(&line_bytes).into_owned()));
+            } else {
+                let chunk_len = available.len();
+                if self.read_buf.len() + chunk_len > MAX_MCP_LINE_BYTES {
+                    self.stdout_reader.consume(chunk_len);
+                    self.read_buf.clear();
+                    bail!("MCP server response line exceeded maximum allowed size (16 MiB)");
+                }
+                self.read_buf.extend_from_slice(available);
+                self.stdout_reader.consume(chunk_len);
+            }
+        }
+    }
+}
+
 pub struct McpClient {
     pub server_name: String,
-    stdin: Arc<Mutex<ChildStdin>>,
-    stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
+    transport: Arc<Mutex<McpTransport>>,
     request_id: AtomicU64,
     _child: Arc<Mutex<tokio::process::Child>>,
 }
@@ -34,17 +77,39 @@ impl McpClient {
     pub async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
-        // Cleanse sensitive core process credentials from MCP child processes
-        cmd.env_remove("COREX_SUDO_PASSWORD");
-        cmd.env_remove("DEEPSEEK_SUDO_PASSWORD");
-        cmd.env_remove("SUDO_ASKPASS");
-        cmd.env_remove("SSH_ASKPASS");
+        // Cleanse sensitive core process credentials and cloud LLM API keys from MCP child processes
+        // unless explicitly provided in `cfg.env`.
+        for sensitive_var in [
+            "COREX_SUDO_PASSWORD",
+            "DEEPSEEK_SUDO_PASSWORD",
+            "SUDO_ASKPASS",
+            "SSH_ASKPASS",
+            "COREX_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GROQ_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MISTRAL_API_KEY",
+            "GITHUB_TOKEN",
+            "COREX_GITHUB_TOKEN",
+        ] {
+            cmd.env_remove(sensitive_var);
+        }
+        for (var_name, _) in std::env::vars() {
+            if var_name.starts_with("COREX_") && var_name.ends_with("_API_KEY") {
+                cmd.env_remove(&var_name);
+            }
+        }
         for (k, v) in &cfg.env {
             cmd.env(k, v);
         }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Discard stderr so a verbose MCP server cannot fill the 64 KB OS pipe buffer and deadlock.
+        cmd.stderr(Stdio::null());
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().with_context(|| {
@@ -57,8 +122,11 @@ impl McpClient {
 
         let client = Self {
             server_name: server_name.to_string(),
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout_reader: Arc::new(Mutex::new(reader)),
+            transport: Arc::new(Mutex::new(McpTransport {
+                stdin,
+                stdout_reader: reader,
+                read_buf: Vec::new(),
+            })),
             request_id: AtomicU64::new(1),
             _child: Arc::new(Mutex::new(child)),
         };
@@ -70,11 +138,9 @@ impl McpClient {
 
     async fn send_raw(&self, request: &Value) -> Result<Value> {
         let payload = serde_json::to_string(request)? + "\n";
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(payload.as_bytes()).await?;
-            stdin.flush().await?;
-        }
+        let mut transport = self.transport.lock().await;
+        transport.stdin.write_all(payload.as_bytes()).await?;
+        transport.stdin.flush().await?;
 
         // If it's a notification without an "id", do not wait for a response
         if request.get("id").is_none() {
@@ -84,15 +150,12 @@ impl McpClient {
         let expected_id = request.get("id").and_then(|v| v.as_u64());
 
         // Read lines until matching response is found (with 60s timeout to prevent hanging)
-        let mut reader = self.stdout_reader.lock().await;
-        let mut line = String::new();
         let timeout_duration = std::time::Duration::from_secs(60);
 
         let read_future = async {
-            while reader.read_line(&mut line).await? > 0 {
+            while let Some(line) = transport.read_next_line().await? {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
-                    line.clear();
                     continue;
                 }
 
@@ -103,7 +166,6 @@ impl McpClient {
                         }
                     }
                 }
-                line.clear();
             }
 
             bail!("MCP server closed stdout stream unexpectedly")

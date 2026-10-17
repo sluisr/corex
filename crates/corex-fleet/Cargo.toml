@@ -1,0 +1,24 @@
+[package]
+name = "corex-fleet"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Multi-server fleet management, SSH orchestrator, and SysAdmin operations engine for Corex"
+
+[dependencies]
+corex-core = { workspace = true }
+corex-tools = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+async-trait = { workspace = true }

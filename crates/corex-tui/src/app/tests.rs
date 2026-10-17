@@ -34,7 +34,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
-        app.selection_lines = vec![
+        app.selection_lines.tail = vec![
             "first line".to_string(),
             "second line".to_string(),
             "third".to_string(),
@@ -99,7 +99,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 40, 10));
-        app.selection_lines = vec!["        ".to_string()];
+        app.selection_lines.tail = vec!["        ".to_string()];
 
         // Selecting blank space carries no text: no feed message, no clipboard call.
         app.selection = Some(Selection { anchor: (0, 0), cursor: (0, 7) });
@@ -115,7 +115,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.selection_lines.tail = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
         // Simulate app running for more than 1 second (past startup grace)
         app.app_start_time = Instant::now() - Duration::from_secs(5);
 
@@ -140,7 +140,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.selection_lines.tail = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
         app.app_start_time = Instant::now() - Duration::from_secs(5);
 
         // Window activation click (FocusGained arrived 50ms ago)
@@ -159,7 +159,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.selection_lines.tail = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
         // App just started 100ms ago (< 800ms threshold)
         app.app_start_time = Instant::now() - Duration::from_millis(100);
 
@@ -175,7 +175,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.selection_lines.tail = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
         app.app_start_time = Instant::now() - Duration::from_secs(5);
 
         // Click and drag across text (from col 22 to 40, elapsed 600ms)
@@ -195,7 +195,7 @@ use corex_core::types::ToolCall;
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);
         app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
-        app.selection_lines = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
+        app.selection_lines.tail = vec!["  │ 🌐 Web personal │ https://sluisr.com               │".to_string()];
         app.app_start_time = Instant::now() - Duration::from_secs(5);
 
         // Click on "Web personal" (col 5) instead of URL
@@ -678,14 +678,14 @@ use corex_core::types::ToolCall;
         assert_eq!(find_url_in_line(table_row, Some(25)), Some("https://sluisr.com".to_string()));
 
         // Markdown link [label](url) tests:
-        let md_line = "Visita [mi portfolio](https://sluisr.com) para ver proyectos";
-        // Clicking on "mi portfolio" label (col 10) -> Some!
+        let md_line = "Visit [my portfolio](https://sluisr.com) to view projects";
+        // Clicking on "my portfolio" label (col 10) -> Some!
         assert_eq!(find_url_in_line(md_line, Some(10)), Some("https://sluisr.com".to_string()));
         // Clicking directly on "https://sluisr.com" (col 25) -> Some!
         assert_eq!(find_url_in_line(md_line, Some(25)), Some("https://sluisr.com".to_string()));
-        // Clicking outside on "Visita" (col 2) or "para" (col 43) -> None!
+        // Clicking outside on "Visit" (col 2) or "view" (col 44) -> None!
         assert_eq!(find_url_in_line(md_line, Some(2)), None);
-        assert_eq!(find_url_in_line(md_line, Some(43)), None);
+        assert_eq!(find_url_in_line(md_line, Some(44)), None);
     }
 
     #[test]
@@ -717,6 +717,44 @@ use corex_core::types::ToolCall;
         assert_eq!(lines_expanded.len(), 8);
         let exp_line1_text: String = lines_expanded[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(exp_line1_text.contains("line 1"));
+    }
+
+    #[test]
+    fn test_format_system_message_subagent_done() {
+        let theme = Theme::default();
+
+        // 1. Success subagent (Scout) with empty output -> single badge line
+        let msg = "SUBAGENT_DONE|sub_c7ac96e4|SCOUT|1.2s\n";
+        let lines = format_system_message(msg, &theme, 80, false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("🔭")));
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("[scout:sub_c7ac96e4]")));
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("completed")));
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("1.2s")));
+
+        // 2. Subagent with many output lines -> badge + omission line + 5 lines preview
+        let msg_long = "SUBAGENT_DONE|sub_1234|TESTER|3s\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
+        let lines_long = format_system_message(msg_long, &theme, 80, false);
+        assert_eq!(lines_long.len(), 7); // 1 badge + 1 omission + 5 lines preview
+        assert!(lines_long[0].spans.iter().any(|s| s.content.contains("🧪")));
+        assert!(lines_long[0].spans.iter().any(|s| s.content.contains("[tester:sub_1234]")));
+        assert!(lines_long[1].spans.iter().any(|s| s.content.contains("… (+3 lines above")));
+
+        // 3. Subagent with failed exit
+        let msg_fail = "SUBAGENT_DONE|sub_err1|WORKER|0.1s\nExit code 1:\nFatal compile error";
+        let lines_fail = format_system_message(msg_fail, &theme, 80, false);
+        assert!(lines_fail[0].spans.iter().any(|s| s.content.contains("failed")));
+
+        // 4. Expanded logs (Ctrl+O)
+        let lines_expanded = format_system_message(msg_long, &theme, 80, true);
+        assert_eq!(lines_expanded.len(), 9); // 1 badge + 8 output lines
+
+        // 5. Without underscore (SUBAGENTDONE|)
+        let msg_no_us = "SUBAGENTDONE|sub33a3f099|SCOUT|0s\n";
+        let lines_no_us = format_system_message(msg_no_us, &theme, 80, false);
+        assert_eq!(lines_no_us.len(), 1);
+        assert!(lines_no_us[0].spans.iter().any(|s| s.content.contains("🔭")));
+        assert!(lines_no_us[0].spans.iter().any(|s| s.content.contains("[scout:sub33a3f099]")));
     }
 
     #[tokio::test]
@@ -766,8 +804,8 @@ use corex_core::types::ToolCall;
             assert!(!line.contains('❯'), "User message should not contain ❯: {}", line);
         }
 
-        // 2. Clean typography: starts with "You: " and the user message
-        assert!(rendered_text[0].contains("You:"));
+        // 2. Clean typography: starts with "[You]" and the user message
+        assert!(rendered_text[0].contains("[You]"));
         assert!(rendered_text[0].contains("hola mundo"));
     }
 
@@ -855,6 +893,21 @@ use corex_core::types::ToolCall;
     }
 
     #[test]
+    fn test_extract_tool_allow_rules_unifies_file_edits() {
+        let patch_call = ToolCall::new("c1", "apply_patch", r#"{"patch":"diff..."}"#.to_string());
+        let rules = extract_tool_allow_rules(&patch_call);
+        assert!(rules.contains(&"apply_patch".to_string()));
+        assert!(rules.contains(&"edit".to_string()));
+        assert!(rules.contains(&"write_file".to_string()));
+
+        let edit_call = ToolCall::new("c2", "edit", r#"{"file_path":"test.rs","old_string":"a","new_string":"b"}"#.to_string());
+        let rules = extract_tool_allow_rules(&edit_call);
+        assert!(rules.contains(&"apply_patch".to_string()));
+        assert!(rules.contains(&"edit".to_string()));
+        assert!(rules.contains(&"write_file".to_string()));
+    }
+
+    #[test]
     fn test_skill_tool_output_suppresses_logs() {
         let theme = Theme::default();
         let mut msg = Message::tool_response("call_1", "---\nname: corex-about\n---\n# Full Skill Markdown\nLots of text");
@@ -872,24 +925,33 @@ use corex_core::types::ToolCall;
         let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
-        assert_eq!(joined, "Bash › cargo build");
+        assert!(!joined.contains('›'), "Must not contain chevron: {}", joined);
+        assert_eq!(joined, "$ cargo build");
 
         let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme);
         let search_joined: String = search_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(search_joined, "Web › \"sluisr sluisr.com Linux\"");
+        assert_eq!(search_joined, "web \"sluisr sluisr.com Linux\"");
 
         let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme);
         let skill_joined: String = skill_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!skill_joined.contains('⚙'), "Must not contain gear emoji: {}", skill_joined);
-        assert_eq!(skill_joined, "Skill › corex-about");
+        assert_eq!(skill_joined, "skill corex-about");
 
         let read_spans = format_tool_call_spans("read_file", r#"{"file_path":"src/main.rs"}"#, &theme);
         let read_joined: String = read_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(read_joined, "Read › src/main.rs");
+        assert_eq!(read_joined, "read src/main.rs");
 
         let list_spans = format_tool_call_spans("list_directory", r#"{"path":"crates"}"#, &theme);
         let list_joined: String = list_spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(list_joined, "List › crates/");
+        assert_eq!(list_joined, "ls crates/");
+
+        let agent_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"scout","prompt":"inspect codebase"}"#, &theme);
+        let agent_joined: String = agent_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(agent_joined, "agent scout inspect codebase");
+
+        let agent_task_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"tester","task":"run all tests"}"#, &theme);
+        let agent_task_joined: String = agent_task_spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(agent_task_joined, "agent tester run all tests");
     }
 
     #[tokio::test]
@@ -941,4 +1003,88 @@ use corex_core::types::ToolCall;
         }
         assert!(app.input_buffer.is_empty());
         assert_eq!(app.cursor_idx, 0);
+    }
+
+    #[test]
+    fn test_grep_pattern_extraction_never_renders_empty_quotes() {
+        use crate::app::formatting::format_tool_call_spans;
+        let theme = Theme::default();
+        
+        // 1. Tool call using "pattern" argument (the schema canonical parameter)
+        let spans = format_tool_call_spans("grep_search", r#"{"pattern":"my_struct","dir_path":"src"}"#, &theme);
+        let joined: String = spans.into_iter().map(|s| s.content.to_string()).collect();
+        assert!(joined.contains("\"my_struct\""), "Expected pattern to be extracted, got: {}", joined);
+        assert!(!joined.contains("\"\""), "Must never render empty quotes, got: {}", joined);
+
+        // 2. Tool call using "query" fallback
+        let spans_q = format_tool_call_spans("grep", r#"{"query":"test_fn","path":"crates"}"#, &theme);
+        let joined_q: String = spans_q.into_iter().map(|s| s.content.to_string()).collect();
+        assert!(joined_q.contains("\"test_fn\""), "Expected query to be extracted, got: {}", joined_q);
+        assert!(!joined_q.contains("\"\""), "Must never render empty quotes, got: {}", joined_q);
+    }
+
+    #[test]
+    fn test_format_call_preview_utf8_boundary_no_panic() {
+        use crate::app::event_loop::format_call_preview;
+        use corex_core::types::{FunctionCall, ToolCall};
+        use corex_tools::ToolRegistry;
+
+        let registry = ToolRegistry::new();
+        // 59 ASCII bytes followed by 'ó' (2 bytes: 59..61) so byte index 60 falls inside 'ó'
+        let val = format!("{}ó_extra_text", "a".repeat(59));
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "custom_tool".to_string(),
+                arguments: serde_json::json!({ "query": val }).to_string(),
+            },
+            extra_content: None,
+        };
+        let preview = format_call_preview(&call, &registry, std::path::Path::new("."));
+        assert!(preview.contains("..."));
+    }
+
+    #[tokio::test]
+    async fn test_fleet_mode_session_isolation() {
+        use corex_core::types::Message;
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        // Populate normal conversation session
+        app.session.add_message(Message::user("Auditing Linux kernel staging drivers"));
+        let normal_id = app.session.id.clone();
+        assert_eq!(app.session.messages.len(), 1);
+
+        // Enter fleet mode
+        app.enter_fleet_mode();
+        assert!(app.normal_session_stash.is_some());
+        assert_ne!(app.session.id, normal_id);
+        assert_eq!(app.session.tag.as_deref(), Some("fleet"));
+        assert_eq!(app.session.title, "SysAdmin Fleet Console");
+
+        // Add a sysadmin command to the fleet session
+        app.session.add_message(Message::user("fleet_run_command df -h"));
+        let fleet_id = app.session.id.clone();
+
+        // Exit fleet mode -> normal session must be restored cleanly
+        app.exit_fleet_mode();
+        assert!(app.normal_session_stash.is_none());
+        assert_eq!(app.session.id, normal_id);
+        assert_eq!(app.session.messages.len(), 1);
+        assert_eq!(app.session.messages[0].text_content(), Some("Auditing Linux kernel staging drivers"));
+
+        // Fleet session must be stashed in fleet_session
+        assert!(app.fleet_session.is_some());
+        let stashed_fleet = app.fleet_session.as_ref().unwrap();
+        assert_eq!(stashed_fleet.id, fleet_id);
+
+        // Re-entering fleet mode restores the fleet session without creating a new blank one
+        app.enter_fleet_mode();
+        assert_eq!(app.session.id, fleet_id);
+        assert!(app.session.messages.iter().any(|m| m.text_content() == Some("fleet_run_command df -h")));
+
+        // Exit back to normal
+        app.exit_fleet_mode();
+        assert_eq!(app.session.id, normal_id);
     }

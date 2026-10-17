@@ -277,8 +277,8 @@ pub fn wrap_spans_with_indent(
     let mut current_line = Vec::new();
     let mut current_len = 0;
 
-    let first_len = first_line_indent.chars().count();
-    let cont_len = continuation_indent.chars().count();
+    let first_len = unicode_width::UnicodeWidthStr::width(first_line_indent);
+    let cont_len = unicode_width::UnicodeWidthStr::width(continuation_indent);
 
     if first_len > 0 {
         current_line.push(Span::raw(first_line_indent.to_string()));
@@ -292,7 +292,7 @@ pub fn wrap_spans_with_indent(
         let words: Vec<&str> = text.split(' ').collect();
         for (i, word) in words.iter().enumerate() {
             let is_first = i == 0;
-            let word_len = word.chars().count();
+            let word_len = unicode_width::UnicodeWidthStr::width(*word);
             let need_space = !is_first;
             let added_len = word_len + if need_space { 1 } else { 0 };
 
@@ -571,13 +571,14 @@ fn parse_inline_spans(
 
         // 6. Standalone Email (e.g. contact@sluisr.com)
         if ch == '@' && !buffer.is_empty() {
-            let user_part_len = buffer
+            let user_part_bytes: usize = buffer
                 .chars()
                 .rev()
                 .take_while(|c| c.is_alphanumeric() || *c == '.' || *c == '_' || *c == '+' || *c == '-')
-                .count();
+                .map(|c| c.len_utf8())
+                .sum();
 
-            if user_part_len > 0 {
+            if user_part_bytes > 0 {
                 let mut lookahead = chars.clone();
                 let mut domain = String::new();
                 while let Some(&next_ch) = lookahead.peek() {
@@ -589,7 +590,7 @@ fn parse_inline_spans(
 
                 if domain.contains('.') && domain.split('.').next_back().map(|ext| ext.len() >= 2).unwrap_or(false) {
                     chars = lookahead;
-                    let split_idx = buffer.len() - user_part_len;
+                    let split_idx = buffer.len() - user_part_bytes;
                     let user_part: String = buffer.drain(split_idx..).collect();
                     if !buffer.is_empty() {
                         spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
@@ -1056,7 +1057,7 @@ mod tests {
 
     #[test]
     fn test_markdown_table() {
-        let text = "## 📊 Desglose de los 53 GB\n\n| Directorio | Tamaño | Qué es |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Log verbose de tmux (creciendo) |\n| `Projects/` | 13 GB | triade-app (7.9G: node_modules 3.6G + build android 4G), corex/target 2.5G |\n";
+        let text = "## 📊 Breakdown of the 53 GB\n\n| Directory | Size | Description |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Verbose tmux log (growing) |\n| `Projects/` | 13 GB | triade-app (7.9G: node_modules 3.6G + build android 4G), corex/target 2.5G |\n";
         let theme = Theme::default();
         let lines = render_markdown(text, &theme, 100);
         for (i, line) in lines.iter().enumerate() {
@@ -1067,7 +1068,7 @@ mod tests {
 
     #[test]
     fn test_markdown_table_escaped_pipes() {
-        let text = "| Dato | Valor |\n|---|---|\n| Handle | sluisr |\n| Bio de GitHub | sluisr 🌌 \\| kernel enthusiast \\| 🛡️ cyber-sec \\| 🎧 jumpstyle & monster vibes \\| > stay arch |\n";
+        let text = "| Field | Value |\n|---|---|\n| Handle | sluisr |\n| GitHub Bio | sluisr 🌌 \\| kernel enthusiast \\| 🛡️ cyber-sec \\| 🎧 jumpstyle & monster vibes \\| > stay arch |\n";
         let theme = Theme::default();
         let lines = render_markdown(text, &theme, 120);
         assert!(!lines.is_empty());
@@ -1085,7 +1086,7 @@ mod tests {
     #[test]
     fn test_markdown_table_wide_middle_column() {
         let theme = Theme::default();
-        let text = "| Vector | Prueba | Resultado |\n|---|---|---|\n| LFI sobre scripts ocultos | ?file/page/inc/… = php://filter/…resource=fun.php en los 7 send/*.php | ❌ ignorado |\n| Fuzz de campos POST | 7 endpoints × 35 nombres ( page,file,include,tpl,view,load,path,url,func,callback… ) con php://filter | ❌ 0 resultados |\n";
+        let text = "| Vector | Test | Result |\n|---|---|---|\n| LFI on hidden scripts | ?file/page/inc/… = php://filter/…resource=fun.php in 7 send/*.php | ❌ ignored |\n| Fuzz POST fields | 7 endpoints × 35 names ( page,file,include,tpl,view,load,path,url,func,callback… ) with php://filter | ❌ 0 results |\n";
         let max_width = 100;
         let lines = render_markdown(text, &theme, max_width);
 
@@ -1099,10 +1100,10 @@ mod tests {
             assert!(s.ends_with('│') || s.ends_with('┤'), "table line missing right border: {}", s);
         }
 
-        // Verify the Resultado column was NOT crushed to "Resul" or "❌ ig"
+        // Verify the Result column was NOT crushed
         let table_str: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
-        assert!(table_str.contains("Resultado"), "Resultado header was crushed: {}", table_str);
-        assert!(table_str.contains("ignorado"), "ignorado was crushed: {}", table_str);
+        assert!(table_str.contains("Result"), "Result header was crushed: {}", table_str);
+        assert!(table_str.contains("ignored"), "ignored was crushed: {}", table_str);
     }
 
     #[test]
@@ -1160,7 +1161,7 @@ mod tests {
     #[test]
     fn test_hanging_indent_bullets_and_headers() {
         let theme = Theme::default();
-        let text = "## Lo bueno ✅\n- CPU muy capaz: El procesador es eficiente y con buena potencia para su gama.\n";
+        let text = "## Highlights ✅\n- Highly capable CPU: The processor is efficient with solid power for its class.\n";
         let lines = render_markdown(text, &theme, 40);
 
         // Header should not contain raw literal "## " or geometric bullets
@@ -1168,7 +1169,7 @@ mod tests {
         assert!(!header_str.contains("##"), "header contains raw hashes: {}", header_str);
         assert!(!header_str.contains('◆'), "header contains geometric bullet: {}", header_str);
         assert!(!header_str.contains('▸'), "header contains geometric bullet: {}", header_str);
-        assert!(header_str.contains("Lo bueno"), "header text missing: {}", header_str);
+        assert!(header_str.contains("Highlights"), "header text missing: {}", header_str);
 
         // First bullet line starts with "  • " (4 visible chars)
         let bullet_line1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1185,7 +1186,7 @@ mod tests {
     #[test]
     fn test_markdown_table_cell_wrapping_preserves_full_content() {
         let theme = Theme::default();
-        let text = "| Proyecto | Descripción | Enlace |\n|---|---|---|\n| DeepSeek CLI | Adaptación no oficial de Gemini CLI para la API de DeepSeek. | [GitHub](https://github.com/sluisr/deepseek-cli) · [npm](https://npmjs.com/@sluisr/deepseek-cli) |\n";
+        let text = "| Project | Description | Link |\n|---|---|---|\n| DeepSeek CLI | Unofficial adaptation of Gemini CLI for DeepSeek API. | [GitHub](https://github.com/sluisr/deepseek-cli) · [npm](https://npmjs.com/@sluisr/deepseek-cli) |\n";
         let max_width = 80;
         let lines = render_markdown(text, &theme, max_width);
         assert!(!lines.is_empty());
@@ -1193,7 +1194,7 @@ mod tests {
         let table_str: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
         // Content should NOT be truncated with ellipsis
         assert!(!table_str.contains('…'), "Table content should wrap, not truncate with ellipsis: {}", table_str);
-        assert!(table_str.contains("Adaptación"), "Description missing start: {}", table_str);
+        assert!(table_str.contains("Unofficial"), "Description missing start: {}", table_str);
         assert!(table_str.contains("DeepSeek"), "Description missing end: {}", table_str);
         assert!(table_str.contains("sluisr/deepseek-cli"), "URL segment missing: {}", table_str);
         assert!(table_str.contains("@sluisr/d"), "npm link segment missing: {}", table_str);
@@ -1209,7 +1210,7 @@ mod tests {
     fn test_markdown_inline_url_and_email_styling() {
         let theme = Theme::default();
         let spans = parse_inline_spans(
-            "Visita [sluisr.com](https://sluisr.com), canal https://www.youtube.com/@sluisr_ o escribe a contact@sluisr.com",
+            "Visit [sluisr.com](https://sluisr.com), channel https://www.youtube.com/@sluisr_ or write to contact@sluisr.com",
             &theme,
             Style::default(),
         );
@@ -1228,5 +1229,18 @@ mod tests {
         let mail_span = spans.iter().find(|s| s.content == "contact@sluisr.com").expect("email missing");
         assert_eq!(mail_span.style.fg, Some(theme.accent_blue));
         assert!(mail_span.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn test_markdown_multibyte_utf8_email_no_panic() {
+        let theme = Theme::default();
+        let spans = parse_inline_spans(
+            "Contact: josé@empresa.es, ñoño@dominio.com or 張三@example.org",
+            &theme,
+            Style::default(),
+        );
+        assert!(spans.iter().any(|s| s.content == "josé@empresa.es"));
+        assert!(spans.iter().any(|s| s.content == "ñoño@dominio.com"));
+        assert!(spans.iter().any(|s| s.content == "張三@example.org"));
     }
 }
