@@ -135,9 +135,9 @@ jobs:
           CHANGELOG_SECTION=$(python3 -c "import sys, re, os; tag = os.environ.get('TAG', '').lstrip('v'); content = open('CHANGELOG.md').read(); m = re.search(r'## \[' + re.escape(tag) + r'\][^\n]*\n(.*?)(?=\n## \[|\Z)', content, re.DOTALL); print(m.group(1).strip()) if m else None" 2>/dev/null || true)
 
           if [ -n "$CHANGELOG_SECTION" ]; then
-            NOTES="## Release $TAG\n\n$CHANGELOG_SECTION\n\n---\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n|---|---|---|\n"
+            NOTES="## Release $TAG\n\n$CHANGELOG_SECTION\n\n---\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n| :--- | :--- | :--- |"
           else
-            NOTES="## Release $TAG\n\nHigh-performance autonomous AI terminal agent compiled in native Rust.\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n|---|---|---|\n"
+            NOTES="## Release $TAG\n\nHigh-performance autonomous AI terminal agent compiled in native Rust.\n\n### Canonical Release Checksums (SHA-256)\n\n| Platform | Archive File | SHA-256 Checksum |\n| :--- | :--- | :--- |"
           fi
           for file in /tmp/checksums/*.sha256; do
             filename=$(basename "$file" .sha256)
