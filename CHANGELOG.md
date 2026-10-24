@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **`cx update` reporting "already on the latest version"**: When the GitHub API failed (unauthenticated requests are limited to 60 per hour), the updater used the first fallback that answered. The CDN's `release.json` is refreshed by hand and could still name the previous version, while the startup notice, which keeps trying sources until it finds a newer one, offered the new release. The updater now reads both the CDN and the web redirect and takes the newer; the download URL is rebuilt from the tag when the redirect has no asset list.
+
+### Security
+- **Dependency updates**: `rustls` 0.23.43 to 0.23.46, `rustls-webpki` 0.103.15 to 0.103.16, `webpki-roots` 1.0.9 to 1.0.11 and `tokio` 1.53.1 to 1.54.1, fixing the RustSec advisories reported by the dependency audit for the TLS stack. The advisories for `zip` 2.4.2 (RUSTSEC-2026-0367, 0368 and 0369) concern `extract()`, which Corex does not call, and remain until `zip` can move to 9.x.
+
+### Documentation
+- **README**: Performance figures, supported platforms and provider lists are now the measured or verified ones, and the claims that did not hold (static linking, glibc 2.17+, a signed audit log, zero network calls in local mode, a built-in SSH client) are gone.
+- **`scripts/benchmark.sh`**: Measures the interactive TUI at idle (resident memory, CPU, time to first frame) instead of `--version`, reads `/proc`, accepts the path of any binary, and no longer prints a fixed conclusion.
+
+---
+
 ## [0.8.1] - 2026-10-25
 
 ### Added
