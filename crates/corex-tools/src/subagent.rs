@@ -1919,7 +1919,7 @@ results = []
 for pkg in packages:
     info_dict = None
     try:
-        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.1'})
+        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.2'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             info = data.get('info', {})
@@ -3450,7 +3450,9 @@ mod tests {
         assert!(deny(worker, "run_shell_command", sh("sudo apt-get update")));
         assert!(!deny(worker, "write_file", serde_json::json!({"file_path": "src/a.rs", "content": "x"})));
         assert!(deny(worker, "write_file", serde_json::json!({"file_path": "/etc/motd", "content": "x"})));
-        assert!(deny(worker, "web_fetch", serde_json::json!({"url": "https://example.org"})));
+        // Reading a web page needs no approval for anyone, like a search.
+        assert!(!deny(worker, "web_fetch", serde_json::json!({"url": "https://example.org"})));
+        assert!(!deny(scout, "web_fetch", serde_json::json!({"url": "https://example.org"})));
         let _ = std::fs::remove_dir_all(&ws);
     }
 

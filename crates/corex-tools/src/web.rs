@@ -714,22 +714,6 @@ impl Tool for WebFetchTool {
         })
     }
 
-    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
-        // Every fetch sends data out (the URL itself can carry anything the model read), so it
-        // runs unprompted only for hosts the user approved: `web_fetch` (any host) or
-        // `web_fetch:<host>` (that host and its subdomains).
-        let Some(host) = fetch_target_host(args) else {
-            return false; // nothing will be fetched; execute() reports the error
-        };
-        !context.allowed_commands.iter().any(|rule| {
-            rule == "web_fetch"
-                || rule.strip_prefix("web_fetch:").is_some_and(|allowed| {
-                    let allowed = allowed.trim().to_ascii_lowercase();
-                    !allowed.is_empty() && (host == allowed || host.ends_with(&format!(".{}", allowed)))
-                })
-        })
-    }
-
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let raw_url = match fetch_target_url(&args) {
             Some(u) => u,
@@ -851,27 +835,18 @@ mod tests {
     }
 
     #[test]
-    fn web_fetch_requires_approval_per_host() {
-        let mut ctx = ToolContext {
+    fn web_fetch_never_asks_for_approval() {
+        // Reading a public page is not an action that needs permission, like a search. The SSRF
+        // checks in `execute` still refuse internal addresses.
+        let ctx = ToolContext {
             workspace_dir: std::env::temp_dir(),
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
         };
-        let docs = json!({ "url": "https://docs.rs/serde" });
-        let other = json!({ "prompt": "read https://example.org/page please" });
-        assert!(WebFetchTool.needs_confirmation(&docs, &ctx));
-        assert_eq!(web_fetch_allow_rule(&docs).as_deref(), Some("web_fetch:docs.rs"));
-        assert_eq!(web_fetch_allow_rule(&other).as_deref(), Some("web_fetch:example.org"));
-
-        ctx.allowed_commands.push("web_fetch:docs.rs".to_string());
-        assert!(!WebFetchTool.needs_confirmation(&docs, &ctx));
-        assert!(!WebFetchTool.needs_confirmation(&json!({ "url": "https://api.docs.rs/x" }), &ctx));
-        assert!(WebFetchTool.needs_confirmation(&json!({ "url": "https://notdocs.rs/x" }), &ctx));
-        assert!(WebFetchTool.needs_confirmation(&other, &ctx));
-
-        ctx.allowed_commands.push("web_fetch".to_string());
-        assert!(!WebFetchTool.needs_confirmation(&other, &ctx));
+        assert!(!WebFetchTool.needs_confirmation(&json!({ "url": "https://docs.rs/serde" }), &ctx));
+        assert!(!WebFetchTool.needs_confirmation(&json!({ "prompt": "read https://example.org/page please" }), &ctx));
+        assert!(!WebFetchTool.needs_confirmation(&json!({ "url": "https://github.com/sluisr/corex/commits/main/" }), &ctx));
     }
 
     #[test]

@@ -3078,17 +3078,18 @@ mod tests {
         };
         let search = ToolCall::new("search", "web_search", r#"{"query":"corex"}"#);
         let fetch = ToolCall::new("fetch", "web_fetch", r#"{"url":"https://example.com/page"}"#);
+        let write = ToolCall::new("write", "write_file", r#"{"file_path":"notes.txt","content":"hi"}"#);
         let sudo = ToolCall::new("sudo", "run_shell_command", r#"{"command":"sudo systemctl restart nginx"}"#);
 
-        // A search never asks; fetching a host that was not approved does, and so does sudo.
-        let (gated, free) = split_by_approval(&app, vec![search.clone(), fetch.clone(), sudo], &context);
-        assert_eq!(ids(&gated), ["fetch", "sudo"]);
-        assert_eq!(ids(&free), ["search"]);
-
-        // Once the host is allowed, nothing is left to ask about.
-        context.allowed_commands.push("web_fetch:example.com".to_string());
-        let (gated, free) = split_by_approval(&app, vec![search, fetch], &context);
-        assert!(gated.is_empty());
+        // Searching and reading a web page never ask; writing a file does, and so does sudo.
+        let (gated, free) = split_by_approval(&app, vec![search.clone(), fetch.clone(), write.clone(), sudo], &context);
+        assert_eq!(ids(&gated), ["write", "sudo"]);
         assert_eq!(ids(&free), ["search", "fetch"]);
+
+        // Once writing files is allowed, nothing is left to ask about.
+        context.allowed_commands.push("write_file".to_string());
+        let (gated, free) = split_by_approval(&app, vec![search, fetch, write], &context);
+        assert!(gated.is_empty());
+        assert_eq!(ids(&free), ["search", "fetch", "write"]);
     }
 }
