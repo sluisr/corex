@@ -80,6 +80,19 @@ pub fn is_context_overflow_error(message: &str) -> bool {
     .any(|needle| m.contains(needle))
 }
 
+/// What a text-only model reads where the user attached an image.
+const IMAGE_OMITTED_NOTE: &str = "[The user attached an image here, but the active model cannot see images. \
+It is not saved as a file, so do not search the disk for it. Tell the user to switch to a vision-capable model \
+with /model (Claude, GPT-4o or Gemini) and send it again.]";
+
+/// True when an API error message says the model does not accept image input.
+pub fn is_image_rejection_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    ["image_url", "image input", "images are not supported", "does not support image", "unsupported image", "not support vision"]
+        .iter()
+        .any(|needle| m.contains(needle))
+}
+
 /// Tool result returned for every call of a truncated turn so the model re-issues it.
 pub const TRUNCATED_TOOL_CALL_ERROR: &str = "Error: this tool call was NOT executed because the response hit the output token limit and its arguments may be truncated. Re-issue it, splitting large content into several smaller calls (e.g. write the file in parts or use apply_patch).";
 
@@ -306,6 +319,40 @@ impl LlmClient {
                 }
             }
             idx += 1;
+        }
+    }
+
+    /// True when the message carries an image.
+    fn has_images(message: &Message) -> bool {
+        matches!(&message.content, Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()))
+    }
+
+    /// Replaces the images of multipart messages with a short note, for models that only read text.
+    ///
+    /// The note says what to do, because left alone the model tends to go looking for the image on
+    /// disk: the image only ever existed in memory, so there is no file to find.
+    ///
+    /// Such an endpoint rejects image parts outright, and since the message stays in the conversation
+    /// every later request would be rejected too.
+    pub fn replace_images_with_notes(messages: &mut [Message]) {
+        for message in messages.iter_mut() {
+            let Some(MessageContent::Parts(parts)) = &message.content else {
+                continue;
+            };
+            if !parts.iter().any(|p| p.image_url.is_some()) {
+                continue;
+            }
+            let text = parts
+                .iter()
+                .map(|p| match (&p.text, &p.image_url) {
+                    (Some(text), _) => text.as_str(),
+                    (None, Some(_)) => IMAGE_OMITTED_NOTE,
+                    (None, None) => "",
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            message.content = Some(MessageContent::Text(text));
         }
     }
 
@@ -579,14 +626,16 @@ impl LlmClient {
         let mut prev_summary: Option<String> = None;
 
         for m in older_slice {
-            let text = m.text_content().unwrap_or("").trim();
+            // A prompt that carries images is multipart: `display_text` keeps the user's words.
+            let full_text = m.display_text();
+            let text = full_text.as_deref().unwrap_or("").trim();
             if m.role == "system" && text.contains("<CONTEXT_SUMMARY>") {
                 prev_summary = Some(text.to_string());
                 continue;
             }
 
             if m.role == "user" {
-                if !text.is_empty() {
+                if !text.is_empty() && !crate::tool_images::is_tool_image_message(m) {
                     user_requests.push(crate::types::truncate_ellipsis(text, 500));
                 }
             } else if m.role == "assistant" {
@@ -826,6 +875,8 @@ impl LlmClient {
             }
         };
         let overflow = matches!(&first, Some(StreamEvent::Error(m)) if is_context_overflow_error(m));
+        let image_rejected = matches!(&first, Some(StreamEvent::Error(m)) if is_image_rejection_error(m))
+            && messages.iter().any(Self::has_images);
 
         let (tx, out) = mpsc::channel::<StreamEvent>(100);
         if overflow {
@@ -852,6 +903,24 @@ impl LlmClient {
                 });
                 return Ok(out);
             }
+        } else if image_rejected {
+            // The model does not take images after all. Send the same conversation with a note in
+            // place of each image; the session keeps the images for a model that can see them.
+            let mut retry_messages = messages;
+            Self::replace_images_with_notes(&mut retry_messages);
+            let mut retry_rx = self.stream_chat_once(retry_messages, tools, cancel_token).await?;
+            let notice = "The active model rejected the image, so it was sent as a note. \
+                          Switch with /model to one that can see images."
+                .to_string();
+            tokio::spawn(async move {
+                let _ = tx.send(StreamEvent::Notice(notice)).await;
+                while let Some(ev) = retry_rx.recv().await {
+                    if tx.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            return Ok(out);
         }
 
         tokio::spawn(async move {
@@ -993,6 +1062,9 @@ impl LlmClient {
             // Signed Claude thinking blocks are only meaningful to Anthropic; never forward
             // them to OpenAI-compatible endpoints after a mid-session provider switch.
             Self::strip_anthropic_thinking(&mut messages);
+        }
+        if !cfg.can_see_images() {
+            Self::replace_images_with_notes(&mut messages);
         }
         if provider_kind == crate::providers::ProviderKind::Anthropic {
             return self.stream_chat_anthropic(
@@ -1882,5 +1954,131 @@ mod overflow_tests {
         assert!(is_context_overflow_error("code: context_length_exceeded"));
         assert!(!is_context_overflow_error("Rate limit or quota exceeded (429 Too Many Requests) from DeepSeek."));
         assert!(!is_context_overflow_error("Too many tokens per minute"));
+    }
+}
+
+#[cfg(test)]
+mod image_note_tests {
+    use super::LlmClient;
+    use crate::types::{ContentPart, Message, MessageContent};
+
+    #[test]
+    fn text_only_models_get_a_note_instead_of_the_image() {
+        let mut messages = vec![
+            Message::user("plain"),
+            Message::user_parts(vec![
+                ContentPart::text("what is this? [Image #1]"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+            ]),
+        ];
+        LlmClient::replace_images_with_notes(&mut messages);
+        assert_eq!(messages[0].text_content(), Some("plain"));
+        let converted = messages[1].text_content().expect("now plain text");
+        assert!(converted.starts_with("what is this? [Image #1]"));
+        assert!(converted.contains("cannot see images"));
+        assert!(converted.contains("do not search the disk"));
+        assert!(!converted.contains("base64"));
+    }
+
+    #[test]
+    fn rejections_of_image_input_are_recognised() {
+        use super::is_image_rejection_error;
+        assert!(is_image_rejection_error("API error (400): unknown variant `image_url`, expected `text`"));
+        assert!(is_image_rejection_error("This model does not support image input"));
+        assert!(!is_image_rejection_error("Rate limit or quota exceeded (429 Too Many Requests)"));
+        assert!(!is_image_rejection_error("maximum context length is 131072 tokens"));
+    }
+
+    #[test]
+    fn a_prompt_with_images_keeps_its_words_for_titles_and_digests() {
+        let msg = Message::user_parts(vec![
+            ContentPart::text("look at [Image #1]"),
+            ContentPart::image_url("data:image/png;base64,AAAA"),
+        ]);
+        assert_eq!(msg.text_content(), None);
+        assert_eq!(msg.display_text().as_deref(), Some("look at [Image #1]"));
+        assert!(matches!(msg.content, Some(MessageContent::Parts(_))));
+    }
+}
+
+#[cfg(test)]
+mod image_fallback_tests {
+    use super::*;
+    use crate::types::ContentPart;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves two requests: a 400 that rejects image input, then a normal streamed answer. Returns
+    /// the address and the bodies of the requests it received.
+    async fn mock_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            for attempt in 0..2 {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut total = 0;
+                loop {
+                    let n = sock.read(&mut buf[total..]).await.unwrap_or(0);
+                    total += n;
+                    let text = String::from_utf8_lossy(&buf[..total]).to_string();
+                    let done = text.split_once("\r\n\r\n").is_some_and(|(head, body)| {
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        body.len() >= len
+                    });
+                    if n == 0 || done {
+                        seen.lock().unwrap().push(text);
+                        break;
+                    }
+                }
+                let response = if attempt == 0 {
+                    let body = r#"{"error":{"message":"Failed to deserialize the JSON body: unknown variant `image_url`, expected `text`"}}"#;
+                    format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                } else {
+                    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (addr, bodies)
+    }
+
+    #[tokio::test]
+    async fn a_model_that_rejects_images_gets_the_conversation_with_a_note_instead() {
+        let (addr, bodies) = mock_server().await;
+        let cfg = Config {
+            base_url: addr,
+            api_key: "test-key".to_string(),
+            model: "some-text-model".to_string(),
+            ..Config::default()
+        };
+        let client = LlmClient::new(cfg);
+        let messages = vec![
+            Message::system("sys"),
+            Message::user_parts(vec![
+                ContentPart::text("what is this? [Image #1]"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+            ]),
+        ];
+
+        let mut rx = client.stream_chat(messages, None, CancellationToken::new()).await.unwrap();
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Notice(n) if n.contains("rejected the image"))), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentDelta(t) if t == "ok")), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, StreamEvent::Error(_))), "{events:?}");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("image_url") && bodies[0].contains("AAAA"));
+        assert!(!bodies[1].contains("AAAA") && bodies[1].contains("do not search the disk"));
     }
 }

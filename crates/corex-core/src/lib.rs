@@ -71,7 +71,7 @@ pub use session::{Session, SessionSummary};
 pub use context_prune::{prune_tool_results, PruneStats};
 pub use repeat_guard::{observe_tool_call, reset_repeat_guard};
 pub use spill::{is_spill_path, spill_large_output};
-pub use tool_images::{drain_tool_images_message, push_tool_image};
+pub use tool_images::{drain_tool_images_message, is_tool_image_message, push_tool_image};
 pub use subagent::{get_subagent_manager, SubagentManager, SubagentRole, SubagentStatus, SubagentTask};
 pub use types::*;
 

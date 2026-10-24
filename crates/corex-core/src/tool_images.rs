@@ -29,6 +29,18 @@ pub fn push_tool_image(label: impl Into<String>, data_uri: impl Into<String>) {
     }
 }
 
+/// Start of the text that labels the `user` message carrying tool images.
+const NOTICE_PREFIX: &str = "[Image(s) loaded by the read_image tool:";
+
+/// True for the bookkeeping `user` message built by [`drain_tool_images_message`]: the user did not
+/// write it, so it is not shown in the feed nor counted as one of their requests.
+pub fn is_tool_image_message(message: &Message) -> bool {
+    message.role == "user"
+        && message
+            .display_text()
+            .is_some_and(|text| text.starts_with(NOTICE_PREFIX))
+}
+
 /// Empties the queue into a single user message, or `None` when no tool produced an image.
 /// Call it after all tool responses of the turn were appended and before the next model request.
 pub fn drain_tool_images_message() -> Option<Message> {
@@ -37,10 +49,7 @@ pub fn drain_tool_images_message() -> Option<Message> {
         return None;
     }
     let names: Vec<&str> = pending.iter().map(|p| p.label.as_str()).collect();
-    let mut parts = vec![ContentPart::text(format!(
-        "[Image(s) loaded by the read_image tool: {}]",
-        names.join(", ")
-    ))];
+    let mut parts = vec![ContentPart::text(format!("{} {}]", NOTICE_PREFIX, names.join(", ")))];
     parts.extend(pending.iter().map(|p| ContentPart::image_url(p.data_uri.clone())));
     Some(Message::user_parts(parts))
 }
@@ -57,6 +66,8 @@ mod tests {
         push_tool_image("b.png", "data:image/png;base64,BBBB");
         let msg = drain_tool_images_message().expect("a message");
         assert_eq!(msg.role, "user");
+        assert!(is_tool_image_message(&msg));
+        assert!(!is_tool_image_message(&Message::user("hello")));
         match msg.content {
             Some(crate::types::MessageContent::Parts(parts)) => assert_eq!(parts.len(), 3),
             _ => panic!("expected multipart content"),

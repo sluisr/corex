@@ -20,7 +20,7 @@
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It delivers sub-10ms startup times, runs as single self-contained static binaries, and consumes negligible system memory (~11.9 MB RSS).
 
 > [!NOTE]
-> **Release Status:** Active Development / Beta (`v0.8.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development / Beta (`v0.8.1`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 

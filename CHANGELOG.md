@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.1] - 2026-10-25
+
+### Added
+
+#### Images from the Clipboard
+- **Paste an image with `Ctrl+V`**: A screenshot or copied image becomes an `[Image #N]` tag in the prompt, and the pixels travel with the message when it is sent. Terminals that cannot paste an image as text send an empty paste, which is treated the same way. When the clipboard holds no image, `Ctrl+V` pastes its text as usual.
+- **The tag behaves as one piece**: It moves, and is deleted, as a whole with the arrow keys, `Backspace` and `Delete`, like `[Pasted text #N]`. Deleting it drops the image, and a message can carry several images.
+- **Highlighted in the conversation**: `[Image #N]` and the other paste tags keep their blue highlight in the feed after the message is sent, not only in the composer.
+- **Clipboard access**: Linux reads through `wl-paste` (Wayland) or `xclip` (X11), and macOS through `pngpaste` when it is installed. Images are limited to 5 MB and must be PNG, JPEG, GIF or WebP. Windows pastes text only for now.
+- **Models that cannot see images**: DeepSeek Pro receives a note in place of each image, telling it that the image is not a file on disk and that the user should switch model with `/model`; a warning is shown when the image is pasted. If any other model rejects image input, the request is retried once with the same note and a notice says so. Images stay in the session for a model that can see them.
+- **Prompts with images keep their words** in the feed, session titles, the session picker preview and `/compact` summaries.
+
+### Changed
+- **Session summary on exit**: Redesigned as five plain rows (`Model`, `Session`, `Tokens`, `Cost`, `Resume`) with dim labels and no decoration. Token counts use thousands separators, cache hits sit on the tokens row, costs show four decimals, and colour is dropped when output is not a terminal or `NO_COLOR` is set.
+- **Tool approval dialog**: It lists only the calls that need approval. The others in the same batch run right away instead of being shown for confirmation.
+
+### Removed
+- **Inline hint in the composer** (`Enter queues · Alt+Enter sends now`): It was drawn next to the text being typed while the agent worked, and the activity bar already shows the same keys.
+
+### Fixed
+- **A web search asking for approval**: In 0.8.0 a search was shown in the approval dialog whenever another call in the same batch needed approval, typically a `web_fetch` to a host not yet allowed. The search itself never needed it.
+- **Empty `[You]` row**: The internal message that carries the images loaded by `read_image` is no longer drawn in the feed as an empty prompt, and no longer counts as one of the user's requests in summaries.
+
+---
+
 ## [0.8.0] - 2026-10-25
 
 ### Added

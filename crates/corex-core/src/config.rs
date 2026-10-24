@@ -361,6 +361,13 @@ impl Config {
         }
     }
 
+    /// False for the models known to read only text, which reject image parts: DeepSeek Pro.
+    /// DeepSeek Flash sees images, like the other vendors' models; one that turns out not to is
+    /// handled when the request is rejected (see `LlmClient::stream_chat`).
+    pub fn can_see_images(&self) -> bool {
+        !(self.is_deepseek_endpoint() && is_pro_model(&self.model))
+    }
+
     /// True when requests go to DeepSeek (enables DeepSeek-only request fields and model aliases).
     pub fn is_deepseek_endpoint(&self) -> bool {
         if self.external_provider().is_some() {
@@ -757,6 +764,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_known_text_models_are_told_apart_from_the_ones_that_see_images() {
+        // DeepSeek Flash is multimodal; Pro is the one that reads text only.
+        let mut cfg = Config::default();
+        assert!(cfg.is_deepseek_endpoint() && cfg.can_see_images());
+        cfg.model = "deepseek-v4-pro".to_string();
+        assert!(!cfg.can_see_images());
+
+        let mut claude = Config::default();
+        claude.active_provider = Some(crate::providers::ANTHROPIC_ID.to_string());
+        claude.model = "claude-opus-5-5".to_string();
+        claude.provider_api_keys.insert(crate::providers::ANTHROPIC_ID.to_string(), "k".to_string());
+        assert!(claude.can_see_images());
+    }
 
     #[test]
     fn strip_secrets_removes_credentials_and_fails_closed() {

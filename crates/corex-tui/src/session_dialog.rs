@@ -491,7 +491,7 @@ fn limit_lines(mut lines: Vec<Line<'static>>, max: usize) -> Vec<Line<'static>> 
 
 /// One-line plain text of a message, markdown markers removed, capped so a huge reply stays cheap.
 fn message_snippet(msg: &corex_core::types::Message) -> String {
-    let text = msg.text_content().unwrap_or("");
+    let text = msg.display_text().unwrap_or_default();
     let joined = text
         .lines()
         .map(strip_inline_markdown)

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use corex_core::client::{get_sudo_password, set_sudo_password, LlmClient, StreamEvent};
 use corex_core::config::Config;
 use corex_core::session::Session;
-use corex_core::types::Message;
+use corex_core::types::{ContentPart, Message};
 use corex_prompt::PromptBuilder;
 use corex_tools::registry::ToolRegistry;
 
@@ -70,6 +70,8 @@ impl App {
             slash_selected_idx: 0,
             pastes: std::collections::HashMap::new(),
             next_paste_id: 1,
+            images: std::collections::HashMap::new(),
+            next_image_id: 1,
             cursor_idx: 0,
 
             is_streaming: false,
@@ -572,7 +574,8 @@ impl App {
         }
         let text = std::mem::take(&mut self.steer_messages).join("\n\n");
         corex_core::reset_repeat_guard();
-        self.session.add_message(Message::user(text));
+        let message = self.user_message(text);
+        self.session.add_message(message);
         true
     }
 
@@ -725,6 +728,97 @@ impl App {
         }
         while !self.input_buffer.is_char_boundary(self.cursor_idx) {
             self.cursor_idx = self.cursor_idx.saturating_sub(1);
+        }
+    }
+
+    /// The user message for `text`. When it mentions pasted images (`[Image #N]`) they travel with
+    /// it as image parts after the text, in the order their tags appear.
+    pub fn user_message(&mut self, text: String) -> Message {
+        use base64::Engine;
+
+        let images: Vec<_> = image_tag_ids(&text)
+            .into_iter()
+            .filter_map(|id| self.images.remove(&id))
+            .collect();
+        if images.is_empty() {
+            return Message::user(text);
+        }
+        let mut parts = vec![ContentPart::text(text)];
+        parts.extend(images.iter().map(|image| {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&image.data);
+            ContentPart::image_url(format!("data:{};base64,{}", image.media_type, encoded))
+        }));
+        Message::user_parts(parts)
+    }
+
+    /// Forgets what a paste tag stood for once the tag is deleted from the prompt.
+    pub fn forget_paste_tag(&mut self, tag: &str) {
+        if let Some(rest) = tag.strip_prefix("[Pasted text #") {
+            if let Some(id) = rest.split(' ').next().and_then(|n| n.parse().ok()) {
+                self.pastes.remove(&id);
+            }
+        } else if let Some(rest) = tag.strip_prefix("[Image #") {
+            if let Ok(id) = rest.trim_end_matches(']').parse() {
+                self.images.remove(&id);
+            }
+        }
+    }
+
+    /// Whether a paste lands in the prompt (no dialog is asking for something else).
+    fn composer_takes_paste(&self) -> bool {
+        !self.sudo_dialog.is_open
+            && !self.auth_dialog.is_open
+            && !self.user_dialog.is_open
+            && !(self.fleet_dialog.is_open && self.fleet_dialog.command_mode)
+            && self.pending_confirmation.is_none()
+    }
+
+    /// Puts the clipboard image in the prompt as an `[Image #N]` tag; the pixels travel with the
+    /// message when it is sent. Returns false when there is nothing to attach (no image on the
+    /// clipboard, or a dialog has the focus), so the caller can paste text instead.
+    pub fn paste_clipboard_image(&mut self) -> bool {
+        if !self.composer_takes_paste() {
+            return false;
+        }
+        match clipboard::read_image() {
+            Ok(Some(image)) => {
+                self.clamp_cursor();
+                let id = self.next_image_id;
+                self.next_image_id += 1;
+                self.images.insert(id, image);
+                let tag = format!("[Image #{}] ", id);
+                self.input_buffer.insert_str(self.cursor_idx, &tag);
+                self.cursor_idx += tag.len();
+                self.slash_selected_idx = 0;
+                self.last_esc_press = None;
+                let cfg = self.llm_client.get_config();
+                if !cfg.can_see_images() {
+                    self.session.add_message(Message::system(format!(
+                        "{} cannot see images: it will only read a note where [Image #{}] is. \
+                         Switch with /model to Claude, GPT-4o or Gemini to have it look at the picture.",
+                        cfg.model,
+                        id
+                    )));
+                    self.invalidate_message_cache();
+                }
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                self.session.add_message(Message::system(format!("Could not paste the image: {}", err)));
+                self.invalidate_message_cache();
+                true
+            }
+        }
+    }
+
+    /// Ctrl+V: the clipboard image if there is one, otherwise its text.
+    pub fn paste_from_clipboard(&mut self) {
+        if self.paste_clipboard_image() {
+            return;
+        }
+        if let Some(text) = clipboard::read_text().filter(|t| !t.is_empty()) {
+            self.handle_paste(text);
         }
     }
 

@@ -225,6 +225,19 @@ impl Message {
     pub fn text_content(&self) -> Option<&str> {
         self.content.as_ref().and_then(|c| c.as_text())
     }
+
+    /// The readable text of the message: plain text as is, or the text parts of a multipart message
+    /// (a prompt that carries images). Unlike `text_content`, it does not lose the user's words
+    /// when images are attached.
+    pub fn display_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self.content.as_ref()? {
+            MessageContent::Text(text) => Some(std::borrow::Cow::Borrowed(text.as_str())),
+            MessageContent::Parts(parts) => {
+                let texts: Vec<&str> = parts.iter().filter_map(|p| p.text.as_deref()).collect();
+                (!texts.is_empty()).then(|| std::borrow::Cow::Owned(texts.join("\n")))
+            }
+        }
+    }
 }
 
 // ─── Tool definitions ────────────────────────────────────────────────────────

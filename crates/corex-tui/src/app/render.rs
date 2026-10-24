@@ -121,8 +121,25 @@ pub fn render_about_card(
     ]
 }
 
-/// Soft hint shown after a message typed while the agent is busy (leading space is part of it).
-const BUSY_INPUT_HINT: &str = " · Enter queues · Alt+Enter sends now";
+/// One line of the user's prompt as owned spans. Paste tags such as `[Image #1]` keep the highlight
+/// they had in the composer, so what was attached stands out in the conversation too.
+fn user_line_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = format_input_spans(line, theme)
+        .into_iter()
+        .map(|span| {
+            let style = if span.style == Style::default() {
+                Style::default().fg(theme.foreground)
+            } else {
+                span.style
+            };
+            Span::styled(span.content.to_string(), style)
+        })
+        .collect();
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), Style::default().fg(theme.foreground)));
+    }
+    spans
+}
 
 /// Rows of a command/subagent log that stay visible while logs are collapsed.
 const COLLAPSED_LOG_ROWS: usize = 5;
@@ -495,7 +512,12 @@ pub fn render_single_message_with_pending_and_thinking(
     let mut lines = Vec::new();
     match msg.role.as_str() {
         "user" => {
-            let content = msg.text_content().unwrap_or("");
+            // The images a tool loaded ride on a `user` message the user never wrote.
+            if corex_core::is_tool_image_message(msg) {
+                return lines;
+            }
+            let text = msg.display_text();
+            let content = text.as_deref().unwrap_or("");
             for (idx, line) in content.split('\n').enumerate() {
                 let (spans, first_indent) = if idx == 0 {
                     (
@@ -503,17 +525,14 @@ pub fn render_single_message_with_pending_and_thinking(
                             Span::styled("[", Style::default().fg(theme.border_dim)),
                             Span::styled("You", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                             Span::styled("] ", Style::default().fg(theme.border_dim)),
-                            Span::styled(line.to_string(), Style::default().fg(theme.foreground)),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(user_line_spans(line, theme))
+                        .collect(),
                         "  ",
                     )
                 } else {
-                    (
-                        vec![
-                            Span::styled(line.to_string(), Style::default().fg(theme.foreground)),
-                        ],
-                        "        ",
-                    )
+                    (user_line_spans(line, theme), "        ")
                 };
                 let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, "        ");
                 lines.extend(wrapped);
@@ -1323,17 +1342,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 "Press Esc again to clear prompt."
             };
             Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray))
-        })
-        .or_else(|| {
-            // While the agent works, say what Enter and Alt+Enter will do with the typed message.
-            // Only when it fits on the row: a hint must never push the text itself around.
-            let hint = BUSY_INPUT_HINT;
-            let used = prefix_width
-                + unicode_width::UnicodeWidthStr::width(app.input_buffer.as_str())
-                + unicode_width::UnicodeWidthStr::width(hint);
-            let fits = used < size.width as usize && !app.input_buffer.contains('\n');
-            (app.is_streaming && fits && !is_mobile_portrait(size.width, size.height))
-                .then(|| Span::styled(hint, Style::default().fg(app.theme.dark_gray)))
         });
 
         let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);

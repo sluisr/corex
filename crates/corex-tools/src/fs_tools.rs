@@ -628,10 +628,10 @@ impl Tool for ReadFileTool {
 // ─── 1b. ReadImageTool ──────────────────────────────────────────────────────
 
 /// Largest image `read_image` loads; matches the strictest provider limit (5 MB per image).
-const READ_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub const READ_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Identifies PNG, JPEG, GIF and WebP from their file signature, ignoring the extension.
-fn sniff_image_media_type(data: &[u8]) -> Option<&'static str> {
+pub fn sniff_image_media_type(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
         Some("image/png")
     } else if data.starts_with(&[0xff, 0xd8, 0xff]) {

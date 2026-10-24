@@ -268,7 +268,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             } else if !app.message_queue.is_empty() {
                 if let Some(next_prompt) = app.message_queue.pop_front() {
                     corex_core::reset_repeat_guard();
-                            app.session.add_message(Message::user(next_prompt));
+                    let message = app.user_message(next_prompt);
+                    app.session.add_message(message);
                     app.start_stream_turn(event_tx.clone());
                     needs_redraw = true;
                 }
@@ -653,8 +654,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.clear_status();
                             app.user_dialog.open(questions, calls.clone(), ask_call.id.clone());
                         } else if requires_confirmation {
-                            let total_count = calls.len();
-                            let first_preview = calls.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                            // Only the calls that need approval reach the dialog. The rest (a web
+                            // search, a read inside the workspace...) run right away, so the user is
+                            // never asked about an action that needs no permission.
+                            let (gated, free) = split_by_approval(&app, calls, &confirmation_context);
+                            let total_count = gated.len();
+                            let first_preview = gated.first().map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
 
                             app.is_streaming = false;
                             app.thinking_state.reset();
@@ -662,8 +667,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             if app.fleet_dialog.is_open {
                                 app.fleet_dialog.command_mode = false;
                             }
+                            if !free.is_empty() {
+                                run_tools_in_parallel(&mut app, free, confirmation_context.clone(), event_tx.clone());
+                            }
                             app.pending_confirmation = Some(PendingToolBatch {
-                                calls: calls.clone(),
+                                calls: gated,
                                 total_count,
                                 current_idx: 1,
                                 diff_preview: first_preview,
@@ -679,71 +687,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.sudo_dialog.open_batch(calls.clone(), sudo_cmd);
                         } else {
                             // Execute all tools concurrently in parallel without blocking UI!
-                            app.in_flight_tool_calls += calls.len();
-                            let tx = event_tx.clone();
-                            let registry = app.tool_registry.clone();
-                            let context = confirmation_context;
-                            let gen = app.current_generation_id;
-
-                            tokio::spawn(async move {
-                                let calls_count = calls.len();
-                                if calls_count > 1 {
-                                    let summary = if calls.iter().all(|c| c.function.name == "run_shell_command" || c.function.name == "execute_command") {
-                                        format!("Running {} commands in parallel...", calls_count)
-                                    } else {
-                                        format!("Running {} tasks in parallel...", calls_count)
-                                    };
-                                    let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
-                                        call_id: "batch".to_string(),
-                                        name: "batch".to_string(),
-                                        summary,
-                                    })).await;
-                                }
-
-                                let mut handles = Vec::new();
-                                for call in calls {
-                                    let reg = registry.clone();
-                                    let ctx = context.clone();
-                                    let tx_call = tx.clone();
-                                    let call_id = call.id.clone();
-                                    let tool_name = call.function.name.clone();
-                                    let args_str = call.function.arguments.clone();
-
-                                    handles.push(tokio::spawn(async move {
-                                        let summary = format_tool_call_summary(&tool_name, &args_str);
-                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
-                                            call_id: call_id.clone(),
-                                            name: tool_name.clone(),
-                                            summary,
-                                        })).await;
-                                        let start_tool = std::time::Instant::now();
-                                        let (output, success) = match corex_core::parse_lenient_json(&args_str) {
-                                            Ok(args_json) => {
-                                                let result = reg.execute(&tool_name, args_json, &ctx).await;
-                                                match result {
-                                                    Ok(o) => (o.output, true),
-                                                    Err(e) => (format!("Error executing {}: {}", tool_name, e), false),
-                                                }
-                                            }
-                                            Err(e) => (format!("Error executing {}: invalid tool arguments JSON: {}", tool_name, e), false),
-                                        };
-                                        let duration_ms = start_tool.elapsed().as_millis();
-                                        corex_core::ForensicLogger::log_tool_call(
-                                            &tool_name,
-                                            &call_id,
-                                            &args_str,
-                                            &output,
-                                            duration_ms,
-                                            success
-                                        );
-                                        let _ = tx_call.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
-                                    }));
-                                }
-                                for h in handles {
-                                    let _ = h.await;
-                                }
-                                let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
-                            });
+                            run_tools_in_parallel(&mut app, calls, confirmation_context, event_tx.clone());
                         }
                     } else {
                         // No tool calls — final model answer received!
@@ -774,7 +718,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.start_stream_turn(event_tx.clone());
                         } else if let Some(next_prompt) = app.message_queue.pop_front() {
                             corex_core::reset_repeat_guard();
-                            app.session.add_message(Message::user(next_prompt));
+                    let message = app.user_message(next_prompt);
+                    app.session.add_message(message);
                             app.scroll_to_bottom();
                             app.start_stream_turn(event_tx.clone());
                         } else if let Some(last_msg) = app.session.messages.last() {
@@ -855,7 +800,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             &format!("Content:\n{}", pasted),
                         );
                     }
-                    app.handle_paste(pasted);
+                    // A terminal that has nothing to paste as text (the clipboard holds an image)
+                    // sends an empty paste: that is the cue to look for an image instead.
+                    if !(pasted.trim().is_empty() && app.paste_clipboard_image()) {
+                        app.handle_paste(pasted);
+                    }
+                    needs_redraw = true;
                 }
                 // A resize or regaining focus can leave ghost cells the diff renderer believes
                 // are correct; wipe the backing buffer so the next draw repaints everything.
@@ -2370,7 +2320,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             } else if app.cursor_idx > 0 {
                                 let before = &app.input_buffer[..app.cursor_idx];
                                 if before.ends_with(']') {
-                                    if let Some(open_idx) = before.rfind("[Pasted text #") {
+                                    if let Some(open_idx) = paste_tag_last_start(before) {
                                         app.cursor_idx = open_idx;
                                     } else {
                                         let prev = before.char_indices().last().map(|(idx, _)| idx).unwrap_or(0);
@@ -2392,7 +2342,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.cursor_idx = (app.cursor_idx + skip_spaces + word_len).min(app.input_buffer.len());
                             } else if app.cursor_idx < app.input_buffer.len() {
                                 let after = &app.input_buffer[app.cursor_idx..];
-                                if after.starts_with("[Pasted text #") {
+                                if starts_with_paste_tag(after) {
                                     if let Some(end_bracket) = after.find(']') {
                                         app.cursor_idx = (app.cursor_idx + end_bracket + 1).min(app.input_buffer.len());
                                     } else {
@@ -2420,16 +2370,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             app.clamp_cursor();
                             if app.cursor_idx < app.input_buffer.len() {
                                 let after = &app.input_buffer[app.cursor_idx..];
-                                if after.starts_with("[Pasted text #") {
+                                if starts_with_paste_tag(after) {
                                     if let Some(end_bracket) = after.find(']') {
-                                        let tag_slice = &after[..=end_bracket];
-                                        if let Some(num_str) = tag_slice.strip_prefix("[Pasted text #") {
-                                            if let Some(space_pos) = num_str.find(' ') {
-                                                if let Ok(id) = num_str[..space_pos].parse::<usize>() {
-                                                    app.pastes.remove(&id);
-                                                }
-                                            }
-                                        }
+                                        let tag = after[..=end_bracket].to_string();
+                                        app.forget_paste_tag(&tag);
                                         app.input_buffer.drain(app.cursor_idx..app.cursor_idx + end_bracket + 1);
                                     } else {
                                         let ch_len = after.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
@@ -2454,6 +2398,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     }
                                     'k' | 'K' | '\x0b' => {
                                         app.input_buffer.truncate(app.cursor_idx);
+                                    }
+                                    // Terminals that do not paste on their own pass Ctrl+V through: take
+                                    // an image from the clipboard if there is one, else its text.
+                                    'v' | 'V' | '\x16' => {
+                                        app.paste_from_clipboard();
+                                        needs_redraw = true;
                                     }
                                     'w' | 'W' | '\x17' => {
                                         let before = &app.input_buffer[..app.cursor_idx];
@@ -2485,16 +2435,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             if app.cursor_idx > 0 {
                                 let before = &app.input_buffer[..app.cursor_idx];
                                 if before.ends_with(']') {
-                                    if let Some(open_idx) = before.rfind("[Pasted text #") {
+                                    if let Some(open_idx) = paste_tag_last_start(before) {
                                         let tag_slice = &before[open_idx..];
                                         if tag_slice.ends_with(']') {
-                                            if let Some(num_str) = tag_slice.strip_prefix("[Pasted text #") {
-                                                if let Some(space_pos) = num_str.find(' ') {
-                                                    if let Ok(id) = num_str[..space_pos].parse::<usize>() {
-                                                        app.pastes.remove(&id);
-                                                    }
-                                                }
-                                            }
+                                            let tag = tag_slice.to_string();
+                                            app.forget_paste_tag(&tag);
                                             app.input_buffer.drain(open_idx..app.cursor_idx);
                                             app.cursor_idx = open_idx;
                                         } else {
@@ -2522,6 +2467,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.input_buffer.clear();
                                 app.cursor_idx = 0;
                                 app.pastes.clear();
+                                app.images.clear();
                                 app.slash_selected_idx = 0;
                                 app.last_esc_press = None;
                             } else if app.fleet_dialog.is_open && !app.fleet_dialog.command_mode {
@@ -2544,6 +2490,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     app.input_buffer.clear();
                                     app.cursor_idx = 0;
                                     app.pastes.clear();
+                                    app.images.clear();
                                     app.history_idx = None;
                                     app.saved_draft.clear();
                                     app.slash_selected_idx = 0;
@@ -2755,6 +2702,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     && app.handle_slash_command(&user_prompt_clean).await {
                                         // Slash commands never expand paste tags; release the buffers.
                                         app.pastes.clear();
+                                        app.images.clear();
                                         if user_prompt_clean.starts_with("/fim")
                                             && app.session.messages.last().map(|m| m.role == "user").unwrap_or(false)
                                         {
@@ -2766,6 +2714,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
                                 if user_prompt_clean.is_empty() {
                                     app.pastes.clear();
+                                    app.images.clear();
                                     continue;
                                 }
 
@@ -2799,7 +2748,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
 
                                 corex_core::reset_repeat_guard();
-                            app.session.add_message(Message::user(user_prompt_clean));
+                                let message = app.user_message(user_prompt_clean);
+                                app.session.add_message(message);
                                 app.scroll_to_bottom();
 
                                 // ⚡ START TURN!
@@ -2830,6 +2780,95 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     print_session_summary(&app);
     Ok(())
+}
+
+/// Splits a tool batch into the calls that wait for the user's approval and the ones that need
+/// none. A shell command that asks for sudo goes with the first group: its own dialog handles it.
+fn split_by_approval(app: &App, calls: Vec<ToolCall>, context: &ToolContext) -> (Vec<ToolCall>, Vec<ToolCall>) {
+    calls.into_iter().partition(|call| {
+        let args = corex_core::parse_lenient_json(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+        let needs_approval = app
+            .tool_registry
+            .get(&call.function.name)
+            .is_some_and(|t| t.needs_confirmation(&args, context));
+        let needs_sudo = call.function.name == "run_shell_command"
+            && args.get("command").and_then(|c| c.as_str()).is_some_and(command_requires_sudo);
+        needs_approval || needs_sudo
+    })
+}
+
+/// Runs `calls` concurrently without blocking the UI. Each one reports `ToolExecutionDone`, and
+/// `AllToolsDone` follows once the last one has finished.
+fn run_tools_in_parallel(
+    app: &mut App,
+    calls: Vec<ToolCall>,
+    context: ToolContext,
+    event_tx: mpsc::Sender<(u64, StreamEvent)>,
+) {
+    app.in_flight_tool_calls += calls.len();
+    let tx = event_tx;
+    let registry = app.tool_registry.clone();
+    let gen = app.current_generation_id;
+
+    tokio::spawn(async move {
+        let calls_count = calls.len();
+        if calls_count > 1 {
+            let summary = if calls.iter().all(|c| c.function.name == "run_shell_command" || c.function.name == "execute_command") {
+                format!("Running {} commands in parallel...", calls_count)
+            } else {
+                format!("Running {} tasks in parallel...", calls_count)
+            };
+            let _ = tx.send((gen, StreamEvent::ToolExecutionStarting {
+                call_id: "batch".to_string(),
+                name: "batch".to_string(),
+                summary,
+            })).await;
+        }
+
+        let mut handles = Vec::new();
+        for call in calls {
+            let reg = registry.clone();
+            let ctx = context.clone();
+            let tx_call = tx.clone();
+            let call_id = call.id.clone();
+            let tool_name = call.function.name.clone();
+            let args_str = call.function.arguments.clone();
+
+            handles.push(tokio::spawn(async move {
+                let summary = format_tool_call_summary(&tool_name, &args_str);
+                let _ = tx_call.send((gen, StreamEvent::ToolExecutionStarting {
+                    call_id: call_id.clone(),
+                    name: tool_name.clone(),
+                    summary,
+                })).await;
+                let start_tool = std::time::Instant::now();
+                let (output, success) = match corex_core::parse_lenient_json(&args_str) {
+                    Ok(args_json) => {
+                        let result = reg.execute(&tool_name, args_json, &ctx).await;
+                        match result {
+                            Ok(o) => (o.output, true),
+                            Err(e) => (format!("Error executing {}: {}", tool_name, e), false),
+                        }
+                    }
+                    Err(e) => (format!("Error executing {}: invalid tool arguments JSON: {}", tool_name, e), false),
+                };
+                let duration_ms = start_tool.elapsed().as_millis();
+                corex_core::ForensicLogger::log_tool_call(
+                    &tool_name,
+                    &call_id,
+                    &args_str,
+                    &output,
+                    duration_ms,
+                    success
+                );
+                let _ = tx_call.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
+    });
 }
 
 /// Finishes the interactive ask_user dialog: executes the pending tool batch
@@ -3015,5 +3054,41 @@ async fn fleet_ensure_session(app: &mut App) -> Option<corex_fleet::RemoteSessio
             app.fleet_dialog.status_msg = Some(format!("Connection failed: {}", e));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corex_core::client::LlmClient;
+    use std::path::PathBuf;
+
+    fn ids(calls: &[ToolCall]) -> Vec<&str> {
+        calls.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn approval_dialog_only_lists_calls_that_need_approval() {
+        let app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        let mut context = ToolContext {
+            workspace_dir: PathBuf::from("/tmp"),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+        let search = ToolCall::new("search", "web_search", r#"{"query":"corex"}"#);
+        let fetch = ToolCall::new("fetch", "web_fetch", r#"{"url":"https://example.com/page"}"#);
+        let sudo = ToolCall::new("sudo", "run_shell_command", r#"{"command":"sudo systemctl restart nginx"}"#);
+
+        // A search never asks; fetching a host that was not approved does, and so does sudo.
+        let (gated, free) = split_by_approval(&app, vec![search.clone(), fetch.clone(), sudo], &context);
+        assert_eq!(ids(&gated), ["fetch", "sudo"]);
+        assert_eq!(ids(&free), ["search"]);
+
+        // Once the host is allowed, nothing is left to ask about.
+        context.allowed_commands.push("web_fetch:example.com".to_string());
+        let (gated, free) = split_by_approval(&app, vec![search, fetch], &context);
+        assert!(gated.is_empty());
+        assert_eq!(ids(&free), ["search", "fetch"]);
     }
 }

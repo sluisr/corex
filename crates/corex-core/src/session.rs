@@ -128,7 +128,7 @@ impl Session {
 
     pub fn add_message(&mut self, message: Message) {
         if self.messages.is_empty() && message.role == "user" {
-            if let Some(text) = message.text_content() {
+            if let Some(text) = message.display_text() {
                 let trimmed = text.trim();
                 let first_line = trimmed.lines().next().unwrap_or("Session");
                 self.title = first_line.chars().take(50).collect();

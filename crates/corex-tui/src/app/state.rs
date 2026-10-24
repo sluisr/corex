@@ -255,6 +255,9 @@ pub struct App {
     pub slash_selected_idx: usize,
     pub pastes: HashMap<usize, String>,
     pub next_paste_id: usize,
+    /// Images pasted from the clipboard, by the id in their `[Image #N]` tag.
+    pub images: HashMap<usize, crate::clipboard::ClipboardImage>,
+    pub next_image_id: usize,
     pub cursor_idx: usize,
 
     pub is_streaming: bool,

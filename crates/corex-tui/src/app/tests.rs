@@ -1356,18 +1356,14 @@ use corex_core::types::ToolCall;
         let empty = screen_text(&mut app, 110);
         assert!(empty.contains("Type to queue a message · Alt+Enter sends it now"), "{empty}");
 
-        // Busy while typing: the hint follows the text and the status bar spells out both keys.
+        // Busy while typing: the status bar spells out the keys, and nothing is appended to the
+        // text itself (the same hint twice, glued to what is being typed, was only clutter).
         app.input_buffer = "check the logs too".to_string();
         app.cursor_idx = app.input_buffer.len();
         let typing = screen_text(&mut app, 110);
-        // (the caret block sits between the text and the hint)
-        assert!(typing.contains("check the logs too█ · Enter queues · Alt+Enter sends now"), "{typing}");
+        assert!(!typing.contains("Enter queues"), "{typing}");
         // The status line on the left is long here (no API key): a shorter hint takes the slot.
         assert!(typing.contains("(Alt+Enter: send now"), "{typing}");
-
-        // Too narrow for the inline hint: the text is never pushed around by it.
-        let narrow = screen_text(&mut app, 40);
-        assert!(!narrow.contains("Enter queues"), "{narrow}");
 
         // Once a message waits in the queue, the status bar offers to send it now.
         app.input_buffer.clear();
@@ -1427,4 +1423,83 @@ use corex_core::types::ToolCall;
         let cut = truncate_to_width("日本語日本語日本語", 10);
         assert!(unicode_width::UnicodeWidthStr::width(cut.as_str()) <= 10);
         assert!(cut.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn test_pasted_images_travel_with_the_prompt_that_names_them() {
+        let mut app = idle_app().await;
+        let image = clipboard::ClipboardImage { media_type: "image/png", data: vec![1, 2, 3] };
+        app.images.insert(1, image.clone());
+        app.images.insert(2, image);
+
+        // No tag, no image: the prompt stays plain text.
+        assert_eq!(app.user_message("hello".to_string()).text_content(), Some("hello"));
+
+        let msg = app.user_message("what is in [Image #1] ?".to_string());
+        // The words (tag included) stay readable for the feed, titles and summaries.
+        assert_eq!(msg.display_text().as_deref(), Some("what is in [Image #1] ?"));
+        match msg.content {
+            Some(corex_core::types::MessageContent::Parts(parts)) => {
+                assert_eq!(parts.len(), 2);
+                let url = &parts[1].image_url.as_ref().expect("image part").url;
+                assert_eq!(url, "data:image/png;base64,AQID");
+            }
+            other => panic!("expected multipart content, got {:?}", other),
+        }
+        // Only the image the prompt names was used.
+        assert!(!app.images.contains_key(&1));
+        assert!(app.images.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn test_deleting_an_image_tag_forgets_its_image() {
+        let mut app = idle_app().await;
+        let image = clipboard::ClipboardImage { media_type: "image/png", data: vec![9] };
+        app.images.insert(4, image);
+        app.pastes.insert(7, "some pasted text".to_string());
+        app.forget_paste_tag("[Image #4]");
+        app.forget_paste_tag("[Pasted text #7 +3 lines]");
+        assert!(app.images.is_empty() && app.pastes.is_empty());
+    }
+
+    #[test]
+    fn test_image_tags_are_found_by_id_and_styled_like_paste_tags() {
+        assert_eq!(image_tag_ids("a [Image #1] b [Image #12] [Image #x] [Image #3"), vec![1, 12]);
+        assert_eq!(paste_tag_start("see [Image #2] now"), Some(4));
+        assert!(starts_with_paste_tag("[Image #2] now"));
+
+        let theme = Theme::default();
+        let spans = format_input_spans("see [Image #2] now", &theme);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[1].content, "[Image #2]");
+        assert_ne!(spans[1].style, spans[0].style);
+    }
+
+    #[test]
+    fn test_image_tags_stand_out_in_the_conversation_feed() {
+        let theme = Theme::default();
+        let msg = Message::user_parts(vec![
+            corex_core::types::ContentPart::text("what is this? [Image #1]"),
+            corex_core::types::ContentPart::image_url("data:image/png;base64,AAAA"),
+        ]);
+        let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
+        // Wrapping cuts the line into words, each keeping the style of the span it came from.
+        let drawn = |text: &str| {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content == text)
+                .unwrap_or_else(|| panic!("{text:?} is drawn"))
+        };
+        // Same highlight as in the composer, not the plain text colour of the prompt.
+        assert!(drawn("[Image").style.bg.is_some());
+        assert_eq!(drawn("[Image").style, drawn("#1]").style);
+        assert!(drawn("what").style.bg.is_none());
+
+        // The message a tool uses to hand over its images is not the user's and stays out of the feed.
+        let tool_images = {
+            corex_core::push_tool_image("a.png", "data:image/png;base64,AAAA");
+            corex_core::drain_tool_images_message().expect("queued image")
+        };
+        assert!(render_single_message_with_pending(0, &tool_images, None, &theme, 80, None, false).is_empty());
     }

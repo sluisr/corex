@@ -531,10 +531,45 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
     }
 }
 
+/// Prefixes of the tags the composer shows in place of pasted content (text or an image).
+const PASTE_TAG_PREFIXES: [&str; 2] = ["[Pasted text #", "[Image #"];
+
+/// Start of the first paste tag in `text`.
+pub fn paste_tag_start(text: &str) -> Option<usize> {
+    PASTE_TAG_PREFIXES.iter().filter_map(|p| text.find(p)).min()
+}
+
+/// Start of the last paste tag in `text`.
+pub fn paste_tag_last_start(text: &str) -> Option<usize> {
+    PASTE_TAG_PREFIXES.iter().filter_map(|p| text.rfind(p)).max()
+}
+
+/// True when `text` begins with a paste tag.
+pub fn starts_with_paste_tag(text: &str) -> bool {
+    PASTE_TAG_PREFIXES.iter().any(|p| text.starts_with(p))
+}
+
+/// Ids of the pasted images `text` refers to (`[Image #3]`), in the order they appear.
+pub fn image_tag_ids(text: &str) -> Vec<usize> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("[Image #") {
+        let after = &rest[at + "[Image #".len()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if after[digits.len()..].starts_with(']') {
+            if let Ok(id) = digits.parse() {
+                ids.push(id);
+            }
+        }
+        rest = after;
+    }
+    ids
+}
+
 pub fn format_input_spans<'a>(text: &'a str, theme: &'a Theme) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
     let mut rest = text;
-    while let Some(start_idx) = rest.find("[Pasted text #") {
+    while let Some(start_idx) = paste_tag_start(rest) {
         if start_idx > 0 {
             spans.push(Span::raw(&rest[..start_idx]));
         }
@@ -588,7 +623,7 @@ pub fn format_input_with_cursor<'a>(
     let mut before_spans = format_input_spans(before, theme);
     let cursor_col: usize = before_spans.iter().map(|s| s.width()).sum();
 
-    if text[clamped..].starts_with("[Pasted text #") {
+    if starts_with_paste_tag(&text[clamped..]) {
         if let Some(end_bracket) = text[clamped..].find(']') {
             let tag = &text[clamped..=clamped + end_bracket];
             let after = &text[clamped + end_bracket + 1..];
