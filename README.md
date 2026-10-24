@@ -17,7 +17,7 @@
 - **`cx` / `corex`**: Autonomous coding and full-stack software development assistant with multi-turn reasoning, subagents, and fuzzy patching.
 - **`cxs` / `cx --fleet`**: Dedicated SysAdmin & Fleet automation console for remote VPS nodes and server clusters, featuring live SSH telemetries (CPU, RAM, Disk) and embedded interactive PTY terminal multiplexing.
 
-Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It delivers sub-10ms startup times, runs as single self-contained static binaries, and consumes negligible system memory (~11.9 MB RSS).
+Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.4 ms (`cx --version`) and draws its first frame in about 3 ms, ships as one native binary per platform, and idles at about 11.7 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
 > **Release Status:** Active Development / Beta (`v0.8.1`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
@@ -26,18 +26,18 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 
 ## Key Highlights
 
-- **Server & Fleet Automation (`cxs`):** Built-in remote VPS cluster management and SysAdmin console (`cxs` or `cx --fleet`). Inspect remote CPU/RAM/Disk metrics, broadcast commands across node clusters, and launch interactive embedded SSH sessions with zero external dependencies.
-- **Native Systems Architecture:** Compiled static binary (~7.0 MB stripped) with zero external runtime dependencies. Instant startup (<10ms) and minimal RAM utilization (~11.9 MB RSS, with only ~2.2 MB anonymous heap).
-- **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash & 2.5 with Thought Signatures), Anthropic Claude (Claude 3.7 / 3.5 Sonnet via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq (500+ tok/s), GitHub Models, OpenRouter, and Mistral AI.
-- **Air-Gapped Offline Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1` for 100% private, zero-cost ($0.00) execution with 0 bytes network egress.
+- **Server & Fleet Automation (`cxs`):** Built-in remote VPS cluster management and SysAdmin console (`cxs` or `cx --fleet`). Inspect remote CPU/RAM/Disk metrics, broadcast commands across node clusters, and open interactive SSH sessions in an embedded terminal. Fleet mode drives the OpenSSH `ssh` client, which must be installed.
+- **Native Systems Architecture:** One native Rust binary per platform (6.3 – 8.1 MB) that needs no Node.js, Python or other runtime to run. On Linux it links dynamically against `libc`, `libm` and `libgcc_s`. Startup in about 1.4 ms and about 11.7 MB of resident memory when idle, of which 1.9 MB is anonymous (heap and stacks).
+- **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash with Thought Signatures), Anthropic Claude (Opus, Sonnet and Haiku 5.5, and Fable 5.1, via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq, GitHub Models, OpenRouter, and Mistral AI.
+- **Local Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1`: prompts, code and responses stay on your machine and inference costs $0.00. Corex still checks for a newer release at startup (see [Offline Sovereign Local LLM](#2-offline-sovereign-local-llm-air-gapped--private)).
 - **Mobile Vertical / Termux Responsive UX:** Auto-detection for Android Termux portrait screens, native tap-to-keyboard, non-overlapping 2-column status bar, and stacked modals for narrow terminals.
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
-- **Enterprise Sandbox & Concurrency Locks:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus strict protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
-- **Forensic Session Audit:** Cryptographic session logging with millisecond timestamps to `~/.corex/logs/corex-forensic-YYYY-MM-DD.log` with automatic 7-day retention.
+- **File Locks & Protected Paths:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
+- **Session Audit Log:** A plain-text log of every tool call, shell command and LLM exchange, with millisecond timestamps, in `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`, kept for 7 days. It is not signed or encrypted.
 - **Global & Workspace Personality (`SYSTEM.md`):** Discovers and applies persistent behavioral rules from `~/.corex/SYSTEM.md` and workspace `COREX.md`.
-- **Native Clipboard Integration:** Seamless terminal text copying via OSC 52 sequences and platform clipboard integration.
-- **KV Cache Preservation:** Context management and tool compression maintain up to a 96%+ KV Cache hit rate across supported providers.
+- **Clipboard Integration:** Copies text through `wl-copy`, `xclip`/`xsel` or OSC 52, and pastes images with `Ctrl+V` (as `[Image #N]`) for models that can see them.
+- **KV Cache Preservation:** Context management and tool compression keep the prompt prefix stable so provider prompt caching applies. The hit rate depends on the provider and the conversation; `/stats` and the summary printed on exit report it.
 - **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands, plus contextual non-intrusive provider auth.
 - **Model Context Protocol (MCP):** Compatible with standard MCP servers (database connectors, GitHub tools, Docker controllers).
 
@@ -45,32 +45,36 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 
 ## Performance & Resource Footprint
 
-Corex is compiled with Link-Time Optimization (`lto = "fat"`), single codegen units, and automatic OS memory compaction (`malloc_trim` on Linux) to minimize memory fragmentation.
+Corex is built with Link-Time Optimization (`lto = "fat"`), a single codegen unit, size optimization (`opt-level = "s"`), `panic = "abort"` and stripped symbols. On Linux it returns freed memory to the OS after heavy turns (`malloc_trim`).
 
-### Hardware & OS Specifications
+### Measured footprint (v0.8.1, Linux x86_64)
 
-| Component | Minimum Specification | Recommended |
-| :--- | :--- | :--- |
-| **RAM** | 32 MB | 64 MB+ |
-| **CPU** | Any 64-bit x86_64 or ARM64 processor | Multi-core processor |
-| **Disk Footprint** | ~5 MB (download) / ~7.0 MB (stripped binary) | 50 MB (including logs) |
-| **Operating System** | Linux (glibc 2.17+ or musl), macOS 11+ (Apple Silicon & Intel), Windows 10/11 | Any modern OS |
-| **Terminal** | ANSI / 256-color terminal | Truecolor (24-bit) terminal |
+| Metric | Result |
+| :--- | :--- |
+| **Binary size** | 8,085,096 bytes (8.09 MB) |
+| **Download** (`.tar.gz`) | 7.23 MB |
+| **Startup**, `cx --version` | median 1.4 ms (min 1.3, max 1.7; 50 runs) |
+| **First frame** of the interactive TUI | median 3.2 ms (min 3.0, max 3.4; 10 runs) |
+| **Resident memory**, TUI idle | 11.7 MB, of which 1.9 MB anonymous (heap and stacks); peak 11.7 MB |
+| **CPU**, TUI idle | 0.10% over 10 s |
+| **Linking** | Dynamic: `libc`, `libm` and `libgcc_s`. The official x86_64 build needs glibc 2.43 or newer |
 
-### Comparative Benchmarks
+### Binaries by platform (v0.8.1)
 
-| Metric | Corex (Native Rust) | Node.js / TS CLIs | Electron CLIs |
-| :--- | :--- | :--- | :--- |
-| **Download Size** | **~4.5 – 5.2 MB** | ~80 – 150 MB | ~180 – 350 MB |
-| **Binary Size** | **~7.0 MB** (static stripped) | Multi-file tree + Node | Chromium + Node bundle |
-| **Memory (Idle)** | **~11.9 MB RSS** (~2.2 MB Heap) | ~120 – 220 MB | ~350 – 600 MB |
-| **Memory (Active Streaming)** | **~14 – 18 MB RSS** | ~180 – 350 MB | ~500 – 850 MB |
-| **Cold Startup Latency** | **< 10 ms** | ~600 – 1,400 ms | ~2,000 – 4,000 ms |
-| **Idle CPU Utilization** | **< 0.1%** | ~1 – 3% | ~3 – 8% |
-| **External Dependencies** | **None** | Node.js >= 18, npm | Node, Chromium |
+| Platform | Download | Binary | Notes |
+| :--- | ---: | ---: | :--- |
+| Linux x86_64 | 7.23 MB | 8.09 MB | glibc 2.43 or newer |
+| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.39 or newer |
+| macOS Apple Silicon | 6.39 MB | 6.31 MB | |
+| macOS Intel | 6.88 MB | 7.02 MB | |
+| Windows x86_64 | 6.77 MB | 6.91 MB | |
+| Android Termux (aarch64) | 6.80 MB | 7.33 MB | |
 
-*Benchmark Methodology & Reproduction:*
-Corex metrics are benchmarked on Linux x86_64 (Linux 6.x kernel, modern x86_64/ARM64) and can be independently reproduced using [`scripts/benchmark.sh`](scripts/benchmark.sh). Comparative Node.js and Electron ranges reflect typical idle and streaming memory/latency profiles of popular terminal assistants running on Node.js v20+ and Chromium/Electron bundles under identical terminal emulator conditions.
+Sizes are in MB of 1,000,000 bytes.
+
+*Methodology:* Measured on 2026-10-24 on an AMD Ryzen 5 7430U, Linux 7.2.11 (Arch), with the official v0.8.1 x86_64 release binary. The TUI ran on a pseudo-terminal with an empty `HOME` and no API key, and sat idle with no input. Reproduce the Linux figures with [`scripts/benchmark.sh`](scripts/benchmark.sh) (`./scripts/benchmark.sh path/to/cx` measures any binary). The run-time measurements were taken on Linux x86_64 only.
+
+*Not measured:* memory while streaming a model response, the footprint of other tools, and run-time behaviour on macOS, Windows, ARM64 and Android.
 
 ---
 
@@ -93,17 +97,17 @@ Corex supports three unified execution paradigms:
 ```
 
 ### 1. Frontier Cloud Matrix
-- **Providers:** DeepSeek (`deepseek-flash`, `deepseek-v4-pro`), Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-2.5-pro`), Anthropic (`claude-3-7-sonnet`, `claude-3-5-sonnet`), OpenAI (`o1`, `o3-mini`, `gpt-4o`), Groq (Llama 3.3 70B @ 500+ tok/s), OpenRouter, Mistral AI, and GitHub Models.
+- **Providers:** DeepSeek (`deepseek-flash`, `deepseek-pro`), Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-3.8-flash`), Anthropic (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`), OpenAI (`o1`, `o3-mini`, `gpt-4o`, `gpt-4o-mini`), Groq (Llama 3.3 70B, Llama 3.1 8B, DeepSeek R1 70B), OpenRouter, Mistral AI (`codestral-latest`, `mistral-large-latest`), and GitHub Models.
 - **Behavior:** High-throughput streaming with Google thought signatures, adaptive reasoning effort, and transparent multi-turn tool calling.
 - **Best For:** Heavy architectural refactoring, full-stack implementations, and complex reasoning tasks.
 
 ### 2. Offline Sovereign Local LLM (Air-Gapped & Private)
 - **Engines:** Any GGUF model served via `llama-server` (llama.cpp) or `Ollama` on `http://127.0.0.1:8080/v1`.
-- **Behavior:** 100% offline, air-gapped execution. Zero network calls, zero telemetry, null-routed egress, and $0.00 API cost.
+- **Behavior:** Inference runs entirely on your machine: prompts, code and responses are never sent to a provider, and API cost is $0.00. At startup Corex makes a background request to find out whether a newer release exists (`corex.sluisr.com`, then GitHub), plain `GET` requests with a `corex/<version>` user agent and no conversation data (the GitHub API request adds your `GITHUB_TOKEN` or `GH_TOKEN` when one is set, to avoid rate limits). There is currently no setting to turn it off, so a fully air-gapped machine will see that request fail silently.
 - **Best For:** Proprietary codebases, classified perimeters, air-gapped environments, and offline development.
 
 ### 3. Fleet & SysAdmin Remote Infrastructure (`cxs`)
-- **Engine:** Built-in SSH client and multi-node orchestrator (`cxs` or `cx --fleet`).
+- **Engine:** Multi-node orchestrator (`cxs` or `cx --fleet`) that drives the system OpenSSH `ssh` client, which must be installed.
 - **Behavior:** Dual-pane split-screen TUI with AI assistance on the left and a live remote server terminal + real-time CPU/RAM/Disk metrics on the right. Supports bastion/jump hosts, key-based auth, and automated diagnostic commands.
 - **Best For:** Server monitoring, incident response, cluster maintenance, and automated deployments.
 
