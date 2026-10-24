@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 
 fn default_flash_temperature() -> f32 { 1.0 }
 fn default_flash_reasoning() -> String { "dynamic".to_string() }
-fn default_command_reasoning() -> String { "low".to_string() }
-fn default_code_reasoning() -> String { "high".to_string() }
-fn default_search_reasoning() -> String { "low".to_string() }
+
+/// Depth used by the `dynamic` reasoning mode on turns that only answer a tool result (~200ms).
+pub const DYNAMIC_TOOL_TURN_EFFORT: &str = "low";
+/// Depth used by the `dynamic` reasoning mode on every other turn.
+pub const DYNAMIC_DEFAULT_EFFORT: &str = "high";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlashSettings {
@@ -16,12 +18,6 @@ pub struct FlashSettings {
     pub temperature: f32,
     #[serde(rename = "reasoningEffort", default = "default_flash_reasoning")]
     pub reasoning_effort: String,
-    #[serde(rename = "commandReasoningEffort", default = "default_command_reasoning")]
-    pub command_reasoning_effort: String,
-    #[serde(rename = "codeReasoningEffort", default = "default_code_reasoning")]
-    pub code_reasoning_effort: String,
-    #[serde(rename = "searchReasoningEffort", default = "default_search_reasoning")]
-    pub search_reasoning_effort: String,
 }
 
 impl Default for FlashSettings {
@@ -29,9 +25,6 @@ impl Default for FlashSettings {
         Self {
             temperature: default_flash_temperature(),
             reasoning_effort: default_flash_reasoning(),
-            command_reasoning_effort: default_command_reasoning(),
-            code_reasoning_effort: default_code_reasoning(),
-            search_reasoning_effort: default_search_reasoning(),
         }
     }
 }
@@ -40,8 +33,6 @@ impl Default for FlashSettings {
 pub struct ProSettings {
     #[serde(rename = "reasoningEffort", default = "default_pro_reasoning")]
     pub reasoning_effort: String,
-    #[serde(rename = "searchReasoningEffort", default = "default_search_reasoning")]
-    pub search_reasoning_effort: String,
 }
 
 fn default_pro_reasoning() -> String { "high".to_string() }
@@ -50,7 +41,6 @@ impl Default for ProSettings {
     fn default() -> Self {
         Self {
             reasoning_effort: default_pro_reasoning(),
-            search_reasoning_effort: default_search_reasoning(),
         }
     }
 }
@@ -179,7 +169,14 @@ fn host_is_or_sub(host: &str, domain: &str) -> bool {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") || host.starts_with("127.")
+    if matches!(host, "localhost" | "::1" | "[::1]") {
+        return true;
+    }
+    let clean = host.trim_start_matches('[').trim_end_matches(']');
+    clean
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 /// A remote `base_url` receives the API key in every request, so it must use TLS.
@@ -297,7 +294,6 @@ impl Config {
                         && validate_base_url(&p.base_url).is_ok()
                 });
         }
-        // Fallback 1: Match by model ID
         if let Some(p) = all.iter().find(|p| {
             !p.is_deepseek()
                 && !p.is_local()
@@ -306,7 +302,23 @@ impl Config {
         }) {
             return Some(p.clone());
         }
-        // Fallback 2: Match by base_url
+        // Match by model prefix so snapshots absent from the built-in catalog still route to their vendor.
+        let model_lower = self.model.to_ascii_lowercase();
+        let family_provider = if model_lower.starts_with("claude-") {
+            Some(crate::providers::ANTHROPIC_ID)
+        } else if model_lower.starts_with("gemini-") {
+            Some(crate::providers::GOOGLE_ID)
+        } else {
+            None
+        };
+        if let Some(name) = family_provider {
+            if let Some(p) = all
+                .iter()
+                .find(|p| p.name == name && validate_base_url(&p.base_url).is_ok())
+            {
+                return Some(p.clone());
+            }
+        }
         let host = url_host(&self.base_url).unwrap_or_default();
         if !is_deepseek_base_url(&self.base_url) && !is_loopback_host(&host) {
             if let Some(p) = all.iter().find(|p| {
@@ -434,12 +446,19 @@ impl Config {
             if dir.exists() {
                 // Workspace copies must never carry credentials: they live inside a repository
                 // that may be committed or shared.
-                let sanitized = Self::strip_secrets(content);
-                if let Err(e) = crate::secure_fs::write_private_atomic(&dir.join(filename), sanitized) {
-                    tracing::warn!("Failed to save workspace settings {}: {}", dir.join(filename).display(), e);
-                    if is_temp {
-                        return Err(e.into());
+                match Self::strip_secrets(content) {
+                    Some(sanitized) => {
+                        if let Err(e) = crate::secure_fs::write_private_atomic(&dir.join(filename), sanitized) {
+                            tracing::warn!("Failed to save workspace settings {}: {}", dir.join(filename).display(), e);
+                            if is_temp {
+                                return Err(e.into());
+                            }
+                        }
                     }
+                    None => tracing::warn!(
+                        "Not writing workspace settings {}: content could not be sanitized",
+                        dir.join(filename).display()
+                    ),
                 }
             }
         }
@@ -454,18 +473,15 @@ impl Config {
     }
 
     /// Removes credentials and secret-bearing maps from a serialized workspace settings document.
-    fn strip_secrets(content: &str) -> String {
-        match serde_json::from_str::<serde_json::Value>(content) {
-            Ok(mut v) => {
-                if let Some(obj) = v.as_object_mut() {
-                    obj.remove("api_key");
-                    obj.remove("provider_api_keys");
-                    obj.remove("mcp_servers");
-                }
-                serde_json::to_string_pretty(&v).unwrap_or_else(|_| content.to_string())
-            }
-            Err(_) => content.to_string(),
+    /// Fails closed: content that cannot be parsed is never returned as-is.
+    fn strip_secrets(content: &str) -> Option<String> {
+        let mut v = serde_json::from_str::<serde_json::Value>(content).ok()?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("api_key");
+            obj.remove("provider_api_keys");
+            obj.remove("mcp_servers");
         }
+        serde_json::to_string_pretty(&v).ok()
     }
 
     pub fn load_flash_settings() -> FlashSettings {
@@ -525,22 +541,28 @@ impl Config {
         let _ = crate::engine_signature();
         let mut config = Config::default();
 
-        // 1. Global config (~/.corex/settings.json, fallback ~/.deepseek/settings.json)
         if let Some(path) = Self::resolve_settings_path(None, "settings.json") {
             if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(parsed) = serde_json::from_str::<Config>(&content) {
-                    config = parsed;
+                match serde_json::from_str::<Config>(&content) {
+                    Ok(parsed) => config = parsed,
+                    Err(e) => {
+                        let backup = path.with_extension("json.invalid");
+                        let _ = crate::secure_fs::write_private(&backup, &content);
+                        tracing::warn!("Ignoring invalid {}: {}", path.display(), e);
+                        eprintln!(
+                            "[corex] warning: {} is not valid ({}); using defaults. A copy was saved to {}",
+                            path.display(),
+                            e,
+                            backup.display()
+                        );
+                    }
                 }
             }
         }
 
-        // 2. Local project config (.corex/settings.json) override (safe merge).
-        //
-        // SECURITY: the workspace is untrusted input (a cloned repository). Its config may only
-        // tune cosmetic/performance knobs. It can NEVER relax security or touch credentials and
-        // endpoints: `yolo_mode`, `local_llm_enabled`, `api_key`, `base_url`, `allowed_commands`
-        // and `mcp_servers` are ignored here. Fields are `Option` so that a key absent from the
-        // file does not silently reset the user's global value to a serde default.
+        // Workspace overrides (`.corex/settings.json`) are restricted to non-privileged fields.
+        // Credentials, endpoints, `yolo_mode`, `local_llm_enabled`, `allowed_commands`, and
+        // `mcp_servers` are ignored from workspace files.
         if let Some(ws) = workspace {
             let local_path = ws.join(".corex").join("settings.json");
             if local_path.exists() {
@@ -549,7 +571,10 @@ impl Config {
                     .and_then(|c| serde_json::from_str::<LocalOverrides>(&c).map_err(|e| e.to_string()))
                 {
                     Ok(o) => {
-                        if let Some(m) = o.model.filter(|m| !m.trim().is_empty()) {
+                        if let Some(m) = o.model.filter(|m| {
+                            let t = m.trim();
+                            !t.is_empty() && !t.to_ascii_lowercase().starts_with("local")
+                        }) {
                             config.model = m;
                         }
                         if let Some(t) = o.temperature {
@@ -660,26 +685,35 @@ impl Config {
         config
     }
 
+    /// The key literally stored in the global `settings.json` (never the environment).
     fn load_existing_api_key(workspace: Option<&Path>) -> Option<String> {
         // Credentials are only ever read from the user's global config, never from a workspace.
         let _ = workspace;
-        if let Some(path) = Self::resolve_settings_path(None, "settings.json") {
-            if let Ok(c) = fs::read_to_string(&path) {
-                if let Ok(parsed) = serde_json::from_str::<Config>(&c) {
-                    if !parsed.api_key.trim().is_empty() {
-                        return Some(parsed.api_key);
-                    }
-                }
-            }
-        }
-        if let Ok(k) = std::env::var("COREX_API_KEY")
-            .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-        {
-            if !k.trim().is_empty() {
-                return Some(k);
-            }
-        }
-        None
+        let path = Self::resolve_settings_path(None, "settings.json")?;
+        let content = fs::read_to_string(path).ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+        parsed
+            .get("api_key")
+            .and_then(|k| k.as_str())
+            .filter(|k| !k.trim().is_empty())
+            .map(str::to_string)
+    }
+
+    /// True when `key` is the value of a provider API-key environment variable. Such keys are
+    /// injected at load time (env > file) and must never be written into `settings.json`.
+    fn is_env_supplied_key(key: &str) -> bool {
+        const KEY_VARS: &[&str] = &[
+            "COREX_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ];
+        !key.trim().is_empty()
+            && KEY_VARS
+                .iter()
+                .any(|v| std::env::var(v).is_ok_and(|val| val == key))
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -688,10 +722,9 @@ impl Config {
 
     pub fn save_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
         let mut to_save = self.clone();
-        if to_save.api_key.trim().is_empty() {
-            if let Some(existing) = Self::load_existing_api_key(workspace) {
-                to_save.api_key = existing;
-            }
+        if to_save.api_key.trim().is_empty() || Self::is_env_supplied_key(&to_save.api_key) {
+            // Keep whatever key the file already had; an environment key stays in the environment.
+            to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
         }
 
         let content = serde_json::to_string_pretty(&to_save)?;
@@ -724,6 +757,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_secrets_removes_credentials_and_fails_closed() {
+        let cleaned = Config::strip_secrets(
+            r#"{"api_key":"sk-1","provider_api_keys":{"openai":"sk-2"},"mcp_servers":{},"model":"m"}"#,
+        )
+        .expect("valid JSON is sanitized");
+        assert!(!cleaned.contains("sk-1") && !cleaned.contains("sk-2"));
+        assert!(cleaned.contains("\"model\""));
+        assert_eq!(Config::strip_secrets(r#"{"api_key":"sk-1", broken"#), None);
+    }
 
 
     #[test]

@@ -183,7 +183,6 @@ impl Session {
             bail!("Session identifier cannot be empty.");
         }
 
-        // 1. Direct file check with id.json
         if Self::is_safe_session_id(target) {
             if let Some(direct_file) = Self::find_session_file(target) {
                 let content = fs::read_to_string(&direct_file)?;
@@ -192,14 +191,13 @@ impl Session {
             }
         }
 
-        let mut all_summaries = Self::list_from_dir(&Self::sessions_dir(), None);
-        for s in Self::list_from_dir(&Self::fleet_sessions_dir(), None) {
+        let mut all_summaries = Self::list_normal(None);
+        for s in Self::list_fleet(None) {
             if !all_summaries.iter().any(|item| item.id == s.id) {
                 all_summaries.push(s);
             }
         }
 
-        // 2. Exact 1-based index
         if let Ok(idx) = target.parse::<usize>() {
             if idx > 0 && idx <= all_summaries.len() {
                 let target_id = &all_summaries[idx - 1].id;
@@ -213,7 +211,6 @@ impl Session {
             }
         }
 
-        // 3. Search matching tag or prefix
         let mut matches = Vec::new();
         for summary in &all_summaries {
             let is_exact_tag = summary
@@ -234,7 +231,6 @@ impl Session {
             );
         }
 
-        // If there is an exact tag match, prioritize it if it's unique
         let exact_tag_matches: Vec<_> = matches.iter().filter(|(_, exact)| *exact).collect();
         if exact_tag_matches.len() == 1 {
             let id = &exact_tag_matches[0].0.id;
@@ -247,7 +243,6 @@ impl Session {
             }
         }
 
-        // Single unique match (either tag or prefix)
         if matches.len() == 1 {
             let id = &matches[0].0.id;
             if Self::is_safe_session_id(id) {
@@ -259,7 +254,6 @@ impl Session {
             }
         }
 
-        // If multiple sessions matched, fail safely instead of guessing or deleting wrong session
         let samples: Vec<String> = matches
             .iter()
             .take(3)

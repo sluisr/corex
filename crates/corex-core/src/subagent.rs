@@ -1,8 +1,4 @@
-//! Autonomous multi-agent coordination and parallel delegation engine.
-//!
-//! Provides isolated actor execution for specialized subagents (Scout, Tester,
-//! Researcher, Worker) with dedicated context boundaries, non-blocking background
-//! scheduling, and reactive completion notifications back to the lead agent.
+//! Subagent task registry and lifecycle tracking.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -12,13 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentRole {
-    /// Read-only repo exploration & symbol finding at zero cost before cloud editing.
     Scout,
-    /// Automated test runner, compiler checker, and linter verifier in background sandbox.
     Tester,
-    /// Documentation researcher, specification reader, and external reference extractor.
     Researcher,
-    /// General-purpose autonomous parallel subtask execution.
     Worker,
 }
 

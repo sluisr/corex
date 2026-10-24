@@ -581,12 +581,12 @@ description: >-
     #[test]
     fn test_build_fleet_prompt_with_active_target() {
         let builder = PromptBuilder::new("/tmp/test-workspace");
-        let active = Some(("triade-ipv4", "ubuntu", "51.195.20.53"));
-        let nodes = [("triade", "ubuntu", "2001:41d0:701:1100::c58b"), ("triade-ipv4", "ubuntu", "51.195.20.53")];
+        let active = Some(("node-ipv4", "ubuntu", "203.0.113.10"));
+        let nodes = [("node-ipv6", "ubuntu", "2001:db8::10"), ("node-ipv4", "ubuntu", "203.0.113.10")];
         let prompt = builder.build_fleet(active, &nodes);
 
-        assert!(prompt.contains("Active Target Server: **triade-ipv4** (ubuntu@51.195.20.53) [CONNECTED & ONLINE]"));
-        assert!(prompt.contains("ACTIVE & CONNECTED REMOTE SERVER: `triade-ipv4` (ubuntu@51.195.20.53)"));
+        assert!(prompt.contains("Active Target Server: **node-ipv4** (ubuntu@203.0.113.10) [CONNECTED & ONLINE]"));
+        assert!(prompt.contains("ACTIVE & CONNECTED REMOTE SERVER: `node-ipv4` (ubuntu@203.0.113.10)"));
         assert!(prompt.contains("COMPLETELY SUPERSEDED"));
         assert!(prompt.contains("fleet_run_command"));
         assert!(!prompt.contains("NO SERVER CURRENTLY CONNECTED"));
@@ -595,7 +595,7 @@ description: >-
     #[test]
     fn test_build_fleet_prompt_no_target() {
         let builder = PromptBuilder::new("/tmp/test-workspace");
-        let nodes = [("triade", "ubuntu", "2001:41d0:701:1100::c58b")];
+        let nodes = [("node-ipv6", "ubuntu", "2001:db8::10")];
         let prompt = builder.build_fleet(None, &nodes);
 
         assert!(prompt.contains("NO SERVER CURRENTLY CONNECTED"));

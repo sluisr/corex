@@ -243,7 +243,6 @@ impl RemoteSession {
 
         let first_word = input.split_whitespace().next().unwrap_or("");
 
-        // 1. Check known subcommands when typing the first argument of common tools
         if input.split_whitespace().count() <= 1 && !cmd_prefix.is_empty() {
             let subcmds: &[&str] = match first_word {
                 "docker" => &[
@@ -278,7 +277,6 @@ impl RemoteSession {
             }
         }
 
-        // 2. Build the remote compgen query
         let script = self.build_completion_script(cmd_prefix, token);
 
         if let Ok(out) = SshExecutor::execute(&self.node, &script, false, 3).await {
@@ -310,8 +308,7 @@ impl RemoteSession {
             };
         }
 
-        // Special case: if completing command name (first word) and token is an exact match
-        // for an existing command/alias (e.g. "ls", "cd", "cat", "git"), complete by adding a space!
+        // Append trailing space when the first token matches an existing command name.
         if cmd_prefix.is_empty() && candidates.iter().any(|c| c == token) {
             return CompletionResult {
                 new_input: format!("{} ", token),
@@ -632,10 +629,10 @@ mod tests {
         assert_eq!(longest_common_prefix(&["ubuntu/".to_string()]), "ubuntu/");
         assert_eq!(
             longest_common_prefix(&[
-                "triade-admin-web/".to_string(),
-                "triade-web/".to_string(),
+                "service-admin-web/".to_string(),
+                "service-web/".to_string(),
             ]),
-            "triade-"
+            "service-"
         );
         assert_eq!(
             longest_common_prefix(&["alpha".to_string(), "beta".to_string()]),

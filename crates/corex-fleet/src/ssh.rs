@@ -47,11 +47,50 @@ const SAFE_PIPE_FILTERS: &[&str] = &[
     "head", "tail", "grep", "egrep", "fgrep", "wc", "sort", "uniq", "cut", "tr", "awk",
 ];
 
+/// Commands that merely run another command. If one leads a segment, the safe-list match on its
+/// name must not apply — the wrapped command is what actually executes (`env rm -rf /var/lib`).
+const COMMAND_WRAPPERS: &[&str] = &[
+    "env", "sudo", "doas", "pkexec", "nice", "nohup", "setsid", "timeout", "stdbuf", "watch",
+    "xargs", "nsenter", "chroot", "unshare", "time", "ionice", "taskset", "exec",
+];
+
+/// True if `needle` appears in `haystack` bounded by non-alphanumeric characters on both sides,
+/// so `dd` matches `dd if=…` but not `ip a**dd**r`. An empty needle never matches.
+fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let needle_starts_word = needle.chars().next().is_some_and(&is_word);
+    let needle_ends_word = needle.chars().next_back().is_some_and(&is_word);
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let left_ok = !needle_starts_word
+            || start == 0
+            || !(bytes[start - 1] as char).is_ascii_alphanumeric() && bytes[start - 1] != b'_';
+        let right_ok = !needle_ends_word
+            || end == haystack.len()
+            || !(bytes[end] as char).is_ascii_alphanumeric() && bytes[end] != b'_';
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 fn has_dangerous_flags_on_safe_cmd(seg: &str, tokens: &[&str]) -> bool {
     let Some(&first) = tokens.first() else {
         return false;
     };
     let args = &tokens[1..];
+    // A wrapper around a safe-listed name still runs an arbitrary payload: never treat it as safe.
+    if COMMAND_WRAPPERS.contains(&first) {
+        return true;
+    }
     match first {
         "find" => args.iter().any(|t| {
             matches!(
@@ -72,15 +111,29 @@ fn has_dangerous_flags_on_safe_cmd(seg: &str, tokens: &[&str]) -> bool {
                 || *t == "--ext-diff"
                 || *t == "--upload-pack"
                 || t.starts_with("--upload-pack=")
-                || *t == "-c"
+                || t.starts_with("-c")
+                || t.starts_with("-C")
         }),
+        "uniq" => args.iter().filter(|t| !t.starts_with('-')).count() > 1,
         "sort" => args.iter().any(|t| {
-            *t == "-o"
-                || t.starts_with("-o")
-                || *t == "--output"
-                || t.starts_with("--output=")
+            (t.starts_with('-') && !t.starts_with("--") && t[1..].chars().take_while(|c| *c != '=').any(|c| c == 'o'))
+                || t.split('=').next().map(|n| "--output".starts_with(n) && n.len() > 3).unwrap_or(false)
+                || t.split('=').next().map(|n| "--compress-program".starts_with(n) && n.len() > 3).unwrap_or(false)
         }),
-        "awk" => seg.contains("system(") || seg.contains("getline"),
+        "awk" => {
+            let no_spaces: String = seg.chars().filter(|c| !c.is_whitespace()).collect();
+            no_spaces.contains("system(")
+                || seg.contains("getline")
+                || args.iter().any(|t| *t == "-f" || t.starts_with("--file"))
+        }
+        // `ip`/`nmcli` mutate the network (can cut off the SSH session itself).
+        "ip" | "nmcli" => args.iter().any(|t| {
+            matches!(*t, "set" | "add" | "del" | "delete" | "change" | "replace" | "flush" | "up" | "down")
+        }),
+        // Host identity / clock / firewall mutations.
+        "hostname" => args.iter().any(|t| !t.starts_with('-')) || args.iter().any(|t| *t == "-b" || *t == "-F" || t.starts_with("--file")),
+        "date" => args.iter().any(|t| *t == "-s" || t.starts_with("--set")),
+        "iptables" | "ip6tables" | "nft" | "ufw" => true,
         "systemctl" => args.iter().any(|t| {
             matches!(
                 *t,
@@ -100,7 +153,23 @@ fn has_dangerous_flags_on_safe_cmd(seg: &str, tokens: &[&str]) -> bool {
                     | "poweroff"
                     | "reboot"
                     | "halt"
+                    | "isolate"
+                    | "default"
+                    | "rescue"
+                    | "emergency"
+                    | "set-default"
+                    | "set-environment"
+                    | "unset-environment"
+                    | "set-property"
+                    | "switch-root"
+                    | "kexec"
+                    | "suspend"
+                    | "hibernate"
             )
+        }),
+        "journalctl" => args.iter().any(|t| {
+            let name = t.split('=').next().unwrap_or(t);
+            name.starts_with("--vacuum") || matches!(name, "--rotate" | "--flush" | "--relinquish-var" | "--sync")
         }),
         "hostnamectl" => args.iter().any(|t| *t == "set-hostname" || t.starts_with("set-")),
         "timedatectl" => args.iter().any(|t| t.starts_with("set-")),
@@ -116,9 +185,10 @@ pub fn assess_command_risk(cmd: &str, safe_list: &[String], dangerous_list: &[St
     }
     let lower = trimmed.to_ascii_lowercase();
 
-    // 1. Check dangerous patterns first
+    // 1. Check dangerous patterns first, matched at word boundaries so a short entry like `dd`
+    //    does not fire on an unrelated substring (`ip addr`, `mkdir`).
     for d in dangerous_list {
-        if lower.contains(&d.to_ascii_lowercase()) {
+        if contains_at_word_boundary(&lower, &d.to_ascii_lowercase()) {
             return CommandRiskLevel::Dangerous;
         }
     }
@@ -145,12 +215,13 @@ pub fn assess_command_risk(cmd: &str, safe_list: &[String], dangerous_list: &[St
         return CommandRiskLevel::Dangerous;
     }
 
-    // Reject multiline commands, command substitutions, or process substitutions from being Safe
+    // Reject multiline commands, backslashes, or any variable/command/process substitution (`$VAR`,
+    // `$(...)`, backticks, `${...}`, `<(...)`, `>(...)`) from being Safe.
     if cmd.contains('\n')
         || cmd.contains('\r')
-        || cmd.contains("$(")
+        || cmd.contains('\\')
+        || cmd.contains('$')
         || cmd.contains('`')
-        || cmd.contains("${")
         || cmd.contains("<(")
         || cmd.contains(">(")
     {
@@ -196,7 +267,11 @@ pub fn assess_command_risk(cmd: &str, safe_list: &[String], dangerous_list: &[St
                 return CommandRiskLevel::Mutating;
             }
 
-            let tokens: Vec<&str> = seg.split_whitespace().collect();
+            let clean_tokens: Vec<String> = seg
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_string())
+                .collect();
+            let tokens: Vec<&str> = clean_tokens.iter().map(|s| s.as_str()).collect();
             let first_word = tokens.first().copied().unwrap_or("");
             if first_word.is_empty() {
                 return CommandRiskLevel::Mutating;
@@ -257,11 +332,17 @@ impl SshExecutor {
         let socket_dir = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".corex").join("ssh"))
             .unwrap_or_else(|| std::env::temp_dir().join(format!("corex-ssh-{}", std::process::id())));
-        let _ = corex_core::ensure_private_dir(&socket_dir);
-        let socket_path = socket_dir.join("cx-%r@%h:%p");
-        cmd.arg("-o").arg("ControlMaster=auto");
-        cmd.arg("-o").arg(format!("ControlPath={}", socket_path.display()));
-        cmd.arg("-o").arg("ControlPersist=10m");
+        if corex_core::ensure_private_dir(&socket_dir).is_ok() {
+            let socket_path = socket_dir.join("cx-%r@%h:%p");
+            cmd.arg("-o").arg("ControlMaster=auto");
+            cmd.arg("-o").arg(format!("ControlPath={}", socket_path.display()));
+            cmd.arg("-o").arg("ControlPersist=10m");
+        } else {
+            // A control socket in a directory another user controls could be hijacked to ride
+            // our authenticated connection: skip multiplexing instead.
+            cmd.arg("-o").arg("ControlMaster=no");
+            cmd.arg("-o").arg("ControlPath=none");
+        }
 
         // Port
         if node.port != 22 {
@@ -436,6 +517,49 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use crate::config::{AuthMethod, NodeConfig};
+
+    #[test]
+    fn test_default_safe_list_rejects_mutating_bypasses() {
+        let c = crate::config::FleetConfig::default();
+        let risk = |cmd: &str| assess_command_risk(cmd, &c.safe_commands, &c.dangerous_commands);
+        let safe = |cmd: &str| risk(cmd) == CommandRiskLevel::Safe;
+
+        // Wrapper and mutating forms that used to pass by matching the first word.
+        assert!(!safe("env rm -rf /var/lib/mysql"));
+        assert!(!safe("sudo systemctl restart nginx"));
+        assert!(!safe("ip link set eth0 down"));
+        assert!(!safe("ip route del default"));
+        assert!(!safe("systemctl isolate rescue.target"));
+        assert!(!safe("systemctl set-default rescue.target"));
+        assert!(!safe("journalctl --vacuum-time=1s"));
+        assert!(!safe("hostname pwned"));
+        assert!(!safe("date -s 2000-01-01"));
+        assert!(!safe("sort -ro /etc/passwd /tmp/x"));
+        assert!(!safe("iptables -A INPUT -j DROP"));
+        assert!(!safe("echo $HOME"));
+
+        // Read-only operations stay Safe (no confirmation needed).
+        assert!(safe("uptime"));
+        assert!(safe("systemctl status nginx"));
+        assert!(safe("ip addr show"));
+        assert!(safe("ip route"));
+        assert!(safe("journalctl -u nginx -n 100"));
+        assert!(safe("date"));
+        assert!(safe("hostname"));
+        assert!(safe("free -m && uptime"));
+
+        // `dd` must stay Dangerous but must not fire on an unrelated substring (`ip addr`).
+        assert_eq!(risk("dd if=/dev/zero of=/dev/sda"), CommandRiskLevel::Dangerous);
+        assert_ne!(risk("ip addr show"), CommandRiskLevel::Dangerous);
+    }
+
+    #[test]
+    fn test_contains_at_word_boundary() {
+        assert!(contains_at_word_boundary("dd if=/dev/zero", "dd"));
+        assert!(!contains_at_word_boundary("ip addr show", "dd"));
+        assert!(!contains_at_word_boundary("mkdir -p x", "dd"));
+        assert!(contains_at_word_boundary("sudo rm -rf /", "rm -rf"));
+    }
 
     #[test]
     fn test_risk_classification() {

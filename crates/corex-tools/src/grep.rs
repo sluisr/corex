@@ -17,6 +17,14 @@ impl Tool for GrepTool {
         "grep_search"
     }
 
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        crate::fs_tools::read_path_needs_confirmation(
+            self.name(),
+            args.get("dir_path").and_then(|v| v.as_str()),
+            context,
+        )
+    }
+
     fn description(&self) -> &'static str {
         "Searches for a regular expression pattern within file contents. [PREFERRED for searching text in files — use this instead of run_shell_command with grep]"
     }

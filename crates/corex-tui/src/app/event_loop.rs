@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     self, EnableBracketedPaste, EnableFocusChange, Event, KeyCode,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
@@ -20,9 +20,10 @@ use corex_tools::types::ToolContext;
 use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
 use super::formatting::*;
-use super::mobile::{is_mobile_portrait, try_show_termux_soft_keyboard};
+use super::mobile::{is_mobile_touch_environment, try_show_termux_soft_keyboard};
 use super::render::render_ui;
 use super::state::{App, PendingToolBatch};
+use super::summary::print_session_summary;
 use super::terminal::{restore_terminal, TerminalGuard, MOUSE_REPORTING_OFF, MOUSE_REPORTING_ON};
 use crate::user_dialog::parse_questions;
 
@@ -35,10 +36,10 @@ pub fn format_call_preview(call: &ToolCall, registry: &corex_tools::ToolRegistry
             return cmd.to_string();
         }
     } else if call.function.name == "delegate_subagent" {
+        // The whole instruction is what gets approved, so the dialog shows all of it.
         let role = args_json.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
-        let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
-        let first_line = prompt.lines().next().unwrap_or(prompt).trim();
-        return format!("Subagent [{}] {}", role.to_uppercase(), first_line);
+        let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("").trim();
+        return format!("Subagent [{}]\n{}", role.to_uppercase(), prompt);
     } else if let Some(t) = tool {
         if let Some(diff) = t.format_diff(&args_json, workspace_dir) {
             return diff;
@@ -75,6 +76,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         restore_terminal();
+        // Release builds use `panic = "abort"`, so no Drop runs after this hook.
+        corex_tools::background::shutdown_all_tasks();
         default_hook(panic_info);
     }));
 
@@ -87,76 +90,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     let resumed_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Closing the terminal window (SIGHUP), `kill` (SIGTERM), or quit (SIGQUIT) skips Drop; restore explicitly.
+    // Closing the terminal window (SIGHUP), `kill` (SIGTERM), quit (SIGQUIT), or suspend (SIGTSTP/SIGCONT)
+    // are cleanly managed by signal handlers to ensure terminal modes never leak to shell.
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        tokio::spawn(async {
-            let (Ok(mut hup), Ok(mut term), Ok(mut quit)) = (
-                signal(SignalKind::hangup()),
-                signal(SignalKind::terminate()),
-                signal(SignalKind::quit()),
-            ) else {
-                return;
-            };
-            tokio::select! {
-                _ = hup.recv() => {}
-                _ = term.recv() => {}
-                _ = quit.recv() => {}
-            }
-            restore_terminal();
-            std::process::exit(130);
-        });
-
-        // Suspend signals (SIGTSTP, SIGTTIN, SIGTTOU):
-        // Clean up terminal modes so mouse escape codes don't leak into the shell,
-        // then pause via SIGSTOP. On resume (SIGCONT), restore TUI terminal state.
-        let resumed_clone = resumed_flag.clone();
-        tokio::spawn(async move {
-            let (Ok(mut tstp), Ok(mut ttin), Ok(mut ttou)) = (
-                signal(SignalKind::from_raw(libc::SIGTSTP)),
-                signal(SignalKind::from_raw(libc::SIGTTIN)),
-                signal(SignalKind::from_raw(libc::SIGTTOU)),
-            ) else {
-                return;
-            };
-
-            loop {
-                tokio::select! {
-                    _ = tstp.recv() => {}
-                    _ = ttin.recv() => {}
-                    _ = ttou.recv() => {}
-                }
-
-                // 1. Cleanly restore terminal to cooked/clean state before suspending
-                restore_terminal();
-
-                // 2. Suspend process via SIGSTOP so the shell regains control cleanly
-                // SAFETY: `libc::raise(SIGSTOP)` sends the stop signal strictly to the calling
-                // process/thread itself. It has no memory-safety preconditions and cleanly yields
-                // execution to the parent shell process group after terminal attributes have been restored.
-                unsafe {
-                    libc::raise(libc::SIGSTOP);
-                }
-
-                // 3. Execution resumes here when shell sends SIGCONT (e.g. via `fg`)
-                let _ = crossterm::terminal::enable_raw_mode();
-                let mut stdout = std::io::stdout();
-                let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
-                let _ = crossterm::execute!(
-                    stdout,
-                    EnterAlternateScreen,
-                    EnableBracketedPaste,
-                    EnableFocusChange
-                );
-                let _ = stdout.write_all(MOUSE_REPORTING_ON.as_bytes());
-                let _ = stdout.flush();
-
-                resumed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
+    crate::app::terminal::setup_signal_handlers(resumed_flag.clone());
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -317,19 +254,26 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         if !app.is_streaming
+            && app.in_flight_tool_calls == 0
             && app.pending_confirmation.is_none()
             && !app.user_dialog.is_open
             && !app.sudo_dialog.is_open
+            && app.fleet_dialog.pending_approval.is_none()
             && !app.is_checking_balance
         {
-            if !app.message_queue.is_empty() {
+            if app.deliver_steer() {
+                // A "send now" message that waited for a dialog to close.
+                app.start_stream_turn(event_tx.clone());
+                needs_redraw = true;
+            } else if !app.message_queue.is_empty() {
                 if let Some(next_prompt) = app.message_queue.pop_front() {
-                    app.session.add_message(Message::user(next_prompt));
+                    corex_core::reset_repeat_guard();
+                            app.session.add_message(Message::user(next_prompt));
                     app.start_stream_turn(event_tx.clone());
                     needs_redraw = true;
                 }
             } else if has_finished_tasks {
-                // Reactive Wakeup: Background tasks completed while idle -> autonomously synthesize response!
+                // Resume turn when background tasks complete while idle.
                 app.start_stream_turn(event_tx.clone());
                 needs_redraw = true;
             }
@@ -343,8 +287,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         };
         let has_active_tasks = !app.active_background_pids.is_empty() || has_active_subagents;
-        let is_header_animating = app.scroll_offset <= 4 && !app.is_streaming && app.last_interaction.elapsed() < Duration::from_secs(4);
-        let is_animating = app.is_slash_animating() || app.status_transition.is_animating() || is_header_animating;
+        let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
+
+        // The caret blinks off the idle clock; a phase change is the only reason to repaint a still screen.
+        if crate::cursor::tick(app.last_interaction.elapsed()) {
+            needs_redraw = true;
+        }
 
         if app.fleet_dialog.poll_telemetry() {
             needs_redraw = true;
@@ -450,6 +398,18 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     }
                     let tool_name = app.session.messages.iter().rev()
                         .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id).map(|c| c.function.name.clone()));
+                    // Huge output is cut to head + tail; the full text stays readable from a file.
+                    let output = corex_core::spill_large_output(tool_name.as_deref().unwrap_or("tool"), output);
+                    // Advisory nudge when the model keeps repeating the exact same call.
+                    let tool_args = app.session.messages.iter().rev()
+                        .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id).map(|c| c.function.arguments.clone()));
+                    let output = match (tool_name.as_deref(), tool_args) {
+                        (Some(name), Some(args)) => match corex_core::observe_tool_call(name, &args) {
+                            Some(reminder) => format!("{}\n\n{}", output, reminder),
+                            None => output,
+                        },
+                        _ => output,
+                    };
                     let mut tool_msg = Message::tool_response(call_id, output.clone());
                     tool_msg.name = tool_name.clone();
                     app.session.add_message(tool_msg);
@@ -497,6 +457,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }
                         needs_redraw = true;
                     } else if app.in_flight_tool_calls == 0 {
+                        if let Some(image_msg) = corex_core::drain_tool_images_message() {
+                            app.session.add_message(image_msg);
+                        }
+                        // Every tool call has its response: the safe point to hand the model what
+                        // the user sent with "send now".
+                        app.deliver_steer();
                         app.start_stream_turn(event_tx.clone());
                     }
                 }
@@ -508,10 +474,16 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         && !app.user_dialog.is_open
                         && app.fleet_dialog.pending_approval.is_none()
                     {
+                        // Images a tool produced (read_image) follow all tool responses.
+                        if let Some(image_msg) = corex_core::drain_tool_images_message() {
+                            app.session.add_message(image_msg);
+                        }
+                        app.deliver_steer();
                         app.start_stream_turn(event_tx.clone());
                     }
                 }
-                StreamEvent::Completed { .. } => {
+                StreamEvent::Completed { finish_reason } => {
+                    let truncated = corex_core::is_truncated_finish(finish_reason.as_deref());
                     let assistant_text = if app.streaming_text.is_empty() {
                         None
                     } else {
@@ -537,7 +509,44 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         .filter(|c| !c.function.name.trim().is_empty())
                         .collect();
 
-                    if !valid_calls.is_empty() {
+                    if !valid_calls.is_empty() && truncated {
+                        // The output hit the token limit: arguments may be cut mid-file or
+                        // mid-command, and lenient JSON repair would happily "fix" them. Answer
+                        // every call with an error instead of running it, and let the model retry
+                        // once in smaller pieces; a second consecutive truncation stops the loop.
+                        for call in &mut valid_calls {
+                            if call.extra_content.is_none() {
+                                call.extra_content = app.streaming_extra_content.clone();
+                            }
+                        }
+                        let already_retried = app.session.messages.iter().rev()
+                            .find(|m| m.role == "tool")
+                            .and_then(|m| m.text_content())
+                            .is_some_and(|t| t == corex_core::TRUNCATED_TOOL_CALL_ERROR);
+                        let call_ids: Vec<String> = valid_calls.iter().map(|c| c.id.clone()).collect();
+                        app.session.add_message(Message::assistant_with_tools(
+                            assistant_text,
+                            reasoning,
+                            valid_calls,
+                        ));
+                        for id in call_ids {
+                            app.session.add_message(Message::tool_response(
+                                id,
+                                corex_core::TRUNCATED_TOOL_CALL_ERROR.to_string(),
+                            ));
+                        }
+                        app.streaming_text.clear();
+                        app.streaming_extra_content = None;
+                        app.invalidate_message_cache();
+                        let _ = app.session.save();
+                        if already_retried {
+                            app.is_streaming = false;
+                            app.thinking_state.reset();
+                            app.set_status("Response truncated twice by the output token limit; tool calls were not executed.");
+                        } else {
+                            app.start_stream_turn(event_tx.clone());
+                        }
+                    } else if !valid_calls.is_empty() {
                         for call in &mut valid_calls {
                             if call.extra_content.is_none() {
                                 call.extra_content = app.streaming_extra_content.clone();
@@ -584,9 +593,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     previews.push(diff);
                                 } else if call.function.name == "delegate_subagent" {
                                     let role = args_json.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
-                                    let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
-                                    let first_line = prompt.lines().next().unwrap_or(prompt).trim();
-                                    previews.push(format!("Subagent [{}] {}", role.to_uppercase(), first_line));
+                                    let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("").trim();
+                                    previews.push(format!("Subagent [{}]\n{}", role.to_uppercase(), prompt));
                                 } else {
                                     let summary = if let Some(obj) = args_json.as_object() {
                                         obj.iter()
@@ -760,7 +768,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         corex_core::trim_memory();
 
                         // ⚡ Automatically dequeue and run next queued user prompt or synthesize finished task!
-                        if let Some(next_prompt) = app.message_queue.pop_front() {
+                        // A "send now" message goes first: it was meant to be read before the queue.
+                        if app.deliver_steer() {
+                            app.scroll_to_bottom();
+                            app.start_stream_turn(event_tx.clone());
+                        } else if let Some(next_prompt) = app.message_queue.pop_front() {
+                            corex_core::reset_repeat_guard();
                             app.session.add_message(Message::user(next_prompt));
                             app.scroll_to_bottom();
                             app.start_stream_turn(event_tx.clone());
@@ -803,17 +816,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             }
         }
 
-        if app.is_streaming && app.thinking_state.is_streaming {
-            if let Some(start) = app.last_turn_start {
-                app.thinking_state.elapsed_secs = start.elapsed().as_secs_f32();
-            }
-        }
-
-        let is_fast_animating = app.is_streaming || app.is_slash_animating() || app.status_transition.is_animating() || pty_dirty;
-        let tick_rate = if is_fast_animating {
+        // Short transitions (popup slide, status wave) last ~200 ms, so they keep 60 FPS to look
+        // smooth; the long-running streaming only needs 30 FPS (the tool-preview beam is the
+        // fastest thing on screen). The live PTY keeps the tight tick for immediate remote output.
+        let is_transitioning = app.is_slash_animating() || app.status_transition.is_animating();
+        let tick_rate = if pty_dirty || is_transitioning {
             Duration::from_millis(16)
-        } else if is_header_animating {
-            Duration::from_millis(60)
+        } else if app.is_streaming {
+            Duration::from_millis(33)
         } else {
             Duration::from_millis(80)
         };
@@ -823,10 +833,19 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             app.last_interaction = Instant::now();
             match event::read()? {
                 Event::Paste(pasted) => {
-                    if app.sudo_dialog.is_open || app.auth_dialog.is_open {
+                    let looks_sensitive = app.sudo_dialog.is_open
+                        || app.auth_dialog.is_open
+                        || app.user_dialog.is_open
+                        || app.fleet_dialog.is_open
+                        || app.input_buffer.trim_start().starts_with("/key")
+                        || app.input_buffer.trim_start().starts_with("/sudo")
+                        || pasted.contains("/key")
+                        || pasted.contains("sk-")
+                        || pasted.contains("API_KEY");
+                    if looks_sensitive {
                         corex_core::forensic::ForensicLogger::log_event(
                             "TUI_PASTE",
-                            &format!("Paste event ({} chars, redacted in credential dialog)", pasted.len()),
+                            &format!("Paste event ({} chars, redacted)", pasted.len()),
                             "Content: [REDACTED]",
                         );
                     } else {
@@ -871,10 +890,37 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         let is_on_server = if is_horizontal {
                             mouse.column >= split_col
                         } else {
-                            mouse.row >= (h * 50) / 100
+                            app.fleet_dialog.command_mode
                         };
 
                         if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+                            // Check for direct click on VPS tabs in the top header row
+                            if is_on_server && mouse.row == 0 && !app.fleet_dialog.items.is_empty() {
+                                let start_col = if is_horizontal { split_col + 5 } else { 5 };
+                                if mouse.column >= start_col {
+                                    let mut curr_x = start_col;
+                                    let mut clicked_tab = None;
+                                    for (i, item) in app.fleet_dialog.items.iter().enumerate() {
+                                        // Tab pattern: " [i] " + id + " ● "
+                                        let tab_w = 4 + item.config.id.chars().count() as u16 + 3;
+                                        if mouse.column >= curr_x && mouse.column < curr_x + tab_w {
+                                            clicked_tab = Some(i);
+                                            break;
+                                        }
+                                        curr_x += tab_w;
+                                    }
+                                    if let Some(idx) = clicked_tab {
+                                        if idx < app.fleet_dialog.items.len() {
+                                            app.fleet_dialog.selected_idx = idx;
+                                            fleet_ensure_session(&mut app).await;
+                                            app.fleet_dialog.command_mode = true;
+                                            needs_redraw = true;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
                             if is_on_server {
                                 if !app.fleet_dialog.command_mode {
                                     app.fleet_dialog.command_mode = true;
@@ -916,12 +962,17 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     }
                     app.handle_mouse(mouse);
                     let (w, h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                    if is_mobile_portrait(w, h) {
+                    if is_mobile_touch_environment(w, h) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                         try_show_termux_soft_keyboard();
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+                    let is_ctrl_p = (is_ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))) || key.code == KeyCode::Char('\x10');
+                    let is_ctrl_n = (is_ctrl && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))) || key.code == KeyCode::Char('\x0e');
+                    let (term_w, term_h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
+                    let is_touch_mobile = is_mobile_touch_environment(term_w, term_h);
 
                     // --- Force Quit: Ctrl+Z ---
                     if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
@@ -949,48 +1000,21 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         && (key.code == KeyCode::Esc
                             || (key.code == KeyCode::Char('c') && is_ctrl))
                         {
-                            if key.code == KeyCode::Esc && !app.message_queue.is_empty() {
-                                if let Some(queued) = app.message_queue.pop_back() {
-                                    if app.input_buffer.is_empty() {
-                                        app.input_buffer = queued;
-                                        app.cursor_idx = app.input_buffer.len();
-                                    }
+                            // Esc first takes back the newest pending message, one per press; the
+                            // generation is only cancelled once nothing is left to take back.
+                            if key.code == KeyCode::Esc && app.has_pending_messages() {
+                                if let Some(pending) = app.undo_last_pending() {
+                                    app.restore_to_input(vec![pending]);
                                 }
                                 needs_redraw = true;
                                 continue;
                             }
 
-                            if let Some(token) = app.cancel_token.take() {
-                                token.cancel();
-                            }
-                            app.current_generation_id = app.current_generation_id.wrapping_add(1);
-                            app.in_flight_tool_calls = 0;
-                            app.is_streaming = false;
-                            app.thinking_state.is_streaming = false;
-                            app.clear_status();
-                            app.message_queue.clear();
-
-                            let partial_text = if app.streaming_text.is_empty() {
-                                None
-                            } else {
-                                Some(format!("{} *(interrupted)*", app.streaming_text.trim_end()))
-                            };
-
-                            let reasoning = if app.thinking_state.content.is_empty() {
-                                None
-                            } else {
-                                Some(app.thinking_state.content.clone())
-                            };
-
-                            if let Some(txt) = partial_text {
-                                app.session.add_message(Message::assistant(txt, reasoning));
-                            } else {
-                                app.session.add_message(Message::system("Generation cancelled by user (Esc)."));
-                            }
-
-                            app.streaming_text.clear();
-                            app.streaming_tool_calls.clear();
-                            let _ = app.session.save();
+                            // Cancelling must not eat what the user typed: whatever never reached
+                            // the model goes back to the composer.
+                            let undelivered = app.take_all_pending();
+                            app.cancel_generation("Generation cancelled by user (Esc).");
+                            app.restore_to_input(undelivered);
                             continue;
                         }
 
@@ -1176,6 +1200,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     // --- 1.5. Session Dialog Active ---
                     if app.session_dialog.is_open {
                         let filtered_count = app.session_dialog.filtered_sessions().len();
+
+                        // A delete is waiting for its answer: `y` confirms, any other key backs out.
+                        if app.session_dialog.pending_delete.is_some() {
+                            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                                if let Some(session_id) = app.session_dialog.take_pending_delete() {
+                                    let _ = Session::delete_by_id_or_tag(&session_id);
+                                    app.session_dialog.reload(&app.workspace_dir.display().to_string());
+                                }
+                            } else {
+                                app.session_dialog.pending_delete = None;
+                            }
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::Esc => {
                                 if !app.session_dialog.search_query.is_empty() {
@@ -1199,13 +1237,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                     app.session_dialog.selected_idx += 1;
                                 }
                             }
-                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) || app.session_dialog.search_query.is_empty() => {
-                                if let Some(selected_session) = app.session_dialog.selected_session().cloned() {
-                                    let session_id = selected_session.id.clone();
-                                    let _ = Session::delete_by_id_or_tag(&session_id);
-                                    // Refresh list
-                                    app.session_dialog.open(&app.workspace_dir.display().to_string(), app.session_dialog.is_fleet);
-                                }
+                            // Delete only through keys that cannot be typed into the filter: a plain
+                            // letter belongs to the search box, and the removal asks to be confirmed.
+                            KeyCode::Delete => {
+                                app.session_dialog.request_delete();
+                            }
+                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.session_dialog.request_delete();
                             }
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT) => {
                                 app.session_dialog.search_query.push(c);
@@ -1484,23 +1522,48 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         let is_pane_toggle = key.code == KeyCode::F(6)
                             || (ctrl && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')))
                             || key.code == KeyCode::BackTab
+                            || (shift && key.code == KeyCode::Tab)
                             || (alt && key.code == KeyCode::Tab)
-                            || (alt && shift)
-                            || (alt && key.code == KeyCode::Left && term_focus)
-                            || (alt && key.code == KeyCode::Right && !term_focus)
-                            || (!term_focus && key.code == KeyCode::Tab && app.input_buffer.is_empty());
+                            || (alt && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')))
+                            || (!term_focus && key.code == KeyCode::Tab && app.input_buffer.trim().is_empty());
 
                         let pick_server: Option<usize> = match key.code {
-                            KeyCode::F(n) if (1..=9).contains(&n) => Some((n - 1) as usize),
+                            KeyCode::F(n) if (1..=9).contains(&n) && n != 2 => Some((n - 1) as usize),
                             KeyCode::Char(d) if alt && d.is_ascii_digit() && d != '0' => Some((d as usize) - ('1' as usize)),
+                            KeyCode::Char(d) if ctrl && d.is_ascii_digit() && d != '0' => Some((d as usize) - ('1' as usize)),
                             _ => None,
                         };
+
+                        let next_vps = alt && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Right);
+                        let prev_vps = alt && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Left);
+                        let open_selector = alt && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'));
 
                         if let Some(idx) = pick_server {
                             if idx < app.fleet_dialog.items.len() {
                                 app.fleet_dialog.selected_idx = idx;
                                 fleet_ensure_session(&mut app).await;
+                                needs_redraw = true;
+                                continue;
                             }
+                        } else if next_vps {
+                            if !app.fleet_dialog.items.is_empty() {
+                                app.fleet_dialog.select_next();
+                                fleet_ensure_session(&mut app).await;
+                                needs_redraw = true;
+                                continue;
+                            }
+                        } else if prev_vps {
+                            if !app.fleet_dialog.items.is_empty() {
+                                app.fleet_dialog.select_prev();
+                                fleet_ensure_session(&mut app).await;
+                                needs_redraw = true;
+                                continue;
+                            }
+                        } else if open_selector {
+                            app.fleet_dialog.active_session = None;
+                            app.fleet_dialog.command_mode = true;
+                            needs_redraw = true;
+                            continue;
                         } else if key.code == KeyCode::Char('r') && ctrl {
                             app.fleet_dialog.status_msg = Some("Probing telemetry...".to_string());
                             let nodes: Vec<corex_fleet::NodeConfig> = app.fleet_dialog.items.iter().map(|i| i.config.clone()).collect();
@@ -1520,28 +1583,70 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         } else if term_focus {
                             let is_connected = app.fleet_dialog.is_selected_connected();
                             if !is_connected {
-                                // Server Selector mode: Up/Down to navigate, Enter to launch session, digits 1-9 direct select.
+                                // Server Selector mode: Up/Down/Tab to navigate, Enter to launch session, digits 1-9 direct select, typing filters.
                                 match key.code {
                                     KeyCode::Esc => {
-                                        app.exit_fleet_mode();
+                                        if !app.fleet_dialog.search_query.is_empty() {
+                                            app.fleet_dialog.search_query.clear();
+                                            let filtered = app.fleet_dialog.filtered_items();
+                                            if let Some((first, _)) = filtered.first() {
+                                                app.fleet_dialog.selected_idx = *first;
+                                            }
+                                        } else {
+                                            app.fleet_dialog.command_mode = false;
+                                        }
                                         needs_redraw = true;
                                         continue;
                                     }
-                                    KeyCode::Up | KeyCode::Char('k') => {
+                                    KeyCode::Backspace => {
+                                        app.fleet_dialog.search_query.pop();
+                                        let filtered = app.fleet_dialog.filtered_items();
+                                        if !filtered.iter().any(|(idx, _)| *idx == app.fleet_dialog.selected_idx) {
+                                            if let Some((first, _)) = filtered.first() {
+                                                app.fleet_dialog.selected_idx = *first;
+                                            }
+                                        }
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Tab => {
+                                        app.fleet_dialog.select_next();
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::BackTab => {
+                                        app.fleet_dialog.select_prev();
+                                        needs_redraw = true;
+                                        continue;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') if app.fleet_dialog.search_query.is_empty() || key.code == KeyCode::Up => {
                                         app.fleet_dialog.select_prev();
                                     }
-                                    KeyCode::Down | KeyCode::Char('j') => {
+                                    KeyCode::Down | KeyCode::Char('j') if app.fleet_dialog.search_query.is_empty() || key.code == KeyCode::Down => {
                                         app.fleet_dialog.select_next();
                                     }
-                                    KeyCode::Char(d) if d.is_ascii_digit() && d != '0' => {
+                                    KeyCode::Char(d) if d.is_ascii_digit() && d != '0' && app.fleet_dialog.search_query.is_empty() => {
                                         let idx = (d as usize) - ('1' as usize);
                                         if idx < app.fleet_dialog.items.len() {
                                             app.fleet_dialog.selected_idx = idx;
                                             fleet_ensure_session(&mut app).await;
                                         }
                                     }
+                                    KeyCode::Char(c) if !ctrl && !alt => {
+                                        app.fleet_dialog.search_query.push(c);
+                                        let filtered = app.fleet_dialog.filtered_items();
+                                        if !filtered.iter().any(|(idx, _)| *idx == app.fleet_dialog.selected_idx) {
+                                            if let Some((first, _)) = filtered.first() {
+                                                app.fleet_dialog.selected_idx = *first;
+                                            }
+                                        }
+                                        needs_redraw = true;
+                                        continue;
+                                    }
                                     KeyCode::Enter => {
                                         fleet_ensure_session(&mut app).await;
+                                        needs_redraw = true;
+                                        continue;
                                     }
                                     _ => {}
                                 }
@@ -1659,6 +1764,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                                     app.fleet_dialog.active_session = Some(sess);
                                                     app.fleet_dialog.status_msg = None;
                                                 } else {
+                                                    let first_word = cmd.split_whitespace().next().unwrap_or("");
+                                                    if matches!(first_word, "top" | "htop" | "btop" | "vim" | "vi" | "nano" | "emacs" | "less" | "more" | "man") {
+                                                        app.fleet_dialog.status_msg = Some(format!("⚠️ '{}' requires an interactive PTY (PTY unavailable on this host)", first_word));
+                                                        needs_redraw = true;
+                                                        continue;
+                                                    }
                                                     app.fleet_dialog.status_msg = Some(format!("$ {}", cmd));
                                                     let tx = app.fleet_dialog.cmd_done_tx.clone();
                                                     let nid = sess.node.id.clone();
@@ -1868,7 +1979,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         if should_allow_session {
                             let mut added_rules = Vec::new();
                             if let Some(ref pb) = app.pending_confirmation {
-                                for call in &pb.calls {
+                                if let Some(call) = pb.calls.first() {
                                     for rule in extract_tool_allow_rules(call) {
                                         if !rule.is_empty() && !app.session_allowed_commands.contains(&rule) {
                                             app.session_allowed_commands.push(rule.clone());
@@ -1895,7 +2006,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                             let mut added_rules = Vec::new();
 
                             if let Some(ref pb) = app.pending_confirmation {
-                                for call in &pb.calls {
+                                if let Some(call) = pb.calls.first() {
                                     for rule in extract_tool_allow_rules(call) {
                                         if !rule.is_empty() && !cfg.allowed_commands.contains(&rule) {
                                             cfg.allowed_commands.push(rule.clone());
@@ -2000,10 +2111,52 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }
 
                         if should_allow_single || should_allow_all || should_allow_session || should_allow_always {
-                            let Some(pending_batch) = app.pending_confirmation.take() else {
+                            let Some(mut pending_batch) = app.pending_confirmation.take() else {
                                 continue;
                             };
-                            let calls = pending_batch.calls;
+                            let context = ToolContext {
+                                workspace_dir: app.workspace_dir.clone(),
+                                yolo_mode: app.always_allow_tools,
+                                sudo_password: get_sudo_password(),
+                                allowed_commands: app.get_effective_allowed_commands(),
+                            };
+
+                            let calls = if (should_allow_session || should_allow_always) && !should_allow_all && pending_batch.calls.len() > 1 {
+                                let mut approved = Vec::new();
+                                let mut remaining = Vec::new();
+                                for (idx, c) in pending_batch.calls.into_iter().enumerate() {
+                                    if idx == 0 {
+                                        approved.push(c);
+                                    } else {
+                                        let args_json = corex_core::parse_lenient_json(&c.function.arguments)
+                                            .unwrap_or(serde_json::Value::Null);
+                                        let still_needs_confirm = app
+                                            .tool_registry
+                                            .get(&c.function.name)
+                                            .map(|t| t.needs_confirmation(&args_json, &context))
+                                            .unwrap_or(true);
+                                        if still_needs_confirm {
+                                            remaining.push(c);
+                                        } else {
+                                            approved.push(c);
+                                        }
+                                    }
+                                }
+                                if !remaining.is_empty() {
+                                    pending_batch.current_idx += approved.len();
+                                    let next_preview = remaining
+                                        .first()
+                                        .map(|c| format_call_preview(c, &app.tool_registry, &app.workspace_dir));
+                                    pending_batch.calls = remaining;
+                                    pending_batch.diff_preview = next_preview;
+                                    pending_batch.selected_option = 0;
+                                    pending_batch.diff_expanded = false;
+                                    app.pending_confirmation = Some(pending_batch);
+                                }
+                                approved
+                            } else {
+                                pending_batch.calls
+                            };
 
                             // Check if sudo password is required before running
                             let sudo_needed = calls.iter().find_map(|c| {
@@ -2022,13 +2175,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.sudo_dialog.open_batch(calls, sudo_cmd);
                                 continue;
                             }
-
-                            let context = ToolContext {
-                                workspace_dir: app.workspace_dir.clone(),
-                                yolo_mode: app.always_allow_tools,
-                                sudo_password: get_sudo_password(),
-                                allowed_commands: app.get_effective_allowed_commands(),
-                            };
 
                             app.in_flight_tool_calls += calls.len();
                             let tx = event_tx.clone();
@@ -2085,22 +2231,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
                                 let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
                             });
-                            continue;
-                        } else if should_deny {
-                            let Some(pending_batch) = app.pending_confirmation.take() else {
-                                continue;
-                            };
-                            for call in pending_batch.calls {
-                                app.session.add_message(Message::tool_response(
-                                    call.id,
-                                    "Tool execution denied by user.",
-                                ));
-                            }
-
-                            // ⚡ TRIGGER NEXT RECURSIVE TURN OF AGENT LOOP!
-                            if app.in_flight_tool_calls == 0 && !app.sudo_dialog.is_open {
-                                app.start_stream_turn(event_tx.clone());
-                            }
                             continue;
                         }
                     }
@@ -2432,8 +2562,55 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.cursor_idx = app.input_buffer.len();
                             }
                         }
-                        // Chat feed scrolling. Bare Up/Down are reserved for prompt history and
-                        // the slash menu, so scrolling uses a modifier (Shift = full page).
+                        // History navigation via readline shortcuts: Ctrl+P / Alt+Up (previous)
+                        _ if is_ctrl_p || (is_alt && key.code == KeyCode::Up) => {
+                            if is_slash_open {
+                                if app.slash_selected_idx > 0 {
+                                    app.slash_selected_idx -= 1;
+                                } else {
+                                    app.slash_selected_idx = matching_cmds.len().saturating_sub(1);
+                                }
+                            } else if !app.input_history.is_empty() {
+                                match app.history_idx {
+                                    None => {
+                                        app.saved_draft = app.input_buffer.clone();
+                                        let last_idx = app.input_history.len() - 1;
+                                        app.history_idx = Some(last_idx);
+                                        app.input_buffer = app.input_history[last_idx].clone();
+                                        app.cursor_idx = app.input_buffer.len();
+                                    }
+                                    Some(i) => {
+                                        if i > 0 {
+                                            let next_i = i - 1;
+                                            app.history_idx = Some(next_i);
+                                            app.input_buffer = app.input_history[next_i].clone();
+                                            app.cursor_idx = app.input_buffer.len();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // History navigation via readline shortcuts: Ctrl+N / Alt+Down (next)
+                        _ if is_ctrl_n || (is_alt && key.code == KeyCode::Down) => {
+                            if is_slash_open && !matching_cmds.is_empty() {
+                                app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_cmds.len();
+                            } else if let Some(i) = app.history_idx {
+                                if i + 1 < app.input_history.len() {
+                                    let next_i = i + 1;
+                                    app.history_idx = Some(next_i);
+                                    app.input_buffer = app.input_history[next_i].clone();
+                                    app.cursor_idx = app.input_buffer.len();
+                                } else {
+                                    app.history_idx = None;
+                                    app.input_buffer = std::mem::take(&mut app.saved_draft);
+                                    app.cursor_idx = app.input_buffer.len();
+                                }
+                            }
+                        }
+                        // Chat feed scrolling:
+                        // On desktop, Ctrl/Shift modifiers or PageUp/PageDown scroll chat.
+                        // On mobile / Termux, touchscreen finger swipes emit bare Up/Down keys;
+                        // thus bare Up/Down must scroll the chat feed instead of cycling history!
                         KeyCode::Up
                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                 || key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -2461,6 +2638,9 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 } else {
                                     app.slash_selected_idx = matching_cmds.len().saturating_sub(1);
                                 }
+                            } else if is_touch_mobile {
+                                // Mobile / Termux touchscreen drag: scroll chat up!
+                                app.scroll_chat(-3);
                             } else if !app.input_history.is_empty() {
                                 match app.history_idx {
                                     None => {
@@ -2484,6 +2664,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         KeyCode::Down => {
                             if is_slash_open && !matching_cmds.is_empty() {
                                 app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_cmds.len();
+                            } else if is_touch_mobile {
+                                // Mobile / Termux touchscreen drag: scroll chat down!
+                                app.scroll_chat(3);
+                            } else if app.scroll_offset > 0 {
+                                // On desktop: if scrolled up reading chat, Down scrolls towards newest message
+                                app.scroll_chat(3);
                             } else if let Some(i) = app.history_idx {
                                 if i + 1 < app.input_history.len() {
                                     let next_i = i + 1;
@@ -2500,9 +2686,26 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         KeyCode::PageUp => app.scroll_chat(-10),
                         KeyCode::PageDown => app.scroll_chat(10),
                         KeyCode::Enter => {
+                            // Alt+Enter while the agent works: hand the message over at the next
+                            // safe point instead of queueing it behind the whole task.
+                            let send_now = is_alt && app.is_streaming;
                             let text = app.input_buffer.trim().to_string();
+                            if text.is_empty() && send_now {
+                                if app.steer_messages.is_empty() {
+                                    // Nothing typed: send the oldest queued message now.
+                                    app.promote_queued_to_steer();
+                                } else {
+                                    // Already waiting for the next safe point: stop and send it now.
+                                    app.cancel_generation("Generation interrupted to deliver your message.");
+                                    app.deliver_steer();
+                                    app.scroll_to_bottom();
+                                    app.start_stream_turn(event_tx.clone());
+                                }
+                                needs_redraw = true;
+                                continue;
+                            }
                             if !text.is_empty() {
-                                let cmd_to_run = if is_slash_open && !text.contains(' ') {
+                                let cmd_to_run =if is_slash_open && !text.contains(' ') {
                                     matching_cmds[app.slash_selected_idx % matching_cmds.len()].to_string()
                                 } else {
                                     text.clone()
@@ -2585,13 +2788,18 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 app.pastes.clear();
 
                                 if app.is_streaming {
-                                    app.message_queue.push_back(user_prompt_clean);
+                                    if send_now {
+                                        app.steer_messages.push(user_prompt_clean);
+                                    } else {
+                                        app.message_queue.push_back(user_prompt_clean);
+                                    }
                                     app.scroll_to_bottom();
                                     needs_redraw = true;
                                     continue;
                                 }
 
-                                app.session.add_message(Message::user(user_prompt_clean));
+                                corex_core::reset_repeat_guard();
+                            app.session.add_message(Message::user(user_prompt_clean));
                                 app.scroll_to_bottom();
 
                                 // ⚡ START TURN!
@@ -2622,115 +2830,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     print_session_summary(&app);
     Ok(())
-}
-
-fn print_session_summary(app: &App) {
-    let cfg = app.llm_client.get_config();
-    let is_local = cfg.local_llm_enabled;
-
-    let is_deepseek = cfg.is_deepseek_endpoint();
-    let model_display = if is_local {
-        if !cfg.local_llm_model.is_empty() {
-            format!("Local Offline Assistant ({})", cfg.local_llm_model)
-        } else {
-            "Local Offline Assistant (Air-gapped SLM)".to_string()
-        }
-    } else if is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat") {
-        if cfg.model == "deepseek-v4.1-flash-1017" {
-            "DeepSeek-V4.1-Flash-1017".to_string()
-        } else {
-            "DeepSeek-V4.1-Flash".to_string()
-        }
-    } else if is_deepseek && (cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner") {
-        "DeepSeek-V4-Pro".to_string()
-    } else {
-        let all = cfg.all_providers();
-        let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
-        prov.and_then(|p| p.models.iter().find(|m| m.id == cfg.model))
-            .map(|m| format!("{} · {}", prov.map(|p| p.display_name()).unwrap_or(""), m.display_name()))
-            .unwrap_or_else(|| cfg.model.clone())
-    };
-
-    let elapsed = chrono::Utc::now().signed_duration_since(app.session.created_at).num_seconds().max(0);
-    let duration_str = if elapsed < 60 {
-        format!("{}s", elapsed)
-    } else {
-        format!("{}m {}s", elapsed / 60, elapsed % 60)
-    };
-
-    let msg_count = app.session.messages.len();
-    let u = &app.session.total_usage;
-
-    let (cost_str, tokens_str, cache_str) = if is_local {
-        (
-            "\x1b[38;2;105;240;174m$0.000000 USD\x1b[0m \x1b[90m(100% Free Local Hardware)\x1b[0m".to_string(),
-            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
-            None,
-        )
-    } else if u.total_tokens > 0 && is_deepseek {
-        let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
-        let (cached_rate, miss_rate, comp_rate) = if is_pro {
-            (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
-        } else {
-            (0.014 / 1_000_000.0, 0.14 / 1_000_000.0, 0.28 / 1_000_000.0)
-        };
-        let miss = u.prompt_tokens.saturating_sub(u.prompt_cache_hit_tokens);
-        let actual_cost = (u.prompt_cache_hit_tokens as f64 * cached_rate)
-            + (miss as f64 * miss_rate)
-            + (u.completion_tokens as f64 * comp_rate);
-        let un_cached = (u.prompt_tokens as f64 * miss_rate) + (u.completion_tokens as f64 * comp_rate);
-        let saved = (un_cached - actual_cost).max(0.0);
-
-        let hit_rate = u.cache_hit_percentage();
-        let cost_text = if saved > 0.00001 {
-            format!("\x1b[38;2;105;240;174m${:.6} USD\x1b[0m \x1b[90m(Saved ${:.6} with KV Cache)\x1b[0m", actual_cost, saved)
-        } else {
-            format!("\x1b[38;2;105;240;174m${:.6} USD\x1b[0m", actual_cost)
-        };
-
-        let cache_info = if u.prompt_tokens > 0 {
-            Some(format!("{:.1}% Hit Rate ({} cached / {} in)", hit_rate, u.prompt_cache_hit_tokens, u.prompt_tokens))
-        } else {
-            None
-        };
-
-        (
-            cost_text,
-            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
-            cache_info,
-        )
-    } else if u.total_tokens > 0 {
-        let hit_rate = u.cache_hit_percentage();
-        let cache_info = if u.prompt_tokens > 0 && u.prompt_cache_hit_tokens > 0 {
-            Some(format!("{:.1}% Hit Rate ({} cached / {} in)", hit_rate, u.prompt_cache_hit_tokens, u.prompt_tokens))
-        } else {
-            None
-        };
-        (
-            "\x1b[90mBilled by active provider\x1b[0m".to_string(),
-            format!("{} in · {} out ({} total)", u.prompt_tokens, u.completion_tokens, u.total_tokens),
-            cache_info,
-        )
-    } else {
-        (
-            "\x1b[90m$0.000000 USD (No LLM turns)\x1b[0m".to_string(),
-            "0 total".to_string(),
-            None,
-        )
-    };
-
-    println!();
-    println!("\x1b[1;38;2;56;189;248m✦ Corex Session Summary\x1b[0m");
-    println!("  \x1b[90mModel:\x1b[0m     \x1b[1m{}\x1b[0m", model_display);
-    println!("  \x1b[90mDuration:\x1b[0m  {} \x1b[90m·\x1b[0m {} messages", duration_str, msg_count);
-    println!("  \x1b[90mTokens:\x1b[0m    {}", tokens_str);
-    if let Some(c_info) = cache_str {
-        println!("  \x1b[90mKV Cache:\x1b[0m  {}", c_info);
-    }
-    println!("  \x1b[90mCost:\x1b[0m      {}", cost_str);
-    println!();
-    println!("  \x1b[90mResume:\x1b[0m    \x1b[38;2;135;215;215mcx --resume {}\x1b[0m", app.session.id);
-    println!();
 }
 
 /// Finishes the interactive ask_user dialog: executes the pending tool batch
@@ -2872,8 +2971,12 @@ async fn fleet_ensure_session(app: &mut App) -> Option<corex_fleet::RemoteSessio
     if let Some(sess) = app.fleet_dialog.active_session.clone() {
         if sess.is_connected && sess.node.id == node.id {
             if app.fleet_dialog.pty_session.as_ref().map(|p| !p.is_alive() || p.node_id != node.id).unwrap_or(true) {
-                if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
-                    app.fleet_dialog.pty_session = Some(pty);
+                match crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                    Ok(pty) => app.fleet_dialog.pty_session = Some(pty),
+                    Err(err) => {
+                        app.fleet_dialog.pty_session = None;
+                        app.fleet_dialog.status_msg = Some(format!("Interactive PTY unavailable ({}); fallback batch SSH active", err));
+                    }
                 }
             }
             return Some(sess);
@@ -2888,8 +2991,12 @@ async fn fleet_ensure_session(app: &mut App) -> Option<corex_fleet::RemoteSessio
             app.fleet_dialog.active_session = Some(session.clone());
             app.fleet_dialog.terminal_scroll = 0;
             app.fleet_dialog.status_msg = None;
-            if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
-                app.fleet_dialog.pty_session = Some(pty);
+            match crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                Ok(pty) => app.fleet_dialog.pty_session = Some(pty),
+                Err(err) => {
+                    app.fleet_dialog.pty_session = None;
+                    app.fleet_dialog.status_msg = Some(format!("Interactive PTY unavailable ({}); fallback batch SSH mode active (interactive tools like htop/nano disabled)", err));
+                }
             }
             app.session.add_message(Message::system(format!(
                 "Connected to remote server: {} ({}@{}) · Active and ready.",

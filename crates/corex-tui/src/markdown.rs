@@ -81,7 +81,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
                 result_lines.push(Line::from(""));
             }
-            let spans = parse_inline_spans(h1, theme, Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+            let spans = parse_inline_spans(h1, theme, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD));
             result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ", "  "));
             continue;
         }
@@ -224,28 +224,35 @@ fn flush_code_block(
         Style::default().fg(theme.dark_gray),
     )));
 
-    // Code lines (each closes with a right border)
+    // Code lines (each closes with a right border, wrapping long lines across multiple rows)
     let inner = box_w.saturating_sub(6);
     for line in buf.iter() {
-        let mut spans = vec![
-            Span::styled("  │ ", Style::default().fg(theme.dark_gray)),
-        ];
         let code_spans = colorize_code_line(line, lang, theme);
-        let code_width: usize = code_spans.iter().map(|s| s.width()).sum();
-        let (code_spans, code_w) = if code_width > inner {
-            let truncated = truncate_spans_to_width(&code_spans, inner);
-            let w = truncated.iter().map(|s| s.width()).sum();
-            (truncated, w)
+        let wrapped_sub_lines = wrap_cell_spans(code_spans, inner);
+        if wrapped_sub_lines.is_empty() {
+            let mut spans = vec![
+                Span::styled("  │ ", Style::default().fg(theme.dark_gray)),
+            ];
+            spans.push(Span::styled(
+                format!("{} │", " ".repeat(inner)),
+                Style::default().fg(theme.dark_gray),
+            ));
+            result.push(Line::from(spans));
         } else {
-            (code_spans, code_width)
-        };
-        spans.extend(code_spans);
-        let pad = inner.saturating_sub(code_w);
-        spans.push(Span::styled(
-            format!("{} │", " ".repeat(pad)),
-            Style::default().fg(theme.dark_gray),
-        ));
-        result.push(Line::from(spans));
+            for sub_line in wrapped_sub_lines {
+                let mut spans = vec![
+                    Span::styled("  │ ", Style::default().fg(theme.dark_gray)),
+                ];
+                let sub_w: usize = sub_line.iter().map(|s| s.width()).sum();
+                spans.extend(sub_line);
+                let pad = inner.saturating_sub(sub_w);
+                spans.push(Span::styled(
+                    format!("{} │", " ".repeat(pad)),
+                    Style::default().fg(theme.dark_gray),
+                ));
+                result.push(Line::from(spans));
+            }
+        }
     }
 
     // Bottom border
@@ -343,42 +350,6 @@ pub fn wrap_spans(
     wrap_spans_with_indent(spans, max_width, indent, indent)
 }
 
-/// Truncates a slice of styled spans so the total visible width is at most
-/// `max_width`, appending an ellipsis when content had to be cut.
-fn truncate_spans_to_width(spans: &[Span<'static>], max_width: usize) -> Vec<Span<'static>> {
-    let mut result = Vec::new();
-    let mut used = 0usize;
-    for span in spans {
-        if used >= max_width {
-            break;
-        }
-        let span_width = span.width();
-        if used + span_width <= max_width {
-            result.push(span.clone());
-            used += span_width;
-        } else {
-            let remaining = max_width - used;
-            let mut cut = String::new();
-            let mut cut_w = 0usize;
-            for c in span.content.chars() {
-                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                if cut_w + w > remaining.saturating_sub(1) {
-                    break;
-                }
-                cut.push(c);
-                cut_w += w;
-            }
-            result.push(Span::styled(cut, span.style));
-            used += cut_w;
-            if used < max_width {
-                result.push(Span::styled("…".to_string(), span.style));
-            }
-            break;
-        }
-    }
-    result
-}
-
 /// Parses inline markdown tokens: `**bold**`, `*italic*`, `` `code` `` into Spans.
 fn parse_inline_spans(
     input: &str,
@@ -405,7 +376,7 @@ fn parse_inline_spans(
             }
             spans.push(Span::styled(
                 format!(" {} ", code),
-                Style::default().fg(theme.accent_cyan).bg(Color::Rgb(30, 35, 45)),
+                Style::default().fg(theme.accent_cyan).bg(theme.code_bg),
             ));
             continue;
         }
@@ -428,7 +399,7 @@ fn parse_inline_spans(
             spans.push(Span::styled(
                 bold_text,
                 base_style
-                    .fg(Color::White)
+                    .fg(theme.foreground)
                     .add_modifier(Modifier::BOLD),
             ));
             continue;
@@ -644,11 +615,11 @@ fn colorize_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static
     if (lang == "bash" || lang == "sh" || lang == "shell")
         && trimmed.starts_with('$') {
             spans.push(Span::styled("$ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled(trimmed[1..].to_string(), Style::default().fg(Color::White)));
+            spans.push(Span::styled(trimmed[1..].to_string(), Style::default().fg(theme.foreground)));
             return spans;
         }
 
-    spans.push(Span::styled(line.to_string(), Style::default().fg(Color::White)));
+    spans.push(Span::styled(line.to_string(), Style::default().fg(theme.foreground)));
     spans
 }
 
@@ -1057,7 +1028,7 @@ mod tests {
 
     #[test]
     fn test_markdown_table() {
-        let text = "## 📊 Breakdown of the 53 GB\n\n| Directory | Size | Description |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Verbose tmux log (growing) |\n| `Projects/` | 13 GB | triade-app (7.9G: node_modules 3.6G + build android 4G), corex/target 2.5G |\n";
+        let text = "## 📊 Breakdown of the 53 GB\n\n| Directory | Size | Description |\n|---|---|---|\n| `tmux-server-26992.log` | **12 GB** | ⚠️ Verbose tmux log (growing) |\n| `Projects/` | 13 GB | web-app (7.9G: node_modules 3.6G + build android 4G), corex/target 2.5G |\n";
         let theme = Theme::default();
         let lines = render_markdown(text, &theme, 100);
         for (i, line) in lines.iter().enumerate() {
@@ -1115,7 +1086,7 @@ mod tests {
         assert!(lines.len() >= 4, "expected >= 4 lines, got {}", lines.len());
 
         let top: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        let bottom: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        let bottom: String = lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(top.starts_with("  ╭─"), "top border malformed: {}", top);
         assert!(top.ends_with('╮'), "top border does not close: {}", top);
         assert!(bottom.starts_with("  ╰"), "bottom border malformed: {}", bottom);
@@ -1128,7 +1099,8 @@ mod tests {
         }
 
         // Code lines must always close with a right border.
-        for line in &lines[1..3] {
+        let n = lines.len();
+        for line in &lines[1..n - 1] {
             let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
             assert!(s.ends_with("│"), "code line lacks right border: {}", s);
         }
@@ -1155,6 +1127,29 @@ mod tests {
         // Top, content and bottom must all have the same width.
         for line in &lines {
             assert_eq!(line.width(), w, "mismatched box width: {:?}", line.spans);
+        }
+    }
+
+    #[test]
+    fn test_markdown_code_block_wraps_long_lines_without_truncation() {
+        let theme = Theme::default();
+        let long_line = "Oct 20 09:47 unknown[92.118.39.202-234] SASL LOGIN failed sasl_username=marketing, ftpuser, noreply, backup, public, postmaster";
+        let text = format!("```log\n{}\n```\n", long_line);
+        let max_width: usize = 50;
+        let lines = render_markdown(&text, &theme, max_width);
+
+        // Entire content must be preserved across wrapped lines without ellipsis
+        let full_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!full_text.contains('…'), "code block truncated with ellipsis: {}", full_text);
+        assert!(full_text.contains("postmaster"), "end of log line missing: {}", full_text);
+        assert!(full_text.contains("marketing"), "start of log line missing: {}", full_text);
+
+        // Every line must have the exact boxed width
+        for line in &lines {
+            assert_eq!(line.width(), max_width);
         }
     }
 

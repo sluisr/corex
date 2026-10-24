@@ -204,7 +204,7 @@ pub fn build_tool_confirmation_lines(
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
     let is_subagent = tool_name == "delegate_subagent";
 
-    let border_color = Color::Rgb(70, 80, 100);
+    let border_color = theme.border_dim;
     let box_width = max_width.clamp(30, 105);
     let inner_width = box_width.saturating_sub(6);
 
@@ -224,7 +224,7 @@ pub fn build_tool_confirmation_lines(
     };
     if shown_diff_lines.is_empty() {
         let (prefix, body, color) = if is_subagent {
-            ("🤖 ", "(subagent delegation)", theme.accent_cyan)
+            ("◆ ", "(subagent delegation)", theme.accent_cyan)
         } else if is_shell {
             ("$ ", "(no arguments provided)", theme.accent_yellow)
         } else {
@@ -292,7 +292,7 @@ pub fn build_tool_confirmation_lines(
                     "  ",
                     Style::default(),
                     line,
-                    Style::default().fg(Color::Rgb(225, 235, 245)),
+                    Style::default().fg(theme.foreground),
                     None,
                     inner_width,
                     border_color,
@@ -302,7 +302,7 @@ pub fn build_tool_confirmation_lines(
         } else {
             let is_sub = is_subagent || line.starts_with("Subagent");
             let (prefix, prefix_style, body) = if is_sub {
-                ("🤖 ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), line.trim_start())
+                ("◆ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), line.trim_start())
             } else if is_shell || line.trim_start().starts_with('$') {
                 let b = if line.trim_start().starts_with('$') {
                     line.trim_start()[1..].trim_start()
@@ -318,7 +318,7 @@ pub fn build_tool_confirmation_lines(
                 prefix,
                 prefix_style,
                 body,
-                Style::default().fg(Color::Rgb(230, 238, 248)),
+                Style::default().fg(theme.text_strong),
                 inner_width,
                 border_color,
                 border_color,
@@ -417,7 +417,7 @@ pub fn build_tool_confirmation_lines(
         };
 
         let text_style = if is_selected {
-            Style::default().fg(Color::Rgb(240, 245, 255)).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
         };
@@ -442,7 +442,7 @@ pub fn build_tool_confirmation_lines(
             Span::styled("    Instructions for Corex:", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
         ]));
 
-        let cursor_char = "█";
+        let cursor_char = crate::cursor::block();
         result.push(Line::from(vec![
             Span::styled("    › ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
             Span::styled(feedback_text.to_string(), Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
@@ -468,7 +468,7 @@ pub fn build_streaming_tool_preview_lines(
     max_width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let dim_border = Color::Rgb(60, 70, 90);
+    let dim_border = theme.border_dim;
     let beam_color = theme.accent_cyan;
     let box_width = max_width.clamp(30, 105);
     let inner_width = box_width.saturating_sub(6);
@@ -661,7 +661,7 @@ pub fn build_streaming_tool_preview_lines(
             prefix,
             Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD),
             clean_body,
-            Style::default().fg(Color::Rgb(225, 235, 245)),
+            Style::default().fg(theme.foreground),
             cursor_span,
             inner_width,
             left_border_color,

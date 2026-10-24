@@ -116,13 +116,13 @@ pub fn render_sudo_dialog(
         if let Some(ref err) = state.error_msg {
             vec![
                 Span::styled("› ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-                Span::styled("█ ", Style::default().fg(theme.accent_yellow)),
+                Span::styled(format!("{} ", crate::cursor::block()), Style::default().fg(theme.accent_yellow)),
                 Span::styled(err.clone(), Style::default().fg(Color::LightRed)),
             ]
         } else {
             vec![
                 Span::styled("› ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-                Span::styled("█ ", Style::default().fg(theme.accent_yellow)),
+                Span::styled(format!("{} ", crate::cursor::block()), Style::default().fg(theme.accent_yellow)),
                 Span::styled("Type password...", Style::default().fg(theme.dark_gray)),
             ]
         }
@@ -130,8 +130,8 @@ pub fn render_sudo_dialog(
         let masked: String = "*".repeat(state.password_input.chars().count());
         vec![
             Span::styled("› ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(masked, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("█", Style::default().fg(theme.accent_yellow)),
+            Span::styled(masked, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_yellow)),
         ]
     };
 

@@ -198,9 +198,10 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             base_url: "https://api.deepseek.com".into(),
             api_key_env: "DEEPSEEK_API_KEY".into(),
             models: vec![
+                // `deepseek-v4.1-flash-1017` is not listed: it is the same Flash model, and the
+                // client still accepts it by name (`-m`, saved settings resolve to this entry).
                 model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["dynamic", "low", "medium", "high"], ModelFamily::Flash),
                 model("deepseek-pro", "DeepSeek-V4-Pro", &["thinking"], &["max", "high", "medium", "low"], ModelFamily::Pro),
-                model("deepseek-v4.1-flash-1017", "DeepSeek-V4.1-Flash-1017", &["latest", "wish-driven", "fast", "tools"], &["dynamic", "low", "medium", "high"], ModelFamily::Flash),
             ],
         },
         ProviderConfig {
@@ -221,9 +222,10 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             base_url: "https://api.anthropic.com/v1".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
             models: vec![
-                model("claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet", &["hybrid", "thinking", "tools", "recommended"], &["dynamic", "low", "medium", "high"], ModelFamily::Generic),
-                model("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet", &["coding", "agentic", "tools"], &[], ModelFamily::Generic),
-                model("claude-3-5-haiku-20241022", "Claude 3.5 Haiku", &["fast", "cheap", "tools"], &[], ModelFamily::Generic),
+                model("claude-opus-5-5", "Claude Opus 5.5", &["thinking", "coding", "agentic", "tools", "recommended"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-sonnet-5-5", "Claude Sonnet 5.5", &["thinking", "coding", "tools"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-haiku-5-5", "Claude Haiku 5.5", &["fast", "cheap", "tools"], &["dynamic", "low", "medium", "high"], ModelFamily::Generic),
+                model("claude-fable-5-1", "Claude Fable 5.1", &["thinking", "deep", "complex", "tools"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
             ],
         },
         ProviderConfig {
@@ -388,5 +390,16 @@ mod tests {
         assert_eq!(all[p].models[m].family, ModelFamily::Pro);
         let (p, _) = locate_active(&all, None, "anything", true);
         assert!(all[p].is_local());
+    }
+
+    #[test]
+    fn flash_1017_resolves_to_the_single_flash_entry() {
+        let all = builtin_providers();
+        let (p, m) = locate_active(&all, Some(DEEPSEEK_ID), "deepseek-v4.1-flash-1017", false);
+        assert_eq!(all[p].models[m].id, "deepseek-flash");
+        assert_eq!(
+            all[p].models.iter().filter(|m| m.family == ModelFamily::Flash).count(),
+            1
+        );
     }
 }

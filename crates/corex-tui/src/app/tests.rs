@@ -641,12 +641,12 @@ use corex_core::types::ToolCall;
     #[test]
     fn test_format_system_message_model_activation() {
         let theme = Theme::default();
-        let msg = "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: max\n- Search CoT: low";
+        let msg = "Activated DeepSeek-V4-Pro (Deep Reasoning Engine)\n- Reasoning Depth: max\n- Temperature: 1.0";
         let lines = format_system_message(msg, &theme, 80, false);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].spans.iter().any(|s| s.content.contains("[model]")));
         assert!(lines[1].spans.iter().any(|s| s.content.contains("Reasoning Depth:")));
-        assert!(lines[2].spans.iter().any(|s| s.content.contains("Search CoT:")));
+        assert!(lines[2].spans.iter().any(|s| s.content.contains("Temperature:")));
     }
 
     #[test]
@@ -727,7 +727,7 @@ use corex_core::types::ToolCall;
         let msg = "SUBAGENT_DONE|sub_c7ac96e4|SCOUT|1.2s\n";
         let lines = format_system_message(msg, &theme, 80, false);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].spans.iter().any(|s| s.content.contains("🔭")));
+        assert!(lines[0].spans.iter().any(|s| s.content.contains("✓")));
         assert!(lines[0].spans.iter().any(|s| s.content.contains("[scout:sub_c7ac96e4]")));
         assert!(lines[0].spans.iter().any(|s| s.content.contains("completed")));
         assert!(lines[0].spans.iter().any(|s| s.content.contains("1.2s")));
@@ -736,7 +736,7 @@ use corex_core::types::ToolCall;
         let msg_long = "SUBAGENT_DONE|sub_1234|TESTER|3s\nline 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8";
         let lines_long = format_system_message(msg_long, &theme, 80, false);
         assert_eq!(lines_long.len(), 7); // 1 badge + 1 omission + 5 lines preview
-        assert!(lines_long[0].spans.iter().any(|s| s.content.contains("🧪")));
+        assert!(lines_long[0].spans.iter().any(|s| s.content.contains("✓")));
         assert!(lines_long[0].spans.iter().any(|s| s.content.contains("[tester:sub_1234]")));
         assert!(lines_long[1].spans.iter().any(|s| s.content.contains("… (+3 lines above")));
 
@@ -744,6 +744,8 @@ use corex_core::types::ToolCall;
         let msg_fail = "SUBAGENT_DONE|sub_err1|WORKER|0.1s\nExit code 1:\nFatal compile error";
         let lines_fail = format_system_message(msg_fail, &theme, 80, false);
         assert!(lines_fail[0].spans.iter().any(|s| s.content.contains("failed")));
+        assert!(lines_fail[0].spans.iter().any(|s| s.content.contains("✕")));
+        assert!(lines_fail[0].spans.iter().any(|s| s.content.contains("[worker:sub_err1]")));
 
         // 4. Expanded logs (Ctrl+O)
         let lines_expanded = format_system_message(msg_long, &theme, 80, true);
@@ -753,7 +755,7 @@ use corex_core::types::ToolCall;
         let msg_no_us = "SUBAGENTDONE|sub33a3f099|SCOUT|0s\n";
         let lines_no_us = format_system_message(msg_no_us, &theme, 80, false);
         assert_eq!(lines_no_us.len(), 1);
-        assert!(lines_no_us[0].spans.iter().any(|s| s.content.contains("🔭")));
+        assert!(lines_no_us[0].spans.iter().all(|s| !s.content.contains("🔭")));
         assert!(lines_no_us[0].spans.iter().any(|s| s.content.contains("[scout:sub33a3f099]")));
     }
 
@@ -1087,4 +1089,342 @@ use corex_core::types::ToolCall;
         // Exit back to normal
         app.exit_fleet_mode();
         assert_eq!(app.session.id, normal_id);
+    }
+
+    #[test]
+    fn test_touch_mobile_detection_and_history_shortcuts() {
+        use crate::app::mobile::is_mobile_touch_environment;
+
+        // Desktop standard dimensions (e.g. 120x40) without COREX_MOBILE env must be false on desktop
+        std::env::remove_var("COREX_MOBILE");
+        if !crate::app::mobile::is_android_or_termux() {
+            assert!(!is_mobile_touch_environment(120, 40));
+        }
+
+        // Forced COREX_MOBILE=1 must return true regardless of dimensions
+        std::env::set_var("COREX_MOBILE", "1");
+        assert!(is_mobile_touch_environment(120, 40));
+        assert!(is_mobile_touch_environment(50, 30));
+        std::env::remove_var("COREX_MOBILE");
+    }
+
+    #[tokio::test]
+    async fn test_fleet_mode_exit_warning_not_truncated() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        let mut app = App::new(
+            corex_core::client::LlmClient::new(corex_core::config::Config::default()),
+            std::path::PathBuf::from("/tmp"),
+            false,
+        );
+        app.git_branch = "main".to_string();
+        app.auth_dialog.close();
+        app.enter_fleet_mode();
+
+        // Simulate Ctrl+C press
+        app.last_ctrl_c_press = Some(std::time::Instant::now());
+
+        // In fleet split mode on a 130x30 terminal (chat area = ~71 cols)
+        let backend = TestBackend::new(130, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+
+        // Inspect the status footer row (row 29)
+        let buffer = terminal.backend().buffer();
+        let footer_line: String = (0..70)
+            .map(|x| buffer[(x, 29)].symbol())
+            .collect();
+
+        // The warning must NOT be cut off at "Press Ctrl+C ag"
+        assert!(
+            footer_line.contains("Press Ctrl+C again to exit"),
+            "Footer in fleet mode truncated the exit warning! Found: '{}'",
+            footer_line
+        );
+    }
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+    }
+
+    #[test]
+    fn test_about_card_rows_stay_inside_the_card_when_narrow() {
+        let theme = Theme::default();
+        for width in [20, 50, 60, 80, 120] {
+            let lines = render_about_card(
+                "0.5.0", "deepseek-flash", "https://api.deepseek.com", "qwen", true,
+                "sess_123", "/home/user/projects/a-rather-long-workspace-name", "main", &theme, width,
+            );
+            let limit = width.saturating_sub(6).clamp(44, 72) + 4;
+            for row in plain(&lines) {
+                let w = unicode_width::UnicodeWidthStr::width(row.as_str());
+                assert!(w <= limit, "width {}: row {:?} is {} wide (limit {})", width, row, w, limit);
+                assert!(!row.ends_with('│') || row.trim() == "│", "width {}: closed right border in {:?}", width, row);
+            }
+        }
+    }
+
+    #[test]
+    fn test_tool_output_mentioning_declined_is_not_a_denial() {
+        let theme = Theme::default();
+        let msg = Message::tool_response("call_1", "commit abc\n    payment declined by bank\ncommit def");
+        let text = plain(&render_single_message_with_pending(0, &msg, None, &theme, 80, None, false)).join("\n");
+        assert!(!text.contains("Execution declined by user"));
+        assert!(text.contains("Output (3 lines)"));
+
+        let denied = Message::tool_response("call_2", "Tool execution denied by user with instruction: use rg");
+        let text = plain(&render_single_message_with_pending(0, &denied, None, &theme, 80, None, false)).join("\n");
+        assert!(text.contains("Execution declined by user: use rg"));
+    }
+
+    #[test]
+    fn test_skill_detection_uses_the_answered_call_name() {
+        let theme = Theme::default();
+        let msg = Message::tool_response("call_1", "Description: Specialized procedural skill for docs\nmore");
+        let shown = render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("read_file", "{}")),
+        );
+        assert!(plain(&shown).join("\n").contains("Specialized procedural skill"));
+
+        let hidden = render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("activate_skill", "{}")),
+        );
+        assert!(!plain(&hidden).join("\n").contains("Specialized procedural skill"));
+    }
+
+    #[test]
+    fn test_subagent_report_is_tagged_with_its_role() {
+        let theme = Theme::default();
+        let msg = Message::tool_response("call_1", "Subagent 'sub_9' completed:\n\nall good");
+        let lines = render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false,
+            Some(("delegate_subagent", r#"{"role":"SCOUT","prompt":"x"}"#)),
+        );
+        assert!(plain(&lines)[0].contains("[scout:sub_9]"));
+    }
+
+    #[test]
+    fn test_system_message_with_inline_hash_is_not_markdown() {
+        let theme = Theme::default();
+        let lines = format_system_message("Could not sync issue #12 --- retry later", &theme, 80, false);
+        let text = plain(&lines);
+        assert_eq!(text.len(), 1);
+        assert!(text[0].starts_with("  · "), "{:?}", text);
+
+        let md = format_system_message("## Summary\nok", &theme, 80, false);
+        assert!(!plain(&md)[0].starts_with("  · "));
+    }
+
+    #[tokio::test]
+    async fn test_scroll_offset_survives_more_than_u16_lines() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.total_rendered_items = 100_000;
+        assert_eq!(app.max_scroll_offset(), 99_990);
+
+        app.scroll_to_bottom();
+        assert_eq!(app.scroll_offset, 99_990);
+        app.scroll_chat(-30);
+        assert_eq!(app.scroll_offset, 99_960);
+        assert!(!app.auto_scroll);
+    }
+
+    async fn idle_app() -> App {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        App::new(client, PathBuf::from("/tmp"), false)
+    }
+
+    #[tokio::test]
+    async fn test_steer_messages_reach_the_model_as_one_user_message() {
+        let mut app = idle_app().await;
+        assert!(!app.deliver_steer(), "nothing to deliver");
+
+        app.steer_messages.push("first".to_string());
+        app.steer_messages.push("second".to_string());
+        app.message_queue.push_back("later".to_string());
+        let before = app.session.messages.len();
+
+        assert!(app.deliver_steer());
+        assert_eq!(app.session.messages.len(), before + 1);
+        let last = app.session.messages.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.text_content(), Some("first\n\nsecond"));
+        // The queue is untouched: it still waits for the end of the answer.
+        assert_eq!(app.message_queue.len(), 1);
+        assert!(app.steer_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_send_now_promotes_the_oldest_queued_message() {
+        let mut app = idle_app().await;
+        assert!(!app.promote_queued_to_steer());
+        app.message_queue.push_back("one".to_string());
+        app.message_queue.push_back("two".to_string());
+
+        assert!(app.promote_queued_to_steer());
+        assert_eq!(app.steer_messages, vec!["one".to_string()]);
+        assert_eq!(app.message_queue.len(), 1);
+        assert_eq!(app.message_queue.front().map(String::as_str), Some("two"));
+    }
+
+    #[tokio::test]
+    async fn test_esc_takes_back_the_newest_pending_message_first() {
+        let mut app = idle_app().await;
+        app.message_queue.push_back("queued".to_string());
+        app.steer_messages.push("steer".to_string());
+        assert!(app.has_pending_messages());
+
+        assert_eq!(app.undo_last_pending().as_deref(), Some("steer"));
+        assert_eq!(app.undo_last_pending().as_deref(), Some("queued"));
+        assert_eq!(app.undo_last_pending(), None);
+        assert!(!app.has_pending_messages());
+    }
+
+    #[tokio::test]
+    async fn test_restored_messages_never_overwrite_what_is_typed() {
+        let mut app = idle_app().await;
+        app.restore_to_input(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(app.input_buffer, "a\nb");
+        assert_eq!(app.cursor_idx, app.input_buffer.len());
+
+        app.input_buffer = "half typed".to_string();
+        app.restore_to_input(vec!["taken back".to_string()]);
+        assert_eq!(app.input_buffer, "taken back\nhalf typed");
+
+        let before = app.input_buffer.clone();
+        app.restore_to_input(vec![]);
+        assert_eq!(app.input_buffer, before);
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_keeps_partial_text_and_returns_every_pending_message() {
+        let mut app = idle_app().await;
+        app.is_streaming = true;
+        app.streaming_text = "I was in the middle of".to_string();
+        app.steer_messages.push("steer".to_string());
+        app.message_queue.push_back("queued".to_string());
+        let generation = app.current_generation_id;
+
+        let undelivered = app.take_all_pending();
+        assert_eq!(undelivered, vec!["steer".to_string(), "queued".to_string()], "delivery order");
+        app.cancel_generation("cancelled");
+        app.restore_to_input(undelivered);
+
+        assert!(!app.is_streaming);
+        assert_ne!(app.current_generation_id, generation, "late events of the old turn are dropped");
+        let last = app.session.messages.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(last.text_content().unwrap().ends_with("*(interrupted)*"));
+        assert_eq!(app.input_buffer, "steer\nqueued");
+        assert!(app.streaming_text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cancelling_without_partial_text_leaves_a_note() {
+        let mut app = idle_app().await;
+        app.is_streaming = true;
+        app.cancel_generation("Generation interrupted to deliver your message.");
+        let last = app.session.messages.last().unwrap();
+        assert_eq!(last.role, "system");
+        assert_eq!(last.text_content(), Some("Generation interrupted to deliver your message."));
+    }
+
+    fn screen_text(app: &mut App, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal.draw(|f| render_ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn test_busy_agent_tells_what_enter_and_alt_enter_do() {
+        let mut app = idle_app().await;
+
+        // Idle: no mention of queueing at all.
+        assert!(!screen_text(&mut app, 110).contains("Alt+Enter"));
+
+        // Busy with an empty prompt: the placeholder explains it.
+        app.is_streaming = true;
+        let empty = screen_text(&mut app, 110);
+        assert!(empty.contains("Type to queue a message · Alt+Enter sends it now"), "{empty}");
+
+        // Busy while typing: the hint follows the text and the status bar spells out both keys.
+        app.input_buffer = "check the logs too".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        let typing = screen_text(&mut app, 110);
+        // (the caret block sits between the text and the hint)
+        assert!(typing.contains("check the logs too█ · Enter queues · Alt+Enter sends now"), "{typing}");
+        // The status line on the left is long here (no API key): a shorter hint takes the slot.
+        assert!(typing.contains("(Alt+Enter: send now"), "{typing}");
+
+        // Too narrow for the inline hint: the text is never pushed around by it.
+        let narrow = screen_text(&mut app, 40);
+        assert!(!narrow.contains("Enter queues"), "{narrow}");
+
+        // Once a message waits in the queue, the status bar offers to send it now.
+        app.input_buffer.clear();
+        app.cursor_idx = 0;
+        app.message_queue.push_back("check the logs too".to_string());
+        let queued = screen_text(&mut app, 170);
+        assert!(queued.contains("Alt+Enter: send now · Esc: undo"), "{queued}");
+        assert!(queued.contains("[queued]") && queued.contains("(after the answer)"), "{queued}");
+
+        // And once promoted, the interrupt shortcut is the one on offer.
+        app.promote_queued_to_steer();
+        let steering = screen_text(&mut app, 170);
+        assert!(steering.contains("[sending]") && steering.contains("Alt+Enter: interrupt now"), "{steering}");
+
+        // On a crowded status line the hint shrinks but the shortcut stays visible.
+        let crowded = screen_text(&mut app, 110);
+        assert!(crowded.contains("Esc: undo"), "{crowded}");
+    }
+
+    #[test]
+    fn test_completion_badges_stack_without_blank_rows() {
+        let theme = Theme::default();
+        let render = |first: &str, next: &str| {
+            let (a, b) = (Message::system(first), Message::system(next));
+            render_single_message_with_pending(0, &a, Some(&b), &theme, 80, None, false)
+        };
+        let done = "TASK_DONE|42|0|1s";
+        // Both spellings of a subagent badge are treated alike.
+        for badge in ["SUBAGENT_DONE|sub_1|SCOUT|1s\nok", "SUBAGENTDONE|sub_1|SCOUT|1s\nok"] {
+            let stacked = render(badge, done);
+            assert_ne!(plain(&stacked).last().map(String::as_str), Some(""), "{badge}");
+        }
+        let separated = render(done, "Activated model x");
+        assert_eq!(plain(&separated).last().map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn test_collapsed_log_keeps_last_rows_behind_a_marker() {
+        let theme = Theme::default();
+        let body = (1..=9).map(|i| format!("row {i}")).collect::<Vec<_>>().join("\n");
+        let msg = format!("TASK_DONE|7|0|2s\n{body}");
+
+        let collapsed = plain(&format_system_message(&msg, &theme, 80, false));
+        assert!(collapsed.iter().any(|l| l.contains("(+4 lines above)")), "{collapsed:?}");
+        assert!(collapsed.iter().any(|l| l.contains("row 9")));
+        assert!(!collapsed.iter().any(|l| l.contains("row 4")));
+
+        let expanded = plain(&format_system_message(&msg, &theme, 80, true));
+        assert!(expanded.iter().any(|l| l.contains("row 1")));
+        assert!(!expanded.iter().any(|l| l.contains("lines above")));
+    }
+
+    #[test]
+    fn test_truncate_to_width_counts_columns() {
+        assert_eq!(truncate_to_width("short", 10), "short");
+        assert_eq!(truncate_to_width("ññññññññññ", 10), "ññññññññññ");
+        let cut = truncate_to_width("日本語日本語日本語", 10);
+        assert!(unicode_width::UnicodeWidthStr::width(cut.as_str()) <= 10);
+        assert!(cut.ends_with("..."));
     }

@@ -96,8 +96,23 @@ pub fn extract_tool_allow_rule(call: &ToolCall) -> String {
         if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
             if let Some(cmd) = args_json.get("command").or_else(|| args_json.get("CommandLine")).and_then(|c| c.as_str()) {
                 let trimmed = cmd.trim();
+                let has_operators = trimmed.chars().any(|c| matches!(c, ';' | '|' | '&' | '>' | '<' | '$' | '`' | '\n'));
                 let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 && !parts[1].starts_with('-') {
+                let bin = parts
+                    .first()
+                    .and_then(|p| p.rsplit('/').next())
+                    .unwrap_or("");
+                let is_high_risk_bin = matches!(
+                    bin,
+                    "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+                        | "python" | "python3" | "node" | "perl" | "ruby" | "php" | "lua"
+                        | "env" | "sudo" | "su" | "doas" | "eval" | "exec"
+                        | "rm" | "find" | "xargs" | "curl" | "wget" | "ssh" | "scp"
+                        | "dd" | "kill" | "pkill" | "chmod" | "chown"
+                );
+                if has_operators || is_high_risk_bin {
+                    trimmed.to_string()
+                } else if parts.len() >= 2 && !parts[1].starts_with('-') {
                     format!("{} {}", parts[0], parts[1])
                 } else if !parts.is_empty() {
                     parts[0].to_string()
@@ -110,6 +125,12 @@ pub fn extract_tool_allow_rule(call: &ToolCall) -> String {
         } else {
             call.function.name.clone()
         }
+    } else if call.function.name == "web_fetch" {
+        // Scope the approval to the host, never to every URL the model may come up with.
+        serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            .ok()
+            .and_then(|args| corex_tools::web::web_fetch_allow_rule(&args))
+            .unwrap_or_default()
     } else {
         call.function.name.clone()
     }
@@ -552,14 +573,14 @@ pub fn format_input_with_cursor<'a>(
     let mut spans = Vec::new();
 
     if text.is_empty() {
-        spans.push(Span::styled("█", Style::default().fg(theme.accent_blue)));
+        spans.push(Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)));
         return (spans, 0);
     }
 
     if clamped >= text.len() {
         spans.extend(format_input_spans(text, theme));
         let cursor_col: usize = spans.iter().map(|s| s.width()).sum();
-        spans.push(Span::styled("█", Style::default().fg(theme.accent_blue)));
+        spans.push(Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)));
         return (spans, cursor_col);
     }
 
@@ -615,38 +636,53 @@ pub fn wrap_composer_spans<'a>(
     let mut current_len = 0usize;
     let mut flat = 0usize;
     let mut cursor_row = 0usize;
+    let indent_str = if indent > 0 { " ".repeat(indent) } else { String::new() };
 
     for span in spans {
         let style = span.style;
-        for ch in span.content.chars() {
+        let content = span.content.as_ref();
+        let mut seg_start = 0usize;
+
+        for (byte_idx, ch) in content.char_indices() {
             if ch == '\n' {
+                if byte_idx > seg_start {
+                    current.push(Span::styled(content[seg_start..byte_idx].to_string(), style));
+                }
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current_len = 0;
                 if indent > 0 {
-                    current.push(Span::raw(" ".repeat(indent)));
+                    current.push(Span::raw(indent_str.clone()));
                     current_len = indent;
                 }
                 flat += 1;
+                seg_start = byte_idx + ch.len_utf8();
                 continue;
             }
 
             let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             if current_len + ch_width > width && current_len > 0 {
+                if byte_idx > seg_start {
+                    current.push(Span::styled(content[seg_start..byte_idx].to_string(), style));
+                }
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current_len = 0;
                 if indent > 0 {
-                    current.push(Span::raw(" ".repeat(indent)));
+                    current.push(Span::raw(indent_str.clone()));
                     current_len = indent;
                 }
+                seg_start = byte_idx;
             }
 
             if flat == cursor_flat {
                 cursor_row = lines.len();
             }
 
-            current.push(Span::styled(ch.to_string(), style));
             current_len += ch_width;
             flat += 1;
+        }
+
+        if seg_start < content.len() {
+            current.push(Span::styled(content[seg_start..].to_string(), style));
         }
     }
 
@@ -694,4 +730,27 @@ pub fn char_range_for_display_columns(text: &str, from: u16, to: u16) -> (usize,
     let first = first.unwrap_or_else(|| text.chars().count());
     let last = last.map(|index| index + 1).unwrap_or(first).max(first);
     (first, last)
+}
+
+/// Cuts `text` to at most `max_cols` terminal columns, ending in `...` when something was dropped.
+/// Counting columns rather than bytes keeps accented or wide text from being cut early or late.
+pub fn truncate_to_width(text: &str, max_cols: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if UnicodeWidthStr::width(text) <= max_cols {
+        return text.to_string();
+    }
+    let budget = max_cols.saturating_sub(3);
+    let mut used = 0;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
 }

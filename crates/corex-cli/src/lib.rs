@@ -107,7 +107,6 @@ pub async fn run() -> Result<()> {
         .directory
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Handle --list-sessions directly
     if cli.list_sessions {
         let ws_str = workspace_dir.display().to_string();
         let sessions = Session::list_all(Some(&ws_str));
@@ -136,7 +135,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Handle --completions or "cx completions <shell>"
     let completions_shell = cli.completions.or_else(|| {
         if cli.message.is_none() && !cli.query.is_empty() && cli.query[0] == "completions" {
             cli.query.get(1).and_then(|s| s.parse::<clap_complete::Shell>().ok())
@@ -156,7 +154,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Handle "cx fleet ...", "cx sysadmin ...", "cxs ...", or "cx --fleet"
     let is_fleet_cmd = cli.fleet
         || (cli.message.is_none()
             && !cli.query.is_empty()
@@ -181,13 +178,11 @@ pub async fn run() -> Result<()> {
             return fleet_cli::handle_fleet_cli(&workspace_dir, &fleet_args).await;
         }
 
-        // If the invocation was "cx fleet" or "cx sysadmin" without subcommands, consume the command word
         if !cli.query.is_empty() && (cli.query[0] == "fleet" || cli.query[0] == "sysadmin") {
             cli.query.remove(0);
         }
     }
 
-    // Handle in-place self-update: "cx update", "cx upgrade", "cx --upgrade", "cx --update"
     let is_update_cmd = cli.upgrade
         || (cli.message.is_none()
             && !cli.query.is_empty()
@@ -219,16 +214,15 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize forensic audit log system (~/.corex/logs/corex-forensic-YYYY-MM-DD.log)
     let log_path = corex_core::ForensicLogger::init(Some(&workspace_dir));
-    tracing::debug!("Forensic audit logger initialized at {:?}", log_path);
+    tracing::debug!("Session logger initialized at {:?}", log_path);
 
     let mut config = Config::load_with_workspace(Some(&workspace_dir));
     let mut headless_prompt = cli.message.clone();
     let mut explicit_model = false;
 
     if let Some(m) = cli.model {
-        // Smart fallback: Only if a multi-word string with spaces was passed to --model, treat as headless prompt!
+        // Multi-word values passed to `-m` are treated as a headless prompt when `-p` is absent.
         if m.contains(' ') && headless_prompt.is_none() {
             headless_prompt = Some(m);
         } else {
@@ -293,7 +287,6 @@ pub async fn run() -> Result<()> {
         })
     };
 
-    // Handle standalone --web / -w or `cx web <query>` search query
     let web_search_query = cli.web.or_else(|| {
         if cli.message.is_none() && !cli.query.is_empty() && (cli.query[0] == "web" || cli.query[0] == "/web" || cli.query[0] == "search" || cli.query[0] == "/search") {
             let q = cli.query[1..].join(" ");
@@ -318,7 +311,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Handle standalone --fetch or `cx fetch <url>`
     let web_fetch_url = cli.fetch.or_else(|| {
         if cli.message.is_none() && !cli.query.is_empty() && (cli.query[0] == "fetch" || cli.query[0] == "/fetch") {
             let u = cli.query[1..].join(" ");
@@ -343,7 +335,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Check if headless mode requested via -m, -p, or positional args
     if headless_prompt.is_none() && !cli.query.is_empty() {
         headless_prompt = Some(cli.query.join(" "));
     }
@@ -354,7 +345,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Launch interactive TUI
     let mut app = App::new(llm_client, workspace_dir.clone(), cli.yolo);
     let _ = app.reload_mcp_servers().await;
     if cli.fleet {
@@ -391,7 +381,13 @@ async fn run_headless(
     let mut messages = Vec::with_capacity(session.messages.len() + 1);
     messages.push(Message::system(prompt_builder.build()));
     for m in &session.messages {
-        if m.role != "system" {
+        let is_preserved_system = m.role == "system"
+            && m.content.as_ref().and_then(|c| c.as_text()).map_or(false, |c| {
+                c.contains("<CONTEXT_SUMMARY>")
+                    || c.starts_with("TASK_DONE|")
+                    || c.starts_with("SUBAGENT_DONE|")
+            });
+        if m.role != "system" || is_preserved_system {
             messages.push(m.clone());
         }
     }
@@ -466,6 +462,7 @@ async fn run_headless(
 
     const MAX_HEADLESS_TURNS: usize = 35;
     let mut turn_count = 0;
+    let mut truncated_retries = 0u8;
 
     loop {
         turn_count += 1;
@@ -485,6 +482,7 @@ async fn run_headless(
         let mut current_extra_content: Option<serde_json::Value> = None;
         let mut active_spinner: Option<StatusSpinner> = None;
         let mut current_stage: u8 = 0; // 0 = idle, 1 = reasoning, 2 = content
+        let mut finish_reason: Option<String> = None;
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -557,13 +555,33 @@ async fn run_headless(
                     if let Some(mut s) = active_spinner.take() {
                         s.stop().await;
                     }
-                    session.messages = compacted_messages;
+                    let sys_prompt = messages.first().cloned();
+                    session.messages = compacted_messages.clone();
+                    messages.clear();
+                    if let Some(sys) = sys_prompt {
+                        messages.push(sys);
+                    }
+                    for m in compacted_messages {
+                        if m.role != "system"
+                            || m.content.as_ref().and_then(|c| c.as_text()).map_or(false, |c| {
+                                c.contains("<CONTEXT_SUMMARY>")
+                                    || c.starts_with("TASK_DONE|")
+                                    || c.starts_with("SUBAGENT_DONE|")
+                            })
+                        {
+                            messages.push(m);
+                        }
+                    }
                     println!("\n[INFO] {}\n", notice);
                 }
                 StreamEvent::UsageUpdate(usage) => {
                     session.update_usage(&usage);
                 }
-                StreamEvent::Completed { .. } => {}
+                StreamEvent::Completed { finish_reason: reason } => {
+                    if reason.is_some() {
+                        finish_reason = reason;
+                    }
+                }
                 StreamEvent::Error(err) => {
                     if let Some(mut s) = active_spinner.take() {
                         s.stop().await;
@@ -586,14 +604,18 @@ async fn run_headless(
         }
 
         if !assistant_text.trim().is_empty() {
+            let safe_text = corex_core::sanitize_for_terminal(&assistant_text);
             if is_tty {
                 let theme = corex_tui::Theme::default();
-                let rendered = corex_tui::render_markdown_to_ansi(&assistant_text, &theme, term_width);
+                let rendered = corex_tui::render_markdown_to_ansi(&safe_text, &theme, term_width);
                 println!("{}\n", rendered);
             } else {
-                println!("{}\n", assistant_text);
+                println!("{}\n", safe_text);
             }
         }
+
+        // Providers that index tool calls by content block (Anthropic) leave empty placeholders.
+        current_tool_calls.retain(|c| !c.function.name.trim().is_empty());
 
         if !current_tool_calls.is_empty() {
             let text_opt = if assistant_text.is_empty() { None } else { Some(assistant_text) };
@@ -612,6 +634,23 @@ async fn run_headless(
             );
             messages.push(assistant_msg.clone());
             session.add_message(assistant_msg);
+
+            if corex_core::is_truncated_finish(finish_reason.as_deref()) {
+                // Arguments may be cut mid-file or mid-command: never run them.
+                for call in &current_tool_calls {
+                    let msg = Message::tool_response(call.id.clone(), corex_core::TRUNCATED_TOOL_CALL_ERROR);
+                    messages.push(msg.clone());
+                    session.add_message(msg);
+                }
+                truncated_retries += 1;
+                if truncated_retries > 1 {
+                    eprintln!("\n[WARNING] Response truncated twice by the output token limit; tool calls were not executed.");
+                    break;
+                }
+                eprintln!("\n[WARNING] Response truncated by the output token limit; asking the model to retry in smaller pieces.");
+                continue;
+            }
+            truncated_retries = 0;
 
             for call in &current_tool_calls {
                 let args_json = corex_core::parse_lenient_json(&call.function.arguments)
@@ -644,7 +683,6 @@ async fn run_headless(
 
                 let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(target_detail), 70);
 
-                // Prompt user for confirmation on potentially mutating/dangerous actions unless YOLO mode is enabled
                 if !context.yolo_mode {
                     if let Some(tool) = tool_registry.get(&call.function.name) {
                         if tool.needs_confirmation(&args_json, &context) {
@@ -655,7 +693,7 @@ async fn run_headless(
                             }
                             println!("\n[WARNING] Action requires confirmation: [{}]", call.function.name);
                             if let Some(diff) = tool.format_diff(&args_json, &context.workspace_dir) {
-                                println!("{}", diff);
+                                println!("{}", corex_core::sanitize_for_terminal(&diff));
                             } else if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
                                 println!("  Command: {}", corex_core::sanitize_for_terminal(cmd));
                             } else {
@@ -680,7 +718,6 @@ async fn run_headless(
                     }
                 }
 
-                // Show real-time animated spinner while the tool executes
                 let mut tool_spinner = StatusSpinner::start(
                     is_tty,
                     "\x1b[33m",
@@ -708,16 +745,26 @@ async fn run_headless(
                         msg
                     }
                 };
+                // Huge output is cut to head + tail; the full text stays readable from a file.
+                let output = corex_core::spill_large_output(&call.function.name, output);
+                // Advisory nudge when the model keeps repeating the exact same call.
+                let output = match corex_core::observe_tool_call(&call.function.name, &call.function.arguments) {
+                    Some(reminder) => format!("{}\n\n{}", output, reminder),
+                    None => output,
+                };
                 let tool_msg = Message::tool_response(call.id.clone(), output);
                 messages.push(tool_msg.clone());
                 session.add_message(tool_msg);
             }
 
-            // Feed the tool results back and continue the agent loop
+            if let Some(image_msg) = corex_core::drain_tool_images_message() {
+                messages.push(image_msg.clone());
+                session.add_message(image_msg);
+            }
+
             continue;
         }
 
-        // No tool calls: record final assistant turn in session and finish
         if !assistant_text.is_empty() || !reasoning_text.is_empty() {
             let cot_opt = if reasoning_text.is_empty() { None } else { Some(reasoning_text) };
             let final_msg = Message::assistant(assistant_text, cot_opt);

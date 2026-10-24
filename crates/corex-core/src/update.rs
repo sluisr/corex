@@ -205,8 +205,7 @@ pub fn verify_checksum_from_text(
     ))
 }
 
-/// Checks online for the latest Corex version with multi-tier fallback (CDN, GitHub API with token, Web redirect).
-/// Sets a strict 3-second timeout so it never hangs or blocks the CLI/TUI.
+/// Checks online for a newer release (CDN -> GitHub API -> GitHub web redirect) with a 3s timeout.
 pub async fn check_for_update_online(current_version: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -214,7 +213,6 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         .build()
         .ok()?;
 
-    // 1. Try Official CDN endpoint first (fastest, zero rate limits)
     if let Ok(resp) = client.get("https://corex.sluisr.com/release.json").send().await {
         if resp.status().is_success() {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
@@ -229,7 +227,6 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         }
     }
 
-    // 2. Try GitHub Releases API with optional auth token
     let mut req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
     if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
         let token = token.trim();
@@ -251,7 +248,6 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         }
     }
 
-    // 3. Fallback: GitHub Web redirect (zero REST rate limit)
     let no_redir_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .user_agent(format!("corex/{}", current_version))
@@ -291,10 +287,7 @@ struct CdnBinaryEntry {
     url: String,
 }
 
-/// Fetches full metadata of latest GitHub release with multi-tiered resilient fallback:
-/// 1. GitHub API (with GITHUB_TOKEN/GH_TOKEN if available)
-/// 2. Official High-Availability CDN (https://corex.sluisr.com/release.json)
-/// 3. GitHub Releases Web Redirect (https://github.com/sluisr/corex/releases/latest -> 302 Location header)
+/// Fetches latest release metadata (GitHub REST API -> CDN -> GitHub web redirect).
 pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseInfo, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -302,7 +295,6 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         .build()
         .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
 
-    // Tier 1: Try GitHub REST API (attach token if available in env)
     let mut api_req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
     if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
         let token = token.trim();
@@ -327,7 +319,6 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         }
     }
 
-    // Tier 2: Try Official CDN endpoint (Cloudflare hosted, zero rate limits)
     let cdn_url = "https://corex.sluisr.com/release.json";
     if let Ok(resp) = client.get(cdn_url).send().await {
         if resp.status().is_success() {
@@ -350,7 +341,6 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         }
     }
 
-    // Tier 3: Follow GitHub web release redirect (no API quota restrictions)
     let no_redirect_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("corex/{}", current_version))

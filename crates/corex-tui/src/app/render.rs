@@ -39,112 +39,203 @@ pub fn render_about_card(
     theme: &Theme,
     content_max_width: usize,
 ) -> Vec<Line<'static>> {
-    // Total inner width between left border and right border
+    // Open gutter instead of a closed box: same visual language as the tool and log blocks, and
+    // no right border to drift on narrow terminals.
     let inner_width = (content_max_width.saturating_sub(6)).clamp(44, 72);
     let label_w = 23;
-    let usable_w = inner_width.saturating_sub(4); // 3 spaces left, 1 space right
+    let usable_w = inner_width.saturating_sub(4);
+
+    let gutter = || Span::styled("  │ ", Style::default().fg(theme.border_dim));
 
     let make_row = |label: &str, val_spans: Vec<Span<'static>>| -> Line<'static> {
         let mut line_spans = vec![
-            Span::styled("  │   ", Style::default().fg(theme.dark_gray)),
-            Span::styled(format!("{:<width$}", label, width = label_w), Style::default().fg(Color::Rgb(160, 172, 190)).add_modifier(Modifier::BOLD)),
+            gutter(),
+            Span::styled(format!("{:<width$}", label, width = label_w), Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
         ];
-        let val_used: usize = val_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
         line_spans.extend(val_spans);
-        let rem = usable_w.saturating_sub(label_w + val_used);
-        if rem > 0 {
-            line_spans.push(Span::raw(" ".repeat(rem)));
-        }
-        line_spans.push(Span::styled(" │", Style::default().fg(theme.dark_gray)));
         Line::from(line_spans)
     };
 
     let empty_row = || -> Line<'static> {
-        Line::from(vec![
-            Span::styled("  │", Style::default().fg(theme.dark_gray)),
-            Span::raw(" ".repeat(inner_width)),
-            Span::styled("│", Style::default().fg(theme.dark_gray)),
-        ])
+        Line::from(Span::styled("  │", Style::default().fg(theme.border_dim)))
     };
 
-    // Top line: ╭─ Corex v0.2.0 ───────╮
-    let title = format!(" Corex v{} ", version);
-    let title_w = unicode_width::UnicodeWidthStr::width(title.as_str());
-    let top_fill = inner_width.saturating_sub(1 + title_w);
-    let top_line = Line::from(vec![
-        Span::styled("  ╭─", Style::default().fg(theme.dark_gray)),
-        Span::styled(title, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{}╮", "─".repeat(top_fill)), Style::default().fg(theme.dark_gray)),
+    let title_line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("Corex v{}", version), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
     ]);
 
-    // Section divider: ├─ Session Telemetry ──────┤
-    let div_title = "─ Session Telemetry ";
-    let div_w = unicode_width::UnicodeWidthStr::width(div_title);
-    let div_fill = inner_width.saturating_sub(div_w);
-    let div_line = Line::from(vec![
-        Span::styled("  ├", Style::default().fg(theme.dark_gray)),
-        Span::styled(div_title, Style::default().fg(Color::Rgb(95, 115, 140)).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{}┤", "─".repeat(div_fill)), Style::default().fg(theme.dark_gray)),
+    let section_line = Line::from(vec![
+        gutter(),
+        Span::styled("Session Telemetry", Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)),
     ]);
-
-    // Bottom line: ╰────────────────────────╯
-    let bot_line = Line::from(Span::styled(
-        format!("  ╰{}╯", "─".repeat(inner_width)),
-        Style::default().fg(theme.dark_gray),
-    ));
 
     let local_status = if local_enabled { "(Active)" } else { "(Disabled)" };
-    let local_color = if local_enabled { Color::Rgb(115, 185, 140) } else { Color::Rgb(110, 120, 135) };
+    let local_color = if local_enabled { theme.success } else { theme.muted };
 
     let val_max = usable_w.saturating_sub(label_w + 1);
 
+    // The author's site only follows the name when it fits: a row must never wrap past the card.
+    let creator = "sluisr";
+    let creator_site = " (https://sluisr.com)";
+    let mut creator_spans = vec![Span::styled(creator, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD))];
+    if creator.len() + creator_site.len() <= val_max {
+        creator_spans.push(Span::styled(creator_site, Style::default().fg(theme.link)));
+    }
+    let link_row = |label: &str, url: &str| make_row(label, vec![
+        Span::styled(corex_core::truncate_ellipsis(url, val_max), Style::default().fg(theme.link)),
+    ]);
+
     vec![
-        top_line,
+        title_line,
         empty_row(),
-        make_row("Creator & Maintainer", vec![
-            Span::styled("sluisr", Style::default().fg(Color::Rgb(225, 230, 242)).add_modifier(Modifier::BOLD)),
-            Span::styled(" (https://sluisr.com)", Style::default().fg(Color::Rgb(115, 160, 220))),
-        ]),
-        make_row("Official Website", vec![
-            Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
-        ]),
-        make_row("Discord Community", vec![
-            Span::styled(corex_core::truncate_ellipsis("https://discord.gg/MGMt6M6Yx", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
-        ]),
-        make_row("Changelog & Releases", vec![
-            Span::styled(corex_core::truncate_ellipsis("https://corex.sluisr.com/changelog", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
-        ]),
-        make_row("Report Issues & Bugs", vec![
-            Span::styled(corex_core::truncate_ellipsis("https://github.com/sluisr/corex/issues", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
-        ]),
-        make_row("GitHub Repository", vec![
-            Span::styled(corex_core::truncate_ellipsis("https://github.com/sluisr/corex", val_max), Style::default().fg(Color::Rgb(105, 185, 235))),
-        ]),
+        make_row("Creator & Maintainer", creator_spans),
+        link_row("Official Website", "https://corex.sluisr.com"),
+        link_row("Discord Community", "https://discord.gg/MGMt6M6Yx"),
+        link_row("Changelog & Releases", "https://corex.sluisr.com/changelog"),
+        link_row("Report Issues & Bugs", "https://github.com/sluisr/corex/issues"),
+        link_row("GitHub Repository", "https://github.com/sluisr/corex"),
         empty_row(),
-        div_line,
+        section_line,
         empty_row(),
         make_row("Active Model", vec![
             Span::styled(corex_core::truncate_ellipsis(model, val_max), Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
         ]),
         make_row("API Base URL", vec![
-            Span::styled(corex_core::truncate_ellipsis(base_url, val_max), Style::default().fg(Color::Rgb(140, 150, 170))),
+            Span::styled(corex_core::truncate_ellipsis(base_url, val_max), Style::default().fg(theme.gray)),
         ]),
         make_row("Local SLM Engine", vec![
-            Span::styled(format!("{} ", corex_core::truncate_ellipsis(local_engine, val_max.saturating_sub(12))), Style::default().fg(Color::Rgb(140, 150, 170))),
+            Span::styled(format!("{} ", corex_core::truncate_ellipsis(local_engine, val_max.saturating_sub(12))), Style::default().fg(theme.gray)),
             Span::styled(local_status, Style::default().fg(local_color)),
         ]),
         make_row("Session ID", vec![
-            Span::styled(corex_core::truncate_ellipsis(session_id, val_max), Style::default().fg(Color::Rgb(125, 135, 150))),
+            Span::styled(corex_core::truncate_ellipsis(session_id, val_max), Style::default().fg(theme.muted)),
         ]),
         make_row("Workspace", vec![
-            Span::styled(corex_core::truncate_ellipsis(workspace, val_max), Style::default().fg(Color::Rgb(150, 180, 135))),
+            Span::styled(corex_core::truncate_ellipsis(workspace, val_max), Style::default().fg(theme.accent_green)),
         ]),
         make_row("Git Branch", vec![
-            Span::styled(corex_core::truncate_ellipsis(branch, val_max), Style::default().fg(Color::Rgb(210, 165, 105))),
+            Span::styled(corex_core::truncate_ellipsis(branch, val_max), Style::default().fg(theme.accent_yellow)),
         ]),
         empty_row(),
-        bot_line,
     ]
+}
+
+/// Soft hint shown after a message typed while the agent is busy (leading space is part of it).
+const BUSY_INPUT_HINT: &str = " · Enter queues · Alt+Enter sends now";
+
+/// Rows of a command/subagent log that stay visible while logs are collapsed.
+const COLLAPSED_LOG_ROWS: usize = 5;
+
+/// Appends `rows` as a gutter-prefixed log: all of it when `expanded`, otherwise only the last
+/// `COLLAPSED_LOG_ROWS` behind a `… (+N lines above)` marker (which `is_collapsed_marker` finds).
+fn push_log_tail(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[&str],
+    expanded: bool,
+    width: usize,
+    gutter: &str,
+    text: Color,
+    dim: Color,
+) {
+    let skipped = if expanded { 0 } else { rows.len().saturating_sub(COLLAPSED_LOG_ROWS) };
+    if skipped > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(gutter.to_string(), Style::default().fg(dim)),
+            Span::styled(format!("… (+{} lines above)", skipped), Style::default().fg(dim)),
+        ]));
+    }
+    for row in &rows[skipped..] {
+        let spans = vec![Span::styled(row.replace('\t', "    "), Style::default().fg(text))];
+        lines.extend(crate::markdown::wrap_spans(spans, width, gutter));
+    }
+}
+
+/// Finds the `(name, arguments)` of the call a tool message answers by matching its
+/// `tool_call_id` against the assistant turns before it.
+fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> {
+    let msg = messages.get(idx)?;
+    if msg.role != "tool" {
+        return None;
+    }
+    let id = msg.tool_call_id.as_deref()?;
+    messages[..idx]
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant")
+        .take(16)
+        .find_map(|m| {
+            m.tool_calls
+                .as_ref()?
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| (c.function.name.as_str(), c.function.arguments.as_str()))
+        })
+}
+
+/// The `… (+N lines above)` row a collapsed log leaves behind.
+fn is_collapsed_marker(line: &Line<'_>) -> bool {
+    line.spans.iter().any(|s| s.content.starts_with("… (+") && s.content.ends_with("lines above)"))
+}
+
+/// Lowercase role tag shared by every subagent badge (`[scout:sub_1]`), whichever path produced it.
+fn subagent_role_label(role: &str) -> String {
+    let role = role.trim().to_lowercase();
+    if role.is_empty() || role == "subagent" { "agent".to_string() } else { role }
+}
+
+/// True only for text carrying block-level markdown (a heading, a fence or a rule on its own
+/// line): a stray `#12` or `a---b` inside a sentence must not turn a notice into a heading.
+fn looks_like_markdown(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|line| {
+        let hashes = line.chars().take_while(|&c| c == '#').count();
+        (1..=6).contains(&hashes) && line[hashes..].starts_with(' ')
+            || line.starts_with("```")
+            || (line.len() >= 3 && line.trim_end().chars().all(|c| c == '-'))
+    })
+}
+
+/// The kinds of system message the feed draws specially. The producers emit them as plain text
+/// (`TASK_DONE|pid|code|time`, `Error: ...`), so this is the single place that knows those
+/// prefixes: the renderer and the spacing logic both go through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemNotice {
+    InfoCard,
+    TaskDone,
+    SubagentDone,
+    ModelChange,
+    Error,
+    Checkpoint,
+    Session,
+    Plain,
+}
+
+impl SystemNotice {
+    fn classify(text: &str) -> Self {
+        let first = text.lines().next().unwrap_or("").trim();
+        if first.starts_with("COREX_INFO_CARD|") {
+            Self::InfoCard
+        } else if first.starts_with("TASK_DONE|") || first.starts_with("[TASK FINISHED]") {
+            Self::TaskDone
+        } else if first.starts_with("SUBAGENT_DONE|") || first.starts_with("SUBAGENTDONE|") {
+            Self::SubagentDone
+        } else if first.starts_with("Activated ") || first.starts_with("Switched ") {
+            Self::ModelChange
+        } else if first.starts_with("Error") || first.starts_with("Failed") {
+            Self::Error
+        } else if first.contains("checkpoint saved") || first.contains("saved with tag") {
+            Self::Checkpoint
+        } else if first.starts_with("Resumed session") || first.starts_with("Started new chat") {
+            Self::Session
+        } else {
+            Self::Plain
+        }
+    }
+
+    /// Background-work completion badges stack tightly, without a blank row between them.
+    fn is_completion_badge(self) -> bool {
+        matches!(self, Self::TaskDone | Self::SubagentDone)
+    }
 }
 
 pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize, logs_expanded: bool) -> Vec<Line<'static>> {
@@ -156,9 +247,9 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
     }
 
     let first_line = raw_lines[0].trim();
+    let notice = SystemNotice::classify(text);
 
-    // 0. Dedicated Corex Info Card
-    if first_line.starts_with("COREX_INFO_CARD|") {
+    if notice == SystemNotice::InfoCard {
         let parts: Vec<&str> = first_line.split('|').collect();
         if parts.len() >= 9 {
             return render_about_card(
@@ -176,14 +267,12 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         }
     }
 
-    // Soft, muted color palette for discreet visual presence (opaco / disimulado)
-    let muted_dim = Color::Rgb(70, 82, 98);
-    let muted_label = Color::Rgb(105, 118, 135);
-    let muted_text = Color::Rgb(155, 168, 185);
-    let muted_tag = Color::Rgb(95, 115, 138);
+    let muted_dim = theme.muted;
+    let muted_label = theme.muted;
+    let muted_text = theme.gray;
+    let muted_tag = theme.muted;
 
-    // 1. Task Finished / Background Task Done (One-Liner Badge + tail or full log)
-    if first_line.starts_with("TASK_DONE|") || first_line.starts_with("[TASK FINISHED]") {
+    if notice == SystemNotice::TaskDone {
         let (pid, exit_code_str, duration) = if first_line.starts_with("TASK_DONE|") {
             let parts: Vec<&str> = first_line.split('|').collect();
             let pid = parts.get(1).copied().unwrap_or("?");
@@ -198,12 +287,12 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         let is_stopped = exit_code_str == "stopped";
 
         let (icon, icon_color, status_text, status_color) = if is_stopped {
-            ("  ■ ", Color::Rgb(215, 175, 100), "stopped".to_string(), Color::Rgb(215, 175, 100))
+            ("  ■ ", theme.warning, "stopped".to_string(), theme.warning)
         } else if is_ok {
-            ("  ✓ ", Color::Rgb(105, 185, 135), "finished (exit 0)".to_string(), Color::Rgb(125, 160, 145))
+            ("  ✓ ", theme.success, "finished (exit 0)".to_string(), theme.success)
         } else {
             let label = format!("finished (exit {})", exit_code_str);
-            ("  ✕ ", Color::Rgb(220, 100, 100), label, Color::Rgb(220, 110, 110))
+            ("  ✕ ", theme.error, label, theme.error)
         };
 
         // Output lines
@@ -212,8 +301,6 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
             .copied()
             .filter(|l| !l.trim().is_empty())
             .collect();
-        let total = output_lines.len();
-        let max_lines = 5;
 
         let mut badge_spans = vec![
             Span::styled(icon, Style::default().fg(icon_color)),
@@ -223,126 +310,51 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         if !duration.trim().is_empty() {
             badge_spans.push(Span::styled(format!(" ({})", duration.trim()), Style::default().fg(muted_dim)));
         }
-        if logs_expanded && total > max_lines {
-            badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(muted_dim)));
-        }
         lines.push(Line::from(badge_spans));
 
-        if !output_lines.is_empty() {
-            if logs_expanded {
-                for line_str in &output_lines {
-                    let clean = line_str.replace('\t', "    ");
-                    let spans = vec![
-                        Span::styled(clean, Style::default().fg(muted_text)),
-                    ];
-                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
-                }
-            } else {
-                if total > max_lines {
-                    let omitted = total - max_lines;
-                    let om_spans = vec![
-                        Span::styled("    │ ", Style::default().fg(muted_dim)),
-                        Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(muted_dim)),
-                    ];
-                    lines.push(Line::from(om_spans));
-                }
-
-                let start_idx = total.saturating_sub(max_lines);
-                for line_str in &output_lines[start_idx..] {
-                    let clean = line_str.replace('\t', "    ");
-                    let spans = vec![
-                        Span::styled(clean, Style::default().fg(muted_text)),
-                    ];
-                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
-                }
-            }
-        }
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
 
         return lines;
     }
 
-    // 1b. Subagent Done / Subagent Task Finished (One-Liner Badge + compact tail or full log)
-    if first_line.starts_with("SUBAGENT_DONE|") || first_line.starts_with("SUBAGENTDONE|") {
+    if notice == SystemNotice::SubagentDone {
         let parts: Vec<&str> = first_line.split('|').collect();
         let sub_id = parts.get(1).copied().unwrap_or("?");
         let role_str = parts.get(2).copied().unwrap_or("SUBAGENT");
         let dur = parts.get(3).copied().unwrap_or("");
 
-        let (icon, role_label) = match role_str.to_uppercase().as_str() {
-            "SCOUT" => ("  🔭 ", "scout"),
-            "TESTER" => ("  🧪 ", "tester"),
-            "RESEARCHER" => ("  📚 ", "researcher"),
-            "WORKER" => ("  ⚙️ ", "worker"),
-            _ => ("  🤖 ", "subagent"),
-        };
+        let role_label = subagent_role_label(role_str);
 
-        // Output lines
         let output_lines: Vec<&str> = raw_lines[1..]
             .iter()
             .copied()
             .filter(|l| !l.trim().is_empty())
             .collect();
-        let total = output_lines.len();
-        let max_lines = 5;
 
         let is_err = output_lines.first().map(|l| l.starts_with("Exit code ") || l.starts_with("Failed")).unwrap_or(false);
 
-        let (status_text, status_color) = if is_err {
-            ("failed".to_string(), Color::Rgb(220, 110, 110))
+        let (icon, status_text, status_color) = if is_err {
+            ("  ✕ ", "failed".to_string(), theme.error)
         } else {
-            ("completed".to_string(), Color::Rgb(105, 185, 135))
+            ("  ✓ ", "completed".to_string(), theme.success)
         };
 
         let mut badge_spans = vec![
-            Span::styled(icon, Style::default().fg(Color::Rgb(105, 185, 135))),
+            Span::styled(icon, Style::default().fg(status_color)),
             Span::styled(format!("[{}:{}] ", role_label, sub_id), Style::default().fg(muted_tag)),
             Span::styled(status_text, Style::default().fg(status_color)),
         ];
         if !dur.trim().is_empty() {
             badge_spans.push(Span::styled(format!(" ({})", dur.trim()), Style::default().fg(muted_dim)));
         }
-        if logs_expanded && total > max_lines {
-            badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(muted_dim)));
-        } else if !logs_expanded && total > max_lines {
-            badge_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(muted_dim)));
-        }
         lines.push(Line::from(badge_spans));
 
-        if !output_lines.is_empty() {
-            if logs_expanded {
-                for line_str in &output_lines {
-                    let clean = line_str.replace('\t', "    ");
-                    let spans = vec![
-                        Span::styled(clean, Style::default().fg(muted_text)),
-                    ];
-                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
-                }
-            } else {
-                if total > max_lines {
-                    let omitted = total - max_lines;
-                    let om_spans = vec![
-                        Span::styled("    │ ", Style::default().fg(muted_dim)),
-                        Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(muted_dim)),
-                    ];
-                    lines.push(Line::from(om_spans));
-                }
-
-                let start_idx = total.saturating_sub(max_lines);
-                for line_str in &output_lines[start_idx..] {
-                    let clean = line_str.replace('\t', "    ");
-                    let spans = vec![
-                        Span::styled(clean, Style::default().fg(muted_text)),
-                    ];
-                    lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
-                }
-            }
-        }
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
 
         return lines;
     }
 
-    // 2. Model Activation Message
-    if first_line.starts_with("Activated ") || first_line.starts_with("Switched ") {
+    if notice == SystemNotice::ModelChange {
         let title = first_line.trim_start_matches("Activated ").trim_start_matches("Switched ");
         let header_spans = vec![
             Span::styled("  · ", Style::default().fg(muted_dim)),
@@ -364,10 +376,10 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
                     spans.push(Span::styled(format!("{}: ", k.trim()), Style::default().fg(muted_label)));
                     let val = v.trim();
                     let val_color = match val.to_lowercase().as_str() {
-                        "dynamic" | "low" | "enabled" => Color::Rgb(115, 150, 135),
-                        "medium" => Color::Rgb(165, 150, 120),
-                        "high" | "max" => Color::Rgb(150, 130, 165),
-                        _ => Color::Rgb(140, 155, 175),
+                        "dynamic" | "low" | "enabled" => theme.success,
+                        "medium" => theme.warning,
+                        "high" | "max" => theme.accent_purple,
+                        _ => theme.gray,
                     };
                     spans.push(Span::styled(val.to_string(), Style::default().fg(val_color)));
                 } else {
@@ -379,58 +391,53 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
                     Span::styled("    ", Style::default()),
                     Span::styled(trimmed.to_string(), Style::default().fg(muted_label)),
                 ];
-                lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    "));
+                lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "    "));
             }
         }
         return lines;
     }
 
-    // 2. Error / Failure Message
-    if first_line.starts_with("Error") || first_line.starts_with("Failed") {
+    if notice == SystemNotice::Error {
         let err_spans = vec![
-            Span::styled("  ✕ ", Style::default().fg(Color::Rgb(190, 95, 95))),
-            Span::styled("[error] ", Style::default().fg(Color::Rgb(190, 95, 95))),
+            Span::styled("  ✕ ", Style::default().fg(theme.error)),
+            Span::styled("[error] ", Style::default().fg(theme.error)),
             Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
         ];
-        lines.extend(crate::markdown::wrap_spans(err_spans, content_max_width, "    "));
+        lines.extend(crate::markdown::wrap_spans_with_indent(err_spans, content_max_width, "", "    "));
         for sub_line in &raw_lines[1..] {
             let spans = vec![
                 Span::styled("    ", Style::default()),
                 Span::styled(sub_line.to_string(), Style::default().fg(muted_label)),
             ];
-            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    "));
+            lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "    "));
         }
         return lines;
     }
 
-    // 3. Checkpoint / Saved Message
-    if first_line.contains("checkpoint saved") || first_line.contains("saved with tag") {
+    if notice == SystemNotice::Checkpoint {
         let save_spans = vec![
-            Span::styled("  ✓ ", Style::default().fg(Color::Rgb(105, 145, 125))),
-            Span::styled("[checkpoint] ", Style::default().fg(Color::Rgb(105, 145, 125))),
+            Span::styled("  ✓ ", Style::default().fg(theme.success)),
+            Span::styled("[checkpoint] ", Style::default().fg(theme.success)),
             Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
         ];
-        lines.extend(crate::markdown::wrap_spans(save_spans, content_max_width, "    "));
+        lines.extend(crate::markdown::wrap_spans_with_indent(save_spans, content_max_width, "", "    "));
         return lines;
     }
 
-    // 4. Session Event
-    if first_line.starts_with("Resumed session") || first_line.starts_with("Started new chat") {
+    if notice == SystemNotice::Session {
         let session_spans = vec![
             Span::styled("  · ", Style::default().fg(muted_dim)),
             Span::styled("[session] ", Style::default().fg(muted_tag)),
             Span::styled(first_line.to_string(), Style::default().fg(muted_text)),
         ];
-        lines.extend(crate::markdown::wrap_spans(session_spans, content_max_width, "    "));
+        lines.extend(crate::markdown::wrap_spans_with_indent(session_spans, content_max_width, "", "    "));
         return lines;
     }
 
-    // 5. Rich Markdown Formatted System Messages (e.g. headers, rules, code blocks)
-    if text.contains('#') || text.contains("```") || text.contains("---") {
+    if looks_like_markdown(text) {
         return crate::markdown::render_markdown(text, theme, content_max_width);
     }
 
-    // 6. Default General Multi-line or Single-line System Message
     let mut is_first = true;
     for line in raw_lines {
         let trimmed = line.trim();
@@ -442,7 +449,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
             Span::styled(prefix, Style::default().fg(muted_dim)),
             Span::styled(trimmed.to_string(), Style::default().fg(muted_label)),
         ];
-        lines.extend(crate::markdown::wrap_spans(sys_spans, content_max_width, "    "));
+        lines.extend(crate::markdown::wrap_spans_with_indent(sys_spans, content_max_width, "", "    "));
         is_first = false;
     }
 
@@ -467,9 +474,11 @@ pub fn render_single_message_with_pending(
         pending_conf,
         logs_expanded,
         logs_expanded,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_single_message_with_pending_and_thinking(
     _msg_idx: usize,
     msg: &Message,
@@ -479,6 +488,9 @@ pub fn render_single_message_with_pending_and_thinking(
     pending_conf: Option<&PendingToolBatch>,
     logs_expanded: bool,
     thinking_expanded: bool,
+    // `(name, arguments)` of the call a tool message answers. Tool responses carry no name of
+    // their own, so without it the renderer would have to guess the tool from the output text.
+    tool_call: Option<(&str, &str)>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match msg.role.as_str() {
@@ -488,17 +500,17 @@ pub fn render_single_message_with_pending_and_thinking(
                 let (spans, first_indent) = if idx == 0 {
                     (
                         vec![
-                            Span::styled("[", Style::default().fg(theme.dark_gray)),
-                            Span::styled("You", Style::default().fg(Color::Rgb(130, 215, 160)).add_modifier(Modifier::BOLD)),
-                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
-                            Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("[", Style::default().fg(theme.border_dim)),
+                            Span::styled("You", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
+                            Span::styled("] ", Style::default().fg(theme.border_dim)),
+                            Span::styled(line.to_string(), Style::default().fg(theme.foreground)),
                         ],
                         "  ",
                     )
                 } else {
                     (
                         vec![
-                            Span::styled(line.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled(line.to_string(), Style::default().fg(theme.foreground)),
                         ],
                         "        ",
                     )
@@ -514,9 +526,8 @@ pub fn render_single_message_with_pending_and_thinking(
                 if !trimmed_cot.is_empty() {
                     if thinking_expanded {
                         lines.push(Line::from(vec![
-                            Span::styled("  [", Style::default().fg(theme.dark_gray)),
-                            Span::styled("• Thought", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
-                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
+                            Span::styled("  ▾ ", Style::default().fg(theme.accent_purple)),
+                            Span::styled("Thought ", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
                             Span::styled("(Ctrl+T to collapse)", Style::default().fg(theme.dark_gray)),
                         ]));
                         for cot_line in trimmed_cot.lines() {
@@ -527,9 +538,8 @@ pub fn render_single_message_with_pending_and_thinking(
                         lines.push(Line::from(""));
                     } else {
                         lines.push(Line::from(vec![
-                            Span::styled("  [", Style::default().fg(theme.dark_gray)),
-                            Span::styled("• Thought", Style::default().fg(theme.accent_purple)),
-                            Span::styled("] ", Style::default().fg(theme.dark_gray)),
+                            Span::styled("  · ", Style::default().fg(theme.accent_purple)),
+                            Span::styled("Thought ", Style::default().fg(theme.accent_purple)),
                             Span::styled("(Ctrl+T to expand)", Style::default().fg(theme.dark_gray)),
                         ]));
                         lines.push(Line::from(""));
@@ -561,20 +571,23 @@ pub fn render_single_message_with_pending_and_thinking(
             let content = msg.text_content().unwrap_or("");
             let is_last_tool = next_msg.map(|m| m.role.as_str() != "tool").unwrap_or(true);
 
-            // Skills are internal procedural knowledge loaded for the AI — suppress raw log dumping
-            let is_skill = msg.name.as_deref() == Some("activate_skill")
-                || content.starts_with("---\nname:")
-                || content.starts_with("# Corex — ")
-                || content.contains("Specialized procedural skill for");
+            let tool_name = tool_call.map(|(name, _)| name).or(msg.name.as_deref());
+
+            // Skills are internal procedural knowledge loaded for the AI — suppress raw log dumping.
+            // The name is authoritative; the prefixes only cover sessions saved without it.
+            let is_skill = match tool_name {
+                Some(name) => name == "activate_skill",
+                None => content.starts_with("---\nname:") || content.starts_with("# Corex — "),
+            };
 
             if is_skill {
                 let is_err = content.starts_with("Error") || content.starts_with("Failed") || content.starts_with("Skill '");
                 if is_err {
                     let line_spans = vec![
-                        Span::styled("    ✕ ", Style::default().fg(Color::Red)),
+                        Span::styled("    ✕ ", Style::default().fg(theme.error)),
                         Span::styled(content.lines().next().unwrap_or("Failed to load skill").to_string(), Style::default().fg(theme.gray)),
                     ];
-                    lines.extend(crate::markdown::wrap_spans(line_spans, content_max_width, "    "));
+                    lines.extend(crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      "));
                 }
                 if is_last_tool {
                     lines.push(Line::from(""));
@@ -582,22 +595,27 @@ pub fn render_single_message_with_pending_and_thinking(
                 return lines;
             }
 
-            let check_slice = corex_core::safe_truncate_str(content, 2048);
-            if check_slice.contains("denied by user") || check_slice.contains("declined") {
-                let line_spans = vec![
-                    Span::styled("    ✕ ", Style::default().fg(Color::Red)),
+            let denial = content
+                .strip_prefix("Tool execution denied by user")
+                .or_else(|| content.strip_prefix("Execution denied by user"));
+            if let Some(rest) = denial {
+                let mut line_spans = vec![
+                    Span::styled("    ✕ ", Style::default().fg(theme.error)),
                     Span::styled("Execution declined by user", Style::default().fg(theme.gray)),
                 ];
-                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                if let Some(feedback) = rest.strip_prefix(" with instruction:").map(str::trim).filter(|f| !f.is_empty()) {
+                    line_spans.push(Span::styled(format!(": {}", feedback), Style::default().fg(theme.muted)));
+                }
+                let wrapped = crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      ");
                 lines.extend(wrapped);
             } else if content.starts_with("Successfully edited") && content.contains('\n') {
                 let mut content_lines = content.lines();
                 let header = content_lines.next().unwrap_or("Successfully edited");
                 let header_spans = vec![
-                    Span::styled("    ✓ ", Style::default().fg(Color::Green)),
+                    Span::styled("    ✓ ", Style::default().fg(theme.success)),
                     Span::styled(header.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
                 ];
-                let wrapped_header = crate::markdown::wrap_spans(header_spans, content_max_width, "    ");
+                let wrapped_header = crate::markdown::wrap_spans_with_indent(header_spans, content_max_width, "", "      ");
                 lines.extend(wrapped_header);
 
                 for row in content_lines {
@@ -645,27 +663,31 @@ pub fn render_single_message_with_pending_and_thinking(
                     Span::styled(format!("[bg:{}] ", pid_str), Style::default().fg(theme.accent_cyan)),
                     Span::styled("running in background...", Style::default().fg(theme.gray)),
                 ];
-                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                let wrapped = crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      ");
                 lines.extend(wrapped);
             } else if content.starts_with("Task ID: sub_") {
                 let sub_id = content.lines().find(|l| l.starts_with("Task ID:")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim()).unwrap_or("?");
                 let role = content.lines().find(|l| l.starts_with("Role:")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim()).unwrap_or("subagent");
                 let line_spans = vec![
                     Span::styled("    · ", Style::default().fg(theme.accent_purple)),
-                    Span::styled(format!("[{}:{}] ", role, sub_id), Style::default().fg(theme.accent_purple)),
+                    Span::styled(format!("[{}:{}] ", subagent_role_label(role), sub_id), Style::default().fg(theme.accent_purple)),
                     Span::styled("running in background...", Style::default().fg(theme.gray)),
                 ];
-                let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                let wrapped = crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      ");
                 lines.extend(wrapped);
             } else if content.starts_with("Subagent '") && (content.contains("' completed:") || content.contains("' failed:")) {
                 let is_err = content.contains("' failed:");
                 let first_line = content.lines().next().unwrap_or("");
                 let sub_id = first_line.split('\'').nth(1).unwrap_or("?");
                 let (status_icon, status_color, status_text) = if is_err {
-                    ("✕ ", Color::Red, "failed")
+                    ("✕ ", theme.error, "failed")
                 } else {
-                    ("✓ ", Color::Green, "completed")
+                    ("✓ ", theme.success, "completed")
                 };
+                let role = tool_call
+                    .and_then(|(_, args)| serde_json::from_str::<serde_json::Value>(args).ok())
+                    .and_then(|v| v.get("role").and_then(|r| r.as_str()).map(subagent_role_label))
+                    .unwrap_or_else(|| "agent".to_string());
 
                 let report_body = content.split_once(":\n\n")
                     .map(|(_, b)| b)
@@ -673,45 +695,15 @@ pub fn render_single_message_with_pending_and_thinking(
                     .unwrap_or(content);
 
                 let raw_lines: Vec<&str> = report_body.lines().filter(|l| !l.trim().is_empty()).collect();
-                let total = raw_lines.len();
-                let max_lines = 5;
 
-                let mut badge_spans = vec![
+                let badge_spans = vec![
                     Span::styled(format!("    {}", status_icon), Style::default().fg(status_color)),
-                    Span::styled(format!("[agent:{}] ", sub_id), Style::default().fg(theme.accent_purple)),
+                    Span::styled(format!("[{}:{}] ", role, sub_id), Style::default().fg(theme.accent_purple)),
                     Span::styled(status_text, Style::default().fg(status_color)),
                 ];
-                if logs_expanded && total > max_lines {
-                    badge_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(theme.dark_gray)));
-                } else if !logs_expanded && total > max_lines {
-                    badge_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(theme.dark_gray)));
-                }
                 lines.push(Line::from(badge_spans));
 
-                if !raw_lines.is_empty() {
-                    if logs_expanded {
-                        for line_str in &raw_lines {
-                            let clean = line_str.replace('\t', "    ");
-                            let spans = vec![Span::styled(clean, Style::default().fg(theme.gray))];
-                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
-                        }
-                    } else {
-                        if total > max_lines {
-                            let omitted = total - max_lines;
-                            let om_spans = vec![
-                                Span::styled("        │ ", Style::default().fg(theme.dark_gray)),
-                                Span::styled(format!("… (+{} lines above, Ctrl+O to expand)", omitted), Style::default().fg(theme.dark_gray)),
-                            ];
-                            lines.push(Line::from(om_spans));
-                        }
-                        let start_idx = total.saturating_sub(max_lines);
-                        for line_str in &raw_lines[start_idx..] {
-                            let clean = line_str.replace('\t', "    ");
-                            let spans = vec![Span::styled(clean, Style::default().fg(theme.gray))];
-                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
-                        }
-                    }
-                }
+                push_log_tail(&mut lines, &raw_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray);
             } else {
                 let raw_output_lines: Vec<&str> = content
                     .lines()
@@ -723,25 +715,17 @@ pub fn render_single_message_with_pending_and_thinking(
                     || content.starts_with("Command exited with status code");
 
                 let icon = if is_err { "    ✕ " } else { "    ✓ " };
-                let icon_color = if is_err { Color::Red } else { Color::Green };
+                let icon_color = if is_err { theme.error } else { theme.success };
 
                 if raw_output_lines.len() <= 1 {
                     let first_line_raw = raw_output_lines.first().copied().unwrap_or("Done").replace('\t', "    ");
-                    let display_first_line = if first_line_raw.len() > 140 {
-                        let mut end = 137;
-                        while end > 0 && !first_line_raw.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &first_line_raw[..end])
-                    } else {
-                        first_line_raw
-                    };
+                    let display_first_line = truncate_to_width(&first_line_raw, 140);
 
                     let line_spans = vec![
                         Span::styled(icon, Style::default().fg(icon_color)),
                         Span::styled(display_first_line, Style::default().fg(theme.gray)),
                     ];
-                    let wrapped = crate::markdown::wrap_spans(line_spans, content_max_width, "    ");
+                    let wrapped = crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      ");
                     lines.extend(wrapped);
                 } else {
                     let total = raw_output_lines.len();
@@ -751,45 +735,12 @@ pub fn render_single_message_with_pending_and_thinking(
                         format!("Output ({} lines)", total)
                     };
 
-                    let mut header_spans = vec![
+                    lines.push(Line::from(vec![
                         Span::styled(icon, Style::default().fg(icon_color)),
                         Span::styled(header_label, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-                    ];
-                    if !logs_expanded {
-                        header_spans.push(Span::styled(" (Ctrl+O to expand)", Style::default().fg(theme.dark_gray)));
-                    } else {
-                        header_spans.push(Span::styled(" (Ctrl+O to collapse)", Style::default().fg(theme.dark_gray)));
-                    }
-                    lines.push(Line::from(header_spans));
+                    ]));
 
-                    let max_lines = 5;
-                    if logs_expanded {
-                        for line_str in &raw_output_lines {
-                            let clean = line_str.replace('\t', "    ");
-                            let spans = vec![
-                                Span::styled(clean, Style::default().fg(theme.gray)),
-                            ];
-                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
-                        }
-                    } else {
-                        if total > max_lines {
-                            let omitted = total - max_lines;
-                            let om_spans = vec![
-                                Span::styled("        │ ", Style::default().fg(theme.dark_gray)),
-                                Span::styled(format!("… (+{} lines above)", omitted), Style::default().fg(theme.dark_gray)),
-                            ];
-                            lines.push(Line::from(om_spans));
-                        }
-
-                        let start_idx = total.saturating_sub(max_lines);
-                        for line_str in &raw_output_lines[start_idx..] {
-                            let clean = line_str.replace('\t', "    ");
-                            let spans = vec![
-                                Span::styled(clean, Style::default().fg(theme.gray)),
-                            ];
-                            lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "        │ "));
-                        }
-                    }
+                    push_log_tail(&mut lines, &raw_output_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray);
                 }
             }
 
@@ -800,13 +751,11 @@ pub fn render_single_message_with_pending_and_thinking(
         "system" => {
             if let Some(text) = msg.text_content() {
                 lines.extend(format_system_message(text, theme, content_max_width, logs_expanded));
-                let is_task_done = text.starts_with("TASK_DONE|") || text.starts_with("[TASK FINISHED]") || text.starts_with("SUBAGENT_DONE|");
-                let next_is_task_done = next_msg
+                let next_is_badge = next_msg
                     .and_then(|m| if m.role.as_str() == "system" { m.text_content() } else { None })
-                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("[TASK FINISHED]") || t.starts_with("SUBAGENT_DONE|"))
-                    .unwrap_or(false);
+                    .is_some_and(|t| SystemNotice::classify(t).is_completion_badge());
 
-                if !is_task_done || !next_is_task_done {
+                if !SystemNotice::classify(text).is_completion_badge() || !next_is_badge {
                     lines.push(Line::from(""));
                 }
             }
@@ -821,7 +770,9 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 
     // Fleet / SysAdmin mode: normal AI chat on one side, live VPS terminal on the other.
     if app.fleet_dialog.is_open {
-        let border = Style::default().fg(Color::Rgb(50, 60, 75));
+        // One divider colour for every fleet layout; the live terminal lights up when focused.
+        let divider = app.theme.rule;
+        let border = Style::default().fg(divider);
 
         // Wide terminals: chat | live output | fleet-wide telemetry.
         if app.fleet_dialog.wide_layout && size.width >= crate::fleet_dialog::FLEET_WIDE_MIN_WIDTH {
@@ -845,23 +796,32 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             return;
         }
 
-        let (chat_area, term_area) = if size.width >= 110 {
-            let h = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(size);
-            (h[0], h[1])
-        } else {
-            let v = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(size);
-            (v[0], v[1])
-        };
+        if size.width < 110 {
+            // Narrow/Mobile screens (e.g. mobile portrait, narrow terminals):
+            // Instead of crushing chat and terminal into a 50/50 vertical split with 0 usable terminal lines,
+            // render the active focused pane in FULL SCREEN!
+            // Tab / Shift+Tab toggles between Chat and VPS Terminal.
+            if app.fleet_dialog.command_mode {
+                render_fleet_dialog(frame, size, &app.fleet_dialog, &app.theme);
+            } else {
+                render_chat_ui(frame, app, size);
+            }
+            return;
+        }
+
+        let h = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(size);
+        let chat_area = h[0];
+        let term_area = h[1];
 
         render_chat_ui(frame, app, chat_area);
 
         let border_color = if app.fleet_dialog.command_mode {
             app.theme.accent_cyan
         } else {
-            Color::Rgb(40, 50, 65)
+            divider
         };
         let term_block = Block::default()
-            .borders(if size.width >= 110 { Borders::LEFT } else { Borders::TOP })
+            .borders(Borders::LEFT)
             .border_style(Style::default().fg(border_color));
         let inner = term_block.inner(term_area);
         frame.render_widget(term_block, term_area);
@@ -877,14 +837,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.last_slash_filter = app.input_buffer.clone();
     }
 
-    let target_height = app.slash_popup_target_height();
-    let speed = 0.35;
-    let diff = target_height - app.slash_popup_height_current;
-    if diff.abs() > 0.05 {
-        app.slash_popup_height_current += diff * speed;
-    } else {
-        app.slash_popup_height_current = target_height;
-    }
+    app.advance_slash_popup();
 
     // Bordered popup needs at least 3 lines (top border, 1 item, bottom border).
     // When closing, any height < 2.5 snaps to 0 so the single top-border line is never rendered.
@@ -904,9 +857,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     // composer grows with the wrapped input: a long message must push the text onto extra rows
     // instead of running off the right edge of the terminal.
     let prompt_prefix = if app.always_allow_tools {
-        Span::styled("* ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        Span::styled("* ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD))
     } else if app.plan_mode {
-        Span::styled("? ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled("? ", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD))
     } else {
         Span::styled("> ", Style::default().fg(app.theme.accent_blue).add_modifier(Modifier::BOLD))
     };
@@ -915,13 +868,23 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     const MAX_COMPOSER_LINES: usize = 6;
     let composer_content_lines = {
         let cursor_at_end = app.cursor_idx >= app.input_buffer.len();
-        let stream_width = unicode_width::UnicodeWidthStr::width(app.input_buffer.as_str())
-            + usize::from(!app.input_buffer.is_empty() && cursor_at_end);
         let capacity = (size.width as usize).saturating_sub(prefix_width).max(1);
         if app.pending_confirmation.is_some() || app.input_buffer.is_empty() {
             1
         } else {
-            stream_width.div_ceil(capacity).clamp(1, MAX_COMPOSER_LINES)
+            // Each line break starts a new row (messages taken back from the queue can hold
+            // several), and the caret needs a cell of its own when it sits at the very end.
+            let last = app.input_buffer.split('\n').count() - 1;
+            app.input_buffer
+                .split('\n')
+                .enumerate()
+                .map(|(i, line)| {
+                    let width = unicode_width::UnicodeWidthStr::width(line)
+                        + usize::from(i == last && cursor_at_end);
+                    width.div_ceil(capacity).max(1)
+                })
+                .sum::<usize>()
+                .clamp(1, MAX_COMPOSER_LINES)
         }
     };
     let composer_height = if app.user_dialog.is_open {
@@ -968,7 +931,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let is_auth = !cfg.api_key.trim().is_empty();
     let is_local = cfg.local_llm_enabled;
     let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
-    let elapsed = app.start_time.elapsed().as_secs_f32();
     let header_lines: Vec<Line<'static>> = if is_mobile_portrait(size.width, size.height) {
         render_gradient_logo_adaptive(
             env!("CARGO_PKG_VERSION"),
@@ -976,7 +938,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             is_auth,
             is_local,
             update_notice.as_deref(),
-            elapsed,
             chat_chunk.width as usize,
         )
     } else {
@@ -986,7 +947,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             is_auth,
             is_local,
             update_notice.as_deref(),
-            elapsed,
         )
     };
 
@@ -999,6 +959,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.cached_message_line_offsets.clear();
         app.selection_lines.cached.clear();
         app.cached_message_count = 0;
+        app.cached_has_collapsed_logs = false;
         app.cached_render_width = content_max_width;
         app.cached_session_id = app.session.id.clone();
         app.cached_logs_expanded = app.logs_expanded;
@@ -1039,7 +1000,11 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 None,
                 app.logs_expanded,
                 app.thinking_state.is_expanded,
+                answered_tool_call(&app.session.messages, msg_idx),
             );
+            if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
+                app.cached_has_collapsed_logs = true;
+            }
             app.cached_message_lines.extend(rendered);
             app.cached_message_line_offsets.push(app.cached_message_lines.len());
         }
@@ -1075,6 +1040,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.pending_confirmation.as_ref(),
             app.logs_expanded,
             app.thinking_state.is_expanded,
+            answered_tool_call(&app.session.messages, msg_idx),
         );
         tail_lines.extend(rendered);
     }
@@ -1105,10 +1071,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         if !app.thinking_state.content.trim().is_empty() {
             if app.thinking_state.is_expanded {
                 tail_lines.push(Line::from(vec![
-                    Span::styled("  [", Style::default().fg(app.theme.dark_gray)),
-                    Span::styled("• Thought", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" · {:.1}s", elapsed), Style::default().fg(app.theme.gray)),
-                    Span::styled("] ", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("  ▾ ", Style::default().fg(app.theme.accent_purple)),
+                    Span::styled("Thought", Style::default().fg(app.theme.accent_purple).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" · {:.1}s ", elapsed), Style::default().fg(app.theme.gray)),
                     Span::styled("(Ctrl+T to collapse)", Style::default().fg(app.theme.dark_gray)),
                 ]));
                 for cot_line in app.thinking_state.content.trim().lines() {
@@ -1119,10 +1084,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 tail_lines.push(Line::from(""));
             } else {
                 tail_lines.push(Line::from(vec![
-                    Span::styled("  [", Style::default().fg(app.theme.dark_gray)),
-                    Span::styled("• Thought", Style::default().fg(app.theme.accent_purple)),
-                    Span::styled(format!(" · {:.1}s", elapsed), Style::default().fg(app.theme.gray)),
-                    Span::styled("] ", Style::default().fg(app.theme.dark_gray)),
+                    Span::styled("  · ", Style::default().fg(app.theme.accent_purple)),
+                    Span::styled("Thought", Style::default().fg(app.theme.accent_purple)),
+                    Span::styled(format!(" · {:.1}s ", elapsed), Style::default().fg(app.theme.gray)),
                     Span::styled("(Ctrl+T to expand)", Style::default().fg(app.theme.dark_gray)),
                 ]));
                 tail_lines.push(Line::from(""));
@@ -1160,20 +1124,31 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.streaming_md_cache_len = 0;
     }
 
-    if !app.message_queue.is_empty() {
+    if app.has_pending_messages() {
         tail_lines.push(Line::from(""));
+        // "Send now" messages come first: that is the order in which the model will read them.
+        for steer_msg in &app.steer_messages {
+            let spans = vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("[sending] ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(steer_msg.clone(), Style::default().fg(app.theme.foreground)),
+                Span::styled(" (next step)", Style::default().fg(app.theme.dark_gray)),
+            ];
+            tail_lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "              "));
+        }
         for (i, queued_msg) in app.message_queue.iter().enumerate() {
             let label = if app.message_queue.len() == 1 {
                 "[queued] ".to_string()
             } else {
                 format!("[queued #{}] ", i + 1)
             };
-            tail_lines.push(Line::from(vec![
+            let spans = vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(label, Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(queued_msg.clone(), Style::default().fg(app.theme.foreground)),
-                Span::styled(" (pending)", Style::default().fg(app.theme.dark_gray)),
-            ]));
+                Span::styled(" (after the answer)", Style::default().fg(app.theme.dark_gray)),
+            ];
+            tail_lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "              "));
         }
         tail_lines.push(Line::from(""));
     }
@@ -1182,7 +1157,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     app.total_rendered_items = total_lines;
 
     let visible_height = (chat_chunk.height as usize).max(1);
-    let max_scroll = total_lines.saturating_sub(visible_height) as u16;
+    let max_scroll = total_lines.saturating_sub(visible_height);
 
     if app.auto_scroll {
         app.scroll_offset = max_scroll;
@@ -1202,7 +1177,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         .iter()
         .chain(app.cached_message_lines.iter())
         .chain(tail_lines.iter())
-        .skip(app.scroll_offset as usize)
+        .skip(app.scroll_offset)
         .take(visible_height)
         .cloned()
         .collect();
@@ -1226,10 +1201,17 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     // 2.5. Fixed Activity / Status Bar (Directly above the Composer!)
     if show_activity {
-        let spinner_frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
         let elapsed = app.last_turn_start.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
-        let idx = ((elapsed * 10.0) as usize) % spinner_frames.len();
-        let spinner_char = spinner_frames[idx];
+        let spinner_char = crate::spinner::frame(elapsed);
+        // The colour tells the phase: a tool is running (or being written), the answer is
+        // streaming, or the model is still reasoning / waiting for its first token.
+        let spinner_color = if app.in_flight_tool_calls > 0 || !app.streaming_tool_calls.is_empty() {
+            app.theme.accent_cyan
+        } else if !app.streaming_text.is_empty() {
+            app.theme.accent_blue
+        } else {
+            app.theme.accent_purple
+        };
 
         if app.status_transition.is_empty() {
             if app.thinking_state.is_streaming {
@@ -1245,7 +1227,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
         let mut left_spans = vec![
             Span::raw(" "),
-            Span::styled(spinner_char, Style::default().fg(app.theme.accent_purple)),
+            Span::styled(spinner_char, Style::default().fg(spinner_color)),
             Span::raw("  "),
         ];
         left_spans.extend(text_spans);
@@ -1257,23 +1239,45 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD),
             ));
         }
-
-        let mut right_spans = Vec::new();
-        if queue_count > 0 {
-            right_spans.push(Span::styled("(Esc to dequeue) ", Style::default().fg(app.theme.dark_gray)));
-        } else {
-            right_spans.push(Span::styled("(Esc to cancel) ", Style::default().fg(app.theme.dark_gray)));
+        let steer_count = app.steer_messages.len();
+        if steer_count > 0 {
+            left_spans.push(Span::styled(
+                " · [sending at next step]",
+                Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD),
+            ));
         }
 
-        let left_len: usize = left_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
-        let right_len: usize = right_spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
+        // Key hints, longest first: the status text on the left varies in length, and a hint that
+        // does not fit must give way to a shorter one instead of vanishing.
+        let is_mobile = is_mobile_portrait(size.width, size.height);
+        let right_options: &[&str] = if steer_count > 0 {
+            &["(Alt+Enter: interrupt now · Esc: undo) ", "(Alt+Enter: interrupt) ", "(Esc: undo) "]
+        } else if queue_count > 0 {
+            &["(Alt+Enter: send now · Esc: undo) ", "(Alt+Enter: send now) ", "(Esc: undo) "]
+        } else if !app.input_buffer.trim().is_empty() && !is_mobile {
+            &[
+                "(Enter: queue · Alt+Enter: send now · Esc: cancel) ",
+                "(Alt+Enter: send now · Esc: cancel) ",
+                "(Alt+Enter: send now) ",
+                "(Esc to cancel) ",
+            ]
+        } else {
+            &["(Esc to cancel) "]
+        };
+
+        let width_of = |s: &str| unicode_width::UnicodeWidthStr::width(s);
+        let left_len: usize = left_spans.iter().map(|s| width_of(s.content.as_ref())).sum();
         let bar_width = activity_chunk.width as usize;
+        let right_text = right_options
+            .iter()
+            .find(|opt| bar_width > left_len + width_of(opt))
+            .copied();
 
         let mut spans = left_spans;
-        if bar_width > left_len + right_len {
-            let pad = bar_width - (left_len + right_len);
+        if let Some(text) = right_text {
+            let pad = bar_width - (left_len + width_of(text));
             spans.push(Span::raw(" ".repeat(pad)));
-            spans.extend(right_spans);
+            spans.push(Span::styled(text, Style::default().fg(app.theme.dark_gray)));
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
@@ -1298,13 +1302,15 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         let is_mobile = is_mobile_portrait(size.width, size.height);
         let placeholder = if is_mobile {
             "Type message or /help"
+        } else if app.is_streaming {
+            "Type to queue a message · Alt+Enter sends it now"
         } else {
             "Type your message or @path/to/file"
         };
         (
             vec![Line::from(vec![
                 prompt_prefix.clone(),
-                Span::styled("█ ", Style::default().fg(app.theme.accent_blue)),
+                Span::styled(format!("{} ", crate::cursor::block()), Style::default().fg(app.theme.accent_blue)),
                 Span::styled(placeholder, Style::default().fg(app.theme.dark_gray)),
             ])],
             0usize,
@@ -1317,6 +1323,17 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 "Press Esc again to clear prompt."
             };
             Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray))
+        })
+        .or_else(|| {
+            // While the agent works, say what Enter and Alt+Enter will do with the typed message.
+            // Only when it fits on the row: a hint must never push the text itself around.
+            let hint = BUSY_INPUT_HINT;
+            let used = prefix_width
+                + unicode_width::UnicodeWidthStr::width(app.input_buffer.as_str())
+                + unicode_width::UnicodeWidthStr::width(hint);
+            let fits = used < size.width as usize && !app.input_buffer.contains('\n');
+            (app.is_streaming && fits && !is_mobile_portrait(size.width, size.height))
+                .then(|| Span::styled(hint, Style::default().fg(app.theme.dark_gray)))
         });
 
         let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
@@ -1346,15 +1363,20 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         0
     };
 
-    let composer_border_color = if !app.auto_scroll {
-        Color::Rgb(75, 110, 155)
-    } else {
-        app.theme.dark_gray
-    };
-
-    let composer_block = Block::default()
+    let lines_below = max_scroll.saturating_sub(app.scroll_offset);
+    let mut composer_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(composer_border_color));
+        .border_style(Style::default().fg(app.theme.border_dim));
+    if !app.auto_scroll && lines_below > 0 {
+        let noun = if lines_below == 1 { "line" } else { "lines" };
+        composer_block = composer_block.title_top(
+            Line::from(vec![
+                Span::styled(format!(" ↓ {} {} below ", lines_below, noun), Style::default().fg(app.theme.accent_blue)),
+                Span::styled("(End) ", Style::default().fg(app.theme.dark_gray)),
+            ])
+            .right_aligned(),
+        );
+    }
 
     if app.user_dialog.is_open {
         render_user_dialog(frame, composer_chunk, &app.user_dialog, &app.theme);
@@ -1379,55 +1401,47 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     // 4. Status Footer Bar (Left: Workspace Path | Right: Model Info)
 
-    // Left spans: ONLY the workspace directory (and git branch)
-    let mut left_spans = vec![
-        Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)),
-    ];
-    if !app.git_branch.is_empty() {
-        left_spans.push(Span::styled(format!("({}) ", app.git_branch), Style::default().fg(app.theme.accent_cyan)));
-    }
-    if app.plan_mode {
-        left_spans.push(Span::styled("[PLAN MODE] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
-    }
-
-    let show_exit_warning = app.last_ctrl_c_press
-        .map(|i| i.elapsed() <= std::time::Duration::from_secs(2))
-        .unwrap_or(false);
-
-    if show_exit_warning {
-        left_spans.push(Span::styled("Press Ctrl+C again to exit. ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
-    }
-
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
     let is_deepseek = cfg.is_deepseek_endpoint();
     let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4.1-Flash-1017" || cfg.model == "DeepSeek-V4-Flash");
     let is_pro = is_deepseek && (cfg.model == "deepseek-pro" || cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro");
 
-    let model_style = Style::default().fg(Color::Rgb(120, 125, 138));
-    let sep_style = Style::default().fg(Color::Rgb(80, 85, 95));
+    // The provider table holds the exact label of every variant (e.g. Flash vs Flash-1017).
+    let display_name = {
+        let all = cfg.all_providers();
+        let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
+        prov.into_iter()
+            .chain(all.iter())
+            .find_map(|p| p.models.iter().find(|m| m.id == cfg.model))
+            .map(|m| m.display_name().to_string())
+    };
+
+    let model_style = Style::default().fg(app.theme.muted);
+    let sep_style = Style::default().fg(app.theme.border_dim);
     let temp_color = if cfg.temperature > 1.2 {
-        Color::Rgb(225, 185, 140)
+        app.theme.warning
     } else {
-        Color::Rgb(135, 215, 215)
+        app.theme.accent_cyan
     };
 
     if is_flash {
-        let effort = if (cfg.local_llm_enabled || cfg.reasoning_effort == "dynamic") && !cfg.flash_settings.code_reasoning_effort.is_empty() {
-            &cfg.flash_settings.code_reasoning_effort
+        let effort = if cfg.local_llm_enabled && cfg.reasoning_effort != "dynamic" {
+            // The local engine always runs the adaptive policy, whatever the setting says.
+            "dynamic"
         } else {
-            &cfg.reasoning_effort
+            cfg.reasoning_effort.as_str()
         };
 
-        let r_color = match effort.as_str() {
-            "none" => Color::Rgb(120, 125, 135),
-            "low" => Color::Rgb(160, 200, 225),
-            "high" => Color::Rgb(185, 160, 225),
-            "xhigh" | "max" => Color::Rgb(215, 165, 240),
-            _ => Color::Rgb(185, 160, 225),
+        let r_color = match effort {
+            "none" => app.theme.muted,
+            "low" => app.theme.effort_low,
+            "high" => app.theme.effort_high,
+            "xhigh" | "max" => app.theme.effort_max,
+            _ => app.theme.effort_high,
         };
 
-        right_spans.push(Span::styled("DeepSeek-V4.1-Flash", model_style));
+        right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4.1-Flash".to_string()), model_style));
         right_spans.push(Span::styled(" · ", sep_style));
         right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         right_spans.push(Span::styled(" · ", sep_style));
@@ -1435,34 +1449,29 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     } else if is_pro {
         let effort = &cfg.pro_settings.reasoning_effort;
         let r_color = match effort.as_str() {
-            "low" => Color::Rgb(160, 200, 225),
-            "medium" => Color::Rgb(185, 160, 225),
-            "high" | "max" => Color::Rgb(215, 165, 240),
-            _ => Color::Rgb(185, 160, 225),
+            "low" => app.theme.effort_low,
+            "medium" => app.theme.effort_high,
+            "high" | "max" => app.theme.effort_max,
+            _ => app.theme.effort_high,
         };
 
-        right_spans.push(Span::styled("DeepSeek-V4-Pro", model_style));
+        // No temperature here: the reasoning engine ignores it, so showing one would mislead.
+        right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4-Pro".to_string()), model_style));
         right_spans.push(Span::styled(" · ", sep_style));
         right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
     } else if cfg.model.starts_with("local") {
         right_spans.push(Span::styled(format!("Local: {}", cfg.local_llm_model), model_style));
         right_spans.push(Span::styled(" · ", sep_style));
-        right_spans.push(Span::styled("Offline @ $0.00 ", Style::default().fg(Color::Rgb(105, 240, 174))));
+        right_spans.push(Span::styled("offline ", Style::default().fg(app.theme.success)));
     } else {
-        let display_name = {
-            let all = cfg.all_providers();
-            let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
-            prov.and_then(|p| p.models.iter().find(|m| m.id == cfg.model))
-                .map(|m| m.display_name().to_string())
-                .unwrap_or_else(|| cfg.model.clone())
-        };
+        let display_name = display_name.unwrap_or_else(|| cfg.model.clone());
 
         let r_color = match cfg.reasoning_effort.as_str() {
-            "none" => Color::Rgb(120, 125, 135),
-            "low" => Color::Rgb(160, 200, 225),
-            "high" => Color::Rgb(185, 160, 225),
-            "xhigh" | "max" => Color::Rgb(215, 165, 240),
-            _ => Color::Rgb(185, 160, 225),
+            "none" => app.theme.muted,
+            "low" => app.theme.effort_low,
+            "high" => app.theme.effort_high,
+            "xhigh" | "max" => app.theme.effort_max,
+            _ => app.theme.effort_high,
         };
 
         right_spans.push(Span::styled(display_name, model_style));
@@ -1484,11 +1493,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let mut center_spans = Vec::new();
     if cfg.local_llm_enabled || cfg.model.starts_with("local") {
         let is_local_online = app.local_llm_online.load(Ordering::Relaxed);
-        let dot_color = if is_local_online {
-            Color::Rgb(105, 240, 174) // Green (#69f0ae)
-        } else {
-            Color::Rgb(244, 67, 54)   // Red (#f44336)
-        };
+        let dot_color = if is_local_online { app.theme.success } else { app.theme.error };
         center_spans.push(Span::styled("● ", Style::default().fg(dot_color)));
         center_spans.push(Span::styled(
             "Local LLM",
@@ -1537,21 +1542,70 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         center_spans.push(Span::styled(
             subagent_badge,
             Style::default()
-                .fg(Color::Rgb(185, 160, 225))
+                .fg(app.theme.effort_high)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
-    if app.logs_expanded {
+    let tail_has_collapsed = !app.logs_expanded && tail_lines.iter().any(is_collapsed_marker);
+    if app.logs_expanded || app.cached_has_collapsed_logs || tail_has_collapsed {
         if !center_spans.is_empty() {
             center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
         }
-        center_spans.push(Span::styled(
-            "[Logs: Full (Ctrl+O)]",
-            Style::default()
-                .fg(app.theme.accent_cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        if app.logs_expanded {
+            center_spans.push(Span::styled(
+                "[Logs: Full (Ctrl+O)]",
+                Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            center_spans.push(Span::styled("Ctrl+O full logs", Style::default().fg(app.theme.dark_gray)));
+        }
+    }
+
+    // Left spans: Workspace directory, git branch, plan mode, and exit warning
+    let show_exit_warning = app.last_ctrl_c_press
+        .map(|i| i.elapsed() <= std::time::Duration::from_secs(2))
+        .unwrap_or(false);
+
+    let right_width = right_spans.iter().map(|s| s.width()).sum::<usize>();
+    let center_width = center_spans.iter().map(|s| s.width()).sum::<usize>();
+
+    let mut left_spans = Vec::new();
+    if show_exit_warning {
+        // Available width for the left side of the status bar (accounting for right & center widgets)
+        let avail = (status_chunk.width as usize).saturating_sub(right_width + center_width + 1);
+        let path_str = format!(" {} ", app.shorten_path());
+        let branch_str = if !app.git_branch.is_empty() {
+            format!("({}) ", app.git_branch)
+        } else {
+            String::new()
+        };
+        let full_needed = unicode_width::UnicodeWidthStr::width(path_str.as_str())
+            + unicode_width::UnicodeWidthStr::width(branch_str.as_str())
+            + 28;
+
+        if avail >= full_needed {
+            // Full space available: render path + branch + plan mode + warning
+            left_spans.push(Span::styled(path_str, Style::default().fg(app.theme.foreground)));
+            if !branch_str.is_empty() {
+                left_spans.push(Span::styled(branch_str, Style::default().fg(app.theme.accent_cyan)));
+            }
+            left_spans.extend(mode_badges(app));
+            left_spans.push(Span::styled("Press Ctrl+C again to exit. ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + 28 && !branch_str.is_empty() {
+            // Medium space: prioritize branch and the exit warning so it is never truncated
+            left_spans.push(Span::styled(format!(" {} ", branch_str.trim()), Style::default().fg(app.theme.accent_cyan)));
+            left_spans.push(Span::styled("Press Ctrl+C again to exit. ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        } else {
+            // Narrow space (e.g. /fleet split mode on narrower terminals): show complete exit warning
+            left_spans.push(Span::styled(" Press Ctrl+C again to exit.", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        }
+    } else {
+        left_spans.push(Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)));
+        if !app.git_branch.is_empty() {
+            left_spans.push(Span::styled(format!("({}) ", app.git_branch), Style::default().fg(app.theme.accent_cyan)));
+        }
+        left_spans.extend(mode_badges(app));
     }
 
     let is_mobile = is_mobile_portrait(size.width, size.height);
@@ -1571,13 +1625,27 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             right_spans
         };
         frame.render_widget(Paragraph::new(Line::from(mobile_right)).alignment(Alignment::Right), footer_cols[1]);
-    } else {
+    } else if center_spans.is_empty() {
+        let r_len = (right_width as u16).min(status_chunk.width);
         let footer_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(33),
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
+                Constraint::Min(0),
+                Constraint::Length(r_len),
+            ])
+            .split(status_chunk);
+
+        frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
+        frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[1]);
+    } else {
+        let r_len = (right_width as u16).min(status_chunk.width);
+        let c_len = (center_width as u16 + 4).min(status_chunk.width.saturating_sub(r_len));
+        let footer_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(c_len),
+                Constraint::Length(r_len),
             ])
             .split(status_chunk);
 
@@ -1609,6 +1677,19 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
 
 
+/// Footer badges for the modes that change how tools run. Auto-approve is the riskiest one, so it
+/// is spelled out instead of being left to the `*` prompt prefix alone.
+fn mode_badges(app: &App) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if app.always_allow_tools {
+        spans.push(Span::styled("[AUTO-APPROVE] ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+    }
+    if app.plan_mode {
+        spans.push(Span::styled("[PLAN MODE] ", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD)));
+    }
+    spans
+}
+
 /// Highlights the selected cells of the chat viewport.
 ///
 /// The feed is drawn from generated lines, so rather than threading selection state through the
@@ -1616,7 +1697,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 pub fn paint_selection(
     buffer: &mut Buffer,
     chat: Rect,
-    scroll_offset: u16,
+    scroll_offset: usize,
     selection: &Selection,
     lines: &SelectionLines,
     theme: &Theme,
@@ -1624,7 +1705,7 @@ pub fn paint_selection(
     use unicode_width::UnicodeWidthStr;
 
     let ((start_line, start_col), (end_line, end_col)) = selection.ordered();
-    let scroll = scroll_offset as usize;
+    let scroll = scroll_offset;
     // Only the background is touched: the text keeps its own colour, so a selection reads like a
     // native terminal one instead of flattening the feed into a slab of accent colour.
     let style = Style::default().bg(theme.selection_bg);

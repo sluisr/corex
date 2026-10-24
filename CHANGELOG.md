@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-10-25
+
+### Added
+
+#### Anthropic (Claude) Provider
+- **Claude 5.x model catalog**: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and `claude-fable-5-1` replace the Claude 3.x entries in the provider list. Older ids are still accepted by name.
+- **Per-generation request profiles (`anthropic::model_profile`)**: Thinking is sent as `adaptive` for Claude 4.6+/5.x and as a fixed `budget_tokens` budget for 3.7 and 4.0–4.5. `temperature` is omitted where the API rejects it (4.7+), `output_config.effort` is mapped from the reasoning setting (including `xhigh`), and `max_tokens` follows the model (8,192 for 3.x, 32,000 for 4.0–4.5, 64,000 for 4.6+).
+- **Signed thinking blocks are replayed**: `thinking`, `redacted_thinking` and `signature_delta` are reassembled from the stream, stored with the turn's tool calls and sent back unchanged, as the API requires for thinking with tool results. They are dropped if the provider is switched mid-session.
+- **Automatic prompt caching and cache accounting**: Requests carry a top-level `cache_control` of type `ephemeral`; `cache_read_input_tokens` and `cache_creation_input_tokens` are counted in prompt usage and cache hit statistics.
+- **Images in user messages** are sent as native `image` blocks (base64 `data:` URIs inline, `http(s)` URLs by reference).
+- **Forward-compatible streaming**: Unknown SSE event types, content blocks and deltas are ignored instead of breaking the stream. `max_tokens` and `model_context_window_exceeded` stop reasons are reported as output truncation, and HTTP error bodies are now shown and logged.
+
+#### Tools
+- **`read_image`**: Looks at PNG, JPEG, GIF and WebP files (type sniffed from the file signature, 5 MB limit). The image reaches the model in a single `user` message after all tool responses of the turn, a shape every provider accepts. `read_file` points binary images to it. Subagents do not get this tool.
+- **Multi-query `web_search`**: A new `queries` argument runs up to 4 searches in parallel and merges the results rank by rank without duplicate URLs.
+- **Readable `web_fetch` (`web_content.rs`)**: HTML is converted to Markdown (headings, links, lists, tables, code blocks), the response charset is honoured (BOM, `Content-Type`, `<meta>`), binary content types (PDF, images, archives) are refused with a clear message, and the output limit grows from 15,000 to 50,000 characters.
+- **Task filter**: The task tracker's list tool (`tracker_list_tasks`) accepts a `status` filter.
+
+#### Context Window & Token Management
+- **Output spill (`spill.rs`)**: A tool result over 30,000 characters is cut to its first 10,000 and last 2,000 characters. The complete text is saved in a private per-user directory under the system temp dir (files older than 3 days are removed) and its path is placed in the cut, so the model can read the middle with `read_file`. Reading spilled files needs no confirmation.
+- **Deterministic pruning before summarizing (`context_prune.rs`)**: Before `/compact` or automatic compaction calls the model, tool results over 8,192 characters from earlier turns are trimmed to head and tail. The turn in progress is never touched, and if pruning is enough no summary is requested.
+- **Automatic recovery from context overflow**: When an API rejects a request for exceeding the context window, the conversation is compacted and the request retried once, invisibly to the consumer.
+- **Truncated tool calls are never executed**: If a response stops because of the output token limit, its tool calls (whose arguments may be cut mid-file or mid-command) are answered with an error and the model retries in smaller pieces. A second consecutive truncation stops the loop. Applies to the TUI, headless CLI and subagents.
+- **Repeated-call guard (`repeat_guard.rs`)**: At the 3rd, 5th and 8th identical consecutive tool call, a short reminder asking the model to change approach is appended to the result. It never blocks a call.
+- **Compaction keeps the active task**: The latest user prompt is never removed, `assistant` tool-call / `tool` response groups are never split, an earlier summary is carried into the new one, and digest entries are longer (500 characters per request, 160 per tool argument or error).
+
+#### Terminal UI
+- **Send-now messages (`Alt+Enter`)**: While the agent works, a message can be handed to the model at the next safe point (between tool rounds) instead of waiting behind the queue. `Enter` still queues.
+- **Take back pending messages**: `Esc` takes back the newest pending message, one per press, before cancelling the generation. Cancelling no longer discards what was typed: messages that never reached the model return to the composer.
+- **History shortcuts**: `Ctrl+P` / `Alt+Up` and `Ctrl+N` / `Alt+Down` navigate the prompt history.
+- **Light and dark themes**: The palette is picked automatically (`COREX_THEME=light|dark` wins, otherwise `COLORFGBG`), with text colours kept at a 4.5:1 contrast on black or white backgrounds.
+- **Terminal-safe visuals**: An ASCII spinner is used on the Linux console and in non-UTF-8 locales, and the text caret blinks while idle.
+- **Footer mode badges**: Auto-approve and other modes that change how tools run are spelled out in the status bar.
+- **Collapsed logs**: Command and subagent logs show their last 5 rows when collapsed, with a single `Ctrl+O` hint in the footer instead of one per block.
+- **Session picker**: Shows a model badge (when models are mixed), relative times and a conversation preview.
+- **Slash command popup**: Shows the cursor position and how many commands are hidden above and below, and never leaves a group header as the last visible row.
+- **Shared text helpers (`text.rs`)**: Column-aware truncation that always marks a cut with `…`, thousands grouping and plain-text previews of Markdown.
+
+### Changed
+- **Resilient update check and `cx update`**: Release information is now resolved through three tiers: the GitHub API (using `GITHUB_TOKEN` or `GH_TOKEN` when present), the `corex.sluisr.com/release.json` CDN, and the `releases/latest` web redirect, which uses no API quota. The GitHub tags fallback was removed.
+- **Release pipeline**: Release notes now include an Installation & Upgrade section, and the checksum table uses aligned columns.
+- **`glob`**: Results are sorted newest first, 100 are shown, up to 20,000 are collected, and the complete list is saved to a file when it does not fit. Invalid patterns report an error.
+- **`read_file`**: Lines over 2,000 characters are truncated and output is paged at 100 KB. Files that are not valid UTF-8 report a clear error.
+- **`write_file`**: Keeps CRLF line endings when overwriting a file that uses them.
+- **`edit`**: Reports real line numbers and says when the match only held ignoring leading or trailing whitespace. Replacement indentation is adjusted to the matched block.
+- **`apply_patch`**: Tracks the line offset accumulated by earlier hunks, keeps the file's original context lines, limits whitespace fuzz to within 100 lines of the expected position, and no longer mistakes `+++` / `---` content lines for file headers.
+- **MCP tools**: Results flagged `isError` are reported as tool errors, and JSON-RPC errors without an id are no longer swallowed.
+- **`dynamic` reasoning mode**: Uses `low` for turns that only answer a tool result and `high` otherwise, independent of per-model settings. `medium` is no longer offered for DeepSeek, which rejects it.
+- **Gemini conversation history**: Consecutive assistant messages left after collapsing unsigned tool turns are merged.
+- **Forensic and subagent logs**: Plain ASCII layout, without box-drawing characters or symbols.
+- **Reasoning cache**: Keys include the tool call id.
+- **Local LLM**: `max_tokens` raised from 2,048 to 4,096, `reasoning_content` is streamed as reasoning, and HTTP errors show the server's message.
+- **Release profile**: `opt-level` is now `"s"` (size) instead of `3`.
+- **Dependencies**: Added `htmd`, `encoding_rs`, `markup5ever_rcdom` and `libc`; removed `tracing-subscriber` and `shell-words`; `chrono` and `zip` use minimal features.
+
+### Security
+- **Edits require a prior read**: `edit`, `apply_patch` and overwriting with `write_file` are refused for a file the model has not read in the session, or that changed on disk since it was read. New files are created with an atomic no-overwrite operation, so a file that appeared in the meantime is never replaced.
+- **Reads outside the workspace ask first**: `read_file`, `read_image`, `grep_search`, `glob` and `list_directory` need approval for paths outside the workspace; an "always allow" decision is stored per tool.
+- **More protected write paths**: `.git/config`, `.git/info/attributes`, `.ssh/config`, `.cargo/config(.toml)`, `~/.config/systemd/user/` and `.gitmodules`.
+- **Shell command safety**: Environment assignments before a command are only ignored for a short allowlist (locale, terminal, pager variables and a trusted `PATH`); `LD_*`, `GIT_*`, `BASH_ENV`, `NODE_OPTIONS`, `PYTHONPATH` and similar are rejected. Commands given with an explicit path are not auto-approved. Abbreviated long flags (`--out` for `--output`) and clustered short flags (`-ro`) are detected for `sort`, `rg`, `git` and `tar`, `ps` is restricted so it cannot print process environments, and a working directory outside the workspace requires approval.
+- **Subagents no longer run unattended with full privileges**: They previously ran with auto-approve on and inherited the sudo password. They now run with auto-approve off and no sudo password, and any action that would need user approval is denied. Scout and Researcher stay read-only, Worker is explicitly granted file editing, and sudo, commands that touch credentials, protected config or hook paths or destructive targets (`rm -rf /`, `mkfs`, `dd if=`, `reboot`, `shutdown`), and working directories outside the workspace are refused.
+- **Fleet command classification**: Command wrappers (`env`, `sudo`, `nohup`, `xargs`, `watch`, …) are never treated as safe, dangerous patterns match at word boundaries, and `$` and `\` in a command disqualify it from the safe list. Mutating forms of `ip`, `nmcli`, `hostname`, `date`, `iptables`/`nft`/`ufw`, `journalctl --vacuum`, `awk -f` and several `systemctl` actions are no longer auto-approved, and `env` is removed from the default safe list. Any fleet containing a node with `sudo` now asks for confirmation.
+- **SSH multiplexing guard**: Control sockets are only used from a directory owned by the current user; otherwise multiplexing is disabled.
+- **SSRF hardening**: Hostnames are resolved through a resolver that returns only public addresses, `0.0.0.0/8` is blocked, and IPv4 addresses embedded in NAT64 and 6to4 IPv6 addresses are checked.
+- **Per-host approval for `web_fetch`**: Approvals can be scoped to a host (`web_fetch:<host>`) rather than every URL.
+- **Untrusted web content**: Fetched pages and search results are prefixed with a notice that they are data and not instructions, and hidden elements (`display:none`, `hidden`, `aria-hidden`, scripts, iframes) are removed before conversion.
+- **Safer configuration handling**: Workspace settings are never written if they cannot be parsed for secret stripping; an invalid `settings.json` is reported and copied to `settings.json.invalid` instead of being silently replaced by defaults; keys supplied through environment variables are not written to `settings.json`; and the model-family fallback (`claude-*`, `gemini-*`) validates the provider URL.
+- **Private directory ownership**: Directories used for credentials, locks and spill files must belong to the current user and be private.
+- **Askpass helper**: The script is created with `0700` permissions from the start and quotes the credential path correctly.
+- **No orphaned processes**: Background tasks and the staged sudo credential are cleaned up on normal exit, on `SIGHUP`/`SIGTERM`/`SIGQUIT` and on panic.
+
+### Fixed
+- **JSON repair**: Escaped `\'` inside double-quoted strings, mismatched closers (`{"a":[1}`), stray closers and output cut right after a colon now produce valid JSON.
+- **Chat scrolling on very long conversations**: The scroll offset no longer overflows a 16-bit counter.
+- **Fleet PTY**: When the interactive terminal cannot be opened, the reason is shown and the console falls back to batch SSH.
+- **Narrow terminals**: Enabling `/fleet wide` below the minimum width explains why the layout does not apply.
+- **Termux**: The soft keyboard request is rate-limited to once per second, so rapid taps no longer spawn a burst of processes.
+- **File search**: `.git`, `node_modules` and `target` are skipped by recursive search.
+- **Truncation of tool output in history**: The cap on tool results kept in the conversation moves from 8,000 characters to the spill limit, preserving both head and tail instead of only the head.
+
+### Removed
+- **Per-mode reasoning settings**: `commandReasoningEffort`, `codeReasoningEffort` and `searchReasoningEffort` are no longer read. Existing `settings.json` files still load, and the values are simply ignored.
+- **Provider list entries**: `deepseek-v4.1-flash-1017` is no longer listed separately (it resolves to the DeepSeek Flash entry and `-m deepseek-v4.1-flash-1017` keeps working), and the Claude 3.x models are no longer listed.
+
+---
+
 ## [0.7.0] - 2026-10-17
 
 ### Added

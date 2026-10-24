@@ -51,14 +51,16 @@ impl FleetPtySession {
         // SSH Multiplexing for near-zero latency reusing ControlPath
         if let Some(base) = directories::BaseDirs::new() {
             let ssh_dir = base.home_dir().join(".corex").join("ssh");
-            let _ = corex_core::ensure_private_dir(&ssh_dir);
-            let control_path = ssh_dir.join("cx-%r@%h:%p");
-            cmd.arg("-o");
-            cmd.arg("ControlMaster=auto");
-            cmd.arg("-o");
-            cmd.arg(format!("ControlPath={}", control_path.display()));
-            cmd.arg("-o");
-            cmd.arg("ControlPersist=10m");
+            // Only multiplex through a directory we own (see SshExecutor::build_ssh_command).
+            if corex_core::ensure_private_dir(&ssh_dir).is_ok() {
+                let control_path = ssh_dir.join("cx-%r@%h:%p");
+                cmd.arg("-o");
+                cmd.arg("ControlMaster=auto");
+                cmd.arg("-o");
+                cmd.arg(format!("ControlPath={}", control_path.display()));
+                cmd.arg("-o");
+                cmd.arg("ControlPersist=10m");
+            }
         }
 
         if node.port != 22 {
@@ -330,7 +332,7 @@ pub fn key_event_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         }
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]), // Standard ASCII DEL for backspace
-        KeyCode::Tab => Some(vec![b'\t']),      // Tab character sent directly to remote bash!
+        KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Esc => Some(vec![0x1b]),
         KeyCode::Up => Some(b"\x1b[A".to_vec()),
         KeyCode::Down => Some(b"\x1b[B".to_vec()),

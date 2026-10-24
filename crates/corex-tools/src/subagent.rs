@@ -69,19 +69,16 @@ impl Tool for DelegateSubagentTool {
         })
     }
 
-    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
-        if context.allowed_commands.iter().any(|cmd| cmd == "delegate_subagent") {
-            return false;
-        }
-        let role_str = args.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
-        matches!(SubagentRole::parse(role_str), SubagentRole::Worker | SubagentRole::Tester)
+    fn needs_confirmation(&self, _args: &serde_json::Value, _context: &ToolContext) -> bool {
+        // Delegating is not gated: what a subagent does is limited by `subagent_denial`.
+        false
     }
 
     fn format_diff(&self, args: &serde_json::Value, _workspace: &std::path::Path) -> Option<String> {
+        // Show the whole instruction: the user is approving all of it, not just its first line.
         let role = args.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
-        let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
-        let first_line = prompt.lines().next().unwrap_or(prompt).trim();
-        Some(format!("Subagent [{}] {}", role.to_uppercase(), first_line))
+        let prompt = args.get("prompt").and_then(|p| p.as_str()).unwrap_or("").trim();
+        Some(format!("Subagent [{}]\n{}", role.to_uppercase(), prompt))
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -106,7 +103,7 @@ impl Tool for DelegateSubagentTool {
 
         let is_background = args.get("background").and_then(|b| b.as_bool()).unwrap_or(true);
         if !is_background {
-            let res = run_subagent_task(&task_id, role, prompt, &context.workspace_dir).await;
+            let res = run_subagent_task(&task_id, role, prompt, &context.workspace_dir, &context.allowed_commands).await;
             let mut mgr = match get_subagent_manager().lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
@@ -129,6 +126,7 @@ impl Tool for DelegateSubagentTool {
 
         let id_clone = task_id.clone();
         let ws = context.workspace_dir.clone();
+        let parent_allowed = context.allowed_commands.clone();
         let prompt_str = prompt.to_string();
 
         tokio::spawn(async move {
@@ -146,7 +144,7 @@ impl Tool for DelegateSubagentTool {
                 }
             }
 
-            let result = run_subagent_task(&id_clone, role, &prompt_str, &ws).await;
+            let result = run_subagent_task(&id_clone, role, &prompt_str, &ws, &parent_allowed).await;
 
             let mut mgr = match get_subagent_manager().lock() {
                 Ok(g) => g,
@@ -173,7 +171,7 @@ impl Tool for DelegateSubagentTool {
         );
 
         let output = format!(
-            "Task ID: {}\nRole: {}\nStatus: RUNNING in background\nLog File: {}\nSubagent dispatched in background. Forensic audit log active.",
+            "Task ID: {}\nRole: {}\nStatus: RUNNING in background\nLog File: {}\nSubagent dispatched in background.",
             task_id, role.as_str(), log_file.display()
         );
 
@@ -250,6 +248,7 @@ async fn run_subagent_task(
     role: SubagentRole,
     prompt: &str,
     workspace: &Path,
+    parent_allowed: &[String],
 ) -> Result<String, String> {
     let mut trace = ForensicTrace::new(task_id, role, prompt, workspace);
 
@@ -273,7 +272,7 @@ async fn run_subagent_task(
 
     let result = if let Some(client) = llm_client {
         trace.record_step(format!("Starting autonomous LLM execution loop for subagent [{}]", role.as_str().to_uppercase()));
-        match run_subagent_llm_loop(task_id, role, prompt, workspace, &client, &mut trace).await {
+        match run_subagent_llm_loop(task_id, role, prompt, workspace, parent_allowed, &client, &mut trace).await {
             Ok(out) => Ok(out),
             Err(e) => {
                 if allow_heuristic {
@@ -336,15 +335,86 @@ impl SubagentChatBackend for LlmClient {
     }
 }
 
+/// Subagents cannot show confirmation dialogs, so every call the main agent would have to ask
+/// the user about is decided here instead. Returns the denial message, or `None` to run it.
+///
+/// - Scout / Researcher run without any approval: anything that would need confirmation is denied.
+/// - Worker / Tester shell commands run without asking, but privilege escalation, sensitive or
+///   protected paths and a working directory outside the workspace stay denied.
+fn subagent_denial(
+    role: SubagentRole,
+    registry: &ToolRegistry,
+    name: &str,
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> Option<String> {
+    let tool = registry.get(name)?;
+    let is_shell = matches!(name, "run_shell_command" | "execute_command" | "bash");
+    if is_shell {
+        let cmd = args
+            .get("command")
+            .or_else(|| args.get("cmd"))
+            .or_else(|| args.get("CommandLine"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if crate::shell::command_requires_sudo(cmd) {
+            return Some(
+                "Access denied: subagents cannot run privileged (sudo/doas/pkexec) commands. Report the command to the main agent instead."
+                    .to_string(),
+            );
+        }
+        if crate::shell::command_references_sensitive_or_protected_path(cmd) {
+            return Some(
+                "Access denied: subagents cannot run commands targeting sensitive credentials, protected config/hook paths, or destructive system targets."
+                    .to_string(),
+            );
+        }
+        if let Some(dir) = args
+            .get("dir_path")
+            .or_else(|| args.get("cwd"))
+            .or_else(|| args.get("Cwd"))
+            .or_else(|| args.get("workdir"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        {
+            let target = crate::fs_tools::resolve_path(&ctx.workspace_dir, dir);
+            if !crate::fs_tools::is_within_workspace(&target, &ctx.workspace_dir) {
+                return Some(
+                    "Access denied: subagents cannot run shell commands with a working directory outside the workspace."
+                        .to_string(),
+                );
+            }
+        }
+        if matches!(role, SubagentRole::Worker | SubagentRole::Tester) {
+            return None;
+        }
+    }
+    if tool.needs_confirmation(args, ctx) {
+        return Some(match role {
+            SubagentRole::Scout | SubagentRole::Researcher => format!(
+                "Access denied: the {} subagent is read-only and may only perform actions that need no user approval (`{}` would).",
+                role.as_str(),
+                name
+            ),
+            _ => format!(
+                "Access denied: `{}` needs user approval (outside the workspace, credentials, or an unapproved host). Ask the main agent to do it.",
+                name
+            ),
+        });
+    }
+    None
+}
+
 async fn run_subagent_llm_loop(
     task_id: &str,
     role: SubagentRole,
     prompt: &str,
     workspace: &Path,
+    parent_allowed: &[String],
     client: &LlmClient,
     trace: &mut ForensicTrace,
 ) -> Result<String, String> {
-    run_subagent_llm_loop_with(task_id, role, prompt, workspace, client, trace).await
+    run_subagent_llm_loop_with(task_id, role, prompt, workspace, parent_allowed, client, trace).await
 }
 
 async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
@@ -352,6 +422,7 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
     role: SubagentRole,
     prompt: &str,
     workspace: &Path,
+    parent_allowed: &[String],
     client: &C,
     trace: &mut ForensicTrace,
 ) -> Result<String, String> {
@@ -363,7 +434,17 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
     sub_reg.unregister("manage_subagents");
     sub_reg.unregister("subagents");
     sub_reg.unregister("ask_user");
+    // Images are queued process-wide for the main conversation, never for a subagent.
+    sub_reg.unregister("read_image");
     sub_reg.unregister("activate_skill");
+
+    // Scout and Researcher start without any user approval, so they must not be able to drive
+    // the user's own background processes (type into a REPL/shell, kill a server).
+    if matches!(role, SubagentRole::Scout | SubagentRole::Researcher) {
+        sub_reg.unregister("write_background_input");
+        sub_reg.unregister("kill_background_process");
+        sub_reg.unregister("manage_task");
+    }
 
     match role {
         SubagentRole::Scout => {
@@ -400,11 +481,18 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
 
     let tools_defs = sub_reg.list_definitions();
 
+    // Subagents never get YOLO mode or the cached sudo password. They inherit the user's
+    // approval rules; an approved Worker may additionally edit files inside the workspace
+    // (the tools still refuse paths outside it, credentials and persistence vectors).
+    let mut allowed_commands = parent_allowed.to_vec();
+    if role == SubagentRole::Worker {
+        allowed_commands.extend(["edit", "write_file", "apply_patch"].map(String::from));
+    }
     let subagent_ctx = ToolContext {
         workspace_dir: workspace.to_path_buf(),
-        yolo_mode: true,
-        sudo_password: corex_core::client::get_sudo_password(),
-        allowed_commands: Vec::new(),
+        yolo_mode: false,
+        sudo_password: None,
+        allowed_commands,
     };
 
     let role_instructions = match role {
@@ -498,6 +586,7 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
 
         let mut assistant_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut finish_reason: Option<String> = None;
 
         while let Some(evt) = rx.recv().await {
             if cancel_token.is_cancelled() {
@@ -536,6 +625,9 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
                         tool_calls[index].extra_content = Some(ec);
                     }
                 }
+                StreamEvent::Completed { finish_reason: Some(r) } => {
+                    finish_reason = Some(r);
+                }
                 StreamEvent::Error(err) => {
                     trace.record_step(format!("Stream error: {}", err));
                     return Err(err);
@@ -543,6 +635,10 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
                 _ => {}
             }
         }
+
+        // Anthropic indexes tool calls by content block, which leaves empty placeholders.
+        tool_calls.retain(|c| !c.function.name.trim().is_empty());
+        let truncated = corex_core::is_truncated_finish(finish_reason.as_deref());
 
         if !assistant_text.trim().is_empty() {
             last_assistant_text = assistant_text.trim().to_string();
@@ -584,33 +680,22 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
             trace.record_step(format!("Subagent calling tool `{}` with args: {}", name, args_raw));
 
             let start = std::time::Instant::now();
-            let (out_str, is_err) = match corex_core::parse_lenient_json(args_raw) {
-                Ok(args_val) => {
-                    let scout_blocked = if matches!(role, SubagentRole::Scout | SubagentRole::Researcher)
-                        && matches!(name, "run_shell_command" | "execute_command" | "bash")
-                    {
-                        let cmd_str = args_val
-                            .get("command")
-                            .or_else(|| args_val.get("cmd"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        !crate::shell::is_known_safe_command(cmd_str)
-                    } else {
-                        false
-                    };
-                    if scout_blocked {
-                        (
-                            "Access denied: Scout/Researcher subagent is read-only and may only execute safe inspection commands.".to_string(),
-                            true,
-                        )
-                    } else {
-                        match sub_reg.execute(name, args_val, &subagent_ctx).await {
-                            Ok(res) => (res.output, res.is_error),
-                            Err(e) => (format!("Error executing tool {}: {}", name, e), true),
+            let (out_str, is_err) = if truncated {
+                (corex_core::TRUNCATED_TOOL_CALL_ERROR.to_string(), true)
+            } else {
+                match corex_core::parse_lenient_json(args_raw) {
+                    Ok(args_val) => {
+                        if let Some(reason) = subagent_denial(role, &sub_reg, name, &args_val, &subagent_ctx) {
+                            (reason, true)
+                        } else {
+                            match sub_reg.execute(name, args_val, &subagent_ctx).await {
+                                Ok(res) => (res.output, res.is_error),
+                                Err(e) => (format!("Error executing tool {}: {}", name, e), true),
+                            }
                         }
                     }
+                    Err(e) => (format!("Invalid arguments JSON for tool {}: {}", name, e), true),
                 }
-                Err(e) => (format!("Invalid arguments JSON for tool {}: {}", name, e), true),
             };
             let duration_ms = start.elapsed().as_millis();
             trace.record_step(format!(
@@ -618,6 +703,7 @@ async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
                 name, duration_ms, is_err, corex_core::truncate_ellipsis(&out_str, 500)
             ));
 
+            let out_str = corex_core::spill_large_output(name, out_str);
             messages.push(Message::tool_response(call.id, out_str));
         }
     }
@@ -1833,7 +1919,7 @@ results = []
 for pkg in packages:
     info_dict = None
     try:
-        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.7.0'})
+        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             info = data.get('info', {})
@@ -3330,6 +3416,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_subagent_policy_denies_unapproved_actions() {
+        let ws = std::env::temp_dir().join(format!("corex-subpolicy-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        let reg = ToolRegistry::new();
+        let ctx_for = |role: SubagentRole| {
+            let mut allowed = Vec::new();
+            if role == SubagentRole::Worker {
+                allowed.extend(["edit", "write_file", "apply_patch"].map(String::from));
+            }
+            ToolContext {
+                workspace_dir: ws.clone(),
+                yolo_mode: false,
+                sudo_password: None,
+                allowed_commands: allowed,
+            }
+        };
+        let deny = |role, name: &str, args: serde_json::Value| {
+            subagent_denial(role, &reg, name, &args, &ctx_for(role)).is_some()
+        };
+        let sh = |c: &str| serde_json::json!({ "command": c });
+
+        let scout = SubagentRole::Scout;
+        assert!(!deny(scout, "read_file", serde_json::json!({"file_path": "src/main.rs"})));
+        assert!(deny(scout, "read_file", serde_json::json!({"file_path": "/etc/hostname"})));
+        assert!(!deny(scout, "run_shell_command", sh("ls -la")));
+        assert!(deny(scout, "run_shell_command", sh("cargo build")));
+        assert!(deny(scout, "run_shell_command", sh("sudo ls")));
+
+        let worker = SubagentRole::Worker;
+        assert!(!deny(worker, "run_shell_command", sh("cargo build")));
+        assert!(deny(worker, "run_shell_command", sh("sudo apt-get update")));
+        assert!(!deny(worker, "write_file", serde_json::json!({"file_path": "src/a.rs", "content": "x"})));
+        assert!(deny(worker, "write_file", serde_json::json!({"file_path": "/etc/motd", "content": "x"})));
+        assert!(deny(worker, "web_fetch", serde_json::json!({"url": "https://example.org"})));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[tokio::test]
     async fn test_llm_loop_forces_synthesis_after_turn_limit() {
         // Regression for the turn-limit bug: a subagent that NEVER yields a tool-free turn must
@@ -3351,6 +3475,7 @@ mod tests {
             SubagentRole::Scout,
             "map the repo",
             &workspace,
+            &[],
             &mock,
             &mut trace,
         )
@@ -3576,9 +3701,9 @@ mod tests {
         }), &ctx).await.expect("log action should succeed");
 
         assert!(!log_res.is_error);
-        assert!(log_res.output.contains("COREX SUBAGENT FORENSIC EXECUTION AUDIT"));
-        assert!(log_res.output.contains("PROMPT INSTRUCTION"));
-        assert!(log_res.output.contains("FORENSIC EXECUTION TRACE & STEPS"));
+        assert!(log_res.output.contains("--- SUBAGENT EXECUTION LOG ---"));
+        assert!(log_res.output.contains("--- PROMPT ---"));
+        assert!(log_res.output.contains("--- STEPS ---"));
         assert!(log_res.output.contains("Testing forensic trace audit"));
 
         let _ = std::fs::remove_dir_all(&temp_dir);

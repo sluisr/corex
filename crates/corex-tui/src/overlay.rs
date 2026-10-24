@@ -37,6 +37,13 @@ pub fn dim_background(frame: &mut Frame, area: Rect) {
     }
 }
 
+/// Paints one border cell (a junction such as `├`) on top of what was already rendered.
+pub fn set_junction(frame: &mut Frame, x: u16, y: u16, ch: char, color: Color) {
+    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+        cell.set_char(ch).set_fg(color);
+    }
+}
+
 /// Common modal setup: dims the chat behind it, clears a `h_margin` x `v_margin` halo so chat
 /// text never touches the border, then clears the dialog area itself.
 pub fn begin_modal(frame: &mut Frame, area: Rect, dialog: Rect, h_margin: u16, v_margin: u16) {

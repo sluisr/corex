@@ -61,22 +61,42 @@ pub fn get_or_create_askpass_script() -> PathBuf {
         .get_or_init(|| {
             let dir = askpass_dir();
 
-            let _ = corex_core::ensure_private_dir(&dir);
             let script_path = dir.join("askpass.sh");
             let cred_path = dir.join(".askpass_cred");
+            if let Err(e) = corex_core::ensure_private_dir(&dir) {
+                // Never place the helper in a directory someone else controls: they could
+                // replace it and capture the password. Without it, sudo simply fails.
+                tracing::warn!("askpass helper disabled: {}", e);
+                return script_path;
+            }
 
             // The password is read exclusively from a 0600 file staged just before the privileged
             // command runs and cleaned up in Rust via AskpassGuard when execution finishes or backgrounds.
+            // POSIX single-quoting: `{:?}` (Rust Debug) is not shell syntax and would let `$` or
+            // backticks in the home path expand inside the helper.
+            let quoted_cred = format!("'{}'", cred_path.to_string_lossy().replace('\'', "'\\''"));
             let script_content = format!(
-                "#!/bin/sh\nCRED={:?}\nif [ -f \"$CRED\" ]; then\n    cat \"$CRED\"\n    exit 0\nfi\nexit 1\n",
-                cred_path.to_string_lossy()
+                "#!/bin/sh\nCRED={}\nif [ -f \"$CRED\" ]; then\n    cat \"$CRED\"\n    exit 0\nfi\nexit 1\n",
+                quoted_cred
             );
 
-            if fs::write(&script_path, script_content).is_ok() {
-                #[cfg(unix)]
-                {
-                    let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
-                }
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o700);
+            }
+            let written = opts
+                .open(&script_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, script_content.as_bytes()));
+            #[cfg(unix)]
+            if written.is_ok() {
+                // `mode()` only applies on creation; fix up a helper left by an older version.
+                let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700));
+            }
+            if let Err(e) = written {
+                tracing::warn!("failed to write askpass helper: {}", e);
             }
 
             script_path
@@ -407,6 +427,105 @@ fn split_segments(cmd: &str) -> Vec<&str> {
     segments
 }
 
+/// Environment variables that are safe to set in front of an auto-approved command because they
+/// only affect locale/output and cannot redirect execution or load code.
+fn is_safe_env_assignment(tok: &str) -> bool {
+    const SAFE_ENV: &[&str] = &[
+        "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME",
+        "TZ", "TERM", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "COLUMNS",
+        "LINES", "PAGER_UNUSED", "GIT_PAGER", "PAGER",
+    ];
+    // GIT_PAGER/PAGER=cat are common and harmless; a pager that is itself a path or carries
+    // arguments is caught by the generic value check below.
+    match tok.split_once('=') {
+        Some(("PATH", value)) => {
+            !value.is_empty()
+                && value.split(':').all(|seg| {
+                    matches!(
+                        seg,
+                        "/usr/bin" | "/bin" | "/usr/local/bin" | "/sbin" | "/usr/sbin"
+                    )
+                })
+        }
+        Some((name, value)) => {
+            SAFE_ENV.contains(&name)
+                && !value.contains('/')
+                && !value.contains(' ')
+                && !value.is_empty()
+        }
+        None => false,
+    }
+}
+
+/// True when an environment variable assignment can hijack code execution or credentials
+/// (`LD_PRELOAD`, `GIT_EXTERNAL_DIFF`, `BASH_ENV`, `RUSTC_WRAPPER`, untrusted `PATH`, etc.).
+fn is_dangerous_env_assignment(tok: &str) -> bool {
+    let Some((name, val)) = tok.split_once('=') else {
+        return false;
+    };
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("LD_")
+        || upper.starts_with("DYLD_")
+        || upper.starts_with("GIT_") && upper != "GIT_PAGER"
+        || matches!(
+            upper.as_str(),
+            "BASH_ENV"
+                | "ENV"
+                | "CDPATH"
+                | "GLOBIGNORE"
+                | "IFS"
+                | "PROMPT_COMMAND"
+                | "PS4"
+                | "SUDO_ASKPASS"
+                | "SSH_ASKPASS"
+                | "PYTHONPATH"
+                | "PYTHONSTARTUP"
+                | "NODE_OPTIONS"
+                | "RUBYOPT"
+                | "PERL5OPT"
+                | "PERL5LIB"
+                | "RUSTC_WRAPPER"
+                | "CARGO_BUILD_RUSTC_WRAPPER"
+                | "EDITOR"
+                | "VISUAL"
+        )
+    {
+        return true;
+    }
+    if upper == "PATH" {
+        // Only allow standard system PATH dirs (`/usr/bin`, `/bin`, `/usr/local/bin`, `/sbin`, `/usr/sbin`)
+        for seg in val.split(':') {
+            if !matches!(
+                seg,
+                "/usr/bin" | "/bin" | "/usr/local/bin" | "/sbin" | "/usr/sbin"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True if `token` is a short-option cluster (`-abc`, not `--long`) containing flag letter `c`.
+/// Used for argument-taking short flags that may hide inside a cluster, e.g. `o` in `-ro file`.
+fn short_cluster_contains(token: &str, flag: char) -> bool {
+    token.starts_with('-')
+        && !token.starts_with("--")
+        && token.len() > 1
+        && token[1..].chars().take_while(|c| *c != '=').any(|c| c == flag)
+}
+
+/// True if `token` is a GNU-style long option that is an unambiguous abbreviation of one of
+/// `dangerous` (getopt accepts any unique prefix, so `--out` triggers `--output`). The option's
+/// `=value` suffix is ignored for the comparison.
+fn is_dangerous_long_abbrev(token: &str, dangerous: &[&str]) -> bool {
+    if !token.starts_with("--") || token.len() < 3 {
+        return false;
+    }
+    let name = token.split('=').next().unwrap_or(token);
+    dangerous.iter().any(|d| d.starts_with(name))
+}
+
 /// True for `VAR=value` environment assignment prefixes (e.g. `LANG=C`).
 fn is_env_assignment(tok: &str) -> bool {
     let Some(eq) = tok.find('=') else {
@@ -465,8 +584,8 @@ fn token_references_sensitive_path(tok: &str) -> bool {
         }
         let lower = v.to_lowercase();
         let has_glob = v.contains('*') || v.contains('?') || v.contains('[');
-        if has_glob
-            && (lower.starts_with("/etc/")
+        if has_glob {
+            if lower.starts_with("/etc/")
                 || lower.starts_with("/proc/")
                 || lower.starts_with("/root")
                 || lower.contains(".ssh")
@@ -474,9 +593,18 @@ fn token_references_sensitive_path(tok: &str) -> bool {
                 || lower.contains(".aws")
                 || lower.contains(".kube")
                 || lower.contains(".corex")
-                || lower.contains(".env"))
-        {
-            return true;
+                || lower.contains(".env")
+            {
+                return true;
+            }
+            // A glob aimed at a hidden directory under $HOME (`~/.?sh/*`, `~/.*/credentials`)
+            // can expand onto a credential store that the literal checks above miss, because
+            // the wildcard hides the real name. Treat any hidden-dir glob in $HOME as sensitive.
+            if let Some(rest) = v.strip_prefix("~/").or_else(|| v.strip_prefix("~")) {
+                if rest.starts_with('.') || rest.contains("/.") {
+                    return true;
+                }
+            }
         }
         crate::fs_tools::is_sensitive_system_path(&resolve_token_path(v))
     };
@@ -489,6 +617,33 @@ fn token_references_sensitive_path(tok: &str) -> bool {
         return false;
     }
     check_val(t)
+}
+
+/// True when `cmd` references sensitive credentials, protected shell/git/cargo files, or system-wide destructive patterns.
+pub fn command_references_sensitive_or_protected_path(cmd: &str) -> bool {
+    let lower = cmd.to_ascii_lowercase();
+    if lower.contains("rm -rf /")
+        || lower.starts_with("mkfs")
+        || lower.contains(" mkfs")
+        || lower.contains("dd if=")
+        || lower.starts_with("reboot")
+        || lower.starts_with("poweroff")
+        || lower.starts_with("shutdown")
+    {
+        return true;
+    }
+    for tok in cmd.split_whitespace() {
+        if token_references_sensitive_path(tok) {
+            return true;
+        }
+        let clean = tok.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
+        if !clean.is_empty() && !clean.starts_with('-') {
+            if crate::fs_tools::is_protected_write_path(&resolve_token_path(clean)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn strip_outer_quotes(s: &str) -> &str {
@@ -521,8 +676,14 @@ fn is_single_segment_safe(segment: &str) -> bool {
 
     let mut parts: Vec<&str> = raw_parts.into_iter().map(strip_outer_quotes).collect();
 
-    // Skip leading VAR=value environment assignments to find the real command.
+    // Skip leading VAR=value environment assignments to find the real command. Only a short
+    // whitelist of cosmetic variables is allowed: `LD_PRELOAD=`, `GIT_EXTERNAL_DIFF=`, `PATH=`
+    // and the like turn a read-only command into arbitrary code execution, so a non-whitelisted
+    // assignment forces confirmation.
     while is_env_assignment(parts[0]) {
+        if !is_safe_env_assignment(parts[0]) {
+            return false;
+        }
         parts.remove(0);
         if parts.is_empty() {
             return true;
@@ -530,10 +691,12 @@ fn is_single_segment_safe(segment: &str) -> bool {
     }
 
     let raw_cmd = parts[0];
-    let cmd = Path::new(raw_cmd)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or(raw_cmd);
+    // A command invoked by path (`./cat`, `/tmp/x/ls`, `bin/tool`) is never auto-approved: the
+    // safe-tool list identifies trusted binaries by name on $PATH, and a path can point anywhere.
+    if raw_cmd.contains('/') {
+        return false;
+    }
+    let cmd = raw_cmd;
 
     // Wrapper commands: validate the wrapped command instead.
     if is_wrapper(cmd) {
@@ -541,9 +704,16 @@ fn is_single_segment_safe(segment: &str) -> bool {
         while j < parts.len()
             && (parts[j].starts_with('-') || parts[j].chars().all(|c| c.is_ascii_digit()))
         {
+            // `env -S ...` / `env -i ...` can alter command splitting or environment security
+            if cmd == "env" && parts[j].starts_with('-') {
+                return false;
+            }
             j += 1;
         }
         while j < parts.len() && is_env_assignment(parts[j]) {
+            if !is_safe_env_assignment(parts[j]) {
+                return false;
+            }
             j += 1;
         }
         if j >= parts.len() {
@@ -564,11 +734,11 @@ fn is_single_segment_safe(segment: &str) -> bool {
     static SAFE_TOOLS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     let safe_tools = SAFE_TOOLS.get_or_init(|| {
         [
-            "cat", "ls", "dir", "tree", "grep", "egrep", "fgrep", "rg", "head", "tail",
-            "wc", "cut", "tr", "uniq", "sort", "tac", "nl", "echo", "printf", "stat",
-            "file", "strings", "column", "pwd", "cd", "which", "whereis", "whoami", "id",
+            "cat", "ls", "dir", "tree", "grep", "egrep", "fgrep", "head", "tail",
+            "wc", "cut", "tr", "tac", "nl", "echo", "printf", "stat",
+            "file", "strings", "column", "pwd", "which", "whereis", "whoami", "id",
             "uname", "uptime", "lscpu", "free", "df", "du", "lsblk", "nproc", "arch",
-            "top", "ps", "expr", "seq", "true", "false", "test", "numfmt", "sensors",
+            "top", "expr", "seq", "true", "false", "test", "numfmt", "sensors",
             "lshw", "lspci", "lsusb", "dmidecode", "dmesg", "journalctl",
             "glxinfo", "vulkaninfo", "clinfo", "inxi",
             // Read-only inspection / text-processing additions
@@ -585,15 +755,45 @@ fn is_single_segment_safe(segment: &str) -> bool {
     });
 
     if safe_tools.contains(cmd) {
-        // Special check for sort output flag
-        if cmd == "sort" && parts.iter().any(|&p| p == "-o" || p.starts_with("-o") || p == "--output" || p.starts_with("--output=")) {
-            return false;
-        }
-        // Special check for ripgrep external preprocessor execution
-        if cmd == "rg" && parts.iter().any(|&p| p == "--pre" || p.starts_with("--pre=") || p == "-z" || p == "--search-zip") {
-            return false;
-        }
         return true;
+    }
+
+    // `sort` writes with `-o`/`--output` and runs a program with `--compress-program`; the long
+    // forms are also reachable by abbreviation (`--out`, `--compress-prog`). `-o` takes an
+    // argument, so it may hide inside a short cluster such as `-ro FILE`.
+    if cmd == "sort" {
+        return !parts.iter().any(|&p| {
+            short_cluster_contains(p, 'o')
+                || is_dangerous_long_abbrev(p, &["--output", "--compress-program", "--files0-from", "--random-source"])
+        });
+    }
+
+    // `rg` can execute a preprocessor (`--pre`) or decompress-and-run (`-z`); `--search-zip` too.
+    if cmd == "rg" {
+        return !parts.iter().any(|&p| {
+            p == "-z"
+                || is_dangerous_long_abbrev(p, &["--pre", "--search-zip", "--pre-glob", "--hostname-bin"])
+        });
+    }
+
+    // `uniq INPUT OUTPUT` and `tee`-like second operands write to disk; only one non-flag
+    // operand (the input) keeps it read-only.
+    if cmd == "uniq" {
+        let operands = parts.iter().skip(1).filter(|p| !p.starts_with('-')).count();
+        return operands <= 1;
+    }
+
+    // `ps` with the BSD `e` flag (e.g. `ps auxeww`, `ps e`) prints each process's environment,
+    // leaking secrets from the user's other processes. `--format`/`-o` can request the same
+    // columns (`env`). The UNIX `-e` ("all processes") is harmless, so only bare BSD clusters
+    // and format specs are blocked.
+    if cmd == "ps" {
+        let leaks_env = parts.iter().skip(1).any(|p| {
+            (!p.starts_with('-') && p.contains('e'))
+                || p == &"-o" || p == &"--format"
+                || p.starts_with("-o") || p.starts_with("--format")
+        });
+        return !leaks_env;
     }
 
     // `find` may not mutate (no -exec/-ok/-delete or -fprint family)
@@ -634,13 +834,16 @@ fn is_single_segment_safe(segment: &str) -> bool {
 
     // Safe Git read-only subcommands
     if cmd == "git" {
+        // `-c key=val` injects config (e.g. `core.pager`, `core.fsmonitor`) that runs programs;
+        // `-C`/`--git-dir`/`--work-tree`/`--namespace` redirect which repo is touched. The long
+        // forms are reachable by abbreviation (`--upl` for `--upload-pack`), so match prefixes.
         if parts[1..].iter().any(|p| {
-            p.starts_with("--output")
-                || p.starts_with("--ext-diff")
-                || p.starts_with("--textconv")
-                || p.starts_with("--upload-pack")
-                || p.starts_with("--exec")
-                || p.starts_with("-c")
+            p.starts_with("-c")
+                || p.starts_with("-C")
+                || is_dangerous_long_abbrev(p, &[
+                    "--output", "--ext-diff", "--textconv", "--upload-pack", "--exec-path",
+                    "--git-dir", "--work-tree", "--namespace", "--config-env",
+                ])
         }) {
             return false;
         }
@@ -662,6 +865,8 @@ fn is_single_segment_safe(segment: &str) -> bool {
                     "tag" => is_safe_git_tag(&parts),
                     "remote" => is_safe_git_remote(&parts),
                     "config" => is_safe_git_config(&parts),
+                    // `git help -w/--web <topic>` launches a browser; plain help paginates.
+                    "help" => !parts[2..].iter().any(|&p| p == "-w" || p == "--web"),
                     _ => true,
                 };
             }
@@ -812,7 +1017,10 @@ fn is_single_segment_safe(segment: &str) -> bool {
         return false;
     }
 
-    if cmd == "wget" && (parts.iter().any(|&p| p == "--version" || p == "-V" || p == "-qO-" || p == "-O-")) {
+    // `wget` reaches the network and can write files (`-O file`) or exfiltrate (`--post-file`,
+    // and the URL itself); the old `-qO-`/`-O-` allowance was defeated by adding a second `-O`.
+    // Only `--version` is auto-approved; use the `web_fetch` tool to read a page.
+    if cmd == "wget" && parts.iter().any(|&p| p == "--version" || p == "-V") {
         return true;
     }
 
@@ -833,16 +1041,15 @@ fn is_safe_tar(parts: &[&str]) -> bool {
             short_chars.extend(p[1..].chars());
         }
     }
+    // Any of these (also reachable by abbreviation, e.g. `--checkpoint-act`, `--compress-prog`,
+    // `--rsh-comm`) either write to disk or run an external program.
     let write_long = [
         "--create", "--extract", "--get", "--append", "--update", "--concatenate",
         "--delete", "--unlink-first", "--checkpoint-action", "--to-command",
-        "--use-compress-program",
+        "--use-compress-program", "--rsh-command", "--rmt-command", "--files-from",
     ];
     let has_write = short_chars.iter().any(|c| matches!(c, 'x' | 'c' | 'r' | 'u' | 'A' | 'U' | 'I'))
-        || long_flags.iter().any(|f| {
-            let name = f.split('=').next().unwrap_or(f);
-            write_long.contains(&name)
-        });
+        || long_flags.iter().any(|f| is_dangerous_long_abbrev(f, &write_long));
     let has_list = short_chars.contains(&'t') || long_flags.contains(&"--list");
     !has_write && has_list
 }
@@ -1070,6 +1277,9 @@ fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
         return false;
     }
     while is_env_assignment(parts[0]) {
+        if is_dangerous_env_assignment(parts[0]) {
+            return false;
+        }
         parts.remove(0);
         if parts.is_empty() {
             return true;
@@ -1192,6 +1402,18 @@ impl Tool for ShellTool {
     }
 
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        // A `cwd` outside the workspace moves the safe-list's path reasoning onto unknown ground
+        // (`{"command":"cat id_ed25519","cwd":"/home/u/.ssh"}`), so it always needs confirmation.
+        if let Some(cwd) = args.get("cwd").or_else(|| args.get("Cwd")).and_then(|v| v.as_str()) {
+            let resolved = if Path::new(cwd).is_absolute() {
+                PathBuf::from(cwd)
+            } else {
+                context.workspace_dir.join(cwd)
+            };
+            if !crate::fs_tools::is_within_workspace(&resolved, &context.workspace_dir) {
+                return true;
+            }
+        }
         let cmd = args.get("command")
             .or_else(|| args.get("CommandLine"))
             .and_then(|v| v.as_str())
@@ -1562,16 +1784,21 @@ mod tests {
 
     #[test]
     fn test_is_known_safe_command() {
-        assert!(is_known_safe_command("cd /home/user/Documents && df -h /home | tail -1"));
-        assert!(!is_known_safe_command("cd /home/user/Documents && df -h /home | tail -1 && rm -v archive.tar.gz"));
+        assert!(is_known_safe_command("ls /home/user/Documents && df -h /home | tail -1"));
+        assert!(!is_known_safe_command("ls /home/user/Documents && df -h /home | tail -1 && rm -v archive.tar.gz"));
         assert!(!is_known_safe_command("rm -rf /"));
+        // `cd` changes the path-resolution context, so a compound using it is never auto-approved.
+        assert!(!is_known_safe_command("cd /home/user/Documents && df -h /home"));
     }
 
     #[test]
     fn test_env_prefix_is_ignored() {
+        // Only cosmetic/locale variables are skipped; arbitrary assignments need confirmation.
         assert!(is_known_safe_command("LANG=C df -h /home"));
         assert!(is_known_safe_command("GIT_PAGER=cat LC_ALL=C git log --oneline"));
-        assert!(is_known_safe_command("FOO=bar baz=qux ls -la"));
+        assert!(!is_known_safe_command("FOO=bar baz=qux ls -la"));
+        assert!(!is_known_safe_command("LD_PRELOAD=./x.so ls -la"));
+        assert!(!is_known_safe_command("GIT_EXTERNAL_DIFF=rm git diff"));
         assert!(!is_known_safe_command("LANG=C rm -rf /"));
     }
 
@@ -1589,6 +1816,35 @@ mod tests {
         // Redirection bypass checks
         assert!(!is_known_safe_command("echo x >&1file"));
         assert!(!is_known_safe_command("echo x >/dev/null_bad"));
+    }
+
+    #[test]
+    fn test_flag_and_path_bypasses_blocked() {
+        // Binary invoked by path, never trusted by name.
+        assert!(!is_known_safe_command("./cat README.md"));
+        assert!(!is_known_safe_command("/tmp/x/ls"));
+        // Long-option abbreviations that getopt expands to a dangerous flag.
+        assert!(!is_known_safe_command("sort --out=/tmp/pwned README.md"));
+        assert!(!is_known_safe_command("sort -ro /tmp/pwned README.md"));
+        assert!(!is_known_safe_command("sort --compress-prog=./x big.txt"));
+        assert!(!is_known_safe_command("git ls-remote --upl=./x ."));
+        assert!(!is_known_safe_command("git diff --outp=diff_out"));
+        assert!(!is_known_safe_command("tar -tf a.tar --checkpoint-act=exec=./x"));
+        assert!(!is_known_safe_command("tar -tf a.tar --rsh-command=./x"));
+        // Network/write tools that used to slip through.
+        assert!(!is_known_safe_command("wget -qO- -O out https://e/x"));
+        assert!(!is_known_safe_command("uniq a.txt b.txt"));
+        assert!(!is_known_safe_command("ps auxeww"));
+        assert!(!is_known_safe_command("git help -w config"));
+        assert!(!is_known_safe_command("git -C .. status"));
+        // Glob aimed at a hidden directory under $HOME.
+        assert!(!is_known_safe_command("cat ~/.?sh/id_ed25519"));
+        // Legitimate read-only forms stay auto-approved.
+        assert!(is_known_safe_command("sort README.md"));
+        assert!(is_known_safe_command("uniq sorted.txt"));
+        assert!(is_known_safe_command("ps aux"));
+        assert!(is_known_safe_command("tar -tf archive.tar"));
+        assert!(is_known_safe_command("git diff --stat"));
     }
 
     #[test]

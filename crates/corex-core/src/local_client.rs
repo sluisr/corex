@@ -85,7 +85,7 @@ impl LocalLlmClient {
             messages,
             tools,
             temperature: Some(0.7),
-            max_tokens: Some(2048),
+            max_tokens: Some(4096),
             stream: true,
         };
 
@@ -163,6 +163,15 @@ impl LocalLlmClient {
                                     }
 
                                     if let Some(choice) = chunk.choices.first() {
+                                        if let Some(ref cot) = choice.delta.reasoning_content {
+                                            if !cot.is_empty() {
+                                                if first_token_time.is_none() {
+                                                    first_token_time = Some(start_time.elapsed().as_millis());
+                                                }
+                                                let _ = tx.send(StreamEvent::ReasoningDelta(cot.clone())).await;
+                                            }
+                                        }
+
                                         if let Some(ref text) = choice.delta.content {
                                             if !text.is_empty() {
                                                 if first_token_time.is_none() {
@@ -209,7 +218,18 @@ impl LocalLlmClient {
                             Some(Err(err)) => {
                                 error!("[LOCAL_SSE] Error: {}", err);
                                 crate::forensic::ForensicLogger::log_error("local_stream_chat_sse", &err.to_string());
-                                let _ = tx.send(StreamEvent::Error(format!("Local stream error: {}", err))).await;
+                                let friendly_err = match err {
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let body_text = resp.text().await.unwrap_or_default();
+                                        if !body_text.is_empty() {
+                                            format!("Local API error ({}): {}", status, body_text)
+                                        } else {
+                                            format!("Local stream error: Invalid status code {}", status)
+                                        }
+                                    }
+                                    other => format!("Local stream error: {}", other),
+                                };
+                                let _ = tx.send(StreamEvent::Error(friendly_err)).await;
                                 break;
                             }
                             None => {
@@ -305,8 +325,8 @@ Keep answers concise and practical with code snippets where helpful."#;
         self.complete(system_prompt, prompt).await
     }
 
-    /// Generates a dense, structured context summary of past conversation messages.
-    /// Run locally on llama-server / local SLM @ $0.00.
+    /// Generates a dense, structured context summary of past conversation messages
+    /// using the configured local LLM endpoint.
     pub async fn compact_conversation(&self, formatted_history: &str) -> Result<String> {
         let system_prompt = r#"You are the Context Compactor for Corex.
 Your job is to condense older conversation messages into a dense, high-signal technical memory block.

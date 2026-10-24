@@ -132,7 +132,7 @@ fn wrap_question(text: &str, width: usize) -> Vec<Line<'static>> {
             if cur_w + w > width && !cur.is_empty() {
                 out.push(Line::from(Span::styled(
                     cur.clone(),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::BOLD),
                 )));
                 cur.clear();
                 cur_w = 0;
@@ -143,7 +143,7 @@ fn wrap_question(text: &str, width: usize) -> Vec<Line<'static>> {
         if !cur.is_empty() {
             out.push(Line::from(Span::styled(
                 cur,
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             )));
         }
     }
@@ -231,7 +231,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
                 Span::styled(
                     opt.clone(),
                     if is_sel {
-                        Style::default().fg(Color::Rgb(240, 245, 255)).add_modifier(Modifier::BOLD)
+                        Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(theme.gray)
                     },
@@ -268,7 +268,7 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
         lines.push(Line::from(vec![
             Span::styled("  › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
             Span::styled(display_text, Style::default().fg(theme.foreground)),
-            Span::styled("█", Style::default().fg(theme.accent_blue)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
         ]));
     }
 

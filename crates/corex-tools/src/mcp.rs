@@ -164,6 +164,10 @@ impl McpClient {
                         if Some(id) == expected_id {
                             return Ok(parsed);
                         }
+                    } else if parsed.get("error").is_some()
+                        && parsed.get("id").map_or(true, |v| v.is_null())
+                    {
+                        return Ok(parsed);
                     }
                 }
             }
@@ -265,7 +269,17 @@ impl McpClient {
             output_str = serde_json::to_string_pretty(res).unwrap_or_default();
         }
 
-        Ok(ToolOutput::success(output_str))
+        let is_error = resp
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if is_error {
+            Ok(ToolOutput::error(output_str))
+        } else {
+            Ok(ToolOutput::success(output_str))
+        }
     }
 }
 

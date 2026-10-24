@@ -79,7 +79,13 @@ impl ReasoningCache {
         let tool_names = tool_calls.map(|calls| {
             let mut names: Vec<String> = calls
                 .iter()
-                .map(|c| format!("{}:{}", c.function.name, c.function.arguments))
+                .map(|c| {
+                    if c.id.is_empty() {
+                        format!("{}:{}", c.function.name, c.function.arguments)
+                    } else {
+                        format!("{}:{}:{}", c.id, c.function.name, c.function.arguments)
+                    }
+                })
                 .collect();
             names.sort();
             names.join(";")

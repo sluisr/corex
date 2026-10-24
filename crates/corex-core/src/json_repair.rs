@@ -152,8 +152,8 @@ fn repair_json_syntax(input: &str) -> Result<String, String> {
         if in_string {
             if escape_next {
                 escape_next = false;
-                if quote_char == '\'' && ch == '\'' {
-                    // `\'` inside single-quoted string becomes unescaped `'` inside double-quoted JSON string
+                if ch == '\'' {
+                    // `\'` inside single- or double-quoted string becomes unescaped `'` inside double-quoted JSON string
                     out.pop(); // remove preceding `\`
                     out.push('\'');
                 } else {
@@ -197,9 +197,17 @@ fn repair_json_syntax(input: &str) -> Result<String, String> {
                         }
                     }
                     if let Some(pos) = stack.iter().rposition(|&expected| expected == ch) {
-                        stack.remove(pos);
+                        // Close any still-open inner containers first (`{"a":[1}` -> `{"a":[1]}`)
+                        // so the output keeps a valid nesting order.
+                        while stack.len() > pos + 1 {
+                            if let Some(inner) = stack.pop() {
+                                out.push(inner);
+                            }
+                        }
+                        stack.pop();
+                        out.push(ch);
                     }
-                    out.push(ch);
+                    // A closer with no matching opener is dropped.
                 }
                 _ => {
                     out.push(ch);
@@ -225,6 +233,11 @@ fn repair_json_syntax(input: &str) -> Result<String, String> {
         } else {
             break;
         }
+    }
+
+    // If truncated immediately after a colon (`{"key":`), supply `null` so the object stays valid JSON.
+    if out.ends_with(':') {
+        out.push_str("null");
     }
 
     // Close any unclosed braces or brackets in reverse order (LIFO)
@@ -328,6 +341,18 @@ mod tests {
         let raw = r#"{"a": "hello\"#;
         let v = parse_lenient_json(raw).expect("truncated string ending with backslash must be repaired");
         assert_eq!(v["a"], "hello");
+    }
+
+    #[test]
+    fn test_mismatched_closer_closes_inner_containers_first() {
+        let v = parse_lenient_json(r#"{"a": [1, 2}"#).unwrap();
+        assert_eq!(v["a"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn test_stray_closer_is_dropped() {
+        let v = parse_lenient_json(r#"{"a": 1}]"#).unwrap();
+        assert_eq!(v["a"], 1);
     }
 }
 

@@ -35,6 +35,8 @@ pub mod mobile;
 pub use mobile::*;
 pub mod terminal;
 pub use terminal::*;
+pub mod summary;
+pub use summary::*;
 pub mod render;
 pub use render::*;
 pub mod event_loop;
@@ -42,6 +44,9 @@ pub use event_loop::*;
 
 impl App {
     pub fn new(llm_client: LlmClient, workspace_dir: PathBuf, yolo: bool) -> Self {
+        // Tests build many Apps and some save sessions: keep them out of the real ~/.corex.
+        #[cfg(test)]
+        crate::test_support::isolate_home();
         corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(llm_client.clone()));
         let branch = Self::detect_git_branch(&workspace_dir);
         let cfg = llm_client.get_config();
@@ -55,7 +60,7 @@ impl App {
             session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir)),
             llm_client: llm_client.clone(),
             tool_registry: ToolRegistry::new(),
-            theme: Theme::default(),
+            theme: Theme::detect(),
             workspace_dir,
 
             input_buffer: String::new(),
@@ -107,6 +112,7 @@ impl App {
             last_esc_press: None,
             last_ctrl_c_press: None,
             slash_popup_height_current: 0.0,
+            slash_popup_clock: None,
             last_slash_filter: String::new(),
             local_llm_online: is_online,
             last_local_check: None,
@@ -116,6 +122,7 @@ impl App {
             cached_render_width: 0,
             cached_session_id: String::new(),
             cached_logs_expanded: false,
+            cached_has_collapsed_logs: false,
             streaming_md_cache: Vec::new(),
             streaming_md_cache_len: 0,
             streaming_md_cache_width: 0,
@@ -130,6 +137,7 @@ impl App {
             is_checking_balance: false,
             pending_balance_msg_index: None,
             message_queue: VecDeque::new(),
+            steer_messages: Vec::new(),
             start_time: Instant::now(),
             last_interaction: Instant::now(),
         };
@@ -214,12 +222,12 @@ impl App {
     fn scroll_selection(&mut self, delta: i32) {
         let before = self.scroll_offset;
         self.scroll_chat(delta);
-        let applied = self.scroll_offset as i32 - before as i32;
+        let applied = self.scroll_offset as i64 - before as i64;
         if applied == 0 {
             return;
         }
         if let Some(selection) = self.selection.as_mut() {
-            selection.cursor.0 = (selection.cursor.0 as i32 + applied).max(0) as usize;
+            selection.cursor.0 = (selection.cursor.0 as i64 + applied).max(0) as usize;
         }
     }
 
@@ -301,7 +309,7 @@ impl App {
     ) {
         let Some(selection) = self.selection else { return };
 
-        // 1. Is this a deliberate point click? (Human tap: between 30ms and 500ms, max 1 cell jitter)
+        // Point click: duration between 30ms and 500ms, max 1 cell jitter.
         let is_point_click = if let (Some(t), Some((dc, dr))) = (down_time, down_pos) {
             let elapsed = t.elapsed();
             let duration_ok = elapsed >= Duration::from_millis(30) && elapsed <= Duration::from_millis(500);
@@ -313,22 +321,17 @@ impl App {
             false
         };
 
-        // 2. Window Focus Activation Guard:
-        // Window managers (Hyprland, Wayland, X11) pass click-through when focusing an inactive window.
-        // A click within 400ms of FocusGained is a window activation click, NOT a deliberate URL click!
+        // Ignore clicks within 400ms of FocusGained (window manager focus click-through).
         let is_focus_activation = self.last_focus_gained
             .map(|t| t.elapsed() < Duration::from_millis(400))
             .unwrap_or(false);
 
-        // 3. App startup grace period (first 800ms of app lifecycle):
         let is_startup_grace = self.app_start_time.elapsed() < Duration::from_millis(800);
 
         if is_point_click && !is_focus_activation && !is_startup_grace {
             let (line_idx, char_col) = selection.anchor;
             if let Some(line) = self.selection_lines.get(line_idx) {
                 if let Some(url) = formatting::find_url_in_line(line, Some(char_col as usize)) {
-                    // 4. Strict Debounce:
-                    // Minimum 1.5s between ANY URL open, 3.0s between opening the exact same URL.
                     let already_opened_recently = self.last_url_open
                         .as_ref()
                         .map(|(t, prev_url)| {
@@ -406,7 +409,7 @@ impl App {
         }
         let row_in_view = row.saturating_sub(rect.y).min(rect.height - 1);
         let col_in_view = column.saturating_sub(rect.x).min(rect.width - 1);
-        Some((self.scroll_offset as usize + row_in_view as usize, col_in_view))
+        Some((self.scroll_offset + row_in_view as usize, col_in_view))
     }
 
     /// Text covered by the active selection, one entry per rendered line.
@@ -490,9 +493,124 @@ impl App {
         }
     }
 
+    /// Eases the popup height toward its target. The step follows the real time between frames,
+    /// so the motion lasts the same ~200 ms whatever the tick rate (a fixed fraction per frame
+    /// made it twice as slow and choppy when the tick was lengthened).
+    pub fn advance_slash_popup(&mut self) {
+        // Equivalent to the original 35% per 16 ms frame.
+        const TAU_MS: f32 = 37.0;
+        let target = self.slash_popup_target_height();
+        let diff = target - self.slash_popup_height_current;
+        if diff.abs() <= 0.05 {
+            self.slash_popup_height_current = target;
+            self.slash_popup_clock = None;
+            return;
+        }
+        let now = Instant::now();
+        let dt_ms = self
+            .slash_popup_clock
+            .map_or(16.0, |t| now.duration_since(t).as_secs_f32() * 1000.0)
+            .clamp(1.0, 50.0);
+        self.slash_popup_clock = Some(now);
+        self.slash_popup_height_current += diff * (1.0 - (-dt_ms / TAU_MS).exp());
+    }
+
     pub fn is_slash_animating(&self) -> bool {
         let target = self.slash_popup_target_height();
         (target - self.slash_popup_height_current).abs() > 0.05
+    }
+
+    /// Messages waiting to reach the model: the steer ones first, then the queue.
+    pub fn has_pending_messages(&self) -> bool {
+        !self.steer_messages.is_empty() || !self.message_queue.is_empty()
+    }
+
+    /// Takes back the newest pending message (what the user did last), steer before queue.
+    pub fn undo_last_pending(&mut self) -> Option<String> {
+        self.steer_messages.pop().or_else(|| self.message_queue.pop_back())
+    }
+
+    /// Empties both lists in delivery order, so nothing the user typed is thrown away.
+    pub fn take_all_pending(&mut self) -> Vec<String> {
+        let mut all = std::mem::take(&mut self.steer_messages);
+        all.extend(self.message_queue.drain(..));
+        all
+    }
+
+    /// Puts messages that were never delivered back in the composer, in front of whatever is
+    /// already typed there.
+    pub fn restore_to_input(&mut self, messages: Vec<String>) {
+        if messages.is_empty() {
+            return;
+        }
+        let mut text = messages.join("\n");
+        if !self.input_buffer.trim().is_empty() {
+            text.push('\n');
+            text.push_str(&self.input_buffer);
+        }
+        self.input_buffer = text;
+        self.cursor_idx = self.input_buffer.len();
+    }
+
+    /// "Send now" for a message already waiting in the queue: the oldest one moves to the steer
+    /// list. Returns false when there was nothing to promote.
+    pub fn promote_queued_to_steer(&mut self) -> bool {
+        match self.message_queue.pop_front() {
+            Some(msg) => {
+                self.steer_messages.push(msg);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adds the steer messages to the conversation as one user message. Call it at a point where
+    /// every tool call has its response, right before the next request to the model.
+    pub fn deliver_steer(&mut self) -> bool {
+        if self.steer_messages.is_empty() {
+            return false;
+        }
+        let text = std::mem::take(&mut self.steer_messages).join("\n\n");
+        corex_core::reset_repeat_guard();
+        self.session.add_message(Message::user(text));
+        true
+    }
+
+    /// Stops the current generation, keeping whatever the model had already written.
+    ///
+    /// Anything still running is orphaned: its late events carry the old generation id and are
+    /// dropped. `reason` is the note left in the conversation when there was no partial text.
+    pub fn cancel_generation(&mut self, reason: &str) {
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+        self.current_generation_id = self.current_generation_id.wrapping_add(1);
+        self.in_flight_tool_calls = 0;
+        self.is_streaming = false;
+        self.thinking_state.is_streaming = false;
+        self.clear_status();
+
+        let partial_text = if self.streaming_text.is_empty() {
+            None
+        } else {
+            Some(format!("{} *(interrupted)*", self.streaming_text.trim_end()))
+        };
+        let reasoning = if self.thinking_state.content.is_empty() {
+            None
+        } else {
+            Some(self.thinking_state.content.clone())
+        };
+
+        if let Some(txt) = partial_text {
+            self.session.add_message(Message::assistant(txt, reasoning));
+        } else {
+            corex_core::LlmClient::sanitize_tool_call_sequences(&mut self.session.messages);
+            self.session.add_message(Message::system(reason));
+        }
+
+        self.streaming_text.clear();
+        self.streaming_tool_calls.clear();
+        let _ = self.session.save();
     }
 
     pub fn invalidate_message_cache(&mut self) {
@@ -510,9 +628,9 @@ impl App {
     }
 
     /// Highest valid scroll offset for the chat feed, in rendered lines.
-    pub fn max_scroll_offset(&self) -> u16 {
+    pub fn max_scroll_offset(&self) -> usize {
         self.total_rendered_items
-            .saturating_sub(self.chat_visible_height()) as u16
+            .saturating_sub(self.chat_visible_height())
     }
 
     /// Scrolls the chat feed by `delta` rendered lines (negative scrolls up).
@@ -523,8 +641,8 @@ impl App {
     /// scrolling always agree on the clamp.
     pub fn scroll_chat(&mut self, delta: i32) {
         let max = self.max_scroll_offset();
-        let current = self.scroll_offset.min(max) as i32;
-        let next = (current + delta).clamp(0, max as i32) as u16;
+        let current = self.scroll_offset.min(max) as i64;
+        let next = (current + delta as i64).clamp(0, max as i64) as usize;
         self.scroll_offset = next;
         self.auto_scroll = next >= max;
     }
@@ -661,7 +779,7 @@ impl App {
         self.thinking_state.reset();
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
-        self.active_status = Some("Generando...".to_string());
+        self.active_status = Some("Generating...".to_string());
         // Preserve user scroll: only follow stream if user has not scrolled up to read
         if self.auto_scroll {
             self.auto_scroll = true;
@@ -1253,6 +1371,7 @@ impl App {
                                         snippet
                                     );
                                     self.session.add_message(Message::system("FIM prompt loaded. Streaming completion..."));
+                                    corex_core::reset_repeat_guard();
                                     self.session.add_message(Message::user(prompt));
                                 } else {
                                     self.session.add_message(Message::system(format!(
@@ -1556,6 +1675,25 @@ impl App {
                         self.enter_fleet_mode();
                         self.fleet_dialog.open_async(&self.workspace_dir).await;
                     }
+                    let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                    if self.fleet_dialog.wide_layout {
+                        if cols < crate::fleet_dialog::FLEET_WIDE_MIN_WIDTH {
+                            self.session.add_message(Message::system(format!(
+                                "Fleet 3-column wide layout enabled, but current terminal width is {} cols (< {} required). Maximizing your terminal window will automatically activate the 3-column view.",
+                                cols,
+                                crate::fleet_dialog::FLEET_WIDE_MIN_WIDTH
+                            )));
+                        } else {
+                            self.session.add_message(Message::system(
+                                "Fleet 3-column wide layout enabled (Chat · Live Terminal · Fleet Telemetry)."
+                            ));
+                        }
+                    } else {
+                        self.session.add_message(Message::system(
+                            "Fleet wide layout disabled (standard view restored)."
+                        ));
+                    }
+                    self.scroll_to_bottom();
                 } else if parts.len() > 1 && matches!(parts[1], "off" | "close" | "exit" | "quit") {
                     self.exit_fleet_mode();
                 } else if parts.len() > 1 && (parts[1] == "resume" || parts[1] == "sessions" || parts[1] == "history") {
@@ -1577,10 +1715,16 @@ impl App {
                                 corex_fleet::global_session_manager().set_session(node.id.clone(), session.clone()).await;
                                 corex_fleet::global_session_manager().set_active_node(Some(node.id.clone())).await;
                                 self.fleet_dialog.active_session = Some(session);
-                                if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
-                                    self.fleet_dialog.pty_session = Some(pty);
+                                match crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80) {
+                                    Ok(pty) => {
+                                        self.fleet_dialog.pty_session = Some(pty);
+                                        self.fleet_dialog.status_msg = Some(format!("Connected to {} in {}ms", node.id, lat));
+                                    }
+                                    Err(err) => {
+                                        self.fleet_dialog.pty_session = None;
+                                        self.fleet_dialog.status_msg = Some(format!("Connected to {} ({}ms); interactive PTY unavailable ({}). Fallback batch SSH mode active.", node.id, lat, err));
+                                    }
                                 }
-                                self.fleet_dialog.status_msg = Some(format!("Connected to {} in {}ms", node.id, lat));
                                 self.session.add_message(Message::system(format!(
                                     "Connected to remote server: {} ({}@{}) · Active and ready.",
                                     node.id, node.user, node.host
@@ -1595,7 +1739,7 @@ impl App {
                         self.fleet_dialog.status_msg = Some(format!("Server '{}' not found in inventory", target_id));
                     }
                 } else if parts.len() > 1 && parts[1] == "status" {
-                    let mut msg = format!("🌐 Fleet Nodes ({} servers):\n", nodes.len());
+                    let mut msg = format!("Fleet Nodes ({} servers):\n", nodes.len());
                     for n in &nodes {
                         msg.push_str(&format!("• [{}] {}\n", n.id, n.target_string()));
                     }
@@ -1732,7 +1876,7 @@ impl App {
         cfg.active_provider = Some(provider.name.clone());
         cfg.local_llm_enabled = provider.is_local();
         let detail = if provider.is_local() {
-            format!("- Endpoint: {}\n- Cost: $0.00 (Zero cloud telemetry)", cfg.local_llm_url)
+            format!("- Endpoint: {}\n- Mode: Local", cfg.local_llm_url)
         } else {
             match profile.family {
                 ModelFamily::Flash => {
@@ -1740,19 +1884,17 @@ impl App {
                     cfg.temperature = flash.temperature;
                     cfg.reasoning_effort = flash.reasoning_effort.clone();
                     format!(
-                        "- Temperature: {:.1}\n- General Reasoning: {}\n- Command CoT: {}\n- Code CoT: {}",
+                        "- Temperature: {:.1}\n- Reasoning: {}",
                         cfg.temperature,
-                        cfg.reasoning_effort,
-                        flash.command_reasoning_effort,
-                        flash.code_reasoning_effort
+                        cfg.reasoning_effort
                     )
                 }
                 ModelFamily::Pro => {
                     cfg.pro_settings = pro.clone();
                     cfg.reasoning_effort = pro.reasoning_effort.clone();
                     format!(
-                        "- Reasoning Depth: {}\n- Search CoT: {}",
-                        pro.reasoning_effort, pro.search_reasoning_effort
+                        "- Reasoning Depth: {}",
+                        pro.reasoning_effort
                     )
                 }
                 ModelFamily::Generic => {

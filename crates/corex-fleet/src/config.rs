@@ -171,9 +171,13 @@ fn default_safe_commands() -> Vec<String> {
         "journalctl".to_string(),
         "netstat".to_string(),
         "ss".to_string(),
-        "ip a".to_string(),
-        "ip r".to_string(),
-        "ip".to_string(),
+        // Read-only `ip` subcommands only; `ip link set`, `ip route del`, … are mutating and are
+        // additionally caught by the flag heuristics in ssh.rs.
+        "ip addr".to_string(),
+        "ip address".to_string(),
+        "ip route".to_string(),
+        "ip link show".to_string(),
+        "ip -br".to_string(),
         "whoami".to_string(),
         "pwd".to_string(),
         "ls".to_string(),
@@ -202,7 +206,6 @@ fn default_safe_commands() -> Vec<String> {
         "whereis".to_string(),
         "pstree".to_string(),
         "pgrep".to_string(),
-        "env".to_string(),
         "printenv".to_string(),
         "column".to_string(),
         "cut".to_string(),
@@ -290,7 +293,6 @@ impl FleetConfig {
             }
         }
 
-        // If no fleet.toml found, attempt auto-discovery from ~/.ssh/config!
         let mut default_cfg = FleetConfig::default();
         if let Ok(discovered) = Self::discover_ssh_config() {
             if !discovered.is_empty() {

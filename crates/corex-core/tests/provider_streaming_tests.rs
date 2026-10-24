@@ -1,6 +1,6 @@
 use corex_core::{
-    anthropic::parse_anthropic_sse_data, parse_lenient_json, parse_openai_sse_data, StreamEvent,
-    Usage,
+    anthropic::{parse_anthropic_sse_data, AnthropicStreamState},
+    parse_lenient_json, parse_openai_sse_data, StreamEvent,
 };
 
 #[test]
@@ -78,7 +78,7 @@ fn test_deepseek_v4_sse_replay_cot_and_tool_calls() {
 
 #[test]
 fn test_anthropic_sse_replay_claude_tool_calling() {
-    let mut usage = Usage::default();
+    let mut state = AnthropicStreamState::new();
 
     let chunks = vec![
         r#"{"type":"message_start","message":{"id":"msg_claude_1","type":"message","role":"assistant","model":"claude-3-7-sonnet-20250219","usage":{"input_tokens":320,"output_tokens":1}}}"#,
@@ -99,7 +99,7 @@ fn test_anthropic_sse_replay_claude_tool_calling() {
     let mut stop_reason = None;
 
     for chunk in chunks {
-        if let Some(events) = parse_anthropic_sse_data(chunk, &mut usage) {
+        if let Some(events) = parse_anthropic_sse_data(chunk, &mut state) {
             for ev in events {
                 match ev {
                     StreamEvent::ReasoningDelta(cot) => accumulated_thinking.push_str(&cot),
@@ -132,8 +132,8 @@ fn test_anthropic_sse_replay_claude_tool_calling() {
     assert_eq!(tool_name, "read_file");
     assert_eq!(tool_args, "{\"path\": \"crates/corex-core/src/lib.rs\"}");
     assert_eq!(stop_reason.as_deref(), Some("tool_calls"));
-    assert_eq!(usage.prompt_tokens, 320);
-    assert_eq!(usage.completion_tokens, 85);
+    assert_eq!(state.usage.prompt_tokens, 320);
+    assert_eq!(state.usage.completion_tokens, 85);
 }
 
 #[test]

@@ -309,6 +309,56 @@ impl TaskManager {
     }
 }
 
+/// Terminates every still-running task's process group and removes the staged sudo credential.
+///
+/// Meant for process exit (signal handlers, panic hook): commands run under `setsid`, so neither
+/// `kill_on_drop` nor the shell's SIGHUP reaches them and they would otherwise outlive Corex as
+/// orphans. Blocks for at most ~300 ms. Uses `try_lock` so it can never deadlock when called
+/// from a panic raised while the manager lock is held.
+pub fn shutdown_all_tasks() {
+    crate::shell::clean_askpass_credential();
+
+    #[cfg(unix)]
+    {
+        let manager = get_task_manager();
+        let pids: Vec<i32> = match manager.try_lock() {
+            Ok(m) => m
+                .all_processes()
+                .values()
+                .filter(|p| p.is_active())
+                .map(|p| p.pid as i32)
+                .filter(|&p| p > 1 && p as u32 != std::process::id())
+                .collect(),
+            Err(_) => return,
+        };
+        if pids.is_empty() {
+            return;
+        }
+        for &p in &pids {
+            // SAFETY: plain signal delivery to validated pids (> 1, not our own) and their groups.
+            unsafe {
+                libc::kill(-p, libc::SIGTERM);
+                libc::kill(p, libc::SIGTERM);
+            }
+        }
+        for _ in 0..6 {
+            if !pids.iter().any(|&p| process_alive(p as u32)) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for &p in &pids {
+            if process_alive(p as u32) {
+                // SAFETY: same contract as above.
+                unsafe {
+                    libc::kill(-p, libc::SIGKILL);
+                    libc::kill(p, libc::SIGKILL);
+                }
+            }
+        }
+    }
+}
+
 pub static GLOBAL_TASK_MANAGER: Mutex<Option<Arc<Mutex<TaskManager>>>> = Mutex::new(None);
 
 pub fn get_task_manager() -> Arc<Mutex<TaskManager>> {
@@ -322,7 +372,6 @@ pub fn get_task_manager() -> Arc<Mutex<TaskManager>> {
     guard.as_ref().expect("TaskManager was just initialized").clone()
 }
 
-// --- ListBackgroundProcessesTool ---
 pub struct ListBackgroundProcessesTool;
 
 #[async_trait]
@@ -352,7 +401,6 @@ impl Tool for ListBackgroundProcessesTool {
     }
 }
 
-// --- ReadBackgroundOutputTool ---
 pub struct ReadBackgroundOutputTool;
 
 #[async_trait]
@@ -397,7 +445,6 @@ impl Tool for ReadBackgroundOutputTool {
     }
 }
 
-// --- KillBackgroundProcessTool ---
 pub struct KillBackgroundProcessTool;
 
 #[async_trait]
@@ -442,7 +489,6 @@ impl Tool for KillBackgroundProcessTool {
     }
 }
 
-// --- WriteBackgroundInputTool ---
 pub struct WriteBackgroundInputTool;
 
 #[async_trait]
@@ -494,7 +540,6 @@ impl Tool for WriteBackgroundInputTool {
     }
 }
 
-// --- ManageTaskTool (Antigravity-compatible Unified Task Management Tool) ---
 pub struct ManageTaskTool;
 
 #[async_trait]

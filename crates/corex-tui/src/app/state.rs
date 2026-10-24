@@ -276,7 +276,7 @@ pub struct App {
     pub in_flight_tool_calls: usize,
     pub response_prefix: Option<String>,
 
-    pub scroll_offset: u16,
+    pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub total_rendered_items: usize,
     pub plan_mode: bool,
@@ -298,6 +298,8 @@ pub struct App {
     pub last_esc_press: Option<Instant>,
     pub last_ctrl_c_press: Option<Instant>,
     pub slash_popup_height_current: f32,
+    /// Time of the last easing step; `None` while the popup is at rest.
+    pub slash_popup_clock: Option<Instant>,
     pub last_slash_filter: String,
     pub local_llm_online: Arc<AtomicBool>,
     pub last_local_check: Option<Instant>,
@@ -307,6 +309,9 @@ pub struct App {
     pub cached_render_width: usize,
     pub cached_session_id: String,
     pub cached_logs_expanded: bool,
+    /// Whether any cached message hid lines behind a collapsed log, so the footer shows the
+    /// Ctrl+O hint once instead of every block repeating it.
+    pub cached_has_collapsed_logs: bool,
     /// Parsed markdown of `streaming_text`, reused across frames until the text grows.
     pub streaming_md_cache: Vec<Line<'static>>,
     pub streaming_md_cache_len: usize,
@@ -322,6 +327,9 @@ pub struct App {
     pub is_checking_balance: bool,
     pub pending_balance_msg_index: Option<usize>,
     pub message_queue: VecDeque<String>,
+    /// Messages sent with "send now" while the agent works. They skip the queue: the model reads
+    /// them at the next safe point (between tool rounds) instead of after the whole task.
+    pub steer_messages: Vec<String>,
     pub start_time: Instant,
     pub last_interaction: Instant,
 }

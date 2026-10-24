@@ -1,24 +1,11 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Renders "Corex" as clean, solid satin-white spans without distracting letter shimmer.
-pub fn render_corex_title_spans(_elapsed_secs: f32) -> Vec<Span<'static>> {
-    vec![Span::styled(
-        "Corex",
-        Style::default()
-            .fg(Color::Rgb(225, 230, 240))
-            .add_modifier(Modifier::BOLD),
-    )]
-}
-
-/// Returns the solid, static satin-gray style for the geometric "C" emblem (◢◤ / ◥◣).
-pub fn render_chevron_glyph_styles(_elapsed_secs: f32) -> (Style, Style, Style, Style) {
-    // 100% solid, static satin titanium gray across all facets (clean, zero animation)
-    let solid_style = Style::default()
+/// Solid, static satin-gray style for the geometric "C" emblem (◢◤ / ◥◣).
+fn chevron_style() -> Style {
+    Style::default()
         .fg(Color::Rgb(155, 165, 178))
-        .add_modifier(Modifier::BOLD);
-
-    (solid_style, solid_style, solid_style, solid_style)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn shorten_model_for_mobile(model: &str) -> String {
@@ -63,9 +50,8 @@ pub fn render_gradient_logo(
     authenticated: bool,
     local_mode: bool,
     update_notice: Option<&str>,
-    elapsed_secs: f32,
 ) -> Vec<Line<'static>> {
-    render_gradient_logo_adaptive(version, model, authenticated, local_mode, update_notice, elapsed_secs, 120)
+    render_gradient_logo_adaptive(version, model, authenticated, local_mode, update_notice, 120)
 }
 
 pub fn render_gradient_logo_adaptive(
@@ -74,7 +60,6 @@ pub fn render_gradient_logo_adaptive(
     authenticated: bool,
     local_mode: bool,
     update_notice: Option<&str>,
-    elapsed_secs: f32,
     max_width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -90,18 +75,17 @@ pub fn render_gradient_logo_adaptive(
     let engine_mode = if local_mode { " (Local)" } else { "" };
     let is_compact = max_width < 65;
 
-    // Retrieve solid satin-gray style for chevron emblem
-    let (c_top1, _, c_bot1, _) = render_chevron_glyph_styles(elapsed_secs);
+    let chevron = chevron_style();
 
     // Line 1: Chevron top (solid gray) + Solid Corex + version
     let mut line1 = Vec::new();
     line1.push(Span::raw("  "));
-    line1.push(Span::styled("◢◤", c_top1));
+    line1.push(Span::styled("◢◤", chevron));
     line1.push(Span::raw("  "));
     line1.push(Span::styled(
         "Corex",
         Style::default()
-            .fg(Color::Rgb(225, 230, 240))
+            .fg(Color::Reset)
             .add_modifier(Modifier::BOLD),
     ));
     line1.push(Span::styled(format!(" v{}", version), Style::default().fg(muted_gray)));
@@ -110,7 +94,7 @@ pub fn render_gradient_logo_adaptive(
     // Line 2: Chevron bottom (solid gray) + Model + Quick Commands
     let mut line2 = Vec::new();
     line2.push(Span::raw("  "));
-    line2.push(Span::styled("◥◣", c_bot1));
+    line2.push(Span::styled("◥◣", chevron));
     line2.push(Span::raw("  "));
 
     if is_compact {
@@ -170,32 +154,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_render_corex_title_spans() {
-        let spans = render_corex_title_spans(0.0);
-        assert_eq!(spans.len(), 1);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "Corex");
-        assert_eq!(spans[0].style.fg, Some(Color::Rgb(225, 230, 240)));
-    }
-
-    #[test]
-    fn test_render_chevron_glyph_styles() {
-        let (t1, t2, b1, b2) = render_chevron_glyph_styles(0.0);
-        // All facets have identical solid satin titanium gray color
-        assert_eq!(t1.fg, b1.fg);
-        assert_eq!(t1.fg, t2.fg);
-        assert_eq!(b1.fg, b2.fg);
-        assert_eq!(t1.fg, Some(Color::Rgb(155, 165, 178)));
-
-        // Fully static: stays identical over time (zero animation)
-        let (w1, _, _, _) = render_chevron_glyph_styles(0.0);
-        let (w2, _, _, _) = render_chevron_glyph_styles(1.8);
-        assert_eq!(w1.fg, w2.fg);
+    fn test_chevron_style_is_solid_satin_gray() {
+        assert_eq!(chevron_style().fg, Some(Color::Rgb(155, 165, 178)));
     }
 
     #[test]
     fn test_render_gradient_logo_no_bullet() {
-        let lines = render_gradient_logo("0.2.0", "deepseek-flash", false, false, None, 0.0);
+        let lines = render_gradient_logo("0.2.0", "deepseek-flash", false, false, None);
         let full_text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect();
         
         // Assert no bullet glyphs like ● or ✦ at startup

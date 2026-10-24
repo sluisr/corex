@@ -102,6 +102,7 @@ fn is_protected_write_path_raw(path: &Path) -> bool {
             ".zshenv",
             ".gitconfig",
             ".git-credentials",
+            ".gitmodules",
         ];
         if PROTECTED_NAMES.contains(&name) {
             return true;
@@ -109,7 +110,13 @@ fn is_protected_write_path_raw(path: &Path) -> bool {
     }
 
     let p_str = path.to_string_lossy();
-    p_str.contains("/.git/hooks/")
+    // A repository's own config can name programs git runs implicitly (`core.fsmonitor`,
+    // `core.hooksPath`, `diff.external`, textconv/filter drivers), even for read-only commands
+    // such as `git status` or `git diff`.
+    p_str.ends_with("/.git/config")
+        || p_str == ".git/config"
+        || p_str.contains("/.git/info/attributes")
+        || p_str.contains("/.git/hooks/")
         || p_str.contains("/.corex/")
         || p_str.starts_with(".corex/")
         || p_str.ends_with("/.corex")
@@ -119,7 +126,11 @@ fn is_protected_write_path_raw(path: &Path) -> bool {
         || p_str.ends_with("/.deepseek")
         || p_str == ".deepseek"
         || p_str.ends_with("/.ssh/authorized_keys")
+        || p_str.ends_with("/.ssh/config")
         || p_str.contains("/authorized_keys")
+        || p_str.contains("/.cargo/config.toml")
+        || p_str.ends_with("/.cargo/config")
+        || p_str.contains("/.config/systemd/user/")
         || p_str.contains("/.config/fish/config.fish")
         || p_str.contains("/etc/profile.d/")
         || p_str.contains("/etc/cron.d/")
@@ -205,6 +216,32 @@ pub fn is_within_workspace(path: &Path, workspace: &Path) -> bool {
     clean_target.starts_with(&clean_ws)
 }
 
+/// Confirmation policy shared by the read-only filesystem tools (`read_file`, `grep_search`,
+/// `glob`, `list_directory`).
+///
+/// Inside the workspace they run freely. Anything outside it needs approval: the denylist in
+/// [`is_sensitive_system_path`] can never enumerate every credential store (CLI tokens, cloud SDK
+/// configs, browser profiles…), and an unapproved read followed by a network tool call is all a
+/// prompt injection needs to leak one. Approving with "always allow" stores the tool name.
+pub fn read_path_needs_confirmation(
+    tool_name: &str,
+    raw_path: Option<&str>,
+    context: &ToolContext,
+) -> bool {
+    let Some(raw) = raw_path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false; // defaults to the workspace root
+    };
+    let path = resolve_path(&context.workspace_dir, raw);
+    if is_within_workspace(&path, &context.workspace_dir) && !is_sensitive_system_path(&path) {
+        return false;
+    }
+    // Output the harness itself spilled to disk is meant to be read back without a prompt.
+    if tool_name != "write_file" && corex_core::is_spill_path(&path) {
+        return false;
+    }
+    !context.allowed_commands.iter().any(|c| c == tool_name)
+}
+
 /// Resolves a file path: expands `~/` to the user home directory,
 /// preserves absolute paths, joins relative paths with the workspace directory,
 /// and normalizes `.` / `..` components.
@@ -237,24 +274,15 @@ pub fn is_binary_file(path: &Path) -> bool {
     false
 }
 
-/// Writes content to a file atomically via a temporary file in the same directory,
-/// preventing corruption if the process is interrupted.
-pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+/// Writes `content` to a fresh temporary file next to `target`, synced to disk.
+fn stage_temp_file(target: &Path, content: &str) -> std::io::Result<PathBuf> {
     use std::io::Write;
-    let target_path = match path.canonicalize() {
-        Ok(canonical) => canonical,
-        Err(_) => path.to_path_buf(),
-    };
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existing_perms = fs::metadata(&target_path).ok().map(|m| m.permissions());
     let pid = std::process::id();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path = target_path.with_extension(format!("tmp.{}.{}", pid, ts));
+    let tmp_path = target.with_extension(format!("tmp.{}.{}", pid, ts));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -263,7 +291,21 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    drop(file);
+    Ok(tmp_path)
+}
+
+/// Writes content to a file atomically via a temporary file in the same directory,
+/// preventing corruption if the process is interrupted.
+pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let target_path = match path.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => path.to_path_buf(),
+    };
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing_perms = fs::metadata(&target_path).ok().map(|m| m.permissions());
+    let tmp_path = stage_temp_file(&target_path, content)?;
     if let Some(perms) = existing_perms {
         let _ = fs::set_permissions(&tmp_path, perms);
     }
@@ -272,6 +314,99 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Atomically creates `path` with `content`, failing with `AlreadyExists` instead of replacing a
+/// file that appeared in the meantime. The content is staged first and published with a hard link,
+/// which refuses to overwrite, so a concurrent creator's file is never clobbered or seen half-written.
+pub fn atomic_create(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = stage_temp_file(path, content)?;
+    let published = fs::hard_link(&tmp_path, path);
+    let _ = fs::remove_file(&tmp_path);
+    match published {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        // Filesystems without hard links: fall back to an exclusive create.
+        Err(_) => {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()
+        }
+    }
+}
+
+/// What a file looked like when the model last saw or wrote it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime_ns: u128,
+    ino: u64,
+}
+
+/// Files the model has read or written, with the state they were in at that moment.
+///
+/// Process-wide on purpose, like [`lock_path`]: tools carry no session handle, so subagents share
+/// it. That only ever loosens the "read it first" rule; the staleness check still guards each file.
+fn observed_files() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, FileStamp>> {
+    static OBSERVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, FileStamp>>> =
+        std::sync::OnceLock::new();
+    OBSERVED.get_or_init(Default::default)
+}
+
+fn observed_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some(FileStamp { len: meta.len(), mtime_ns, ino })
+}
+
+/// Records the file's current state as the one the model has seen. Call after a read or after a
+/// successful write, so the model's own edits never count as external changes.
+pub fn observe_file(path: &Path) {
+    if let Some(stamp) = file_stamp(path) {
+        if let Ok(mut map) = observed_files().lock() {
+            map.insert(observed_key(path), stamp);
+        }
+    }
+}
+
+/// Refuses to modify an existing file the model never read, or one that changed since it did.
+/// A missing file passes: creating it needs no prior read.
+pub fn check_observed(path: &Path, display: &str) -> Result<(), String> {
+    let Some(current) = file_stamp(path) else {
+        return Ok(());
+    };
+    let seen = observed_files()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&observed_key(path)).copied());
+    match seen {
+        None => Err(format!(
+            "Refusing to modify {}: the file has not been read in this session. Read it with read_file, then retry.",
+            display
+        )),
+        Some(seen) if seen != current => Err(format!(
+            "Refusing to modify {}: the file changed since it was read. Re-read it with read_file, then retry.",
+            display
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 /// Formats byte counts into clean human-readable representations.
@@ -300,6 +435,11 @@ pub fn is_file_edit_allowed(allowed_commands: &[String]) -> bool {
 
 // ─── 1. ReadFileTool ────────────────────────────────────────────────────────
 
+/// Longest line `read_file` returns whole; a minified bundle would otherwise flood the context.
+const READ_MAX_LINE_CHARS: usize = 2000;
+/// Most text one `read_file` call returns before asking the caller to page.
+const READ_MAX_OUTPUT_BYTES: usize = 100 * 1024;
+
 
 pub struct ReadFileTool;
 
@@ -311,6 +451,14 @@ impl Tool for ReadFileTool {
 
     fn description(&self) -> &'static str {
         "Reads the contents of a file with line numbers and optional start/end ranges. Includes binary file protection and automatic pagination. [PREFERRED instead of shell cat]"
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        read_path_needs_confirmation(
+            self.name(),
+            args.get("file_path").and_then(|v| v.as_str()),
+            context,
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -362,10 +510,23 @@ impl Tool for ReadFileTool {
         let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
 
         if is_binary_file(&path) {
+            let mut header = [0u8; 32];
+            let is_image = fs::File::open(&path)
+                .and_then(|mut f| {
+                    let n = f.read(&mut header)?;
+                    Ok(sniff_image_media_type(&header[..n]).is_some())
+                })
+                .unwrap_or(false);
+            let hint = if is_image {
+                " It is an image: use 'read_image' to view it."
+            } else {
+                ""
+            };
             return Ok(ToolOutput::success(format!(
-                "[Binary file: {} ({}). Cannot display content as plain text]",
+                "[Binary file: {} ({}). Cannot display content as plain text.{}]",
                 rel_path,
-                format_size(size)
+                format_size(size),
+                hint
             )));
         }
 
@@ -379,6 +540,13 @@ impl Tool for ReadFileTool {
 
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(ToolOutput::error(format!(
+                    "{} is not valid UTF-8 text, so it cannot be shown or edited as text. \
+                     Use 'run_shell_command' (e.g. file, xxd) to inspect it.",
+                    rel_path
+                )));
+            }
             Err(e) => return Ok(ToolOutput::error(format!("Failed to read {}: {}", rel_path, e))),
         };
 
@@ -397,6 +565,7 @@ impl Tool for ReadFileTool {
         };
 
         if total_lines == 0 {
+            observe_file(&path);
             return Ok(ToolOutput::success("(Empty file)".to_string()));
         }
 
@@ -418,10 +587,25 @@ impl Tool for ReadFileTool {
             )));
         }
 
+        observe_file(&path);
+
         let mut output = String::new();
+        let mut shown_end = s;
         for (i, line) in lines[s..e].iter().enumerate() {
-            output.push_str(&format!("{:4} | {}\n", s + i + 1, line));
+            let rendered = if line.chars().count() > READ_MAX_LINE_CHARS {
+                let head: String = line.chars().take(READ_MAX_LINE_CHARS).collect();
+                format!("{}… [line truncated, {} chars total]", head, line.chars().count())
+            } else {
+                (*line).to_string()
+            };
+            // Always show at least one line so an oversized read still makes progress.
+            if i > 0 && output.len() + rendered.len() > READ_MAX_OUTPUT_BYTES {
+                break;
+            }
+            output.push_str(&format!("{:4} | {}\n", s + i + 1, rendered));
+            shown_end = s + i + 1;
         }
+        let e = shown_end;
 
         if e < total_lines {
             output.push_str(&format!(
@@ -441,6 +625,115 @@ impl Tool for ReadFileTool {
     }
 }
 
+// ─── 1b. ReadImageTool ──────────────────────────────────────────────────────
+
+/// Largest image `read_image` loads; matches the strictest provider limit (5 MB per image).
+const READ_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Identifies PNG, JPEG, GIF and WebP from their file signature, ignoring the extension.
+fn sniff_image_media_type(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+pub struct ReadImageTool;
+
+#[async_trait]
+impl Tool for ReadImageTool {
+    fn name(&self) -> &'static str {
+        "read_image"
+    }
+
+    fn description(&self) -> &'static str {
+        "Looks at a PNG/JPEG/GIF/WebP image file: the image itself is shown to you in the next message. \
+         Use it for screenshots, diagrams and photos instead of shell tools. Requires a vision-capable model; \
+         images over 5 MB are refused."
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        read_path_needs_confirmation(
+            self.name(),
+            args.get("file_path").and_then(|v| v.as_str()),
+            context,
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path of the image file (relative or absolute, supports ~/)."
+                }
+            },
+            "required": ["file_path"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
+        use base64::Engine;
+
+        let rel_path = match args.get("file_path").and_then(|v| v.as_str()) {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => return Ok(ToolOutput::error("Missing 'file_path' argument.")),
+        };
+        let path = resolve_path(&context.workspace_dir, rel_path);
+        if is_sensitive_system_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: reading sensitive credential or authentication file '{}' is forbidden.",
+                rel_path
+            )));
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            return Ok(ToolOutput::error(format!("File does not exist: {}", rel_path)));
+        };
+        if !meta.is_file() {
+            return Ok(ToolOutput::error(format!("'{}' is not a regular file.", rel_path)));
+        }
+        if meta.len() > READ_IMAGE_MAX_BYTES {
+            return Ok(ToolOutput::error(format!(
+                "Image '{}' is {} which exceeds the {} limit. Downscale it (e.g. with ImageMagick `convert -resize`) and read the smaller copy.",
+                rel_path,
+                format_size(meta.len()),
+                format_size(READ_IMAGE_MAX_BYTES)
+            )));
+        }
+        let data = match fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => return Ok(ToolOutput::error(format!("Failed to read {}: {}", rel_path, e))),
+        };
+        let Some(media_type) = sniff_image_media_type(&data) else {
+            return Ok(ToolOutput::error(format!(
+                "'{}' is not a supported image (PNG, JPEG, GIF or WebP). Use read_file for text.",
+                rel_path
+            )));
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        corex_core::push_tool_image(rel_path, format!("data:{};base64,{}", media_type, encoded));
+
+        Ok(ToolOutput::success_with_summary(
+            format!(
+                "Loaded {} ({}, {}). The image is attached in the next message.",
+                rel_path,
+                media_type,
+                format_size(data.len() as u64)
+            ),
+            format!("Viewed {}", rel_path),
+        ))
+    }
+}
+
 // ─── 2. WriteFileTool ───────────────────────────────────────────────────────
 
 pub struct WriteFileTool;
@@ -452,7 +745,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Writes complete content to a file atomically, creating any missing parent directories. [PREFERRED for new files]"
+        "Writes complete content to a file atomically, creating any missing parent directories. Overwriting an existing file requires reading it first. [PREFERRED for new files]"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -534,18 +827,53 @@ impl Tool for WriteFileTool {
         let _guard = lock_path(&path).await;
 
         let existed = path.exists();
+        if existed {
+            if let Err(msg) = check_observed(&path, rel_path) {
+                return Ok(ToolOutput::error(msg));
+            }
+        }
         let old_size = if existed {
             fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
         } else {
             0
         };
 
-        if let Err(e) = atomic_write(&path, content) {
-            return Ok(ToolOutput::error(format!("Failed to write to {}: {}", rel_path, e)));
+        // Keep the file's own line-ending convention when the new content never mentioned one.
+        let mut converted = false;
+        let content: std::borrow::Cow<str> = if existed
+            && !content.contains('\r')
+            && fs::read_to_string(&path).map_or(false, |old| {
+                old.contains("\r\n") && old.matches('\n').count() == old.matches("\r\n").count()
+            })
+        {
+            converted = content.contains('\n');
+            std::borrow::Cow::Owned(content.replace('\n', "\r\n"))
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        };
+        let content: &str = &content;
+
+        let written = if existed {
+            atomic_write(&path, content)
+        } else {
+            atomic_create(&path, content)
+        };
+        if let Err(e) = written {
+            let msg = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "Refusing to create {}: it was created by someone else in the meantime. Read it with read_file, then edit it.",
+                    rel_path
+                )
+            } else {
+                format!("Failed to write to {}: {}", rel_path, e)
+            };
+            return Ok(ToolOutput::error(msg));
         }
+        observe_file(&path);
 
         let line_count = content.lines().count();
         let byte_count = content.len();
+        let eol_note = if converted { " Line endings kept as CRLF to match the existing file." } else { "" };
         let summary_msg = if existed {
             format!(
                 "Successfully updated {} ({} lines, {}, previous size: {}).",
@@ -564,7 +892,7 @@ impl Tool for WriteFileTool {
         };
 
         Ok(ToolOutput::success_with_summary(
-            summary_msg,
+            format!("{}{}", summary_msg, eol_note),
             format!("Wrote {}", rel_path),
         ))
     }
@@ -642,7 +970,7 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &'static str {
-        "Replaces exact text within a file (old_string -> new_string). Includes CRLF/LF resilience, whitespace-tolerant fallback matching, intelligent diagnostics, and immediate edit preview. [PREFERRED for surgical code edits]"
+        "Replaces exact text within a file (old_string -> new_string). The file must have been read with read_file first. Includes CRLF/LF resilience, whitespace-tolerant fallback matching, intelligent diagnostics, and immediate edit preview. [PREFERRED for surgical code edits]"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -696,13 +1024,26 @@ impl Tool for EditTool {
         let path = resolve_path(workspace, rel_path);
         let content = fs::read_to_string(&path).ok()?;
 
-        let new_content = if allow_multiple {
-            content.replace(old_str, new_str)
+        let (base_content, new_content) = if content.contains(old_str) {
+            let updated = if allow_multiple {
+                content.replace(old_str, new_str)
+            } else {
+                content.replacen(old_str, new_str, 1)
+            };
+            (content, updated)
         } else {
-            content.replacen(old_str, new_str, 1)
+            let content_norm = content.replace("\r\n", "\n");
+            let old_norm = old_str.replace("\r\n", "\n");
+            let new_norm = new_str.replace("\r\n", "\n");
+            let updated = if allow_multiple {
+                content_norm.replace(&old_norm, &new_norm)
+            } else {
+                content_norm.replacen(&old_norm, &new_norm, 1)
+            };
+            (content_norm, updated)
         };
 
-        let diff = TextDiff::from_lines(content.as_str(), new_content.as_str());
+        let diff = TextDiff::from_lines(base_content.as_str(), new_content.as_str());
         let formatted = diff
             .unified_diff()
             .context_radius(3)
@@ -757,13 +1098,21 @@ impl Tool for EditTool {
         // read the same original and clobber this edit.
         let _guard = lock_path(&path).await;
 
+        if let Err(msg) = check_observed(&path, rel_path) {
+            return Ok(ToolOutput::error(msg));
+        }
+
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("Failed to read {}: {}", rel_path, e))),
         };
 
+        let uniform_crlf = content.contains("\r\n")
+            && content.matches('\n').count() == content.matches("\r\n").count();
+
         // 1. Fast exact matching
         let count = content.matches(old_string).count();
+        let mut tolerant_match = false;
         let (modified, start_line, end_line) = if count == 1 {
             let offset = content.find(old_string).unwrap();
             let start_line = content[..offset].chars().filter(|&c| c == '\n').count() + 1;
@@ -778,8 +1127,11 @@ impl Tool for EditTool {
                     count, rel_path
                 )));
             }
+            let first_offset = content.find(old_string).unwrap_or(0);
+            let start_line = content[..first_offset].chars().filter(|&c| c == '\n').count() + 1;
             let res = content.replace(old_string, new_string);
-            (res, 1, 1)
+            let end_line = res.lines().count().max(start_line);
+            (res, start_line, end_line)
         } else {
             // 2. CRLF/LF newline normalization match
             let content_norm = content.replace("\r\n", "\n");
@@ -793,7 +1145,7 @@ impl Tool for EditTool {
                 let replaced_lines = new_norm.lines().count().max(1);
                 let end_line = start_line + replaced_lines - 1;
                 let mut res = content_norm.replacen(&old_norm, &new_norm, 1);
-                if content.contains("\r\n") {
+                if uniform_crlf {
                     res = res.replace('\n', "\r\n");
                 }
                 (res, start_line, end_line)
@@ -803,11 +1155,14 @@ impl Tool for EditTool {
                     norm_count, rel_path
                 )));
             } else if norm_count > 1 && allow_multiple {
+                let first_offset = content_norm.find(&old_norm).unwrap_or(0);
+                let start_line = content_norm[..first_offset].chars().filter(|&c| c == '\n').count() + 1;
                 let mut res = content_norm.replace(&old_norm, &new_norm);
-                if content.contains("\r\n") {
+                let end_line = res.lines().count().max(start_line);
+                if uniform_crlf {
                     res = res.replace('\n', "\r\n");
                 }
-                (res, 1, 1)
+                (res, start_line, end_line)
             } else {
                 // 3. Flexible line-by-line trimmed matching fallback
                 let content_lines: Vec<&str> = content.lines().collect();
@@ -827,21 +1182,44 @@ impl Tool for EditTool {
 
                 if matching_indices.len() == 1 || (matching_indices.len() > 1 && allow_multiple) {
                     let mut current_lines: Vec<String> = content_lines.iter().map(|s| s.to_string()).collect();
-                    let replacement_vec: Vec<String> = new_string.lines().map(|s| s.to_string()).collect();
+                    let raw_replacement: Vec<&str> = new_string.lines().collect();
+                    let old_base_indent = old_lines
+                        .iter()
+                        .find(|l| !l.trim().is_empty())
+                        .map(|l| l.len() - l.trim_start().len())
+                        .unwrap_or(0);
                     // Apply in reverse order so earlier indices remain valid
                     for &start_idx in matching_indices.iter().rev() {
                         let end_idx = start_idx + old_trimmed.len();
                         if end_idx <= current_lines.len() {
-                            current_lines.splice(start_idx..end_idx, replacement_vec.clone());
+                            let file_base_prefix: String = current_lines[start_idx..end_idx]
+                                .iter()
+                                .find(|l| !l.trim().is_empty())
+                                .map(|l| l.chars().take_while(|c| c.is_whitespace()).collect())
+                                .unwrap_or_default();
+                            let adjusted_replacement: Vec<String> = raw_replacement
+                                .iter()
+                                .map(|line| {
+                                    if line.trim().is_empty() {
+                                        String::new()
+                                    } else if old_base_indent == 0 && !file_base_prefix.is_empty() && !line.starts_with(&file_base_prefix) {
+                                        format!("{}{}", file_base_prefix, line)
+                                    } else {
+                                        (*line).to_string()
+                                    }
+                                })
+                                .collect();
+                            current_lines.splice(start_idx..end_idx, adjusted_replacement);
                         }
                     }
-                    let line_ending = if content.contains("\r\n") { "\r\n" } else { "\n" };
+                    let line_ending = if uniform_crlf { "\r\n" } else { "\n" };
                     let mut res = current_lines.join(line_ending);
                     if content.ends_with('\n') || content.ends_with("\r\n") {
                         res.push_str(line_ending);
                     }
+                    tolerant_match = true;
                     let start_line = matching_indices[0] + 1;
-                    let replaced_lines = replacement_vec.len().max(1);
+                    let replaced_lines = raw_replacement.len().max(1);
                     let end_line = start_line + replaced_lines - 1;
                     (res, start_line, end_line)
                 } else if matching_indices.len() > 1 && !allow_multiple {
@@ -894,6 +1272,7 @@ impl Tool for EditTool {
         if let Err(e) = atomic_write(&path, &modified) {
             return Ok(ToolOutput::error(format!("Failed to write edited content to {}: {}", rel_path, e)));
         }
+        observe_file(&path);
 
         let preview = format_edit_preview(&content, &modified);
         let lines_str = if start_line == end_line {
@@ -901,13 +1280,18 @@ impl Tool for EditTool {
         } else {
             format!("lines {}-{}", start_line, end_line)
         };
+        let tolerance_note = if tolerant_match {
+            " old_string only matched ignoring leading/trailing whitespace; check the indentation in the preview."
+        } else {
+            ""
+        };
         let output_msg = if !preview.is_empty() {
             format!(
-                "Successfully edited {} ({}):\n{}",
-                rel_path, lines_str, preview
+                "Successfully edited {} ({}):{}\n{}",
+                rel_path, lines_str, tolerance_note, preview
             )
         } else {
-            format!("Successfully edited {}.", rel_path)
+            format!("Successfully edited {}.{}", rel_path, tolerance_note)
         };
 
         Ok(ToolOutput::success_with_summary(
@@ -925,6 +1309,14 @@ pub struct GlobTool;
 impl Tool for GlobTool {
     fn name(&self) -> &'static str {
         "glob"
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        read_path_needs_confirmation(
+            self.name(),
+            args.get("dir_path").and_then(|v| v.as_str()),
+            context,
+        )
     }
 
     fn description(&self) -> &'static str {
@@ -960,9 +1352,12 @@ impl Tool for GlobTool {
             .map(|p| resolve_path(&context.workspace_dir, p))
             .unwrap_or_else(|| context.workspace_dir.clone());
 
-        let glob_pattern = glob::Pattern::new(pattern_str);
+        let glob_pattern = match glob::Pattern::new(pattern_str) {
+            Ok(g) => g,
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid glob pattern '{}': {}", pattern_str, e))),
+        };
 
-        let mut matches = Vec::new();
+        let mut matches: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
         let walker = WalkBuilder::new(&root_dir)
             .hidden(false)
             .git_ignore(true)
@@ -974,34 +1369,78 @@ impl Tool for GlobTool {
 
         for entry in walker.flatten() {
             let path = entry.path();
-            if let Ok(rel) = path.strip_prefix(&context.workspace_dir) {
-                let rel_str = rel.to_string_lossy();
-                let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                if let Ok(ref g) = glob_pattern {
-                    // Match relative path, full path, or file basename (for patterns like "*.rs")
-                    if g.matches(&rel_str) || g.matches(path.to_str().unwrap_or("")) || g.matches(&file_name) {
-                        matches.push(rel_str.to_string());
-                        if matches.len() >= 150 {
-                            break;
-                        }
-                    }
+            if path == root_dir || !path.is_file() {
+                continue;
+            }
+            let rel_to_root = path.strip_prefix(&root_dir).unwrap_or(path);
+            let rel_root_str = rel_to_root.to_string_lossy();
+            let display_rel = path
+                .strip_prefix(&context.workspace_dir)
+                .unwrap_or(path)
+                .to_string_lossy();
+            let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            if glob_pattern.matches(&rel_root_str)
+                || glob_pattern.matches(&display_rel)
+                || glob_pattern.matches(path.to_str().unwrap_or(""))
+                || glob_pattern.matches(&file_name)
+            {
+                let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+                matches.push((display_rel.to_string(), mtime));
+                if matches.len() >= GLOB_COLLECT_LIMIT {
+                    break;
                 }
             }
         }
 
-        matches.sort();
+        // Most recently modified first: that is the part of a big result worth seeing.
+        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if matches.is_empty() {
-            Ok(ToolOutput::success("No matching files found."))
-        } else {
-            let count = matches.len();
-            let header = if count >= 150 {
-                "Found 150+ matching files (capped at 150):\n".to_string()
-            } else {
-                format!("Found {} matching file(s):\n", count)
-            };
-            Ok(ToolOutput::success(format!("{}{}", header, matches.join("\n"))))
+            return Ok(ToolOutput::success("No matching files found."));
         }
+
+        let total = matches.len();
+        let shown: Vec<&str> = matches.iter().take(GLOB_SHOW_LIMIT).map(|(p, _)| p.as_str()).collect();
+        if total <= GLOB_SHOW_LIMIT {
+            return Ok(ToolOutput::success(format!(
+                "Found {} matching file(s), newest first:\n{}",
+                total,
+                shown.join("\n")
+            )));
+        }
+
+        let full_list: String = matches.iter().map(|(p, _)| format!("{}\n", p)).collect();
+        let saved = save_full_listing(&full_list);
+        let capped = if total >= GLOB_COLLECT_LIMIT { "+" } else { "" };
+        let tail = match saved {
+            Some(path) => format!(
+                "... {} more not shown. The complete list is saved at {} (read it with read_file or grep it), or narrow the pattern.",
+                total - GLOB_SHOW_LIMIT,
+                path.display()
+            ),
+            None => format!(
+                "... {} more not shown. Narrow the pattern to see them.",
+                total - GLOB_SHOW_LIMIT
+            ),
+        };
+        Ok(ToolOutput::success(format!(
+            "Found {}{} matching files; showing the {} newest:\n{}\n{}",
+            total,
+            capped,
+            GLOB_SHOW_LIMIT,
+            shown.join("\n"),
+            tail
+        )))
     }
+}
+
+/// Matches `glob` shows to the model per call.
+const GLOB_SHOW_LIMIT: usize = 100;
+/// Matches `glob` collects before it stops walking the tree.
+const GLOB_COLLECT_LIMIT: usize = 20_000;
+
+/// Saves a listing too long for the context to a private spill file and returns where it is.
+fn save_full_listing(content: &str) -> Option<PathBuf> {
+    corex_core::spill::spill_text("glob", content)
 }
 
 // ─── 5. LsTool ──────────────────────────────────────────────────────────────
@@ -1012,6 +1451,14 @@ pub struct LsTool;
 impl Tool for LsTool {
     fn name(&self) -> &'static str {
         "list_directory"
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        read_path_needs_confirmation(
+            self.name(),
+            args.get("dir_path").and_then(|v| v.as_str()),
+            context,
+        )
     }
 
     fn description(&self) -> &'static str {
@@ -1139,7 +1586,33 @@ mod tests {
         assert!(is_protected_write_path(Path::new("/home/x/.corex/mcp.json")));
         assert!(is_protected_write_path(Path::new(".corex/settings.json")));
         assert!(is_protected_write_path(Path::new("/home/x/.deepseek/settings.json")));
+        assert!(is_protected_write_path(Path::new("/home/x/project/.git/config")));
+        assert!(is_protected_write_path(Path::new(".git/config")));
+        assert!(is_protected_write_path(Path::new("/home/x/project/.git/info/attributes")));
         assert!(!is_protected_write_path(Path::new("/home/x/project/build.rs")));
+        assert!(!is_protected_write_path(Path::new("/home/x/project/config")));
+    }
+
+    #[test]
+    fn reads_outside_workspace_need_confirmation() {
+        let ws = std::env::temp_dir().join(format!("corex-readpolicy-{}", std::process::id()));
+        fs::create_dir_all(ws.join("src")).unwrap();
+        let mut ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+        assert!(!read_path_needs_confirmation("read_file", Some("src/main.rs"), &ctx));
+        assert!(!read_path_needs_confirmation("read_file", None, &ctx));
+        assert!(read_path_needs_confirmation("read_file", Some("../outside.txt"), &ctx));
+        assert!(read_path_needs_confirmation("read_file", Some("/etc/hostname"), &ctx));
+        assert!(read_path_needs_confirmation("grep_search", Some("~/"), &ctx));
+
+        ctx.allowed_commands.push("read_file".to_string());
+        assert!(!read_path_needs_confirmation("read_file", Some("/etc/hostname"), &ctx));
+        assert!(read_path_needs_confirmation("glob", Some("/etc"), &ctx));
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[cfg(unix)]
@@ -1448,6 +1921,7 @@ mod tests {
 
         let original: String = (1..=8).map(|i| format!("line {}\n", i)).collect();
         fs::write(ws.join("sample.txt"), &original).unwrap();
+        observe_file(&ws.join("sample.txt"));
 
         let context = ToolContext {
             workspace_dir: ws.clone(),
@@ -1577,5 +2051,198 @@ mod tests {
         assert!(WriteFileTool.needs_confirmation(&json!({ "file_path": "test.txt", "content": "hi" }), &context));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn observed_ctx(tag: &str) -> (PathBuf, ToolContext) {
+        let ws = std::env::temp_dir().join(format!("corex_observed_{}_{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+        (ws, ctx)
+    }
+
+    fn edit_args(old: &str, new: &str) -> serde_json::Value {
+        json!({ "file_path": "f.txt", "old_string": old, "new_string": new })
+    }
+
+    #[tokio::test]
+    async fn edit_and_overwrite_require_a_prior_read() {
+        let (ws, ctx) = observed_ctx("unread");
+        fs::write(ws.join("f.txt"), "alpha\n").unwrap();
+
+        let out = EditTool.execute(edit_args("alpha", "beta"), &ctx).await.unwrap();
+        assert!(out.is_error && out.output.contains("has not been read"), "{}", out.output);
+
+        let out = WriteFileTool
+            .execute(json!({ "file_path": "f.txt", "content": "x" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error && out.output.contains("has not been read"), "{}", out.output);
+        assert_eq!(fs::read_to_string(ws.join("f.txt")).unwrap(), "alpha\n");
+
+        // Creating a brand-new file needs no prior read.
+        let out = WriteFileTool
+            .execute(json!({ "file_path": "new.txt", "content": "hi" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn edit_after_read_succeeds_and_own_edits_are_not_external_changes() {
+        let (ws, ctx) = observed_ctx("read");
+        fs::write(ws.join("f.txt"), "alpha\nbeta\n").unwrap();
+        ReadFileTool.execute(json!({ "file_path": "f.txt" }), &ctx).await.unwrap();
+
+        let out = EditTool.execute(edit_args("alpha", "one"), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        // A second edit without re-reading must still work: the first edit updated the record.
+        let out = EditTool.execute(edit_args("beta", "two"), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(fs::read_to_string(ws.join("f.txt")).unwrap(), "one\ntwo\n");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_a_file_changed_externally_since_the_read() {
+        let (ws, ctx) = observed_ctx("stale");
+        fs::write(ws.join("f.txt"), "alpha\n").unwrap();
+        ReadFileTool.execute(json!({ "file_path": "f.txt" }), &ctx).await.unwrap();
+
+        // Another process rewrites the file (different length, so the stamp differs for sure).
+        fs::write(ws.join("f.txt"), "alpha, edited elsewhere\n").unwrap();
+
+        let out = EditTool.execute(edit_args("alpha", "beta"), &ctx).await.unwrap();
+        assert!(out.is_error && out.output.contains("changed since it was read"), "{}", out.output);
+
+        // Re-reading restores the ability to edit.
+        ReadFileTool.execute(json!({ "file_path": "f.txt" }), &ctx).await.unwrap();
+        let out = EditTool.execute(edit_args("alpha", "beta"), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn write_file_keeps_crlf_of_the_existing_file() {
+        let (ws, ctx) = observed_ctx("crlf");
+        fs::write(ws.join("f.txt"), "a\r\nb\r\n").unwrap();
+        ReadFileTool.execute(json!({ "file_path": "f.txt" }), &ctx).await.unwrap();
+
+        let out = WriteFileTool
+            .execute(json!({ "file_path": "f.txt", "content": "x\ny\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        assert_eq!(fs::read_to_string(ws.join("f.txt")).unwrap(), "x\r\ny\r\n");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn atomic_create_never_replaces_an_existing_file() {
+        let ws = std::env::temp_dir().join(format!("corex_create_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let target = ws.join("n.txt");
+
+        atomic_create(&target, "first").unwrap();
+        let err = atomic_create(&target, "second").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+        let leftovers = fs::read_dir(&ws).unwrap().count();
+        assert_eq!(leftovers, 1, "no temp files may be left behind");
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn read_file_truncates_huge_lines_and_pages_by_bytes() {
+        let (ws, ctx) = observed_ctx("readcaps");
+        let long = "x".repeat(READ_MAX_LINE_CHARS + 500);
+        fs::write(ws.join("min.js"), format!("{}\nshort\n", long)).unwrap();
+        let out = ReadFileTool.execute(json!({ "file_path": "min.js" }), &ctx).await.unwrap();
+        assert!(out.output.contains("line truncated"), "{}", out.output);
+        assert!(out.output.len() < READ_MAX_LINE_CHARS + 200);
+
+        let big: String = (0..3000).map(|i| format!("{:0>60}\n", i)).collect();
+        fs::write(ws.join("big.txt"), big).unwrap();
+        let out = ReadFileTool.execute(json!({ "file_path": "big.txt" }), &ctx).await.unwrap();
+        assert!(out.output.len() < READ_MAX_OUTPUT_BYTES + 1024);
+        assert!(out.output.contains("Specify start_line="), "{}", out.output);
+
+        fs::write(ws.join("bad.txt"), [0x66u8, 0xff, 0xfe, 0x67]).unwrap();
+        let out = ReadFileTool.execute(json!({ "file_path": "bad.txt" }), &ctx).await.unwrap();
+        assert!(out.is_error && out.output.contains("not valid UTF-8"), "{}", out.output);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn read_image_queues_the_image_and_rejects_non_images() {
+        let (ws, ctx) = observed_ctx("img");
+        // Smallest valid-looking PNG header is enough: only the signature is sniffed.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&[0u8; 16]);
+        fs::write(ws.join("shot"), &png).unwrap(); // no extension on purpose
+        fs::write(ws.join("notes.png"), "just text").unwrap();
+
+        let _ = corex_core::drain_tool_images_message();
+        let out = ReadImageTool.execute(json!({ "file_path": "shot" }), &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.contains("image/png"));
+        let msg = corex_core::drain_tool_images_message().expect("image queued");
+        assert_eq!(msg.role, "user");
+
+        let out = ReadImageTool.execute(json!({ "file_path": "notes.png" }), &ctx).await.unwrap();
+        assert!(out.is_error && out.output.contains("not a supported image"), "{}", out.output);
+
+        // read_file on a binary image points the model at read_image.
+        let out = ReadFileTool.execute(json!({ "file_path": "shot" }), &ctx).await.unwrap();
+        assert!(out.output.contains("read_image"), "{}", out.output);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn glob_shows_newest_first_and_saves_the_full_list_when_large() {
+        let (ws, ctx) = observed_ctx("glob");
+        for i in 0..130 {
+            fs::write(ws.join(format!("f{:03}.txt", i)), "x").unwrap();
+        }
+        let out = GlobTool.execute(json!({ "pattern": "*.txt" }), &ctx).await.unwrap();
+        assert!(!out.is_error);
+        assert!(out.output.contains("Found 130 matching files; showing the 100 newest"), "{}", out.output);
+        assert!(out.output.contains("30 more not shown"), "{}", out.output);
+        let saved = out
+            .output
+            .split("saved at ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+            .expect("a saved path");
+        assert_eq!(fs::read_to_string(saved).unwrap().lines().count(), 130);
+        let _ = fs::remove_file(saved);
+
+        let out = GlobTool.execute(json!({ "pattern": "f00*.txt" }), &ctx).await.unwrap();
+        assert!(out.output.contains("Found 10 matching file(s)"), "{}", out.output);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn spilled_output_can_be_read_back_without_confirmation() {
+        let (ws, ctx) = observed_ctx("spillread");
+        let spilled = corex_core::spill_large_output("grep_search", "x".repeat(40_000));
+        let path = spilled
+            .split("saved at ")
+            .nth(1)
+            .and_then(|r| r.split(" — ").next())
+            .unwrap()
+            .to_string();
+        assert!(!ReadFileTool.needs_confirmation(&json!({ "file_path": path }), &ctx));
+        // Other files outside the workspace still need it.
+        assert!(ReadFileTool.needs_confirmation(&json!({ "file_path": "/etc/hostname" }), &ctx));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&ws);
     }
 }

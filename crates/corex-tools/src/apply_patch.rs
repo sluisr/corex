@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use diffy::Patch;
 
-use crate::fs_tools::{atomic_write, lock_path, resolve_path};
+use crate::fs_tools::{atomic_write, check_observed, lock_path, observe_file, resolve_path};
 use crate::types::{Tool, ToolContext, ToolOutput};
 
 pub struct ApplyPatchTool;
@@ -91,10 +91,15 @@ impl ApplyPatchTool {
             }
         };
 
+        let header_section: Vec<&str> = hunk_header
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("@@"))
+            .collect();
+
         // Priority 1: +++ b/path (post-image target)
-        for line in hunk_header.lines() {
+        for line in &header_section {
             let trimmed = line.trim();
-            if trimmed.starts_with("+++") && !trimmed.starts_with("++++") {
+            if (trimmed.starts_with("+++ ") || trimmed.starts_with("+++\t")) && !trimmed.starts_with("++++") {
                 let rest = trimmed.strip_prefix("+++").unwrap_or("").trim_start();
                 let path_part = rest.split('\t').next().unwrap_or("").trim();
                 if let Some(res) = clean_path(path_part) {
@@ -103,9 +108,9 @@ impl ApplyPatchTool {
             }
         }
         // Priority 2: --- a/path (pre-image fallback)
-        for line in hunk_header.lines() {
+        for line in &header_section {
             let trimmed = line.trim();
-            if trimmed.starts_with("---") && !trimmed.starts_with("----") {
+            if (trimmed.starts_with("--- ") || trimmed.starts_with("---\t")) && !trimmed.starts_with("----") {
                 let rest = trimmed.strip_prefix("---").unwrap_or("").trim_start();
                 let path_part = rest.split('\t').next().unwrap_or("").trim();
                 if let Some(res) = clean_path(path_part) {
@@ -114,7 +119,7 @@ impl ApplyPatchTool {
             }
         }
         // Priority 3: diff --git a/path b/path
-        for line in hunk_header.lines() {
+        for line in &header_section {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("diff --git ") {
                 if let Some((_, b_part)) = rest.rsplit_once(" b/") {
@@ -249,7 +254,7 @@ fn sanitize_and_repair_patch(raw: &str) -> Result<(String, Vec<ParsedHunk>), Str
                 '+' | '-' | ' ' => {
                     hunk.lines.push((first_char, line_no_cr[1..].to_string()));
                 }
-                '\\' => {
+                '\\' if line_no_cr.starts_with("\\ No newline") => {
                     // Ignore "\ No newline at end of file"
                 }
                 _ => {
@@ -304,6 +309,7 @@ fn apply_fuzzy_hunks(original: &str, hunks: &[ParsedHunk]) -> Result<String, Str
 
     let mut file_lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
     let mut any_applied = false;
+    let mut line_offset: isize = 0;
 
     for (hunk_idx, hunk) in hunks.iter().enumerate() {
         let old_lines: Vec<&str> = hunk
@@ -313,32 +319,63 @@ fn apply_fuzzy_hunks(original: &str, hunks: &[ParsedHunk]) -> Result<String, Str
             .map(|(_, l)| l.as_str())
             .collect();
 
-        let new_lines: Vec<String> = hunk
-            .lines
-            .iter()
-            .filter(|(c, _)| *c == ' ' || *c == '+')
-            .map(|(_, l)| l.clone())
-            .collect();
-
         if old_lines.is_empty() {
-            let pos = hunk.new_start.saturating_sub(1).min(file_lines.len());
+            let new_lines: Vec<String> = hunk
+                .lines
+                .iter()
+                .filter(|(c, _)| *c == ' ' || *c == '+')
+                .map(|(_, l)| l.clone())
+                .collect();
+            let added = new_lines.len() as isize;
+            let pos = ((hunk.new_start as isize + line_offset).max(1) as usize)
+                .saturating_sub(1)
+                .min(file_lines.len());
             for (idx, nl) in new_lines.into_iter().enumerate() {
                 file_lines.insert(pos + idx, nl);
             }
+            line_offset += added;
             any_applied = true;
             continue;
         }
 
-        let match_range = find_hunk_match(&file_lines, &old_lines, hunk.old_start);
+        let hinted_start = (hunk.old_start as isize + line_offset).max(1) as usize;
+        let match_range = find_hunk_match(&file_lines, &old_lines, hinted_start);
         if let Some((start_idx, end_idx, inner_only)) = match_range {
+            // Build replacement preserving the original file's exact context lines (`c == ' '`)
+            // so a patch with slightly drifted indentation on context lines never corrupts untouched lines.
+            let mut replacement = Vec::new();
+            let mut old_cursor = start_idx;
+            for &(op, ref text) in &hunk.lines {
+                match op {
+                    ' ' => {
+                        if let Some(orig_line) = file_lines.get(old_cursor) {
+                            replacement.push(orig_line.clone());
+                        } else {
+                            replacement.push(text.clone());
+                        }
+                        old_cursor += 1;
+                    }
+                    '-' => {
+                        old_cursor += 1;
+                    }
+                    '+' => {
+                        replacement.push(text.clone());
+                    }
+                    _ => {}
+                }
+            }
+
             let first_is_ctx = hunk.lines.first().map(|(c, _)| *c == ' ').unwrap_or(false);
             let last_is_ctx = hunk.lines.last().map(|(c, _)| *c == ' ').unwrap_or(false);
-            if inner_only && first_is_ctx && last_is_ctx && new_lines.len() >= 2 && end_idx >= start_idx + 2 {
-                let inner_new = new_lines[1..new_lines.len() - 1].to_vec();
+            let old_span = end_idx.saturating_sub(start_idx) as isize;
+            let new_span = replacement.len() as isize;
+            if inner_only && first_is_ctx && last_is_ctx && replacement.len() >= 2 && end_idx >= start_idx + 2 {
+                let inner_new = replacement[1..replacement.len() - 1].to_vec();
                 file_lines.splice(start_idx + 1..end_idx - 1, inner_new);
             } else {
-                file_lines.splice(start_idx..end_idx, new_lines);
+                file_lines.splice(start_idx..end_idx, replacement);
             }
+            line_offset += new_span - old_span;
             any_applied = true;
         } else {
             return Err(format!(
@@ -421,18 +458,22 @@ fn find_hunk_match(file_lines: &[String], old_lines: &[&str], hint_line: usize) 
         }
     }
 
-    // Pass 4: Fuzz 1 - ignore first and last context line if hunk has >= 3 lines
+    // Pass 4: Fuzz 1 - ignore first and last context line if hunk has >= 3 lines and is within 100 lines of hint
     if target_len >= 3 {
         let sub_old = &old_lines[1..target_len - 1];
         let sub_len = sub_old.len();
-        for &i in &candidates {
-            if i + 1 + sub_len <= file_lines.len()
-                && file_lines[i + 1..i + 1 + sub_len]
-                    .iter()
-                    .zip(sub_old.iter())
-                    .all(|(f, o)| f.trim() == o.trim())
-            {
-                return Some((i, i + target_len, true));
+        let non_trivial = sub_old.iter().any(|l| l.trim().len() > 2);
+        if non_trivial {
+            for &i in &candidates {
+                if i.abs_diff(hint_idx) <= 100
+                    && i + 1 + sub_len <= file_lines.len()
+                    && file_lines[i + 1..i + 1 + sub_len]
+                        .iter()
+                        .zip(sub_old.iter())
+                        .all(|(f, o)| f.trim() == o.trim())
+                {
+                    return Some((i, i + target_len, true));
+                }
             }
         }
     }
@@ -565,6 +606,10 @@ impl Tool for ApplyPatchTool {
         };
         let normalized_patch = Self::normalize_patch(&repaired_patch);
 
+        if let Err(msg) = check_observed(&target_path, &target_file) {
+            return Ok(ToolOutput::error(msg));
+        }
+
         // 2. Attempt primary application via diffy
         let mut patch_result = None;
         if let Ok(diffy_patch) = Patch::from_str(normalized_patch.as_ref()) {
@@ -612,6 +657,7 @@ impl Tool for ApplyPatchTool {
         if let Err(e) = atomic_write(&target_path, &patched_content) {
             return Ok(ToolOutput::error(format!("Failed to write patched content to {}: {}", target_path.display(), e)));
         }
+        observe_file(&target_path);
 
         let action = if original_content.is_empty() { "Created" } else { "Patched" };
         Ok(ToolOutput::success_with_summary(
@@ -715,7 +761,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let target = dir.join("notrail.txt");
-        fs::write(&target, "uno\ndos\ntres").unwrap(); // deliberately unterminated
+        fs::write(&target, "uno\ndos\ntres").unwrap();
+        crate::fs_tools::observe_file(&target); // deliberately unterminated
+        crate::fs_tools::observe_file(&target);
 
         let patch =
             "--- a/notrail.txt\n+++ b/notrail.txt\n@@ -1,3 +1,3 @@\n uno\n-dos\n+DOS\n tres\n";
@@ -792,6 +840,7 @@ mod tests {
         let dir = unique_temp_dir("noop");
         let target = dir.join("notrail.txt");
         fs::write(&target, "uno\ndos\ntres").unwrap();
+        crate::fs_tools::observe_file(&target);
 
         let context = ToolContext {
             workspace_dir: dir.clone(),
@@ -867,6 +916,7 @@ mod tests {
         let dir = unique_temp_dir("md_test");
         let target = dir.join("code.rs");
         fs::write(&target, "fn foo() {\n    let a = 1;\n    let b = 2;\n    println!(\"{}\", a + b);\n}\n").unwrap();
+        crate::fs_tools::observe_file(&target);
 
         // Model generated markdown fences, wrong count in @@ header (claims 99 lines),
         // and context lines with missing leading space!
@@ -911,6 +961,7 @@ Hope this helps!
         let target = dir.join("code.py");
         // Target file has trailing spaces on some lines
         fs::write(&target, "def hello():   \n    x = 10   \n    return x\n").unwrap();
+        crate::fs_tools::observe_file(&target);
 
         // Patch was written without trailing whitespace
         let patch = "--- a/code.py\n+++ b/code.py\n@@ -1,3 +1,3 @@\n def hello():\n-    x = 10\n+    x = 20\n return x\n";
@@ -988,6 +1039,7 @@ Hope this helps!
         let dir = unique_temp_dir("trailing_spaces");
         let target = dir.join("trail.txt");
         fs::write(&target, "ctx  \nold\n").unwrap();
+        crate::fs_tools::observe_file(&target);
 
         let patch = "--- a/trail.txt\n+++ b/trail.txt\n@@ -1,2 +1,2 @@\n ctx  \n-old\n+new   \n";
 

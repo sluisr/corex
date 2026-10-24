@@ -57,6 +57,32 @@ pub enum StreamEvent {
     Error(String),
 }
 
+/// True when the provider stopped because the output hit its token limit. Tool calls from such a
+/// turn may have truncated arguments (half-written files, cut commands) and must not run.
+pub fn is_truncated_finish(finish_reason: Option<&str>) -> bool {
+    matches!(finish_reason, Some("length" | "max_tokens" | "model_context_window_exceeded"))
+}
+
+/// True when an API error message says the request did not fit the model's context window.
+pub fn is_context_overflow_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context_length_exceeded",
+        "context length exceeded",
+        "exceeds the context window",
+        "exceed the context window",
+        "prompt is too long",
+        "input is too long",
+        "reduce the length of the messages",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
+}
+
+/// Tool result returned for every call of a truncated turn so the model re-issues it.
+pub const TRUNCATED_TOOL_CALL_ERROR: &str = "Error: this tool call was NOT executed because the response hit the output token limit and its arguments may be truncated. Re-issue it, splitting large content into several smaller calls (e.g. write the file in parts or use apply_patch).";
+
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
@@ -283,6 +309,26 @@ impl LlmClient {
         }
     }
 
+    /// Removes Anthropic thinking blocks stored in tool calls' `extra_content`.
+    pub fn strip_anthropic_thinking(messages: &mut [Message]) {
+        for call in messages
+            .iter_mut()
+            .filter_map(|m| m.tool_calls.as_mut())
+            .flat_map(|calls| calls.iter_mut())
+        {
+            let now_empty = match call.extra_content.as_mut().and_then(|ec| ec.as_object_mut()) {
+                Some(obj) => {
+                    obj.remove(crate::anthropic::THINKING_EXTRA_KEY);
+                    obj.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                call.extra_content = None;
+            }
+        }
+    }
+
     /// Sanitizes tool call history for Google Gemini models:
     /// Google requires a valid cryptographic `thought_signature` on every tool_call in functionCall parts.
     /// If older turns (e.g. from previous sessions or other models like DeepSeek) lack `thought_signature`,
@@ -329,6 +375,32 @@ impl LlmClient {
             }
             i += 1;
         }
+
+        // Merge consecutive plain-text assistant messages created by collapsing unsigned tool turns
+        // so Gemini never sees adjacent model turns without an intervening user/tool turn.
+        let mut idx = 0;
+        while idx + 1 < messages.len() {
+            if messages[idx].role == "assistant"
+                && messages[idx + 1].role == "assistant"
+                && messages[idx].tool_calls.is_none()
+            {
+                let next_msg = messages.remove(idx + 1);
+                let prev_text = messages[idx].text_content().unwrap_or("").to_string();
+                let next_text = next_msg.text_content().unwrap_or("").to_string();
+                let merged = match (prev_text.is_empty(), next_text.is_empty()) {
+                    (false, false) => format!("{}\n\n{}", prev_text, next_text),
+                    (false, true) => prev_text,
+                    (true, false) => next_text,
+                    (true, true) => String::new(),
+                };
+                messages[idx].content = Some(MessageContent::Text(merged));
+                if messages[idx].tool_calls.is_none() {
+                    messages[idx].tool_calls = next_msg.tool_calls;
+                }
+                continue;
+            }
+            idx += 1;
+        }
     }
 
     /// Normalizes tools by sorting them alphabetically to guarantee 100% prefix matching
@@ -337,12 +409,10 @@ impl LlmClient {
         tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
     }
 
-    /// Truncates tool response messages and background task / subagent dumps that are excessively long.
-    /// Large shell outputs (recursive ls, grep dumps, logs) get re-sent every turn
-    /// and are the single biggest source of unexpected token growth in agentic loops.
-    /// Cap at 8 000 chars (~2 600 tokens) — enough for the model to understand the
-    /// result, while keeping the prefix deterministic across turns for KV cache hits.
-    const TOOL_OUTPUT_MAX_CHARS: usize = 8_000;
+    /// Truncates tool response messages and background task / subagent dumps that exceed the
+    /// spill threshold (`SPILL_THRESHOLD_CHARS = 30_000`), preserving both head and tail and
+    /// saving the full output to `/tmp/corex-spill-...` so the model never loses the tail or path.
+    const TOOL_OUTPUT_MAX_CHARS: usize = crate::spill::SPILL_THRESHOLD_CHARS;
 
     pub fn truncate_tool_outputs(messages: &mut [Message]) {
         for msg in messages.iter_mut() {
@@ -358,18 +428,12 @@ impl LlmClient {
 
             if is_truncatable {
                 if let Some(content) = msg.text_content().map(|s| s.to_string()) {
-                    if content.len() > Self::TOOL_OUTPUT_MAX_CHARS
+                    if content.chars().count() > Self::TOOL_OUTPUT_MAX_CHARS
+                        && !content.contains(crate::spill::TRIM_MARKER)
                         && !content.contains("chars truncated to save tokens")
                     {
-                        let truncated =
-                            crate::types::safe_truncate_str(&content, Self::TOOL_OUTPUT_MAX_CHARS);
-                        let omitted = content.len() - truncated.len();
                         msg.content = Some(
-                            format!(
-                                "{}\n\n[... {} chars truncated to save tokens ...]",
-                                truncated, omitted
-                            )
-                            .into(),
+                            crate::spill::spill_large_output("tool_output", content).into(),
                         );
                     }
                 }
@@ -398,7 +462,8 @@ impl LlmClient {
             let reasoning_toks = m.reasoning_content.as_deref().map(Self::estimate_tokens).unwrap_or(0);
             let tool_call_toks = m.tool_calls.as_ref().map(|calls| {
                 calls.iter().map(|c| {
-                    Self::estimate_tokens(&c.function.name) + Self::estimate_tokens(&c.function.arguments) + 8
+                    let extra_toks = c.extra_content.as_ref().map(|ec| Self::estimate_tokens(&ec.to_string())).unwrap_or(0);
+                    Self::estimate_tokens(&c.function.name) + Self::estimate_tokens(&c.function.arguments) + extra_toks + 8
                 }).sum::<usize>()
             }).unwrap_or(0);
             content_toks + reasoning_toks + tool_call_toks + 4 // per-message overhead
@@ -425,23 +490,84 @@ impl LlmClient {
             return Ok(None);
         }
 
-        let total_msgs = messages.len();
-        if total_msgs < 8 {
-            return Ok(None);
+        // Cheapest relief first: cut oversized tool results down to head + tail. It needs no model
+        // call, and if it brings the prompt back under the threshold no summary is needed.
+        let prune = crate::context_prune::prune_tool_results(messages);
+        let prune_note = (prune.pruned > 0).then(|| {
+            let freed = current_tokens.saturating_sub(Self::estimate_messages_tokens(messages));
+            format!(
+                "Trimmed {} oversized tool result(s), freeing ~{} tokens.",
+                prune.pruned, freed
+            )
+        });
+        if !force && prune_note.is_some() && Self::estimate_messages_tokens(messages) <= effective_threshold {
+            return Ok(prune_note);
         }
 
-        // Find system prompt end index (first non-system message = Root User Anchor)
+        let total_msgs = messages.len();
+        if total_msgs < 8 {
+            return Ok(prune_note);
+        }
+
+        // Root user prompt anchor (first non-system message).
         let first_non_system = messages.iter().position(|m| m.role != "system").unwrap_or(0);
 
-        // Keep the latest 8-10 messages (representing current active turns / tools / reasoning)
-        let keep_recent = 10.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
-        let split_at = total_msgs.saturating_sub(keep_recent);
+        // Locate the last user message (active directive that initiated the current work).
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
 
-        // The root user prompt (anchor) is preserved at first_non_system.
-        // We only compact the middle turns between the anchor and recent active turns.
-        let middle_start = first_non_system + 1;
+        // Determine the middle slice to compact while preserving both `first_non_system`
+        // (session anchor) and `last_user_idx` (active directive).
+        let (middle_start, mut split_at) = if let Some(last_u_idx) = last_user_idx {
+            let pre_user_start = first_non_system + 1;
+            let pre_user_count = last_u_idx.saturating_sub(pre_user_start);
+            let only_summary_before = pre_user_count == 1
+                && messages[pre_user_start].role == "system"
+                && messages[pre_user_start]
+                    .text_content()
+                    .map(|t| t.contains("<CONTEXT_SUMMARY>"))
+                    .unwrap_or(false);
+            let post_user_count = total_msgs.saturating_sub(last_u_idx + 1);
+
+            if pre_user_count >= 2 && (!only_summary_before && post_user_count < 8) {
+                (pre_user_start, last_u_idx)
+            } else if post_user_count >= 6 {
+                let anchor = last_u_idx;
+                let keep_recent = 6.min(total_msgs.saturating_sub(anchor + 3)).max(4);
+                let start = anchor + 1;
+                let end = total_msgs.saturating_sub(keep_recent);
+                (start, end)
+            } else if pre_user_count >= 2 {
+                (pre_user_start, last_u_idx)
+            } else {
+                let keep_recent = 8.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
+                let start = first_non_system + 1;
+                let end = total_msgs.saturating_sub(keep_recent);
+                (start, end)
+            }
+        } else {
+            let keep_recent = 8.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
+            let start = first_non_system + 1;
+            let end = total_msgs.saturating_sub(keep_recent);
+            (start, end)
+        };
+
+        // Never split an atomic `assistant(tool_calls) -> tool` group at `split_at`.
+        while split_at > middle_start && split_at < messages.len() && messages[split_at].role == "tool" {
+            split_at -= 1;
+        }
+        // If stepping back landed on the assistant message that owns those tool responses, include
+        // that assistant + its tool responses in the kept tail rather than orphaning them.
+        if split_at > middle_start
+            && split_at < messages.len()
+            && messages[split_at].role == "assistant"
+            && messages[split_at].tool_calls.is_some()
+        {
+            // `split_at` is exclusive in `middle_start..split_at`, so `messages[split_at]` is the
+            // first message KEPT after compaction, keeping the assistant and its tool outputs together.
+        }
+
         if middle_start >= split_at || split_at.saturating_sub(middle_start) < 2 {
-            return Ok(None);
+            return Ok(prune_note);
         }
 
         let older_slice = &messages[middle_start..split_at];
@@ -461,27 +587,33 @@ impl LlmClient {
 
             if m.role == "user" {
                 if !text.is_empty() {
-                    user_requests.push(crate::types::truncate_ellipsis(text, 250));
+                    user_requests.push(crate::types::truncate_ellipsis(text, 500));
                 }
             } else if m.role == "assistant" {
                 if let Some(ref calls) = m.tool_calls {
                     for c in calls {
-                        let short_args = crate::types::truncate_ellipsis(&c.function.arguments, 120);
+                        let short_args = crate::types::truncate_ellipsis(&c.function.arguments, 160);
                         tool_actions.push(format!("{}({})", c.function.name, short_args));
                     }
                 }
             } else if m.role == "tool" && (text.starts_with("Error") || text.contains("failed") || text.contains("error:")) {
-                let err_snip = crate::types::truncate_ellipsis(text, 120);
+                let err_snip = crate::types::truncate_ellipsis(text, 160);
                 tool_actions.push(format!("Tool result error: {}", err_snip));
             }
         }
 
         let mut summary_opt: Option<String> = None;
-        let digest = format!(
-            "User Requests:\n{}\n\nTool Actions:\n{}",
-            user_requests.join("\n"),
-            tool_actions.join("\n")
-        );
+        let mut digest_parts = Vec::new();
+        if let Some(ref prev) = prev_summary {
+            digest_parts.push(format!("Prior Context Summary:\n{}", prev));
+        }
+        if !user_requests.is_empty() {
+            digest_parts.push(format!("User Directives:\n{}", user_requests.join("\n")));
+        }
+        if !tool_actions.is_empty() {
+            digest_parts.push(format!("Tool Actions:\n{}", tool_actions.join("\n")));
+        }
+        let digest = digest_parts.join("\n\n");
 
         // 1. If local SLM is enabled, try local compaction first
         if cfg.local_llm_enabled {
@@ -636,11 +768,28 @@ impl LlmClient {
         while messages.len() > first_non_system + 2
             && Self::estimate_messages_tokens(messages) > token_limit
         {
-            let drop_idx = if messages.len() > first_non_system + 3 {
+            let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+            let mut drop_idx = if messages.len() > first_non_system + 3 {
                 first_non_system + 1
             } else {
                 first_non_system
             };
+
+            // Never drop the latest active user prompt if there are alternative turns to trim
+            if let Some(last_u) = last_user_idx {
+                if drop_idx == last_u {
+                    if drop_idx + 1 < messages.len() {
+                        drop_idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if drop_idx >= messages.len() {
+                break;
+            }
+
             let removed = messages.remove(drop_idx);
             // If we removed an assistant message with tool calls, also remove its immediate tool responses
             if removed.role == "assistant" && removed.tool_calls.is_some() {
@@ -659,6 +808,74 @@ impl LlmClient {
 
     pub async fn stream_chat(
         &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancel_token: CancellationToken,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let mut rx = self
+            .stream_chat_once(messages.clone(), tools.clone(), cancel_token.clone())
+            .await?;
+
+        // Look at the first real event. A context-overflow rejection arrives before any content, so
+        // this is the one moment where compacting and retrying is invisible to the consumer.
+        let mut prefix = Vec::new();
+        let first = loop {
+            match rx.recv().await {
+                Some(ev @ StreamEvent::ContextCompacted { .. }) => prefix.push(ev),
+                other => break other,
+            }
+        };
+        let overflow = matches!(&first, Some(StreamEvent::Error(m)) if is_context_overflow_error(m));
+
+        let (tx, out) = mpsc::channel::<StreamEvent>(100);
+        if overflow {
+            let mut retry_messages = messages;
+            if let Ok(Some(notice)) = self.compact_messages(&mut retry_messages, true).await {
+                let compacted_session = if retry_messages.len() > 1 {
+                    retry_messages[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut retry_rx = self
+                    .stream_chat_once(retry_messages, tools, cancel_token)
+                    .await?;
+                let notice = format!("The request exceeded the model's context window. {} Retrying.", notice);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(StreamEvent::ContextCompacted { compacted_messages: compacted_session, notice })
+                        .await;
+                    while let Some(ev) = retry_rx.recv().await {
+                        if tx.send(ev).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                return Ok(out);
+            }
+        }
+
+        tokio::spawn(async move {
+            for ev in prefix {
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(ev) = first {
+                if tx.send(ev).await.is_err() {
+                    return;
+                }
+            }
+            while let Some(ev) = rx.recv().await {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(out)
+    }
+
+    async fn stream_chat_once(
+        &self,
         mut messages: Vec<Message>,
         mut tools: Option<Vec<ToolDefinition>>,
         cancel_token: CancellationToken,
@@ -666,11 +883,11 @@ impl LlmClient {
         let cfg = self.get_config();
         let is_local_model = cfg.model.starts_with("local");
 
-        // ⚡ 100% STANDALONE OFFLINE LOCAL MODEL (Zero Cloud, 100% Local):
         if is_local_model {
             let local_client = self.local_client();
             if local_client.health_check().await {
                 let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
+                Self::sanitize_tool_call_sequences(&mut messages);
                 let auto_compact_event = compact_notice.map(|notice| {
                     let compacted_session_messages = if messages.len() > 1 {
                         messages[1..].to_vec()
@@ -687,7 +904,7 @@ impl LlmClient {
                 crate::forensic::ForensicLogger::log_event(
                     "LOCAL_LLM",
                     "STANDALONE_OFFLINE",
-                    "Running 100% offline on Local LLM (zero Cloud dependency, $0.00).",
+                    "Routing request to local LLM endpoint.",
                 );
                 let mut inner_rx = local_client.stream_chat(messages, tools, cancel_token).await?;
                 if let Some((compacted_messages, notice)) = auto_compact_event {
@@ -736,11 +953,10 @@ impl LlmClient {
             }
         }
 
-        // ⚡ ORDER OF INTEGRITY:
-        // 1. Auto-compact conversation turns if threshold is reached (Gemini CLI / Antigravity spec)
         let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
-        // Capture compacted session messages immediately after compact_messages, before wire-only
-        // mutations (cap_history_if_needed, sanitize_tool_call_sequences, sanitize_for_google_tool_calls, truncate_tool_outputs)
+        Self::sanitize_tool_call_sequences(&mut messages);
+        // Capture compacted session messages before wire-only mutations
+        // (cap_history_if_needed, sanitize_for_google_tool_calls, truncate_tool_outputs).
         let auto_compact_event = compact_notice.map(|notice| {
             let compacted_session_messages = if messages.len() > 1 {
                 messages[1..].to_vec()
@@ -749,31 +965,21 @@ impl LlmClient {
             };
             (compacted_session_messages, notice)
         });
-        // 2. Cap history limit as emergency fallback
         Self::cap_history_if_needed(&mut messages);
-        // 3. Sanitize tool call sequences so no orphaned messages exist
         Self::sanitize_tool_call_sequences(&mut messages);
         if cfg.provider_kind() == crate::providers::ProviderKind::Google {
             Self::sanitize_for_google_tool_calls(&mut messages);
         }
-        // 4. Truncate active tool outputs exceeding safety limits
         Self::truncate_tool_outputs(&mut messages);
-
-        // 5. Sanitize any past CJK drift from history if user didn't request Chinese
         crate::language::sanitize_messages_cjk_drift(&mut messages);
 
-        // 5b. Heal history written by older builds, which spliced the recency anchor onto the
-        // trailing tool output and persisted it into the session file on disk. Must run before
-        // step 6 applies a fresh anchor, so we strip the stale splice rather than dedupe on it.
+        // Strip legacy recency anchors spliced onto trailing tool outputs by older builds
+        // before applying a fresh standalone anchor.
         crate::language::sanitize_messages_recency_anchor(&mut messages);
 
-        // 6. ⚡ DYNAMIC RECENCY LANGUAGE ANCHOR:
-        // When synthesizing tool outputs (especially long web search or command dumps),
-        // DeepSeek's attention to the system prompt degrades, causing it to fall back to base
-        // multilingual training (Chinese drift). We re-anchor the dynamic language constraint at
-        // the tail of the context window as a standalone message, never inside a tool payload:
-        // tool results are untrusted data, so splicing an instruction there would be read as
-        // file contents and would contradict the instruction to ignore directives in tool output.
+        // Re-anchor the conversation language at the tail of the context window as a
+        // standalone message (never spliced into untrusted tool payloads) so long tool
+        // outputs do not cause DeepSeek to drift into Chinese.
         if is_deepseek {
             crate::language::apply_recency_anchor(&mut messages);
         }
@@ -783,6 +989,11 @@ impl LlmClient {
         }
 
         let provider_kind = cfg.provider_kind();
+        if provider_kind != crate::providers::ProviderKind::Anthropic {
+            // Signed Claude thinking blocks are only meaningful to Anthropic; never forward
+            // them to OpenAI-compatible endpoints after a mid-session provider switch.
+            Self::strip_anthropic_thinking(&mut messages);
+        }
         if provider_kind == crate::providers::ProviderKind::Anthropic {
             return self.stream_chat_anthropic(
                 &endpoint_url,
@@ -866,16 +1077,19 @@ impl LlmClient {
 
         let tools_count = tools.as_ref().map(|t| t.len()).unwrap_or(0);
         let messages_count = messages.len();
-        // ⚡ DYNAMIC ADAPTIVE REASONING EFFORT:
-        // When configured as "dynamic" (default for flash), adapt depth per turn:
-        // - Tool Call Rounds / System Inspection / Command Execution / Quick Queries -> command_reasoning_effort (default "low" ~200ms)
-        // - Heavy Code Generation / Patch Creation / Architecture -> code_reasoning_effort (default "high" Deep CoT)
-        let raw_reasoning_effort = if cfg.local_llm_enabled || cfg.reasoning_effort == "dynamic" || cfg.flash_settings.reasoning_effort == "dynamic" {
+        // When configured as "dynamic" (default for flash), adapt reasoning depth per turn:
+        // tool-response turns use DYNAMIC_TOOL_TURN_EFFORT ("low"), others use DYNAMIC_DEFAULT_EFFORT ("high").
+        let is_flash = !crate::config::is_pro_model(&cfg.model)
+            && (cfg.model.to_ascii_lowercase().contains("flash") || cfg.model == "deepseek-chat");
+        let raw_reasoning_effort = if cfg.local_llm_enabled
+            || cfg.reasoning_effort == "dynamic"
+            || (is_flash && cfg.flash_settings.reasoning_effort == "dynamic")
+        {
             let is_tool_response_turn = messages.last().map(|m| m.role == "tool").unwrap_or(false);
             if is_tool_response_turn {
-                cfg.flash_settings.command_reasoning_effort.clone()
+                crate::config::DYNAMIC_TOOL_TURN_EFFORT.to_string()
             } else {
-                cfg.flash_settings.code_reasoning_effort.clone()
+                crate::config::DYNAMIC_DEFAULT_EFFORT.to_string()
             }
         } else {
             cfg.reasoning_effort.clone()
@@ -1031,7 +1245,7 @@ impl LlmClient {
                                         match ev {
                                             StreamEvent::UsageUpdate(ref u) => {
                                                 final_usage = Some(u.clone());
-                                                let _ = tx.send(ev).await;
+                                                if tx.send(ev).await.is_err() { return; }
                                                 if final_reason.is_some() {
                                                     let duration_ms = start_time.elapsed().as_millis();
                                                     crate::forensic::ForensicLogger::log_llm_response(
@@ -1053,23 +1267,23 @@ impl LlmClient {
                                                     first_token_time = Some(start_time.elapsed().as_millis());
                                                 }
                                                 total_reasoning_chars += cot.len();
-                                                let _ = tx.send(ev).await;
+                                                if tx.send(ev).await.is_err() { return; }
                                             }
                                             StreamEvent::ContentDelta(ref text) => {
                                                 if first_token_time.is_none() {
                                                     first_token_time = Some(start_time.elapsed().as_millis());
                                                 }
                                                 total_content_chars += text.len();
-                                                let _ = tx.send(ev).await;
+                                                if tx.send(ev).await.is_err() { return; }
                                             }
                                             StreamEvent::ToolCallDelta { .. } => {
                                                 if first_token_time.is_none() {
                                                     first_token_time = Some(start_time.elapsed().as_millis());
                                                 }
-                                                let _ = tx.send(ev).await;
+                                                if tx.send(ev).await.is_err() { return; }
                                             }
                                             StreamEvent::ExtraContentDelta(_) => {
-                                                let _ = tx.send(ev).await;
+                                                if tx.send(ev).await.is_err() { return; }
                                             }
                                             StreamEvent::Completed { ref finish_reason } => {
                                                 if finish_reason.is_some() {
@@ -1189,24 +1403,32 @@ impl LlmClient {
             crate::anthropic::convert_messages_and_tools(&messages, tools.as_deref());
 
         let cfg = self.get_config();
-        let max_tokens = if model.contains("claude-3-7") || model.contains("claude-3-5") {
-            8192
-        } else {
-            4096
-        };
+        let profile = crate::anthropic::model_profile(model);
+        let max_tokens = profile.max_output_tokens;
 
-        let is_thinking = model.contains("3-7")
-            && (cfg.reasoning_effort == "high" || cfg.reasoning_effort == "dynamic");
-        let thinking_config = if is_thinking {
-            Some(crate::anthropic::AnthropicThinkingConfig {
-                thinking_type: "enabled".to_string(),
-                budget_tokens: 2048,
-            })
-        } else {
-            None
+        let effort_setting = cfg.reasoning_effort.as_str();
+        let thinking_off = matches!(effort_setting, "none" | "off" | "false");
+        let thinking_config = match profile.thinking {
+            crate::anthropic::ThinkingMode::Adaptive => Some(crate::anthropic::AnthropicThinkingConfig {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: None,
+            }),
+            crate::anthropic::ThinkingMode::Budget if !thinking_off && effort_setting != "low" => {
+                Some(crate::anthropic::AnthropicThinkingConfig {
+                    thinking_type: "enabled".to_string(),
+                    budget_tokens: Some((max_tokens / 4).clamp(1024, 16_000)),
+                })
+            }
+            _ => None,
         };
+        let output_config = crate::anthropic::effort_for(&profile, effort_setting)
+            .map(|effort| crate::anthropic::AnthropicOutputConfig { effort });
 
-        let temperature = if is_thinking || !(0.0..=1.0).contains(&cfg.temperature) {
+        // Thinking requires the default sampling, and 4.7+/5.x models reject `temperature`.
+        let temperature = if thinking_config.is_some()
+            || !profile.accepts_temperature
+            || !(0.0..=1.0).contains(&cfg.temperature)
+        {
             None
         } else {
             Some(cfg.temperature)
@@ -1221,6 +1443,8 @@ impl LlmClient {
             stream: true,
             temperature,
             thinking: thinking_config,
+            output_config,
+            cache_control: Some(serde_json::json!({ "type": "ephemeral" })),
         };
 
         if crate::forensic::ForensicLogger::is_enabled() {
@@ -1256,7 +1480,7 @@ impl LlmClient {
             let timeout_duration = std::time::Duration::from_secs(180);
             let mut total_content_chars = 0;
             let mut total_reasoning_chars = 0;
-            let mut current_usage = Usage::default();
+            let mut stream_state = crate::anthropic::AnthropicStreamState::new();
             let mut final_reason: Option<String> = None;
 
             loop {
@@ -1277,7 +1501,7 @@ impl LlmClient {
                                 debug!("[ANTHROPIC SSE] Stream opened");
                             }
                             Some(Ok(Event::Message(msg))) => {
-                                if let Some(evs) = crate::anthropic::parse_anthropic_sse_data(&msg.data, &mut current_usage) {
+                                if let Some(evs) = crate::anthropic::parse_anthropic_sse_data(&msg.data, &mut stream_state) {
                                     for ev in evs {
                                         match &ev {
                                             StreamEvent::ContentDelta(text) => {
@@ -1303,14 +1527,14 @@ impl LlmClient {
                                                     duration_ms,
                                                     first_token_time,
                                                     final_reason.as_deref().or(Some("stop")),
-                                                    Some(&current_usage),
+                                                    Some(&stream_state.usage),
                                                 );
                                                 let _ = tx.send(ev).await;
                                                 return;
                                             }
                                             _ => {}
                                         }
-                                        let _ = tx.send(ev).await;
+                                        if tx.send(ev).await.is_err() { return; }
                                     }
                                 }
                             }
@@ -1318,11 +1542,18 @@ impl LlmClient {
                                 error!("[ANTHROPIC SSE] Error: {}", err);
                                 crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse", &err.to_string());
                                 let friendly_err = match err {
-                                    reqwest_eventsource::Error::InvalidStatusCode(status, _) if status == reqwest::StatusCode::UNAUTHORIZED => {
-                                        "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Export ANTHROPIC_API_KEY or configure ~/.corex/settings.json".to_string()
-                                    }
-                                    reqwest_eventsource::Error::InvalidStatusCode(status, _) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                                        "Rate limit or quota exceeded (429 Too Many Requests) from Anthropic API.".to_string()
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let body_text = resp.text().await.unwrap_or_default();
+                                        crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse_body", &body_text);
+                                        if status == reqwest::StatusCode::UNAUTHORIZED {
+                                            "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Export ANTHROPIC_API_KEY or configure ~/.corex/settings.json".to_string()
+                                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                            "Rate limit or quota exceeded (429 Too Many Requests) from Anthropic API.".to_string()
+                                        } else if !body_text.is_empty() {
+                                            format!("Anthropic API error ({}): {}", status, body_text)
+                                        } else {
+                                            format!("Anthropic Stream error: Invalid status code {}", status)
+                                        }
                                     }
                                     other => format!("Anthropic Stream error: {}", other),
                                 };
@@ -1339,7 +1570,7 @@ impl LlmClient {
                                     duration_ms,
                                     first_token_time,
                                     final_reason.as_deref(),
-                                    Some(&current_usage),
+                                    Some(&stream_state.usage),
                                 );
                                 let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
                                 break;
@@ -1518,6 +1749,50 @@ mod tests {
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].text_content().unwrap(), "Hello 1");
         assert!(messages[2].text_content().unwrap().contains("<CONTEXT_SUMMARY>"));
+        // The LATEST user prompt MUST be preserved immediately after context summary!
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].text_content().unwrap(), "Hello 6");
+    }
+
+    #[tokio::test]
+    async fn test_compact_preserves_latest_user_prompt_during_heavy_tool_task() {
+        let client = LlmClient::new(Config::default());
+        let mut messages = vec![
+            Message::system("System prompt instructions"),
+            Message::user("First ancient request from hours ago"),
+            Message::assistant("Ancient response", None),
+            Message::user("ACTIVE DIRECTIVE: Fix the database connection pool leak!"),
+        ];
+
+        // Simulate 8 tool turns executed under this active directive (16 tool messages)
+        for i in 1..=8 {
+            let call_id = format!("call_{}", i);
+            messages.push(Message::assistant_with_tools(
+                None,
+                None,
+                vec![ToolCall::new(&call_id, "run_shell_command", "{\"command\":\"test\"}")],
+            ));
+            messages.push(Message::tool_response(&call_id, format!("Output from tool step {}", i)));
+        }
+
+        let initial_count = messages.len();
+        assert_eq!(initial_count, 20); // 1 sys + 1 old user + 1 old asst + 1 active user + 16 tool msgs
+
+        let result = client.compact_messages(&mut messages, true).await;
+        assert!(result.is_ok());
+        let notice = result.unwrap();
+        assert!(notice.is_some(), "Expected compaction to shrink heavy tool turns after active user prompt");
+        assert!(messages.len() < initial_count, "Expected message count to shrink after compaction");
+
+        // Verify that the active user prompt was NEVER deleted or forgotten!
+        let has_active_directive = messages.iter().any(|m| {
+            m.role == "user" && m.text_content().unwrap_or("").contains("Fix the database connection pool leak!")
+        });
+        assert!(has_active_directive, "CRITICAL: The active user prompt was deleted during compaction!");
+
+        // The latest user prompt should still be in messages
+        let last_user = messages.iter().filter(|m| m.role == "user").last().unwrap();
+        assert_eq!(last_user.text_content().unwrap(), "ACTIVE DIRECTIVE: Fix the database connection pool leak!");
     }
 
     #[test]
@@ -1596,3 +1871,16 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod overflow_tests {
+    use super::is_context_overflow_error;
+
+    #[test]
+    fn recognises_context_overflow_but_not_rate_limits() {
+        assert!(is_context_overflow_error("API error (400): This model's maximum context length is 131072 tokens"));
+        assert!(is_context_overflow_error("prompt is too long: 250000 tokens > 200000 maximum"));
+        assert!(is_context_overflow_error("code: context_length_exceeded"));
+        assert!(!is_context_overflow_error("Rate limit or quota exceeded (429 Too Many Requests) from DeepSeek."));
+        assert!(!is_context_overflow_error("Too many tokens per minute"));
+    }
+}

@@ -38,5 +38,77 @@ pub struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
+        // Normal exit path: tasks run under `setsid`, so nothing else stops them.
+        corex_tools::background::shutdown_all_tasks();
     }
+}
+
+/// Sets up POSIX signal listeners for clean terminal teardown on hangup/terminate/quit,
+/// and proper terminal suspension (SIGSTOP/SIGCONT) when sent to background via Ctrl+Z.
+#[cfg(unix)]
+pub fn setup_signal_handlers(resumed_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange};
+    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+    use tokio::signal::unix::{signal, SignalKind};
+
+    // Closing the terminal window (SIGHUP), `kill` (SIGTERM), or quit (SIGQUIT) skips Drop; restore
+    // explicitly, stop the detached (setsid) child process groups and wipe any staged sudo
+    // credential, which `process::exit` would otherwise leave behind.
+    tokio::spawn(async {
+        let (Ok(mut hup), Ok(mut term), Ok(mut quit)) = (
+            signal(SignalKind::hangup()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::quit()),
+        ) else {
+            return;
+        };
+        let signo = tokio::select! {
+            _ = hup.recv() => libc::SIGHUP,
+            _ = term.recv() => libc::SIGTERM,
+            _ = quit.recv() => libc::SIGQUIT,
+        };
+        restore_terminal();
+        corex_tools::background::shutdown_all_tasks();
+        std::process::exit(128 + signo);
+    });
+
+    // Suspend signals (SIGTSTP, SIGTTIN, SIGTTOU):
+    // Clean up terminal modes so mouse escape codes don't leak into the shell,
+    // then pause via SIGSTOP. On resume (SIGCONT), restore TUI terminal state.
+    let resumed_clone = resumed_flag;
+    tokio::spawn(async move {
+        let (Ok(mut tstp), Ok(mut ttin), Ok(mut ttou)) = (
+            signal(SignalKind::from_raw(libc::SIGTSTP)),
+            signal(SignalKind::from_raw(libc::SIGTTIN)),
+            signal(SignalKind::from_raw(libc::SIGTTOU)),
+        ) else {
+            return;
+        };
+
+        loop {
+            tokio::select! {
+                _ = tstp.recv() => {}
+                _ = ttin.recv() => {}
+                _ = ttou.recv() => {}
+            }
+
+            restore_terminal();
+
+            // SAFETY: `libc::raise(SIGSTOP)` sends the stop signal strictly to the calling
+            // process/thread itself. It has no memory-safety preconditions and cleanly yields
+            // execution to the parent shell process group after terminal attributes have been restored.
+            unsafe {
+                libc::raise(libc::SIGSTOP);
+            }
+
+            // Resumed by SIGCONT from shell.
+            let _ = enable_raw_mode();
+            let mut out = stdout();
+            let _ = out.write_all(MOUSE_REPORTING_OFF.as_bytes());
+            let _ = execute!(out, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange);
+            let _ = out.write_all(MOUSE_REPORTING_ON.as_bytes());
+            let _ = out.flush();
+            resumed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }

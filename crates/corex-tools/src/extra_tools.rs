@@ -8,9 +8,6 @@ use ignore::WalkBuilder;
 
 use crate::types::{Tool, ToolContext, ToolOutput};
 
-// ==========================================
-// 1. ReadManyFilesTool
-// ==========================================
 pub struct ReadManyFilesTool;
 
 #[async_trait]
@@ -95,7 +92,10 @@ impl Tool for ReadManyFilesTool {
         }
 
         let mut walker = WalkBuilder::new(&context.workspace_dir);
-        walker.hidden(false).git_ignore(true);
+        walker.hidden(false).git_ignore(true).filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            name != ".git" && name != "node_modules" && name != "target"
+        });
         if let Some(depth) = max_depth {
             walker.max_depth(Some(depth));
         }
@@ -170,6 +170,7 @@ impl Tool for ReadManyFilesTool {
 
             match fs::read_to_string(file) {
                 Ok(content) => {
+                    crate::fs_tools::observe_file(file);
                     concatenated.push_str(&content);
                 }
                 Err(e) => {
@@ -187,9 +188,6 @@ impl Tool for ReadManyFilesTool {
     }
 }
 
-// ==========================================
-// 2. AskUserTool
-// ==========================================
 pub struct AskUserTool;
 
 #[async_trait]
@@ -249,9 +247,6 @@ impl Tool for AskUserTool {
     }
 }
 
-// ==========================================
-// 3. WriteTodosTool
-// ==========================================
 pub struct WriteTodosTool;
 
 #[async_trait]
@@ -302,9 +297,6 @@ impl Tool for WriteTodosTool {
     }
 }
 
-// ==========================================
-// 5. Skills and Internal Docs
-// ==========================================
 pub struct ActivateSkillTool;
 
 #[async_trait]
@@ -404,18 +396,18 @@ impl Tool for GetInternalDocsTool {
     async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let docs = r#"
 Corex Documentation:
-- Architecture: 100% Native Rust autonomous agent with DeepSeek Cloud & Local (llama.cpp/Ollama) inference.
-- Model Selection: Supports deepseek-flash, deepseek-v4-pro, deepseek-chat, deepseek-reasoner, and local SLM on :8080.
+- Architecture: Rust autonomous agent with DeepSeek Cloud, Anthropic Claude, and local (llama.cpp/Ollama) inference.
+- Model Selection: Supports deepseek-flash, deepseek-v4-pro, deepseek-chat, deepseek-reasoner, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5, and local OpenAI-compatible servers.
 - Operating Modes:
-  * Pure Cloud (DeepSeek Cloud API)
-  * Offline Local ($0.00 air-gapped llama-server)
+  * Cloud API (DeepSeek / Anthropic)
+  * Offline Local (llama-server / Ollama)
 - Built-in Slash Commands:
   * /chat, /resume, /save, /new : Session lifecycle management
-  * /model : Model switcher (DeepSeek-V4.1-Flash, DeepSeek-V4-Pro, Local Offline)
-  * /local : Query local LLM directly ($0.00)
+  * /model : Model switcher
+  * /local : Query local LLM directly
   * /web : Search live internet via DeepSeek
   * /yolo : Toggle auto-approval
-  * /plan : Architectural planning mode (read-only safe exploration)
+  * /plan : Architectural planning mode (read-only exploration)
   * /balance : DeepSeek account balance lookup
   * /fim : Fill-in-the-Middle code autocompletion
   * /rewind : Step back turns in the current session
@@ -430,10 +422,6 @@ Corex Documentation:
         Ok(ToolOutput::success(docs))
     }
 }
-
-// ==========================================
-// 6. Task Tracker
-// ==========================================
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Task {
@@ -633,12 +621,22 @@ impl Tool for TrackerListTasksTool {
         })
     }
 
-    async fn execute(&self, _args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let tasks = load_tasks(&context.workspace_dir);
         if tasks.is_empty() {
-            Ok(ToolOutput::success("No tasks tracked yet."))
+            return Ok(ToolOutput::success("No tasks tracked yet."));
+        }
+        let status_filter = args.get("status").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+
+        let filtered: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| status_filter.map_or(true, |s| t.status.eq_ignore_ascii_case(s)))
+            .collect();
+
+        if filtered.is_empty() {
+            Ok(ToolOutput::success("No tasks matched the given filters."))
         } else {
-            Ok(ToolOutput::success(serde_json::to_string_pretty(&tasks)?))
+            Ok(ToolOutput::success(serde_json::to_string_pretty(&filtered)?))
         }
     }
 }
@@ -843,9 +841,6 @@ impl Tool for TrackerVisualizeTool {
     }
 }
 
-// ==========================================
-// 7. Update Topic
-// ==========================================
 pub struct UpdateTopicTool;
 
 #[async_trait]

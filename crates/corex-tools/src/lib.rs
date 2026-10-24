@@ -6,13 +6,14 @@ pub mod registry;
 pub mod shell;
 pub mod types;
 pub mod web;
+pub mod web_content;
 pub mod extra_tools;
 pub mod mcp;
 pub mod subagent;
 
 pub use apply_patch::ApplyPatchTool;
 pub use background::{get_task_manager, ManageTaskTool, TaskManager};
-pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, WriteFileTool};
+pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use mcp::{
     find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,

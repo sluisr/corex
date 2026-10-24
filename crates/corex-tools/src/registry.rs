@@ -8,7 +8,7 @@ use crate::background::{
     KillBackgroundProcessTool, ListBackgroundProcessesTool, ManageTaskTool, ReadBackgroundOutputTool,
     WriteBackgroundInputTool,
 };
-use crate::fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, WriteFileTool};
+use crate::fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
 use crate::grep::GrepTool;
 use crate::shell::ShellTool;
 use crate::types::{Tool, ToolContext, ToolOutput};
@@ -69,6 +69,7 @@ impl ToolRegistry {
         // Register official primary tool definitions
         registry.register_primary(apply_patch.clone());
         registry.register_primary(read_file.clone());
+        registry.register_primary(Arc::new(ReadImageTool));
         registry.register_primary(write_file.clone());
         registry.register_primary(edit.clone());
         registry.register_primary(grep_search.clone());
@@ -98,7 +99,7 @@ impl ToolRegistry {
         registry.register_primary(delegate_subagent.clone());
         registry.register_primary(manage_subagents.clone());
 
-        // Dynamic 1:1 aliases so DeepSeek / Codex / Gemini can invoke either canonical name or alias:
+        // Tool name aliases for compatibility across model families:
         registry.tools.insert("replace".to_string(), edit.clone());
         registry.tools.insert("edit_file".to_string(), edit);
         registry.tools.insert("grep".to_string(), grep_search.clone());

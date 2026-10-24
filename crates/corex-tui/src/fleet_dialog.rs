@@ -34,6 +34,7 @@ pub struct FleetDialogState {
     pub is_open: bool,
     pub selected_idx: usize,
     pub items: Vec<FleetItem>,
+    pub search_query: String,
     pub is_refreshing: bool,
     pub status_msg: Option<String>,
     pub command_input: String,
@@ -72,6 +73,7 @@ impl FleetDialogState {
             is_open: false,
             selected_idx: 0,
             items: Vec::new(),
+            search_query: String::new(),
             is_refreshing: false,
             status_msg: None,
             command_input: String::new(),
@@ -135,6 +137,7 @@ impl FleetDialogState {
         self.is_open = true;
         self.command_input.clear();
         self.last_tab_input = None;
+        self.search_query.clear();
 
         let cfg = FleetConfig::load(Some(workspace)).unwrap_or_default();
         let all_nodes = cfg.all_nodes();
@@ -157,8 +160,14 @@ impl FleetDialogState {
                     .map(|p| !p.is_alive() || p.node_id != sess.node.id)
                     .unwrap_or(true);
                 if need_spawn {
-                    if let Ok(pty) = crate::fleet_pty::FleetPtySession::spawn(&sess.node, 24, 80) {
-                        self.pty_session = Some(pty);
+                    match crate::fleet_pty::FleetPtySession::spawn(&sess.node, 24, 80) {
+                        Ok(pty) => {
+                            self.pty_session = Some(pty);
+                        }
+                        Err(err) => {
+                            self.pty_session = None;
+                            self.status_msg = Some(format!("Interactive PTY unavailable ({}); fallback batch SSH mode active", err));
+                        }
                     }
                 }
             } else {
@@ -261,15 +270,48 @@ impl FleetDialogState {
         }
     }
 
+    pub fn filtered_items(&self) -> Vec<(usize, &FleetItem)> {
+        if self.search_query.trim().is_empty() {
+            return self.items.iter().enumerate().collect();
+        }
+        let q = self.search_query.trim().to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                it.config.id.to_lowercase().contains(&q)
+                    || it.config.host.to_lowercase().contains(&q)
+                    || it.config.user.to_lowercase().contains(&q)
+                    || it.config.tags.iter().any(|t| t.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
     pub fn select_prev(&mut self) {
-        if !self.items.is_empty() && self.selected_idx > 0 {
-            self.selected_idx -= 1;
+        let filtered = self.filtered_items();
+        if filtered.is_empty() {
+            return;
+        }
+        if let Some(pos) = filtered.iter().position(|(idx, _)| *idx == self.selected_idx) {
+            if pos > 0 {
+                self.selected_idx = filtered[pos - 1].0;
+            }
+        } else if let Some(first) = filtered.first() {
+            self.selected_idx = first.0;
         }
     }
 
     pub fn select_next(&mut self) {
-        if !self.items.is_empty() && self.selected_idx + 1 < self.items.len() {
-            self.selected_idx += 1;
+        let filtered = self.filtered_items();
+        if filtered.is_empty() {
+            return;
+        }
+        if let Some(pos) = filtered.iter().position(|(idx, _)| *idx == self.selected_idx) {
+            if pos + 1 < filtered.len() {
+                self.selected_idx = filtered[pos + 1].0;
+            }
+        } else if let Some(first) = filtered.first() {
+            self.selected_idx = first.0;
         }
     }
 
@@ -302,13 +344,9 @@ impl FleetDialogState {
     }
 }
 
-const RULE: Color = Color::Rgb(35, 45, 60);
-const SELECTED_BG: Color = Color::Rgb(26, 38, 58);
-const TEXT: Color = Color::Rgb(215, 220, 230);
-const LIVE: Color = Color::Rgb(100, 240, 160);
 
-fn rule(width: u16) -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled("─".repeat(width as usize), Style::default().fg(RULE))))
+fn rule(width: u16, theme: &Theme) -> Paragraph<'static> {
+    Paragraph::new(Line::from(Span::styled("─".repeat(width as usize), Style::default().fg(theme.rule))))
 }
 
 /// Right-hand pane of the Fleet split view:
@@ -338,7 +376,7 @@ pub fn render_fleet_dialog(
             Constraint::Length(1),                    // rule
             Constraint::Length(metrics_height(state)), // telemetry card
             Constraint::Length(1),                    // titled rule: terminal
-            Constraint::Min(4),                       // REAL LIVE PTY TERMINAL
+            Constraint::Min(4),                       // PTY terminal
             Constraint::Length(approval_height),      // approval strip
             Constraint::Length(1),                    // rule (aligns with chat composer top border)
             Constraint::Length(1),                    // footer (aligns with chat status bar)
@@ -346,7 +384,7 @@ pub fn render_fleet_dialog(
         .split(area);
 
         render_header(frame, v[0], state, theme);
-        frame.render_widget(rule(area.width), v[1]);
+        frame.render_widget(rule(area.width, theme), v[1]);
         render_metrics(frame, v[2], state, theme);
         render_section_title(frame, v[3], "terminal", theme);
 
@@ -364,7 +402,7 @@ pub fn render_fleet_dialog(
         if approval_height > 0 {
             render_approval(frame, v[5], state, theme);
         }
-        frame.render_widget(rule(area.width), v[6]);
+        frame.render_widget(rule(area.width, theme), v[6]);
         render_footer(frame, v[7], state, theme);
     } else {
         let v = Layout::vertical([
@@ -382,16 +420,16 @@ pub fn render_fleet_dialog(
         .split(area);
 
         render_header(frame, v[0], state, theme);
-        frame.render_widget(rule(area.width), v[1]);
+        frame.render_widget(rule(area.width, theme), v[1]);
         render_metrics(frame, v[2], state, theme);
-        render_section_title(frame, v[3], "output", theme);
+        render_section_title(frame, v[3], "output [batch ssh]", theme);
         render_feed(frame, v[4], state, theme);
         if approval_height > 0 {
             render_approval(frame, v[5], state, theme);
         }
-        frame.render_widget(rule(area.width), v[6]);
+        frame.render_widget(rule(area.width, theme), v[6]);
         render_prompt(frame, v[7], state, theme);
-        frame.render_widget(rule(area.width), v[8]);
+        frame.render_widget(rule(area.width, theme), v[8]);
         render_footer(frame, v[9], state, theme);
     }
 }
@@ -403,7 +441,7 @@ fn render_server_selector(
     theme: &Theme,
 ) {
     let dim = Style::default().fg(theme.dark_gray);
-    let val = Style::default().fg(TEXT);
+    let val = Style::default().fg(theme.text_strong);
     let focused = state.command_mode;
 
     let v = Layout::vertical([
@@ -418,15 +456,23 @@ fn render_server_selector(
     ])
     .split(area);
 
-    // 1. Header
-    let title_line = Line::from(vec![
-        Span::styled(" SSH SERVERS ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("({} available)", state.items.len()), dim),
-    ]);
+    let filtered = state.filtered_items();
+    let title_line = if state.search_query.is_empty() {
+        Line::from(vec![
+            Span::styled(" SSH SERVERS ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("({} available)", state.items.len()), dim),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" SSH SERVERS ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("({}/{} available) · Filter: ", filtered.len(), state.items.len()), dim),
+            Span::styled(&state.search_query, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_yellow)),
+        ])
+    };
     frame.render_widget(Paragraph::new(title_line), v[0]);
-    frame.render_widget(rule(area.width), v[1]);
+    frame.render_widget(rule(area.width, theme), v[1]);
 
-    // 2. Clean single-line server list
     let mut list_lines: Vec<Line> = Vec::new();
     if state.items.is_empty() {
         list_lines.push(Line::from(""));
@@ -436,26 +482,37 @@ fn render_server_selector(
         list_lines.push(Line::from(vec![
             Span::styled("  Add hosts to ~/.ssh/config or create .corex/fleet.toml", dim),
         ]));
+    } else if filtered.is_empty() {
+        list_lines.push(Line::from(""));
+        list_lines.push(Line::from(vec![
+            Span::styled(format!("  No servers matching '{}'.", state.search_query), Style::default().fg(theme.accent_yellow)),
+        ]));
+        list_lines.push(Line::from(vec![
+            Span::styled("  Press Esc or Backspace to clear filter.", dim),
+        ]));
     } else {
         list_lines.push(Line::from("")); // subtle top padding
-        for (i, item) in state.items.iter().enumerate() {
-            let is_selected = i == state.selected_idx;
-            let bg = if is_selected { SELECTED_BG } else { Color::Reset };
+        for &(orig_idx, item) in &filtered {
+            let is_selected = orig_idx == state.selected_idx;
+            let bg = if is_selected { theme.selected_bg } else { Color::Reset };
             let prefix = if is_selected { " > " } else { "   " };
-            let num_badge = format!("[{}] ", i + 1);
+            let num_badge = if orig_idx < 9 && state.search_query.is_empty() {
+                format!("[{}] ", orig_idx + 1)
+            } else {
+                format!("[{:>2}] ", orig_idx + 1)
+            };
 
             let line = vec![
                 Span::styled(prefix, Style::default().fg(if is_selected { theme.accent_cyan } else { Color::Reset }).bg(bg).add_modifier(Modifier::BOLD)),
                 Span::styled(num_badge, Style::default().fg(if is_selected { theme.accent_yellow } else { theme.dark_gray }).bg(bg)),
-                Span::styled(format!("{:<18}", item.config.id), Style::default().fg(if is_selected { Color::White } else { theme.gray }).bg(bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
-                Span::styled(format!("{}@{}", item.config.user, item.config.host), Style::default().fg(if is_selected { Color::Rgb(180, 200, 230) } else { theme.dark_gray }).bg(bg)),
+                Span::styled(format!("{:<18}", item.config.id), Style::default().fg(if is_selected { theme.text_on_selected } else { theme.gray }).bg(bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+                Span::styled(format!("{}@{}", item.config.user, item.config.host), Style::default().fg(if is_selected { theme.text_strong } else { theme.dark_gray }).bg(bg)),
             ];
             list_lines.push(Line::from(line));
         }
     }
     frame.render_widget(Paragraph::new(list_lines), v[2]);
 
-    // 3. Status message (e.g. if Enter failed to connect)
     if let Some(ref msg) = state.status_msg {
         let msg_style = if msg.contains("failed") || msg.contains("Error") {
             Style::default().fg(theme.accent_red).add_modifier(Modifier::BOLD)
@@ -467,9 +524,8 @@ fn render_server_selector(
         frame.render_widget(Paragraph::new(Line::from("")), v[3]);
     }
 
-    frame.render_widget(rule(area.width), v[4]);
+    frame.render_widget(rule(area.width, theme), v[4]);
 
-    // 4. Action bar (aligns with chat input prompt)
     let sel_name = state.selected_node().map(|n| n.id.as_str()).unwrap_or("server");
     let action_line = Line::from(vec![
         Span::raw(" "),
@@ -477,17 +533,22 @@ fn render_server_selector(
         Span::styled(format!(" Connect to {}", sel_name), val),
     ]);
     frame.render_widget(Paragraph::new(action_line), v[5]);
-    frame.render_widget(rule(area.width), v[6]);
+    frame.render_widget(rule(area.width, theme), v[6]);
 
-    // 5. Footer navigation
-    let footer_line = Line::from(vec![
+    let mut footer_spans = vec![
         Span::raw(" "),
-        Span::styled("↑↓ / 1-9", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(" Select  ·  ", dim),
-        Span::styled("Tab", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(if focused { " Switch to Chat" } else { " Switch to Servers" }, dim),
-    ]);
-    frame.render_widget(Paragraph::new(footer_line), v[7]);
+        Span::styled("↑↓ / Tab / 1-9", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+        Span::styled(" Select VPS  ·  ", dim),
+        Span::styled("Enter", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+        Span::styled(" Connect  ·  ", dim),
+        Span::styled("Esc", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+        Span::styled(if focused { " Chat" } else { " Close" }, dim),
+    ];
+    if !state.search_query.is_empty() {
+        footer_spans.push(Span::styled("  ·  Esc", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)));
+        footer_spans.push(Span::styled(" Clear Filter", dim));
+    }
+    frame.render_widget(Paragraph::new(Line::from(footer_spans)), v[7]);
 }
 
 /// Minimum terminal width at which Fleet switches to the 3-column layout.
@@ -531,7 +592,7 @@ pub fn render_fleet_output(frame: &mut Frame, area: Rect, state: &FleetDialogSta
         if approval_height > 0 {
             render_approval(frame, v[2], state, theme);
         }
-        frame.render_widget(rule(area.width), v[3]);
+        frame.render_widget(rule(area.width, theme), v[3]);
         render_footer(frame, v[4], state, theme);
     } else {
         let v = Layout::vertical([
@@ -545,15 +606,15 @@ pub fn render_fleet_output(frame: &mut Frame, area: Rect, state: &FleetDialogSta
         .split(area);
 
         let title = match state.active_session.as_ref().filter(|s| s.is_connected) {
-            Some(s) => format!("output · {}@{} · {}", s.node.user, s.node.host, s.current_dir),
-            None => "output".to_string(),
+            Some(s) => format!("output [batch ssh] · {}@{} · {}", s.node.user, s.node.host, s.current_dir),
+            None => "output [batch ssh]".to_string(),
         };
         render_section_title(frame, v[0], &title, theme);
         render_feed(frame, v[1], state, theme);
         if approval_height > 0 {
             render_approval(frame, v[2], state, theme);
         }
-        frame.render_widget(rule(area.width), v[3]);
+        frame.render_widget(rule(area.width, theme), v[3]);
         render_prompt(frame, v[4], state, theme);
         render_footer(frame, v[5], state, theme);
     }
@@ -577,7 +638,7 @@ pub fn render_fleet_column(frame: &mut Frame, area: Rect, state: &FleetDialogSta
     }
     const CARD_H: u16 = 5; // 4 content lines + 1 spacer
     let dim = Style::default().fg(theme.dark_gray);
-    let val = Style::default().fg(TEXT);
+    let val = Style::default().fg(theme.text_strong);
 
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     let online = state
@@ -614,7 +675,7 @@ pub fn render_fleet_column(frame: &mut Frame, area: Rect, state: &FleetDialogSta
         }
         let card = Rect { x: body.x, y, width: body.width, height: 4 };
         let selected = i == state.selected_idx;
-        let bg = if selected { SELECTED_BG } else { Color::Reset };
+        let bg = if selected { theme.selected_bg } else { Color::Reset };
         let live = state
             .active_session
             .as_ref()
@@ -622,7 +683,7 @@ pub fn render_fleet_column(frame: &mut Frame, area: Rect, state: &FleetDialogSta
             .unwrap_or(false);
         let tel = item.telemetry.as_ref();
         let (dot, dot_col) = if live {
-            ("●", LIVE)
+            ("●", theme.success)
         } else {
             match tel {
                 Some(t) if t.is_online => ("●", theme.accent_green),
@@ -631,7 +692,7 @@ pub fn render_fleet_column(frame: &mut Frame, area: Rect, state: &FleetDialogSta
             }
         };
         let name_style = Style::default()
-            .fg(if selected { Color::White } else { theme.gray })
+            .fg(if selected { theme.text_on_selected } else { theme.gray })
             .bg(bg)
             .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() });
 
@@ -719,45 +780,56 @@ fn render_section_title(frame: &mut Frame, area: Rect, title: &str, theme: &Them
     let label_w = unicode_width::UnicodeWidthStr::width(label.as_str());
     let fill = (area.width as usize).saturating_sub(label_w + 1);
     let line = Line::from(vec![
-        Span::styled("─", Style::default().fg(RULE)),
+        Span::styled("─", Style::default().fg(theme.rule)),
         Span::styled(label, Style::default().fg(theme.dark_gray)),
-        Span::styled("─".repeat(fill), Style::default().fg(RULE)),
+        Span::styled("─".repeat(fill), Style::default().fg(theme.rule)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme: &Theme) {
-    let mut spans = vec![Span::styled(" vps ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))];
+    let mut spans = vec![Span::styled(" vps ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD))];
+
+    if state.items.is_empty() {
+        spans.push(Span::styled("no servers · configure .corex/fleet.toml or ~/.ssh/config", Style::default().fg(theme.dark_gray)));
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
+    let active_node_id = state.active_session.as_ref().filter(|s| s.is_connected).map(|s| s.node.id.as_str());
+
+    for (i, item) in state.items.iter().enumerate() {
+        let is_selected = i == state.selected_idx;
+        let is_active = active_node_id == Some(&item.config.id);
+        let bg = if is_selected { theme.selected_bg } else { Color::Reset };
+        let num_fg = if is_selected { theme.accent_cyan } else { theme.dark_gray };
+        let name_fg = if is_selected { theme.text_on_selected } else { theme.gray };
+        let mut name_style = Style::default().fg(name_fg).bg(bg);
+        if is_selected {
+            name_style = name_style.add_modifier(Modifier::BOLD);
+        }
+
+        spans.push(Span::styled(format!(" [{}] ", i + 1), Style::default().fg(num_fg).bg(bg)));
+        spans.push(Span::styled(item.config.id.clone(), name_style));
+
+        if is_active {
+            spans.push(Span::styled(" ● ", Style::default().fg(theme.success).bg(bg)));
+        } else if item.telemetry.is_some() {
+            spans.push(Span::styled(" ○ ", Style::default().fg(theme.accent_cyan).bg(bg)));
+        } else {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.dark_gray).bg(bg)));
+        }
+    }
 
     if let Some(s) = state.active_session.as_ref().filter(|s| s.is_connected) {
-        let node_idx = state.items.iter().position(|it| it.config.id == s.node.id).map(|i| i + 1).unwrap_or(1);
-        spans.push(Span::styled(format!(" [{}] ", node_idx), Style::default().fg(theme.dark_gray).bg(SELECTED_BG)));
-        spans.push(Span::styled(s.node.id.clone(), Style::default().fg(Color::White).bg(SELECTED_BG).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(" ● ", Style::default().fg(LIVE).bg(SELECTED_BG)));
-
-        // Right side: cwd + latency of the live session.
         let ping_str = s.last_ping_ms.map(|ms| format!(" · {}ms", ms)).unwrap_or_default();
         let right = format!("{}@{} · {}{} ", s.node.user, s.node.host, s.current_dir, ping_str);
         let used: usize = spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum();
         let right_w = unicode_width::UnicodeWidthStr::width(right.as_str());
-        let pad = (area.width as usize).saturating_sub(used + right_w);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(right, Style::default().fg(theme.gray)));
-    } else {
-        if state.items.is_empty() {
-            spans.push(Span::styled("no servers · configure .corex/fleet.toml or ~/.ssh/config", Style::default().fg(theme.dark_gray)));
-        }
-        for (i, item) in state.items.iter().enumerate() {
-            let selected = i == state.selected_idx;
-            let bg = if selected { SELECTED_BG } else { Color::Reset };
-            let name_fg = if selected { Color::White } else { theme.gray };
-            let mut name_style = Style::default().fg(name_fg).bg(bg);
-            if selected {
-                name_style = name_style.add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled(format!(" {} ", i + 1), Style::default().fg(theme.dark_gray).bg(bg)));
-            spans.push(Span::styled(item.config.id.clone(), name_style));
-            spans.push(Span::styled(" ○ ", Style::default().fg(theme.dark_gray).bg(bg)));
+        if (area.width as usize) > used + right_w + 2 {
+            let pad = (area.width as usize) - (used + right_w);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(right, Style::default().fg(theme.gray)));
         }
     }
 
@@ -791,7 +863,7 @@ fn metrics_height(state: &FleetDialogState) -> u16 {
 
 fn render_metrics(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme: &Theme) {
     let dim = Style::default().fg(theme.dark_gray);
-    let val = Style::default().fg(TEXT);
+    let val = Style::default().fg(theme.text_strong);
     let mut lines: Vec<Line> = Vec::new();
 
     match telemetry_for(state) {
@@ -800,7 +872,7 @@ fn render_metrics(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme
             let mut l1 = vec![Span::raw(" ")];
             if let Some(ref h) = t.hostname {
                 let short_h = h.split('.').next().unwrap_or(h);
-                l1.push(Span::styled(short_h.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                l1.push(Span::styled(short_h.to_string(), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)));
             }
             if let Some(ref os) = t.os_name {
                 let os_short = if os.starts_with("Linux") { "Linux" } else { os.split_whitespace().next().unwrap_or(os) };
@@ -958,7 +1030,7 @@ fn render_feed(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme: &
                     } else if cleaned.starts_with("  ›") {
                         Style::default().fg(theme.accent_yellow).add_modifier(Modifier::ITALIC)
                     } else {
-                        Style::default().fg(TEXT)
+                        Style::default().fg(theme.text_strong)
                     };
                     lines.push(Line::from(Span::styled(cleaned, style)));
                 }
@@ -1003,8 +1075,8 @@ fn render_approval(frame: &mut Frame, area: Rect, state: &FleetDialogState, them
     if p.edit_mode {
         lines.push(Line::from(vec![
             Span::styled(" $ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(p.edited_command.clone(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(theme.accent_yellow)),
+            Span::styled(p.edited_command.clone(), Style::default().fg(theme.foreground)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_yellow)),
         ]));
         let mut l = key("Enter", "run edited", theme.accent_green);
         l.extend(key("Esc", "cancel", theme.gray));
@@ -1012,8 +1084,8 @@ fn render_approval(frame: &mut Frame, area: Rect, state: &FleetDialogState, them
     } else if p.instructions_mode {
         lines.push(Line::from(vec![
             Span::styled(" instruct › ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(p.instructions_text.clone(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(theme.accent_cyan)),
+            Span::styled(p.instructions_text.clone(), Style::default().fg(theme.foreground)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_cyan)),
         ]));
         let mut l = key("Enter", "send", theme.accent_green);
         l.extend(key("Esc", "cancel", theme.gray));
@@ -1021,7 +1093,7 @@ fn render_approval(frame: &mut Frame, area: Rect, state: &FleetDialogState, them
     } else {
         lines.push(Line::from(vec![
             Span::styled(" $ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(p.command.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(p.command.clone(), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
         ]));
         let mut l = key("y", "allow", theme.accent_green);
         l.extend(key("e", "edit", theme.accent_yellow));
@@ -1040,10 +1112,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme:
     let focused = state.command_mode;
     let mut spans = vec![
         Span::styled(format!(" {} $ ", prefix), Style::default().fg(if focused { theme.accent_cyan } else { theme.dark_gray }).add_modifier(Modifier::BOLD)),
-        Span::styled(state.command_input.clone(), Style::default().fg(Color::White)),
+        Span::styled(state.command_input.clone(), Style::default().fg(theme.foreground)),
     ];
     if focused {
-        spans.push(Span::styled("█", Style::default().fg(theme.accent_yellow)));
+        spans.push(Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_yellow)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1068,17 +1140,17 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme:
             spans.push(Span::styled("Shift+Tab", key_style));
             spans.push(Span::styled(" Chat  ·  ", dim));
 
-            spans.push(Span::styled("Tab", key_style));
-            spans.push(Span::styled(" Native AutoComplete  ·  ", dim));
+            spans.push(Span::styled("Alt+1..9/n", key_style));
+            spans.push(Span::styled(" Switch VPS  ·  ", dim));
 
-            spans.push(Span::styled("Ctrl+C", key_style));
-            spans.push(Span::styled(" Interrupt  ·  ", dim));
+            spans.push(Span::styled("Tab", key_style));
+            spans.push(Span::styled(" AutoComplete  ·  ", dim));
 
             spans.push(Span::styled("exit", key_style));
             spans.push(Span::styled(" Disconnect", dim));
         } else {
-            spans.push(Span::styled("Shift+Tab", key_style));
-            spans.push(Span::styled(" Terminal  ·  ", dim));
+            spans.push(Span::styled("Shift+Tab / Tab", key_style));
+            spans.push(Span::styled(" VPS Terminal  ·  ", dim));
 
             spans.push(Span::styled("Esc", key_style));
             spans.push(Span::styled(" Close", dim));
@@ -1145,6 +1217,48 @@ mod tests {
 
         state.select_prev();
         assert_eq!(state.selected_idx, 0);
+    }
+
+    #[test]
+    fn test_fleet_dialog_search_filter() {
+        let mut state = FleetDialogState::new();
+        let mut n1 = dummy_node("web-alpha");
+        n1.tags = vec!["frontend".to_string()];
+        let mut n2 = dummy_node("db-primary");
+        n2.tags = vec!["database".to_string()];
+        let mut n3 = dummy_node("web-beta");
+        n3.tags = vec!["frontend".to_string()];
+
+        state.items = vec![
+            FleetItem { config: n1, telemetry: None },
+            FleetItem { config: n2, telemetry: None },
+            FleetItem { config: n3, telemetry: None },
+        ];
+
+        // All items match when search_query is empty
+        assert_eq!(state.filtered_items().len(), 3);
+
+        // Filter by id substring
+        state.search_query = "web".to_string();
+        let filtered = state.filtered_items();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].0, 0);
+        assert_eq!(filtered[1].0, 2);
+
+        // Navigation respects filtered items
+        state.selected_idx = 0;
+        state.select_next();
+        assert_eq!(state.selected_idx, 2);
+        state.select_next();
+        assert_eq!(state.selected_idx, 2); // Clamps at end of filtered list
+        state.select_prev();
+        assert_eq!(state.selected_idx, 0);
+
+        // Filter by tag
+        state.search_query = "database".to_string();
+        let db_filtered = state.filtered_items();
+        assert_eq!(db_filtered.len(), 1);
+        assert_eq!(db_filtered[0].0, 1);
     }
 
     #[test]

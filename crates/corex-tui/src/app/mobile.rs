@@ -25,9 +25,26 @@ pub fn is_mobile_portrait(width: u16, height: u16) -> bool {
     false
 }
 
+/// Returns true if running in a touch or mobile environment (Android, Termux, or mobile portrait).
+pub fn is_mobile_touch_environment(width: u16, height: u16) -> bool {
+    is_android_or_termux() || is_mobile_portrait(width, height)
+}
+
 /// Attempts to trigger Termux soft keyboard via termux-api if installed.
+/// Rate-limited to at most once per 1000ms to prevent thread storms during rapid taps.
 pub fn try_show_termux_soft_keyboard() {
     if is_android_or_termux() {
+        static LAST_TRIGGER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_TRIGGER_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 1000 {
+            return;
+        }
+        LAST_TRIGGER_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
         std::thread::spawn(|| {
             if let Ok(mut child) = std::process::Command::new("termux-keyboard")
                 .arg("-s")
@@ -44,10 +61,8 @@ pub fn try_show_termux_soft_keyboard() {
 
 /// Whether the TUI should request mouse reporting from the terminal.
 ///
-/// On mobile vertical screens (especially Termux on Android), mouse reporting is DISABLED by default.
-/// In Termux, enabling mouse reporting intercepts touches as mouse clicks instead of letting Android
-/// open the virtual soft keyboard. Disabling mouse reporting lets Termux natively pop up the keyboard
-/// upon tapping anywhere on the screen!
+/// On mobile vertical viewports (e.g., Termux on Android), mouse reporting is disabled by default
+/// so touch events trigger the native soft keyboard rather than being intercepted as mouse clicks.
 ///
 /// Set `COREX_MOUSE=1` to force mouse reporting on mobile, or `COREX_MOUSE=0` to force it off everywhere.
 pub(crate) fn mouse_capture_enabled() -> bool {

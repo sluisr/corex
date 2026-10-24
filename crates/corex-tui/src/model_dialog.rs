@@ -7,28 +7,25 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::overlay::begin_modal;
+use crate::overlay::{begin_modal, set_junction};
+use crate::text::{fit_text, pad_right};
 use crate::theme::Theme;
 
 pub const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0];
-pub const REASONING_LEVELS: &[&str] = &["dynamic", "low", "medium", "high"];
-pub const COMMAND_REASONING_LEVELS: &[&str] = &["low", "medium", "high"];
-pub const CODE_REASONING_LEVELS: &[&str] = &["high", "max", "medium", "low"];
-pub const SEARCH_REASONING_LEVELS: &[&str] = &["low", "medium", "high", "max"];
-pub const PRO_REASONING_LEVELS: &[&str] = &["max", "high", "medium", "low"];
+/// DeepSeek rejects `medium` (the client turns it into `high`), so it is not offered.
+pub const REASONING_LEVELS: &[&str] = &["dynamic", "low", "high", "max"];
+pub const PRO_REASONING_LEVELS: &[&str] = &["max", "high", "low"];
 
-const SELECTED_BG: Color = Color::Rgb(26, 38, 58);
-const RULE: Color = Color::Rgb(35, 45, 60);
 
 pub fn get_temp_info(temp: f32) -> (&'static str, &'static str, Color) {
     if temp <= 0.25 {
-        ("Precise", "Exact reproducibility & code generation", Color::Rgb(79, 195, 247))
+        ("Precise", "Exact, reproducible code", Color::Rgb(79, 195, 247))
     } else if temp <= 0.65 {
-        ("Balanced", "Code synthesis with balanced heuristics", Color::Rgb(105, 240, 174))
+        ("Balanced", "Balanced code synthesis", Color::Rgb(105, 240, 174))
     } else if temp <= 1.05 {
-        ("Default", "Standard conversational coding & discovery", Color::Rgb(255, 213, 79))
+        ("Default", "Everyday coding & discovery", Color::Rgb(255, 213, 79))
     } else {
-        ("Creative", "High variance & exploratory brainstorming", Color::Rgb(255, 152, 0))
+        ("Creative", "Exploratory brainstorming", Color::Rgb(255, 152, 0))
     }
 }
 
@@ -42,6 +39,11 @@ pub fn get_reasoning_color(r: &str) -> Color {
         _ => Color::Rgb(135, 175, 255),
     }
 }
+
+/// Widest the dialog grows on a big terminal: the extra room goes to the setting descriptions.
+const MAX_DIALOG_WIDTH: u16 = 116;
+/// Width of the providers column, sized for the longest built-in names ("GitHub Models (Free)").
+const PROVIDERS_COL_WIDTH: u16 = 34;
 
 /// Which of the three panes has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +76,6 @@ impl Pane {
 pub enum SettingRow {
     Temperature,
     Reasoning,
-    CommandCot,
-    CodeCot,
-    SearchCot,
     Persist,
 }
 
@@ -112,13 +111,9 @@ pub struct ModelDialogState {
     // Flash family
     pub temperature: f32,
     pub flash_reasoning: String,
-    pub flash_command_reasoning: String,
-    pub flash_code_reasoning: String,
-    pub flash_search_reasoning: String,
 
     // Pro family
     pub pro_reasoning: String,
-    pub pro_search_reasoning: String,
 
     // Generic family (OpenAI-compatible providers, local)
     pub generic_temperature: f32,
@@ -194,12 +189,8 @@ impl ModelDialogState {
 
             temperature: 1.0,
             flash_reasoning: "dynamic".to_string(),
-            flash_command_reasoning: "low".to_string(),
-            flash_code_reasoning: "high".to_string(),
-            flash_search_reasoning: "low".to_string(),
 
             pro_reasoning: "max".to_string(),
-            pro_search_reasoning: "low".to_string(),
 
             generic_temperature: 1.0,
             generic_reasoning: String::new(),
@@ -253,12 +244,8 @@ impl ModelDialogState {
 
         self.temperature = cfg.flash_settings.temperature;
         self.flash_reasoning = cfg.flash_settings.reasoning_effort.clone();
-        self.flash_command_reasoning = cfg.flash_settings.command_reasoning_effort.clone();
-        self.flash_code_reasoning = cfg.flash_settings.code_reasoning_effort.clone();
-        self.flash_search_reasoning = cfg.flash_settings.search_reasoning_effort.clone();
 
         self.pro_reasoning = cfg.pro_settings.reasoning_effort.clone();
-        self.pro_search_reasoning = cfg.pro_settings.search_reasoning_effort.clone();
 
         self.generic_temperature = cfg.temperature;
         self.generic_reasoning = if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled {
@@ -287,12 +274,9 @@ impl ModelDialogState {
             ModelFamily::Flash => vec![
                 SettingRow::Temperature,
                 SettingRow::Reasoning,
-                SettingRow::CommandCot,
-                SettingRow::CodeCot,
-                SettingRow::SearchCot,
                 SettingRow::Persist,
             ],
-            ModelFamily::Pro => vec![SettingRow::Reasoning, SettingRow::SearchCot, SettingRow::Persist],
+            ModelFamily::Pro => vec![SettingRow::Reasoning, SettingRow::Persist],
             ModelFamily::Generic => {
                 let mut rows = vec![SettingRow::Temperature];
                 if !m.reasoning.is_empty() {
@@ -343,23 +327,6 @@ impl ModelDialogState {
                     self.generic_reasoning = cycle_str(&levels, &self.generic_reasoning, forward);
                 }
             },
-            SettingRow::CommandCot => {
-                self.flash_command_reasoning =
-                    cycle_static(COMMAND_REASONING_LEVELS, &self.flash_command_reasoning, forward)
-            }
-            SettingRow::CodeCot => {
-                self.flash_code_reasoning =
-                    cycle_static(CODE_REASONING_LEVELS, &self.flash_code_reasoning, forward)
-            }
-            SettingRow::SearchCot => {
-                if family == ModelFamily::Pro {
-                    self.pro_search_reasoning =
-                        cycle_static(SEARCH_REASONING_LEVELS, &self.pro_search_reasoning, forward)
-                } else {
-                    self.flash_search_reasoning =
-                        cycle_static(SEARCH_REASONING_LEVELS, &self.flash_search_reasoning, forward)
-                }
-            }
             SettingRow::Persist => self.persist = !self.persist,
         }
     }
@@ -368,16 +335,12 @@ impl ModelDialogState {
         FlashSettings {
             temperature: self.temperature,
             reasoning_effort: self.flash_reasoning.clone(),
-            command_reasoning_effort: self.flash_command_reasoning.clone(),
-            code_reasoning_effort: self.flash_code_reasoning.clone(),
-            search_reasoning_effort: self.flash_search_reasoning.clone(),
         }
     }
 
     pub fn to_pro_settings(&self) -> ProSettings {
         ProSettings {
             reasoning_effort: self.pro_reasoning.clone(),
-            search_reasoning_effort: self.pro_search_reasoning.clone(),
         }
     }
 
@@ -477,23 +440,14 @@ impl ModelDialogState {
     }
 }
 
-fn key_badge(key: &'static str, desc: &'static str, color: Color, gray: Color) -> Vec<Span<'static>> {
+fn key_badge(key: &'static str, desc: &'static str, color: Color, theme: &Theme) -> Vec<Span<'static>> {
     vec![
-        Span::styled("[", Style::default().fg(Color::Rgb(70, 85, 110))),
+        Span::styled("[", Style::default().fg(theme.border_dim)),
         Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled("] ", Style::default().fg(Color::Rgb(70, 85, 110))),
-        Span::styled(desc, Style::default().fg(gray)),
+        Span::styled("] ", Style::default().fg(theme.border_dim)),
+        Span::styled(desc, Style::default().fg(theme.gray)),
         Span::raw("  "),
     ]
-}
-
-fn pad_right(s: &str, w: usize) -> String {
-    let n = s.chars().count();
-    if n >= w {
-        s.chars().take(w).collect()
-    } else {
-        format!("{}{}", s, " ".repeat(w - n))
-    }
 }
 
 fn pane_title(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
@@ -515,7 +469,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     let dialog_width = if is_mobile {
         area.width.saturating_sub(2).max(20)
     } else {
-        100.min(area.width.saturating_sub(4)).max(60.min(area.width))
+        MAX_DIALOG_WIDTH.min(area.width.saturating_sub(4)).max(60.min(area.width))
     };
     let dialog_height = if is_mobile {
         area.height.saturating_sub(2).min(28)
@@ -539,6 +493,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     let vertical = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
     let (body, footer_area) = (vertical[0], vertical[1]);
 
+    let mut divider_x = None;
     if is_mobile {
         let vert_body = Layout::vertical([
             Constraint::Length(6),
@@ -548,12 +503,12 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         .split(body);
 
         render_providers_pane(frame, vert_body[0], state, theme);
-        let sep = vec![Line::from(Span::styled("─".repeat(vert_body[1].width as usize), Style::default().fg(RULE)))];
+        let sep = vec![Line::from(Span::styled("─".repeat(vert_body[1].width as usize), Style::default().fg(theme.rule)))];
         frame.render_widget(Paragraph::new(sep), vert_body[1]);
         render_detail_pane(frame, vert_body[2], state, theme);
     } else {
         let horizontal = Layout::horizontal([
-            Constraint::Length(26),
+            Constraint::Length(PROVIDERS_COL_WIDTH),
             Constraint::Length(1),
             Constraint::Min(20),
         ])
@@ -561,36 +516,49 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
 
         render_providers_pane(frame, horizontal[0], state, theme);
         let sep: Vec<Line> = (0..horizontal[1].height)
-            .map(|_| Line::from(Span::styled("│", Style::default().fg(RULE))))
+            .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.rule))))
             .collect();
         frame.render_widget(Paragraph::new(sep), horizontal[1]);
         render_detail_pane(frame, horizontal[2], state, theme);
+        divider_x = Some(horizontal[1].x);
     }
 
     let mut footer = vec![Span::raw(" ")];
     if is_mobile {
         match state.pane {
-            Pane::Providers => footer.extend(key_badge("Tab/→", "Models", theme.accent_cyan, theme.gray)),
-            Pane::Models => footer.extend(key_badge("Enter", "Use", theme.accent_green, theme.gray)),
-            Pane::Settings => footer.extend(key_badge("◄/►", "Adj", theme.accent_green, theme.gray)),
+            Pane::Providers => footer.extend(key_badge("Tab/→", "Models", theme.accent_cyan, theme)),
+            Pane::Models => footer.extend(key_badge("Enter", "Use", theme.accent_green, theme)),
+            Pane::Settings => footer.extend(key_badge("◄/►", "Adj", theme.accent_green, theme)),
         }
-        footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
+        footer.extend(key_badge("Esc", "Close", theme.gray, theme));
     } else {
-        footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme.gray));
-        footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme.gray));
+        footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme));
+        footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme));
         match state.pane {
-            Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme.gray)),
-            Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme.gray)),
-            Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme.gray)),
+            Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme)),
+            Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme)),
+            Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme)),
         }
-        footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme.gray));
-        footer.extend(key_badge("Esc", "Close", theme.gray, theme.gray));
+        footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme));
+        footer.extend(key_badge("Esc", "Close", theme.gray, theme));
     }
     let footer_lines = vec![
-        Line::from(Span::styled("─".repeat(footer_area.width as usize), Style::default().fg(RULE))),
+        Line::from(Span::styled("─".repeat(footer_area.width as usize), Style::default().fg(theme.rule))),
         Line::from(footer),
     ];
     frame.render_widget(Paragraph::new(footer_lines), footer_area);
+
+    // Join the rules to the frame so the lines read as one drawing. This runs last: the footer
+    // rule and the panes would otherwise paint over the junctions.
+    let (left_x, right_x) = (dialog_area.x, dialog_area.right().saturating_sub(1));
+    set_junction(frame, left_x, footer_area.y, '├', theme.accent_blue);
+    set_junction(frame, right_x, footer_area.y, '┤', theme.accent_blue);
+    if let Some(x) = divider_x {
+        set_junction(frame, x, dialog_area.y, '┬', theme.accent_blue);
+        set_junction(frame, x, footer_area.y, '┴', theme.rule);
+        set_junction(frame, x, body.y + 1, '├', theme.rule);
+        set_junction(frame, right_x, body.y + 1, '┤', theme.accent_blue);
+    }
 }
 
 fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
@@ -608,12 +576,13 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
         } else if ready {
             ("○", theme.gray)
         } else {
-            ("◌", theme.accent_yellow)
+            ("!", theme.accent_yellow)
         };
-        let bg = if selected && focused { SELECTED_BG } else { Color::Reset };
-        let name_fg = if selected { Color::White } else { theme.foreground };
+        let bg = if selected && focused { theme.selected_bg } else { Color::Reset };
+        let name_fg = if selected && focused { theme.text_on_selected } else { theme.foreground };
         let count = format!("{}", p.models.len());
-        let name_w = w.saturating_sub(5 + count.chars().count() + 1);
+        // Marker (3) + dot (2) + a gap before the count + the count + a trailing pad.
+        let name_w = w.saturating_sub(5 + 1 + count.chars().count() + 1);
 
         let mut name_style = Style::default().fg(name_fg).bg(bg);
         if selected {
@@ -626,6 +595,7 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
             ),
             Span::styled(format!("{} ", dot), Style::default().fg(dot_col).bg(bg)),
             Span::styled(pad_right(p.display_name(), name_w), name_style),
+            Span::styled(" ", Style::default().bg(bg)),
             Span::styled(count, Style::default().fg(theme.dark_gray).bg(bg)),
             Span::styled(" ", Style::default().bg(bg)),
         ]));
@@ -639,7 +609,7 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
         Span::styled("ready", Style::default().fg(theme.dark_gray)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled(" ◌ ", Style::default().fg(theme.accent_yellow)),
+        Span::styled(" ! ", Style::default().fg(theme.accent_yellow)),
         Span::styled("needs API key", Style::default().fg(theme.dark_gray)),
     ]));
 
@@ -659,21 +629,21 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     } else if ready {
         ("○ ready", theme.gray)
     } else {
-        ("◌ needs API key", theme.accent_yellow)
+        ("! needs API key", theme.accent_yellow)
     };
     let endpoint = if provider.base_url.is_empty() { String::new() } else { provider.base_url.clone() };
     lines.push(Line::from(vec![
         Span::styled(
             format!(" {}", provider.display_name()),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(status, Style::default().fg(status_col).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", endpoint), Style::default().fg(theme.dark_gray)),
     ]));
     lines.push(Line::from(Span::styled(
-        "─".repeat(w.saturating_sub(1)),
-        Style::default().fg(RULE),
+        "─".repeat(w),
+        Style::default().fg(theme.rule),
     )));
 
     // Models
@@ -682,7 +652,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     for (i, m) in provider.models.iter().enumerate() {
         let selected = i == state.model_idx;
         let is_active = is_active_provider && i == state.active_model;
-        let bg = if selected && models_focused { SELECTED_BG } else { Color::Reset };
+        let bg = if selected && models_focused { theme.selected_bg } else { Color::Reset };
 
         let radio = if is_active { "(●) " } else { "( ) " };
         let radio_col = if is_active { theme.accent_green } else { theme.dark_gray };
@@ -690,7 +660,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
         let name_w = 26usize;
         let tags_w = w.saturating_sub(3 + 4 + name_w + 1);
 
-        let mut name_style = Style::default().fg(if selected { Color::White } else { theme.foreground }).bg(bg);
+        let mut name_style = Style::default().fg(if selected { theme.text_on_selected } else { theme.foreground }).bg(bg);
         if selected {
             name_style = name_style.add_modifier(Modifier::BOLD);
         }
@@ -703,7 +673,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
             Span::styled(pad_right(m.display_name(), name_w), name_style),
             Span::styled(" ", Style::default().bg(bg)),
             Span::styled(
-                pad_right(&corex_core::truncate_ellipsis(&tags, tags_w), tags_w),
+                pad_right(&tags, tags_w),
                 Style::default().fg(theme.dark_gray).bg(bg),
             ),
         ]));
@@ -734,15 +704,17 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     let family = state.selected_model().map(|m| m.family).unwrap_or_default();
     for (i, row) in state.settings_rows().iter().enumerate() {
         let selected = i == state.row_idx;
-        let bg = if selected && settings_focused { SELECTED_BG } else { Color::Reset };
+        let bg = if selected && settings_focused { theme.selected_bg } else { Color::Reset };
         let (label, value, val_col, desc) = setting_display(*row, family, state);
 
         let arrow_col = if selected && settings_focused { theme.accent_cyan } else { theme.dark_gray };
         let label_style = if selected {
-            Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text_on_selected).bg(bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.gray)
         };
+        // Every row but the on/off one is a value picker, so only those advertise ◄ ►.
+        let (left_arrow, right_arrow) = if *row == SettingRow::Persist { ("  ", "  ") } else { ("◄ ", " ►") };
         let desc_w = w.saturating_sub(3 + 20 + 2 + 11 + 2 + 2);
         lines.push(Line::from(vec![
             Span::styled(
@@ -750,15 +722,15 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
                 Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
             ),
             Span::styled(pad_right(label, 20), label_style),
-            Span::styled("◄ ", Style::default().fg(arrow_col).bg(bg)),
+            Span::styled(left_arrow, Style::default().fg(arrow_col).bg(bg)),
             Span::styled(
                 format!("{:^9}", value),
                 Style::default().fg(val_col).bg(bg).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ►", Style::default().fg(arrow_col).bg(bg)),
+            Span::styled(right_arrow, Style::default().fg(arrow_col).bg(bg)),
             Span::styled("  ", Style::default().bg(bg)),
             Span::styled(
-                pad_right(&corex_core::truncate_ellipsis(&desc, desc_w), desc_w),
+                pad_right(&desc, desc_w),
                 Style::default().fg(if selected { theme.foreground } else { theme.dark_gray }).bg(bg),
             ),
         ]));
@@ -768,7 +740,7 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     lines.push(Line::from(""));
     let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
     lines.push(Line::from(Span::styled(
-        format!(" {}", corex_core::truncate_ellipsis(&hint, w.saturating_sub(2))),
+        format!(" {}", fit_text(&hint, w.saturating_sub(2))),
         Style::default().fg(if ready { theme.dark_gray } else { theme.accent_yellow }),
     )));
 
@@ -793,37 +765,17 @@ fn setting_display(
                 ModelFamily::Generic => &state.generic_reasoning,
             };
             let desc = match family {
-                ModelFamily::Flash => "Adaptive · ~200ms tools, deep CoT for complex code",
-                ModelFamily::Pro => "Exhaustive reasoning for novel architecture",
+                ModelFamily::Flash if r == "dynamic" => "Adaptive: light on tool results, deep otherwise",
+                ModelFamily::Flash => "Same depth on every turn",
+                ModelFamily::Pro => "Exhaustive, for novel architecture",
                 ModelFamily::Generic => "Model reasoning level",
             };
             let shown = if r.is_empty() { "default".to_string() } else { r.to_uppercase() };
             ("Reasoning", shown, get_reasoning_color(r), desc.to_string())
         }
-        SettingRow::CommandCot => (
-            "Command & Tool CoT",
-            state.flash_command_reasoning.to_uppercase(),
-            get_reasoning_color(&state.flash_command_reasoning),
-            "Quick checks for shell tools".to_string(),
-        ),
-        SettingRow::CodeCot => (
-            "Coding & Dev CoT",
-            state.flash_code_reasoning.to_uppercase(),
-            get_reasoning_color(&state.flash_code_reasoning),
-            "Verification for architecture & code".to_string(),
-        ),
-        SettingRow::SearchCot => {
-            let r = if family == ModelFamily::Pro { &state.pro_search_reasoning } else { &state.flash_search_reasoning };
-            (
-                "Web Search CoT",
-                r.to_uppercase(),
-                get_reasoning_color(r),
-                "Quick snippets & direct links".to_string(),
-            )
-        }
         SettingRow::Persist => (
-            "Save changes",
-            if state.persist { "PERMANENT".to_string() } else { "SESSION".to_string() },
+            "Save permanently",
+            if state.persist { "[x]".to_string() } else { "[ ]".to_string() },
             if state.persist { Color::Rgb(105, 240, 174) } else { Color::Rgb(255, 152, 0) },
             if state.persist { "Saved to ~/.corex/settings.json".to_string() } else { "Active in this session only".to_string() },
         ),
@@ -838,6 +790,34 @@ mod tests {
         let mut s = ModelDialogState::new();
         s.open(&Config::default());
         s
+    }
+
+    #[test]
+    fn dialog_draws_joined_frame_without_clipped_names() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut s = open_default();
+        s.is_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal
+            .draw(|f| render_model_dialog(f, f.area(), &s, &Theme::default()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let screen = rows.join("\n");
+
+        assert!(screen.contains("┬"), "pane divider meets the top border");
+        assert!(screen.contains("┴"), "pane divider meets the footer rule");
+        assert!(screen.contains("├") && screen.contains("┤"), "rules meet the side borders");
+        assert!(screen.contains("DeepSeek-V4.1-Flash"));
+        assert!(!screen.contains("Flash-1017"), "Flash is listed once");
+        // Every provider name is either whole or ends in an ellipsis, never glued to its count.
+        for line in screen.lines().filter(|l| l.contains("GitHub Models")) {
+            assert!(line.contains("GitHub Models (Free)") || line.contains("…"), "{line}");
+        }
     }
 
     #[test]
@@ -859,9 +839,12 @@ mod tests {
     #[test]
     fn settings_rows_follow_model_family() {
         let mut s = open_default();
-        assert_eq!(s.settings_rows().len(), 6); // flash
+        assert_eq!(
+            s.settings_rows(),
+            vec![SettingRow::Temperature, SettingRow::Reasoning, SettingRow::Persist]
+        ); // flash
         s.model_idx = 1; // pro
-        assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::SearchCot, SettingRow::Persist]);
+        assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::Persist]);
         let local = s.providers.iter().position(|p| p.is_local()).unwrap();
         s.select_provider(local);
         assert_eq!(s.settings_rows(), vec![SettingRow::Temperature, SettingRow::Persist]);

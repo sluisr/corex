@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod builtin_skills;
 pub mod client;
 pub mod config;
+pub mod context_prune;
 pub mod file_lock;
 pub mod forensic;
 pub mod history;
@@ -10,9 +11,12 @@ pub mod language;
 pub mod local_client;
 pub mod providers;
 pub mod reasoning_cache;
+pub mod repeat_guard;
 pub mod secure_fs;
 pub mod session;
+pub mod spill;
 pub mod subagent;
+pub mod tool_images;
 pub mod types;
 pub mod update;
 
@@ -51,7 +55,10 @@ pub fn engine_signature() -> String {
     verify_author_signature()
 }
 
-pub use client::{get_sudo_password, parse_openai_sse_data, set_sudo_password, LlmClient, StreamEvent};
+pub use client::{
+    get_sudo_password, is_truncated_finish, parse_openai_sse_data, set_sudo_password, LlmClient,
+    StreamEvent, TRUNCATED_TOOL_CALL_ERROR,
+};
 pub use config::{Config, McpServerConfig};
 pub use file_lock::lock_path;
 pub use forensic::ForensicLogger;
@@ -61,6 +68,10 @@ pub use local_client::LocalLlmClient;
 pub use reasoning_cache::ReasoningCache;
 pub use secure_fs::{ensure_private_dir, sanitize_for_terminal, write_private, write_private_atomic};
 pub use session::{Session, SessionSummary};
+pub use context_prune::{prune_tool_results, PruneStats};
+pub use repeat_guard::{observe_tool_call, reset_repeat_guard};
+pub use spill::{is_spill_path, spill_large_output};
+pub use tool_images::{drain_tool_images_message, push_tool_image};
 pub use subagent::{get_subagent_manager, SubagentManager, SubagentRole, SubagentStatus, SubagentTask};
 pub use types::*;
 

@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, BorderType};
 use ratatui::Frame;
 
+use crate::text::{fit_text, pad_right};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -306,14 +307,19 @@ pub fn render_command_popup(
     let inner_w = popup_width.saturating_sub(2) as usize;
     let name_w = 11usize;
     let args_w = 20usize.min(inner_w / 3);
-    let desc_w = inner_w.saturating_sub(2 + name_w + args_w + 1);
+    // Two spaces between the argument hint and the description, one of air before the border.
+    let desc_w = inner_w.saturating_sub(2 + name_w + args_w + 2 + 1);
 
     let mut lines: Vec<Line> = Vec::new();
     let mut selected_line = 0usize;
     let mut last_group = "";
+    // Line index of every group header and of every command, to place the scroll window cleanly.
+    let mut header_lines: Vec<usize> = Vec::new();
+    let mut command_lines: Vec<usize> = Vec::new();
     for (i, cmd) in matching.iter().enumerate() {
         if show_groups && cmd.group != last_group {
             last_group = cmd.group;
+            header_lines.push(lines.len());
             lines.push(Line::from(Span::styled(
                 format!(" ── {} ", cmd.group),
                 Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD),
@@ -324,6 +330,7 @@ pub fn render_command_popup(
         if is_selected {
             selected_line = lines.len();
         }
+        command_lines.push(lines.len());
         let prefix = if is_selected { "› " } else { "  " };
 
         let style = if is_selected {
@@ -346,36 +353,57 @@ pub fn render_command_popup(
         let name_text = format!("{:<w$}", cmd.name, w = name_w);
         spans.extend(highlighted(&name_text, &format!("/{}", query), style, hit));
         spans.push(Span::styled(
-            format!("{:<w$} ", corex_core::truncate_ellipsis(cmd.args, args_w), w = args_w),
+            format!("{}  ", pad_right(cmd.args, args_w)),
             Style::default().fg(theme.dark_gray),
         ));
         let desc = match alias_hit {
             Some(a) => format!("{} (alias {})", cmd.description, a),
             None => cmd.description.to_string(),
         };
-        spans.push(Span::styled(
-            corex_core::truncate_ellipsis(&desc, desc_w),
-            Style::default().fg(theme.gray),
-        ));
+        spans.push(Span::styled(fit_text(&desc, desc_w), Style::default().fg(theme.gray)));
         lines.push(Line::from(spans));
     }
 
     let visible_items = (area.height.saturating_sub(2) as usize).max(1);
     let scroll_offset = if selected_line >= visible_items {
-        (selected_line + 1 - visible_items) as u16
+        selected_line + 1 - visible_items
     } else {
         0
     };
 
-    let block = Block::default()
+    // A group header on the last visible row would announce commands that are all below the
+    // fold: leave that row empty instead (the header shows up together with its first command).
+    let last_visible = scroll_offset + visible_items - 1;
+    if header_lines.contains(&last_visible) && last_visible + 1 < lines.len() {
+        lines.truncate(last_visible);
+    }
+
+    // What is out of sight, counted in commands: the list never says it goes on otherwise.
+    let hidden_above = command_lines.iter().filter(|&&l| l < scroll_offset).count();
+    let hidden_below = command_lines.iter().filter(|&&l| l > last_visible).count();
+
+    let mut block = Block::default()
         .title(" Slash Commands ")
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(theme.accent_blue));
+    if hidden_above > 0 || hidden_below > 0 {
+        let mut hint = format!(" {}/{}", selected + 1, count);
+        if hidden_above > 0 {
+            hint.push_str(&format!(" · ↑ {}", hidden_above));
+        }
+        if hidden_below > 0 {
+            hint.push_str(&format!(" · ↓ {} more", hidden_below));
+        }
+        hint.push(' ');
+        block = block.title_bottom(
+            Line::from(Span::styled(hint, Style::default().fg(theme.dark_gray))).right_aligned(),
+        );
+    }
 
     let widget = Paragraph::new(lines)
         .block(block)
-        .scroll((scroll_offset, 0));
+        .scroll((scroll_offset as u16, 0));
     frame.render_widget(widget, popup_area);
 }
 
@@ -467,5 +495,64 @@ mod tests {
         let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("Session"));
         assert!(text.contains("/chat"));
+    }
+
+    fn popup_rows(input: &str, selected: usize, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(90, height)).unwrap();
+        terminal
+            .draw(|f| render_command_popup(f, input, selected, Rect::new(0, 0, 90, height), &Theme::default()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_group_header_is_never_the_last_visible_row() {
+        // Every window height, from the top of the list: no row may be a header whose commands
+        // are all below the fold.
+        for height in 5..=12u16 {
+            let rows = popup_rows("/", 0, height);
+            let body = &rows[1..rows.len() - 1];
+            let last = body.last().unwrap();
+            assert!(!last.contains("──") || last.trim_matches(|c| c == '│' || c == ' ').is_empty(), "height {height}: {last:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_says_how_much_is_hidden_and_where_the_cursor_is() {
+        let rows = popup_rows("/", 0, 10);
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains("1/") && bottom.contains("more"), "{bottom:?}");
+
+        // Scrolled to the end nothing is left below, only what is above.
+        let last = ALL_COMMANDS.len() - 1;
+        let rows = popup_rows("/", last, 10);
+        let bottom = rows.last().unwrap();
+        assert!(bottom.contains('↑') && !bottom.contains("more"), "{bottom:?}");
+
+        // A list that fits shows no counter at all.
+        let rows = popup_rows("/mod", 0, 10);
+        let bottom = rows.last().unwrap();
+        assert!(!bottom.contains("more") && !bottom.contains('↑'), "{bottom:?}");
+    }
+
+    #[test]
+    fn argument_hint_and_description_do_not_touch() {
+        let rows = popup_rows("/chat", 0, 6);
+        let row = rows.iter().find(|r| r.contains("/chat")).expect("row");
+        let args_end = row.find("list|save|resume|new").unwrap() + "list|save|resume|new".len();
+        assert!(row[args_end..].starts_with("  "), "{row:?}");
+    }
+
+    #[test]
+    fn long_descriptions_leave_air_before_the_border() {
+        // `/resume`'s description is the longest one: it gets cut, but not against the border.
+        let rows = popup_rows("/resume", 0, 6);
+        let row = rows.iter().find(|r| r.contains("/resume")).expect("row");
+        let border = row.rfind('│').expect("right border");
+        let before = row[..border].chars().last().unwrap();
+        assert_eq!(before, ' ', "{row:?}");
     }
 }

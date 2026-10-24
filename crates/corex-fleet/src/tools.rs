@@ -199,6 +199,8 @@ impl Tool for FleetRunCommandTool {
             if node.sudo {
                 return true;
             }
+        } else if config.nodes.iter().any(|n| n.sudo) {
+            return true;
         }
 
         let risk = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands);
@@ -265,7 +267,7 @@ impl Tool for FleetRunCommandTool {
                 match s.connect(config.timeout_secs.min(6)).await {
                     Ok(_) => s,
                     Err(e) => {
-                        bail!("Failed to connect to server '{}' ({}@{}): {}. Host is unreachable or down. Please choose an alternate server (e.g. 'triade-ipv4').", node.id, node.user, node.host, e);
+                        bail!("Failed to connect to server '{}' ({}@{}): {}.", node.id, node.user, node.host, e);
                     }
                 }
             }
@@ -404,7 +406,7 @@ impl Tool for FleetBroadcastTool {
         let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs).await;
 
         let mut output = format!(
-            "🚀 Broadcast complete on {} nodes for command: `{}`\n\n",
+            "Broadcast complete on {} nodes for command: `{}`\n\n",
             results.len(),
             command
         );

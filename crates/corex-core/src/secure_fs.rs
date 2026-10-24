@@ -38,15 +38,27 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         if !dir.exists() {
             fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        } else {
-            let mut perms = fs::metadata(dir)?.permissions();
-            if perms.mode() & 0o077 != 0 {
-                perms.set_mode(0o700);
-                let _ = fs::set_permissions(dir, perms);
-            }
+        }
+        // Follows symlinks (a dotfiles-managed ~/.corex is fine); what matters is who owns the
+        // directory our files actually land in.
+        let meta = fs::metadata(dir)?;
+        // SAFETY: getuid() has no preconditions and cannot fail.
+        let uid = unsafe { libc::getuid() };
+        if !meta.is_dir() || meta.uid() != uid {
+            // Typical in shared fallbacks such as /tmp/corex-*: another local user created the
+            // directory first and could read or swap whatever we put in it.
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a directory owned by the current user", dir.display()),
+            ));
+        }
+        let mut perms = meta.permissions();
+        if perms.mode() & 0o077 != 0 {
+            perms.set_mode(0o700);
+            fs::set_permissions(dir, perms)?;
         }
         Ok(())
     }

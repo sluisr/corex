@@ -112,7 +112,7 @@ pub fn render_auth_dialog(
     let (input_span, cursor) = if state.input_buffer.is_empty() {
         (
             Span::styled(format!("Paste or type key ({})", state.api_key_env), Style::default().fg(theme.dark_gray)),
-            Span::styled("█", Style::default().fg(theme.accent_blue)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
         )
     } else {
         let chars: Vec<char> = state.input_buffer.chars().collect();
@@ -126,8 +126,8 @@ pub fn render_auth_dialog(
             "*".repeat(total_chars)
         };
         (
-            Span::styled(masked, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("█", Style::default().fg(theme.accent_blue)),
+            Span::styled(masked, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
         )
     };
 
