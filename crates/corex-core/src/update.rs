@@ -319,57 +319,74 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         }
     }
 
-    let cdn_url = "https://corex.sluisr.com/release.json";
-    if let Ok(resp) = client.get(cdn_url).send().await {
-        if resp.status().is_success() {
-            if let Ok(payload) = resp.json::<CdnReleasePayload>().await {
-                let tag = payload.tag.or(payload.version);
-                if let Some(tag_name) = tag {
-                    let assets = payload.binaries.into_iter().map(|b| ReleaseAsset {
-                        name: b.archive,
-                        browser_download_url: b.url,
-                        size: None,
-                    }).collect();
-                    return Ok(ReleaseInfo {
-                        tag_name,
-                        html_url: Some("https://corex.sluisr.com".to_string()),
-                        body: None,
-                        assets,
-                    });
-                }
-            }
-        }
-    }
+    // Neither fallback is trusted alone. The CDN file is refreshed by hand after a release, so it can
+    // still name the previous version (the API being rate limited then made `cx update` report
+    // "already on the latest version"), and the web redirect names the newest tag but lists no
+    // assets. The newest of the two wins; the download URL is rebuilt from the tag when needed.
+    let cdn = fetch_release_from_cdn(&client).await;
+    let redirect = fetch_release_from_web_redirect(current_version).await;
 
-    let no_redirect_client = reqwest::Client::builder()
+    newest_release(cdn, redirect).ok_or_else(|| {
+        last_api_err.unwrap_or_else(|| {
+            "Could not retrieve latest release information across GitHub API, CDN, and web mirrors. Check internet connectivity.".to_string()
+        })
+    })
+}
+
+/// The release described by the CDN's `release.json`, with its asset list.
+async fn fetch_release_from_cdn(client: &reqwest::Client) -> Option<ReleaseInfo> {
+    let resp = client.get("https://corex.sluisr.com/release.json").send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let payload = resp.json::<CdnReleasePayload>().await.ok()?;
+    let tag_name = payload.tag.or(payload.version)?;
+    let assets = payload
+        .binaries
+        .into_iter()
+        .map(|b| ReleaseAsset {
+            name: b.archive,
+            browser_download_url: b.url,
+            size: None,
+        })
+        .collect();
+    Some(ReleaseInfo {
+        tag_name,
+        html_url: Some("https://corex.sluisr.com".to_string()),
+        body: None,
+        assets,
+    })
+}
+
+/// The newest release tag, read from where GitHub's `releases/latest` page redirects. It uses no
+/// API quota, and carries no asset list.
+async fn fetch_release_from_web_redirect(current_version: &str) -> Option<ReleaseInfo> {
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("corex/{}", current_version))
         .redirect(reqwest::redirect::Policy::none())
-        .build();
-
-    if let Ok(client_nr) = no_redirect_client {
-        if let Ok(resp) = client_nr.get("https://github.com/sluisr/corex/releases/latest").send().await {
-            if resp.status().is_redirection() {
-                if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
-                    if let Ok(loc_str) = loc.to_str() {
-                        if let Some(tag) = loc_str.split("/tag/").nth(1) {
-                            let tag = tag.trim_matches('/').to_string();
-                            return Ok(ReleaseInfo {
-                                tag_name: tag,
-                                html_url: Some(loc_str.to_string()),
-                                body: None,
-                                assets: vec![],
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        .build()
+        .ok()?;
+    let resp = client.get("https://github.com/sluisr/corex/releases/latest").send().await.ok()?;
+    if !resp.status().is_redirection() {
+        return None;
     }
+    let location = resp.headers().get(reqwest::header::LOCATION)?.to_str().ok()?.to_string();
+    let tag_name = location.split("/tag/").nth(1)?.trim_matches('/').to_string();
+    Some(ReleaseInfo {
+        tag_name,
+        html_url: Some(location),
+        body: None,
+        assets: vec![],
+    })
+}
 
-    Err(last_api_err.unwrap_or_else(|| {
-        "Could not retrieve latest release information across GitHub API, CDN, and web mirrors. Check internet connectivity.".to_string()
-    }))
+/// The newer of two releases. On a tie the first is kept, since it is the one with the asset list.
+fn newest_release(first: Option<ReleaseInfo>, second: Option<ReleaseInfo>) -> Option<ReleaseInfo> {
+    match (first, second) {
+        (Some(a), Some(b)) => Some(if is_newer_version(&a.tag_name, &b.tag_name) { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Maximum extracted binary size (200 MB) to guard against decompression bombs.
@@ -725,6 +742,31 @@ mod tests {
         assert!(release.is_ok(), "fetch_latest_release_info should succeed via CDN/fallback: {:?}", release.err());
         let rel = release.unwrap();
         assert!(rel.tag_name.starts_with('v'));
+    }
+
+    fn release(tag: &str, assets: usize) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: tag.to_string(),
+            html_url: None,
+            body: None,
+            assets: (0..assets)
+                .map(|i| ReleaseAsset { name: format!("asset-{}", i), browser_download_url: String::new(), size: None })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_stale_cdn_does_not_hide_the_newest_release() {
+        // The CDN still names v0.7.0 while GitHub's redirect already names v0.8.1.
+        let newest = newest_release(Some(release("v0.7.0", 6)), Some(release("v0.8.1", 0))).unwrap();
+        assert_eq!(newest.tag_name, "v0.8.1");
+        // The same version on both keeps the CDN entry, which is the one with the asset list.
+        let tie = newest_release(Some(release("v0.8.1", 6)), Some(release("v0.8.1", 0))).unwrap();
+        assert_eq!(tie.assets.len(), 6);
+        // A newer CDN beats an older redirect, and either source alone is used as it is.
+        assert_eq!(newest_release(Some(release("v0.9.0", 6)), Some(release("v0.8.1", 0))).unwrap().tag_name, "v0.9.0");
+        assert_eq!(newest_release(None, Some(release("v0.8.1", 0))).unwrap().tag_name, "v0.8.1");
+        assert!(newest_release(None, None).is_none());
     }
 }
 
