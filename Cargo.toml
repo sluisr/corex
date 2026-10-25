@@ -47,7 +47,7 @@ clap_complete = "4.5"
 sha2 = "0.10"
 flate2 = "1.0"
 tar = "0.4"
-zip = { version = "2.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+zip = { version = "9.1", default-features = false, features = ["deflate-flate2"] }
 toml = "0.8"
 
 # Internal crates

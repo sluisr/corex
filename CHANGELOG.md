@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Security
+- **`zip` 2.4.2 to 9.1.0**: Fixes RUSTSEC-2026-0367, 0368 and 0369, which concern `ZipArchive::extract()` (symbolic links pointing outside the destination and SUID/SGID bits preserved on extraction). Corex never called `extract()`: the self-updater reads the one binary it needs from the Windows archive in memory. That code was adapted to the new API (an entry whose name cannot be decoded is skipped) and is now covered by tests, one of which runs against a real release archive. The dependency audit reports no vulnerabilities; the remaining warnings are `paste` (unmaintained) and two soundness notes on `lru`, both pulled in by `ratatui`.
+
+---
+
 ## [0.8.2] - 2026-10-25
 
 ### Fixed

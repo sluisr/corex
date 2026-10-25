@@ -399,7 +399,11 @@ pub fn extract_binary_from_archive(archive_bytes: &[u8], is_zip: bool, bin_name:
         let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("Failed to read zip archive: {}", e))?;
         for i in 0..zip.len() {
             let file = zip.by_index(i).map_err(|e| format!("Zip entry error: {}", e))?;
-            let name = file.name().to_string();
+            // An entry whose name cannot be decoded cannot be the binary we are looking for.
+            let name = match file.name() {
+                Ok(name) => name.into_owned(),
+                Err(_) => continue,
+            };
             let file_base = Path::new(&name).file_name().and_then(|f| f.to_str()).unwrap_or("");
             if file_base == bin_name || file_base == format!("{}.exe", bin_name) {
                 if file.size() > MAX_EXTRACTED_BINARY_BYTES {
@@ -742,6 +746,40 @@ mod tests {
         assert!(release.is_ok(), "fetch_latest_release_info should succeed via CDN/fallback: {:?}", release.err());
         let rel = release.unwrap();
         assert!(rel.tag_name.starts_with('v'));
+    }
+
+    #[test]
+    fn test_extract_zip_in_memory() {
+        use std::io::Write;
+
+        let payload = b"MZ fake windows binary".to_vec();
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("docs/readme.txt", options).unwrap();
+            writer.write_all(b"hello").unwrap();
+            writer.start_file("cx.exe", options).unwrap();
+            writer.write_all(&payload).unwrap();
+            writer.finish().unwrap();
+        }
+        let bytes = cursor.into_inner();
+
+        // The Windows release names the binary `cx.exe`; it is found by its base name.
+        assert_eq!(extract_binary_from_archive(&bytes, true, "cx").unwrap(), payload);
+        assert!(extract_binary_from_archive(&bytes, true, "missing").unwrap_err().contains("not found"));
+    }
+
+    /// Runs against a real release archive when `COREX_TEST_ZIP` names one, for example
+    /// `COREX_TEST_ZIP=corex-v0.8.1-x86_64-pc-windows-msvc.zip cargo test -p corex-core real_release_zip`.
+    #[test]
+    fn real_release_zip_yields_the_windows_binary() {
+        let Some(path) = std::env::var_os("COREX_TEST_ZIP") else {
+            return;
+        };
+        let bytes = std::fs::read(path).expect("readable archive");
+        let binary = extract_binary_from_archive(&bytes, true, "cx").expect("cx.exe in the archive");
+        assert!(binary.starts_with(b"MZ"), "a Windows executable starts with the MZ header");
     }
 
     fn release(tag: &str, assets: usize) -> ReleaseInfo {
