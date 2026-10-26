@@ -55,6 +55,11 @@ pub fn current_target_triple() -> Option<&'static str> {
             Some("aarch64-unknown-linux-gnu")
         }
     }
+    // Builds for Termux target Android, where `target_os` is "android", not "linux".
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    {
+        Some("aarch64-linux-android")
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         Some("aarch64-apple-darwin")
@@ -69,6 +74,7 @@ pub fn current_target_triple() -> Option<&'static str> {
     }
     #[cfg(not(any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "android", target_arch = "aarch64"),
         all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64")),
         all(target_os = "windows", target_arch = "x86_64")
     )))]

@@ -177,7 +177,8 @@ cx --yolo
 | :--- | :--- |
 | `/info` | Version, author credits, official links, and session telemetry |
 | `/update` | Check for updates, or apply in-place atomically (`/update apply` / `/update force`) |
-| `/mouse` | Toggle terminal mouse capture (enable/disable native terminal text selection; alias: `/keyboard`) |
+| `/mouse` | Toggle terminal mouse capture (enable/disable native terminal text selection) |
+| `/keyboard` | Termux / Android: pause mouse reporting for a few seconds so the next tap raises the soft keyboard |
 | `/help` | Show keyboard shortcuts and command list |
 | `/clear` | Clear the terminal conversation view |
 | `/quit` | Exit the session (saves state for later resumption) |

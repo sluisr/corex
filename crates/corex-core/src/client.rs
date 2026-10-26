@@ -1414,7 +1414,7 @@ impl LlmClient {
                                         let body_text = resp.text().await.unwrap_or_default();
                                         crate::forensic::ForensicLogger::log_error("stream_chat_sse_body", &body_text);
                                         if status == reqwest::StatusCode::UNAUTHORIZED {
-                                            format!("Authentication error (401 Unauthorized): Invalid or missing API key for {}. Please check your API key in ~/.corex/settings.json or export the environment variable.", provider_label_clone)
+                                            format!("Authentication error (401 Unauthorized): Invalid or missing API key for {}. Run /key to enter a new one, press E in /model to change another provider's key, or fix the environment variable that supplies it.", provider_label_clone)
                                         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                                             format!("Rate limit or quota exceeded (429 Too Many Requests) from {}.", provider_label_clone)
                                         } else if !body_text.is_empty() {
@@ -1618,7 +1618,7 @@ impl LlmClient {
                                         let body_text = resp.text().await.unwrap_or_default();
                                         crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse_body", &body_text);
                                         if status == reqwest::StatusCode::UNAUTHORIZED {
-                                            "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Export ANTHROPIC_API_KEY or configure ~/.corex/settings.json".to_string()
+                                            "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Run /key to enter a new one, or fix ANTHROPIC_API_KEY.".to_string()
                                         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                                             "Rate limit or quota exceeded (429 Too Many Requests) from Anthropic API.".to_string()
                                         } else if !body_text.is_empty() {

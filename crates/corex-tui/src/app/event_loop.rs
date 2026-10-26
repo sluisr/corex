@@ -20,7 +20,7 @@ use corex_tools::types::ToolContext;
 use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
 use super::formatting::*;
-use super::mobile::{is_mobile_touch_environment, try_show_termux_soft_keyboard};
+use super::mobile::{arrows_may_be_swipes, is_android_or_termux};
 use super::render::render_ui;
 use super::state::{App, PendingToolBatch};
 use super::summary::print_session_summary;
@@ -117,6 +117,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         app.poll_local_health_check();
+
+        app.tap_keyboard.resume_if_due(Instant::now(), &mut app.mouse_capture);
 
         // Reconcile terminal mouse reporting with the app state (COREX_MOUSE or F2).
         if app.mouse_capture != mouse_capture_applied {
@@ -911,9 +913,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         }
                     }
                     app.handle_mouse(mouse);
-                    let (w, h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                    if is_mobile_touch_environment(w, h) && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        try_show_termux_soft_keyboard();
+                    if is_android_or_termux() && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        app.tap_keyboard.on_tap(Instant::now(), &mut app.mouse_capture);
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -921,8 +922,6 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                     let is_alt = key.modifiers.contains(KeyModifiers::ALT);
                     let is_ctrl_p = (is_ctrl && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))) || key.code == KeyCode::Char('\x10');
                     let is_ctrl_n = (is_ctrl && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))) || key.code == KeyCode::Char('\x0e');
-                    let (term_w, term_h) = terminal.size().map(|s| (s.width, s.height)).unwrap_or((80, 24));
-                    let is_touch_mobile = is_mobile_touch_environment(term_w, term_h);
 
                     // --- Force Quit: Ctrl+Z ---
                     if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
@@ -1132,9 +1131,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                         }
                                     }
                                     app.auth_dialog.close();
+                                    let note = crate::auth_dialog::env_override_note(&prov_name, &key_str).unwrap_or_default();
                                     app.session.add_message(Message::system(format!(
-                                        "API key saved for {} (${})!",
-                                        prov_label, env_var
+                                        "API key saved for {} (${})!{}",
+                                        prov_label, env_var, note
                                     )));
 
                                     if let Some((p_idx, m_idx)) = pending {
@@ -2554,10 +2554,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 }
                             }
                         }
-                        // Chat feed scrolling:
-                        // On desktop, Ctrl/Shift modifiers or PageUp/PageDown scroll chat.
-                        // On mobile / Termux, touchscreen finger swipes emit bare Up/Down keys;
-                        // thus bare Up/Down must scroll the chat feed instead of cycling history!
+                        // Chat feed scrolling: Ctrl/Shift modifiers or PageUp/PageDown scroll chat.
                         KeyCode::Up
                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                 || key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -2585,9 +2582,12 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                                 } else {
                                     app.slash_selected_idx = matching_cmds.len().saturating_sub(1);
                                 }
-                            } else if is_touch_mobile {
-                                // Mobile / Termux touchscreen drag: scroll chat up!
-                                app.scroll_chat(-3);
+                            } else if app.tap_keyboard.in_tap_window(Instant::now())
+                                || (arrows_may_be_swipes(app.mouse_capture)
+                                    && app.touch_arrows.is_swipe(Instant::now(), |d| event::poll(d).unwrap_or(false)))
+                            {
+                                // Termux sends one arrow per row the finger moves: follow it 1:1.
+                                app.scroll_chat(-1);
                             } else if !app.input_history.is_empty() {
                                 match app.history_idx {
                                     None => {
@@ -2611,11 +2611,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                         KeyCode::Down => {
                             if is_slash_open && !matching_cmds.is_empty() {
                                 app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_cmds.len();
-                            } else if is_touch_mobile {
-                                // Mobile / Termux touchscreen drag: scroll chat down!
-                                app.scroll_chat(3);
-                            } else if app.scroll_offset > 0 {
-                                // On desktop: if scrolled up reading chat, Down scrolls towards newest message
+                            } else if app.tap_keyboard.in_tap_window(Instant::now())
+                                || (arrows_may_be_swipes(app.mouse_capture)
+                                    && app.touch_arrows.is_swipe(Instant::now(), |d| event::poll(d).unwrap_or(false)))
+                            {
+                                app.scroll_chat(1);
+                            } else if app.history_idx.is_none() && !app.auto_scroll && !is_android_or_termux() {
+                                // Scrolled up reading the chat: Down scrolls towards the newest message.
+                                // While browsing history, Down keeps walking it back to the draft.
                                 app.scroll_chat(3);
                             } else if let Some(i) = app.history_idx {
                                 if i + 1 < app.input_history.len() {

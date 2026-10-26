@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use corex_core::types::Message;
-use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive};
+use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive, shorten_model_for_mobile};
 use crate::auth_dialog::render_auth_dialog;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::fleet_dialog::render_fleet_dialog;
@@ -1424,6 +1424,19 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             .find_map(|p| p.models.iter().find(|m| m.id == cfg.model))
             .map(|m| m.display_name().to_string())
     };
+    // DeepSeek models always show their short name ("DeepSeek Flash", as in the header). A phone
+    // has ~48 columns: there every model name is shortened and the temperature is dropped, so the
+    // model and the reasoning effort fit next to the path instead of being cut off.
+    let is_mobile = is_mobile_portrait(size.width, size.height);
+    let display_name = if is_flash {
+        Some("DeepSeek Flash".to_string())
+    } else if is_pro {
+        Some("DeepSeek Pro".to_string())
+    } else if is_mobile {
+        Some(shorten_model_for_mobile(&cfg.model))
+    } else {
+        display_name
+    };
 
     let model_style = Style::default().fg(app.theme.muted);
     let sep_style = Style::default().fg(app.theme.border_dim);
@@ -1450,8 +1463,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         };
 
         right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4.1-Flash".to_string()), model_style));
-        right_spans.push(Span::styled(" · ", sep_style));
-        right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
+        if !is_mobile {
+            right_spans.push(Span::styled(" · ", sep_style));
+            right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
+        }
         right_spans.push(Span::styled(" · ", sep_style));
         right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
     } else if is_pro {
@@ -1483,8 +1498,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         };
 
         right_spans.push(Span::styled(display_name, model_style));
-        right_spans.push(Span::styled(" · ", sep_style));
-        right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
+        if !is_mobile {
+            right_spans.push(Span::styled(" · ", sep_style));
+            right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
+        }
         if !cfg.reasoning_effort.is_empty() {
             right_spans.push(Span::styled(" · ", sep_style));
             right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(r_color)));
@@ -1616,22 +1633,23 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         left_spans.extend(mode_badges(app));
     }
 
-    let is_mobile = is_mobile_portrait(size.width, size.height);
     if is_mobile {
-        let footer_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(45),
-                Constraint::Percentage(55),
-            ])
-            .split(status_chunk);
-
-        frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
         let mobile_right = if active_tasks > 0 || active_subagents > 0 {
             center_spans
         } else {
             right_spans
         };
+        // The right side gets its full width; the path takes what is left.
+        let r_len = (mobile_right.iter().map(|s| s.width()).sum::<usize>() as u16).min(status_chunk.width);
+        let footer_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(r_len),
+            ])
+            .split(status_chunk);
+
+        frame.render_widget(Paragraph::new(Line::from(left_spans)).alignment(Alignment::Left), footer_cols[0]);
         frame.render_widget(Paragraph::new(Line::from(mobile_right)).alignment(Alignment::Right), footer_cols[1]);
     } else if center_spans.is_empty() {
         let r_len = (right_width as u16).min(status_chunk.width);

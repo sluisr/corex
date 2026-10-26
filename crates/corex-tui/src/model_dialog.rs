@@ -86,6 +86,8 @@ pub enum DialogAction {
     Close,
     /// Make `provider`/`model` (indices into the dialog's provider list) the active model.
     Activate { provider: usize, model: usize },
+    /// Replace the API key of `provider` (index into the dialog's provider list).
+    EditKey { provider: usize },
     /// A setting value changed; the app should apply (and optionally persist) it.
     SettingsChanged,
 }
@@ -360,6 +362,11 @@ impl ModelDialogState {
             KeyCode::Esc => return DialogAction::Close,
             KeyCode::Tab => self.pane = self.pane.next(),
             KeyCode::BackTab => self.pane = self.pane.prev(),
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                if self.selected_provider().is_some_and(|p| !p.is_local()) {
+                    return DialogAction::EditKey { provider: self.prov_idx };
+                }
+            }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 self.persist = !self.persist;
                 return DialogAction::SettingsChanged;
@@ -539,6 +546,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
             Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme)),
             Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme)),
         }
+        footer.extend(key_badge("E", "Key", theme.accent_yellow, theme));
         footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme));
         footer.extend(key_badge("Esc", "Close", theme.gray, theme));
     }
@@ -790,6 +798,15 @@ mod tests {
         let mut s = ModelDialogState::new();
         s.open(&Config::default());
         s
+    }
+
+    #[test]
+    fn e_edits_the_key_of_any_non_local_provider() {
+        let mut s = open_default();
+        assert_eq!(s.handle_key(KeyCode::Char('e')), DialogAction::EditKey { provider: s.prov_idx });
+        let local = s.providers.iter().position(|p| p.is_local()).expect("local provider");
+        s.prov_idx = local;
+        assert_eq!(s.handle_key(KeyCode::Char('e')), DialogAction::None);
     }
 
     #[test]

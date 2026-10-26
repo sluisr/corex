@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.8.3] - 2026-10-26
+
+**Lil peep**
+
+### Fixed
+- **Replacing an API key that stopped working**: The only way to change a key was `/key`, which was missing from the command menu and `/help` described it as DeepSeek-only; the model picker offered no way to change the key of a provider that already had one. `/key` (alias `/auth`) is now listed, `E` in `/model` replaces the key of the highlighted provider, a 401 tells you to run `/key`, and saving a DeepSeek key warns when `COREX_API_KEY` or `DEEPSEEK_API_KEY` holds a different one, since the environment overrides `settings.json` on the next launch.
+- **Arrow keys on Android / Termux**: Up and Down always scrolled the chat, so the history of sent messages was unreachable. With mouse reporting off, Termux turns a finger swipe into bare arrows that are byte-identical to the extra-keys arrows (`TerminalView.doScroll`), and keeps sending them, ever more spaced out, while the fling slows down after the finger lifts. Telling them apart by pace could never be exact: a slow swipe or the tail of a fling was taken for the arrow key and changed the message. Corex now asks for mouse reporting on Android / Termux in portrait too, so a swipe arrives as a wheel event and the arrows are always keys, as on the desktop. Termux raises the keyboard on a tap only while mouse reporting is off, and decides about 300 ms after the finger lifts, so Corex switches reporting off for 700 ms after each tap and back on: the tap still opens the keyboard. A swipe that starts inside that gap arrives as arrows and still scrolls, and on Android a wheel event moves the feed one line (one event per row the finger travels), so the chat follows the finger; Down no longer scrolls the feed on Android, only the history. `COREX_MOUSE=0` or F2 turns it off for good; the pace-based detection (`COREX_TOUCH_SCROLL_MS`, `0` disables it) stays as the fallback while it is off.
+- **`/keyboard` on Android / Termux**: It ran `termux-keyboard`, a command `termux-api` does not have, so it never raised anything. It now pauses mouse reporting for a few seconds so that the next tap opens the keyboard.
+- **`cx update` on Android / Termux**: It answered "Auto-update is not supported on this platform". The Termux build targets Android, where Rust's `target_os` is `android`, not `linux`, so the platform check found no match; the Termux branch inside the Linux case never ran in the published binary. It now resolves to the `aarch64-linux-android` release archive.
+- **Links did not open on Android / Termux**: Opening a link only knew `xdg-open`, `open` and `rundll32`, so on Android it did nothing. It now uses `termux-open-url`, which ships with Termux.
+- **Broken logo emblem outside kitty**: The `◢◤ / ◥◣` emblem only joins into one chevron in terminals that draw those shapes themselves (kitty). Alacritty and Termux take them from the font, where they are small centred triangles with gaps between them. Corex now picks the emblem per terminal: kitty keeps the wedges, Alacritty gets sextants (`🬵🬆 / 🬊🬱`, drawn by Alacritty itself) and every other terminal block quadrants (`▗▞▘ / ▝▚▖`), which fill the cell in any font. Inside tmux the terminal is taken from the tmux client (`#{client_termname}`).
+- **Short DeepSeek name in the status bar**: The bar now reads `DeepSeek Flash` / `DeepSeek Pro`, as the header does, instead of `DeepSeek-V4.1-Flash` / `DeepSeek-V4-Pro`.
+- **Status bar cut off on phones**: In portrait mode the bar split the width 45/55, so on a ~48-column screen the model and reasoning effort were truncated (`DeepSeek-V4.1-Flash · 1.0 · dy`). It now shows the short model name, as the header does, without the temperature, and the path takes only the space it needs: `~/ (main)   DeepSeek Flash · dynamic`.
+- **Down arrow and history**: Down only reached the next history entry when the conversation fit on one screen; it now scrolls only while the feed is scrolled up.
+
 ### Security
 - **`zip` 2.4.2 to 9.1.0**: Fixes RUSTSEC-2026-0367, 0368 and 0369, which concern `ZipArchive::extract()` (symbolic links pointing outside the destination and SUID/SGID bits preserved on extraction). Corex never called `extract()`: the self-updater reads the one binary it needs from the Windows archive in memory. That code was adapted to the new API (an entry whose name cannot be decoded is skipped) and is now covered by tests, one of which runs against a real release archive. The dependency audit reports no vulnerabilities; the remaining warnings are `paste` (unmaintained) and two soundness notes on `lru`, both pulled in by `ratatui`.
 

@@ -69,6 +69,22 @@ impl AuthDialogState {
     }
 }
 
+/// Note to show after saving `new_key` for `provider` when an environment variable still holds a
+/// different DeepSeek key: `Config::load` lets it override `settings.json` on the next launch.
+pub fn env_override_note(provider: &str, new_key: &str) -> Option<String> {
+    if provider != "deepseek" {
+        return None;
+    }
+    ["COREX_API_KEY", "DEEPSEEK_API_KEY"].into_iter().find_map(|var| {
+        let val = std::env::var(var).ok()?;
+        (!val.trim().is_empty() && val.trim() != new_key).then(|| {
+            format!(
+                " ${var} is set to a different key and overrides it on the next launch: update or unset it."
+            )
+        })
+    })
+}
+
 pub fn render_auth_dialog(
     frame: &mut Frame,
     area: Rect,
@@ -171,4 +187,15 @@ pub fn render_auth_dialog(
         .title_alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(Paragraph::new(lines).block(block), dialog_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_override_note_only_for_deepseek_with_a_different_env_key() {
+        // Only the DeepSeek key is overridden by the environment at load time.
+        assert_eq!(env_override_note("openai", "sk-new"), None);
+    }
 }

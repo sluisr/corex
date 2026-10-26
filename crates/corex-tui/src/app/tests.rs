@@ -1108,6 +1108,42 @@ use corex_core::types::ToolCall;
         std::env::remove_var("COREX_MOBILE");
     }
 
+    #[test]
+    fn test_touch_arrow_classifier_separates_swipes_from_key_presses() {
+        use crate::app::mobile::TouchArrowClassifier;
+        use std::time::{Duration, Instant};
+
+        std::env::remove_var("COREX_TOUCH_SCROLL_MS");
+        let mut arrows = TouchArrowClassifier::default();
+        let t0 = Instant::now();
+
+        // A lone arrow with nothing behind it is a key press: history navigation.
+        assert!(!arrows.is_swipe(t0, |_| false));
+        // An arrow followed at once by more input is the start of a swipe burst.
+        assert!(arrows.is_swipe(t0, |window| window == Duration::from_millis(50)));
+        // Mid-swipe arrows keep scrolling without waiting, even after a slow stretch.
+        let mid = t0 + Duration::from_millis(200);
+        assert!(arrows.is_swipe(mid, |_| panic!("must not wait during a swipe")));
+        // Once the finger has been still long enough, the next lone arrow is a key again.
+        assert!(!arrows.is_swipe(mid + Duration::from_millis(400), |_| false));
+
+        // COREX_TOUCH_SCROLL_MS=0 turns detection off: every arrow is a key press.
+        std::env::set_var("COREX_TOUCH_SCROLL_MS", "0");
+        assert!(!arrows.is_swipe(t0, |_| true));
+        std::env::remove_var("COREX_TOUCH_SCROLL_MS");
+    }
+
+    #[test]
+    fn test_arrows_are_never_swipes_with_mouse_reporting() {
+        use crate::app::mobile::arrows_may_be_swipes;
+
+        // With mouse reporting on, Termux sends swipes as wheel events, so arrows are keys.
+        assert!(!arrows_may_be_swipes(true));
+        if !crate::app::mobile::is_android_or_termux() {
+            assert!(!arrows_may_be_swipes(false));
+        }
+    }
+
     #[tokio::test]
     async fn test_fleet_mode_exit_warning_not_truncated() {
         use ratatui::backend::TestBackend;
@@ -1503,3 +1539,61 @@ use corex_core::types::ToolCall;
         };
         assert!(render_single_message_with_pending(0, &tool_images, None, &theme, 80, None, false).is_empty());
     }
+
+#[test]
+fn mouse_reporting_default_follows_the_platform() {
+    use crate::app::mobile::{is_android_or_termux, mouse_capture_default};
+    // A wide terminal always gets it; Android keeps it on in portrait so swipes arrive as wheel events.
+    assert!(mouse_capture_default(120, 30));
+    if is_android_or_termux() {
+        assert!(mouse_capture_default(48, 90));
+    }
+}
+
+#[test]
+fn tap_pauses_mouse_reporting_then_resumes_it() {
+    use crate::app::mobile::TapKeyboardGate;
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let (mut gate, mut capture) = (TapKeyboardGate::default(), true);
+
+    gate.on_tap(t0, &mut capture);
+    assert!(!capture, "Termux raises the keyboard only while reporting is off");
+    gate.resume_if_due(t0 + Duration::from_millis(300), &mut capture);
+    assert!(!capture, "the tap is not confirmed yet");
+    gate.resume_if_due(t0 + Duration::from_millis(800), &mut capture);
+    assert!(capture, "swipes are wheel events again");
+
+    // Reporting the user turned off stays off: a tap must not switch it on later.
+    let mut capture = false;
+    gate.on_tap(t0, &mut capture);
+    gate.resume_if_due(t0 + Duration::from_secs(10), &mut capture);
+    assert!(!capture);
+
+    // F2 during a pause wins over the pending resume.
+    let mut capture = true;
+    gate.on_tap(t0, &mut capture);
+    gate.cancel();
+    gate.resume_if_due(t0 + Duration::from_secs(10), &mut capture);
+    assert!(!capture);
+}
+
+#[test]
+fn arrows_right_after_a_tap_count_as_a_swipe_only_inside_the_window() {
+    use crate::app::mobile::TapKeyboardGate;
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let (mut gate, mut capture) = (TapKeyboardGate::default(), true);
+    assert!(!gate.in_tap_window(t0));
+    gate.on_tap(t0, &mut capture);
+    assert!(gate.in_tap_window(t0 + Duration::from_millis(100)));
+    assert!(!gate.in_tap_window(t0 + Duration::from_millis(800)));
+
+    // `/keyboard` waits much longer, but arrow keys keep working during that wait.
+    let (mut gate, mut capture) = (TapKeyboardGate::default(), true);
+    gate.request_keyboard(t0, &mut capture);
+    assert!(!capture);
+    assert!(!gate.in_tap_window(t0 + Duration::from_millis(100)));
+}

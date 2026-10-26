@@ -1,11 +1,59 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// Solid, static satin-gray style for the geometric "C" emblem (◢◤ / ◥◣).
+/// Solid, static satin-gray style for the geometric "C" emblem (see [`emblem`]).
 fn chevron_style() -> Style {
     Style::default()
         .fg(Color::Rgb(155, 165, 178))
         .add_modifier(Modifier::BOLD)
+}
+
+/// The two rows of the "C" emblem, in the glyphs this terminal draws as a solid shape.
+///
+/// `◢◤ / ◥◣` only join into one chevron where the terminal draws those shapes itself (kitty).
+/// Taken from a font, they are small centred triangles with gaps between them (Alacritty,
+/// Termux). Alacritty draws the sextants (U+1FB00-1FB3B) itself, and block quadrants
+/// (U+2596-259F) fill the cell in practically every terminal and font.
+pub fn emblem() -> (&'static str, &'static str) {
+    static EMBLEM: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
+    *EMBLEM.get_or_init(|| emblem_for(&outer_terminal_name()))
+}
+
+fn emblem_for(term: &str) -> (&'static str, &'static str) {
+    if term.contains("kitty") {
+        ("◢◤", "◥◣")
+    } else if term.contains("alacritty") {
+        ("🬵🬆", "🬊🬱")
+    } else {
+        ("▗▞▘", "▝▚▖")
+    }
+}
+
+/// Name of the terminal on screen. Each terminal sets `$TERM` afresh, while `KITTY_WINDOW_ID`
+/// and the like leak into terminals launched from it, so `$TERM` wins. Inside tmux `$TERM`
+/// names tmux itself, so tmux is asked for the terminal of its client.
+fn outer_terminal_name() -> String {
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term.contains("kitty") || term.contains("alacritty") {
+        return term;
+    }
+    if std::env::var_os("TMUX").is_some() {
+        let client = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#{client_termname}"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Ok(out) = client {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !name.is_empty() {
+                return name;
+            }
+        }
+    } else if std::env::var_os("ALACRITTY_WINDOW_ID").is_some() {
+        // Alacritty without its terminfo installed reports a generic `xterm-256color`.
+        return "alacritty".to_string();
+    }
+    term
 }
 
 pub fn shorten_model_for_mobile(model: &str) -> String {
@@ -76,11 +124,12 @@ pub fn render_gradient_logo_adaptive(
     let is_compact = max_width < 65;
 
     let chevron = chevron_style();
+    let (emblem_top, emblem_bottom) = emblem();
 
     // Line 1: Chevron top (solid gray) + Solid Corex + version
     let mut line1 = Vec::new();
     line1.push(Span::raw("  "));
-    line1.push(Span::styled("◢◤", chevron));
+    line1.push(Span::styled(emblem_top, chevron));
     line1.push(Span::raw("  "));
     line1.push(Span::styled(
         "Corex",
@@ -94,7 +143,7 @@ pub fn render_gradient_logo_adaptive(
     // Line 2: Chevron bottom (solid gray) + Model + Quick Commands
     let mut line2 = Vec::new();
     line2.push(Span::raw("  "));
-    line2.push(Span::styled("◥◣", chevron));
+    line2.push(Span::styled(emblem_bottom, chevron));
     line2.push(Span::raw("  "));
 
     if is_compact {
@@ -171,7 +220,17 @@ mod tests {
         assert!(full_text.contains("deepseek-flash"));
         assert!(full_text.contains("/help"));
         assert!(full_text.contains("/model"));
-        assert!(full_text.contains("◢◤"));
-        assert!(full_text.contains("◥◣"));
+        let (top, bottom) = emblem();
+        assert!(full_text.contains(top));
+        assert!(full_text.contains(bottom));
+    }
+
+    #[test]
+    fn test_emblem_matches_what_the_terminal_draws() {
+        // kitty draws the wedges itself; Alacritty draws sextants; quadrants fill any cell.
+        assert_eq!(emblem_for("xterm-kitty"), ("◢◤", "◥◣"));
+        assert_eq!(emblem_for("alacritty"), ("🬵🬆", "🬊🬱"));
+        assert_eq!(emblem_for("xterm-256color"), ("▗▞▘", "▝▚▖"));
+        assert_eq!(emblem_for(""), ("▗▞▘", "▝▚▖"));
     }
 }

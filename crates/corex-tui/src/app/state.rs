@@ -15,6 +15,7 @@ use corex_core::session::Session;
 use corex_core::types::ToolCall;
 use corex_tools::registry::ToolRegistry;
 
+use crate::app::mobile::{TapKeyboardGate, TouchArrowClassifier};
 use crate::auth_dialog::AuthDialogState;
 use crate::fleet_dialog::FleetDialogState;
 use crate::model_dialog::ModelDialogState;
@@ -285,6 +286,10 @@ pub struct App {
     pub plan_mode: bool,
     pub always_allow_tools: bool,
     pub mouse_capture: bool,
+    /// Pauses mouse reporting around a tap so Termux raises the soft keyboard.
+    pub tap_keyboard: TapKeyboardGate,
+    /// Separates Termux finger swipes from arrow key presses (both arrive as bare Up/Down).
+    pub touch_arrows: TouchArrowClassifier,
     pub selection: Option<Selection>,
     pub selection_lines: SelectionLines,
     /// Last cell the pointer was seen at while the left button is down.

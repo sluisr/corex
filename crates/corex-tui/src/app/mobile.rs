@@ -30,48 +30,143 @@ pub fn is_mobile_touch_environment(width: u16, height: u16) -> bool {
     is_android_or_termux() || is_mobile_portrait(width, height)
 }
 
-/// Attempts to trigger Termux soft keyboard via termux-api if installed.
-/// Rate-limited to at most once per 1000ms to prevent thread storms during rapid taps.
-pub fn try_show_termux_soft_keyboard() {
-    if is_android_or_termux() {
-        static LAST_TRIGGER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let last = LAST_TRIGGER_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < 1000 {
-            return;
-        }
-        LAST_TRIGGER_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+/// How long mouse reporting stays off after a tap so Termux can confirm it and raise the keyboard.
+const TAP_KEYBOARD_PAUSE: std::time::Duration = std::time::Duration::from_millis(700);
 
-        std::thread::spawn(|| {
-            if let Ok(mut child) = std::process::Command::new("termux-keyboard")
-                .arg("-s")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                let _ = child.wait();
-            }
-        });
+/// How long `/keyboard` leaves mouse reporting off, waiting for the tap that raises the keyboard.
+const KEYBOARD_REQUEST_PAUSE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Lets a tap raise the soft keyboard while mouse reporting stays on for swipes.
+///
+/// Termux reports a tap to the app as soon as the finger lifts, but only decides about the keyboard
+/// when the gesture detector confirms the tap, some 300 ms later (`onSingleTapConfirmed`), and it
+/// raises it only if mouse tracking is off at that moment (`TermuxTerminalViewClient.onSingleTapUp`).
+/// There is no command that shows it: `termux-api` has none. So on a tap, reporting is switched off
+/// for a moment and back on afterwards.
+#[derive(Debug, Default)]
+pub struct TapKeyboardGate {
+    resume_at: Option<std::time::Instant>,
+    /// End of the pause a tap started. Not set by `/keyboard`, whose pause is much longer.
+    tap_until: Option<std::time::Instant>,
+}
+
+impl TapKeyboardGate {
+    /// A tap arrived at `now`: turn mouse reporting off until Termux has handled it.
+    pub(crate) fn on_tap(&mut self, now: std::time::Instant, mouse_capture: &mut bool) {
+        if *mouse_capture {
+            self.tap_until = Some(now + TAP_KEYBOARD_PAUSE);
+        }
+        self.pause_for(now, TAP_KEYBOARD_PAUSE, mouse_capture);
     }
+
+    /// True while a tap holds reporting off: a swipe started now arrives as bare arrows, and
+    /// nobody presses an arrow key in the blink after tapping to raise the keyboard.
+    pub(crate) fn in_tap_window(&self, now: std::time::Instant) -> bool {
+        self.tap_until.is_some_and(|t| now < t)
+    }
+
+    /// `/keyboard`: leave the next tap to Termux, as nothing can raise the keyboard from here.
+    pub(crate) fn request_keyboard(&mut self, now: std::time::Instant, mouse_capture: &mut bool) {
+        self.pause_for(now, KEYBOARD_REQUEST_PAUSE, mouse_capture);
+    }
+
+    fn pause_for(&mut self, now: std::time::Instant, pause: std::time::Duration, mouse_capture: &mut bool) {
+        if *mouse_capture {
+            *mouse_capture = false;
+            self.resume_at = Some(now + pause);
+        }
+    }
+
+    /// Turns mouse reporting back on once the pause is over.
+    pub(crate) fn resume_if_due(&mut self, now: std::time::Instant, mouse_capture: &mut bool) {
+        if self.resume_at.is_some_and(|t| now >= t) {
+            self.resume_at = None;
+            *mouse_capture = true;
+        }
+    }
+
+    /// The user flipped mouse reporting themselves (F2, `/mouse`): their choice stands.
+    pub(crate) fn cancel(&mut self) {
+        self.resume_at = None;
+        self.tap_until = None;
+    }
+}
+
+/// Lines the feed moves per wheel event. Termux sends one event per text row the finger travels,
+/// so one line each keeps the chat under the finger; a desktop wheel notch is one event for three lines.
+pub(crate) fn wheel_lines() -> i32 {
+    if is_android_or_termux() { 1 } else { 3 }
 }
 
 /// Whether the TUI should request mouse reporting from the terminal.
 ///
-/// On mobile vertical viewports (e.g., Termux on Android), mouse reporting is disabled by default
-/// so touch events trigger the native soft keyboard rather than being intercepted as mouse clicks.
+/// Android / Termux always asks for it: with reporting off, Termux turns a finger swipe on the
+/// alternate screen into bare Up/Down keys (`TerminalView.doScroll`), indistinguishable from the
+/// arrow keys that browse the message history. With it on, a swipe is a wheel event and the arrows
+/// are always keys. A narrow desktop window (`COREX_MOBILE=1`) still leaves the mouse to the terminal.
 ///
-/// Set `COREX_MOUSE=1` to force mouse reporting on mobile, or `COREX_MOUSE=0` to force it off everywhere.
+/// Set `COREX_MOUSE=1` to force mouse reporting on, or `COREX_MOUSE=0` to force it off everywhere.
 pub(crate) fn mouse_capture_enabled() -> bool {
     if let Ok(v) = std::env::var("COREX_MOUSE") {
         return !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off");
     }
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if is_mobile_portrait(cols, rows) {
-        return false;
+    mouse_capture_default(cols, rows)
+}
+
+/// Mouse reporting default for a `cols` x `rows` terminal when `COREX_MOUSE` is unset.
+pub(crate) fn mouse_capture_default(cols: u16, rows: u16) -> bool {
+    is_android_or_termux() || !is_mobile_portrait(cols, rows)
+}
+
+/// Longest gap between two bare arrows that still counts as one finger swipe.
+///
+/// With mouse reporting off, Termux turns a finger drag on the alternate screen into one bare
+/// Up/Down per text row (`TerminalView.doScroll`), byte-identical to the extra-keys arrows. Only
+/// the pace tells them apart: a swipe emits rows back to back (0-16 ms apart), while a tapped
+/// arrow arrives alone and a held one repeats every 80 ms (`ExtraKeysView` default).
+/// `COREX_TOUCH_SCROLL_MS` tunes it; `0` turns swipe detection off.
+const DEFAULT_SWIPE_BURST_MS: u64 = 50;
+
+/// Once a swipe is detected, arrows keep scrolling until the stream pauses this long, so a slow
+/// stretch in the middle of a drag does not fall back to history navigation.
+const SWIPE_CONTINUE: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn swipe_burst_window() -> std::time::Duration {
+    let ms = std::env::var("COREX_TOUCH_SCROLL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| ms.min(500))
+        .unwrap_or(DEFAULT_SWIPE_BURST_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// True when bare Up/Down may come from a finger swipe: Termux with mouse reporting off.
+/// With mouse reporting on, Termux sends swipes as wheel events, so arrows are always keys.
+pub(crate) fn arrows_may_be_swipes(mouse_capture: bool) -> bool {
+    !mouse_capture && is_android_or_termux()
+}
+
+/// Tells Termux finger swipes apart from real arrow key presses (see [`DEFAULT_SWIPE_BURST_MS`]).
+#[derive(Debug, Default)]
+pub struct TouchArrowClassifier {
+    last_swipe_arrow: Option<std::time::Instant>,
+}
+
+impl TouchArrowClassifier {
+    /// Classifies a bare arrow received at `now`. `input_within` waits up to the given duration
+    /// for more input without consuming it; another event that quickly means a swipe burst.
+    pub(crate) fn is_swipe(
+        &mut self,
+        now: std::time::Instant,
+        input_within: impl FnOnce(std::time::Duration) -> bool,
+    ) -> bool {
+        let window = swipe_burst_window();
+        let continues_swipe = self
+            .last_swipe_arrow
+            .is_some_and(|t| now.saturating_duration_since(t) <= SWIPE_CONTINUE);
+        let swipe = !window.is_zero() && (continues_swipe || input_within(window));
+        self.last_swipe_arrow = swipe.then_some(now);
+        swipe
     }
-    true
 }

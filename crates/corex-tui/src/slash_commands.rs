@@ -79,6 +79,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         group: MODEL,
     },
     CommandItem {
+        name: "/key",
+        args: "[api_key]",
+        description: "Set or replace the API key of the active provider",
+        aliases: &["/auth"],
+        group: MODEL,
+    },
+    CommandItem {
         name: "/local",
         args: "<prompt>|status",
         description: "Ask the local LLM directly ($0.00 cost)",
@@ -203,7 +210,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "/keyboard",
         args: "",
-        description: "Request soft keyboard (Termux / Android)",
+        description: "Pause the mouse so the next tap raises the keyboard (Termux)",
         aliases: &[],
         group: APP,
     },
@@ -440,6 +447,7 @@ mod tests {
         assert_eq!(names("/compress"), vec!["/compact"]);
         assert_eq!(names("/wallet"), vec!["/balance"]);
         assert_eq!(names("/search"), vec!["/web"]);
+        assert_eq!(names("/auth"), vec!["/key"]);
         assert!(!ALL_COMMANDS.iter().any(|c| c.name == "/compress"));
     }
 

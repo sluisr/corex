@@ -99,6 +99,8 @@ impl App {
             plan_mode: false,
             always_allow_tools: yolo,
             mouse_capture: mouse_capture_enabled(),
+            tap_keyboard: TapKeyboardGate::default(),
+            touch_arrows: TouchArrowClassifier::default(),
             selection: None,
             selection_lines: SelectionLines::default(),
             drag_point: None,
@@ -164,6 +166,7 @@ impl App {
     /// all funnel through one code path.
     pub fn set_mouse_capture(&mut self, enabled: bool) {
         self.mouse_capture = enabled;
+        self.tap_keyboard.cancel();
         let msg = if enabled {
             "Mouse reporting ENABLED: the wheel scrolls the feed, and dragging over it selects text, which is copied to the clipboard on release. F2 gives the mouse back to the terminal."
         } else {
@@ -178,14 +181,14 @@ impl App {
     }
 
     /// Responds to terminal resize events: clears rendering caches and dynamically adapts
-    /// mouse reporting on mobile vertical screens unless COREX_MOUSE is pinned.
+    /// mouse reporting on narrow non-Android windows unless COREX_MOUSE is pinned.
     pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.cached_message_lines.clear();
         self.cached_message_line_offsets.clear();
         self.cached_render_width = 0;
         self.last_chat_rect = None;
         if std::env::var("COREX_MOUSE").is_err() {
-            let should_capture = !is_mobile_portrait(width, height);
+            let should_capture = mouse_capture_default(width, height);
             if self.mouse_capture != should_capture {
                 self.mouse_capture = should_capture;
             }
@@ -197,8 +200,8 @@ impl App {
     /// Routes a mouse event: the wheel scrolls the feed, the left button selects text or opens links.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection(-3),
-            MouseEventKind::ScrollDown => self.scroll_selection(3),
+            MouseEventKind::ScrollUp => self.scroll_selection(-wheel_lines()),
+            MouseEventKind::ScrollDown => self.scroll_selection(wheel_lines()),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down_time = Some(Instant::now());
                 self.mouse_down_pos = Some((mouse.column, mouse.row));
@@ -1275,9 +1278,10 @@ impl App {
                             self.model_dialog.ready[pos] = true;
                         }
                     }
+                    let note = crate::auth_dialog::env_override_note(&prov, &key_str).unwrap_or_default();
                     self.session.add_message(Message::system(format!(
-                        "API key updated and saved for {} (${})!",
-                        label, env_var
+                        "API key updated and saved for {} (${})!{}",
+                        label, env_var, note
                     )));
                 } else {
                     let portal = self.model_dialog.providers.iter()
@@ -1401,8 +1405,8 @@ impl App {
                 true
             }
             "/keyboard" => {
-                try_show_termux_soft_keyboard();
-                self.session.add_message(Message::system("Virtual keyboard requested (Termux tap-to-type active on mobile vertical screens)."));
+                self.tap_keyboard.request_keyboard(Instant::now(), &mut self.mouse_capture);
+                self.session.add_message(Message::system("Tap the screen to raise the keyboard: mouse reporting is paused for a few seconds so Termux handles the tap."));
                 true
             }
             "/prefix" => {
@@ -1865,7 +1869,6 @@ impl App {
                     };
                     help.push_str(&format!("  {:<30} {}{}\n", usage, c.description, alias));
                 }
-                help.push_str("  /key <sk..>  Set or update your DeepSeek API key\n");
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
                 help.push_str("\nKeyboard Shortcuts:\n  Enter: Submit | Ctrl+T: Toggle Thought Box | Ctrl+C: Cancel/Exit | Up/Down: History / Command Nav");
                 help.push_str("\n  Scroll chat: Mouse wheel | PageUp / PageDown | Shift+Up / Shift+Down");
@@ -1887,6 +1890,19 @@ impl App {
             DialogAction::Close => self.model_dialog.close(),
             DialogAction::SettingsChanged => self.apply_dialog_settings(),
             DialogAction::Activate { provider, model } => self.activate_model(provider, model),
+            DialogAction::EditKey { provider } => {
+                let Some(p) = self.model_dialog.providers.get(provider).cloned() else {
+                    return;
+                };
+                self.model_dialog.close();
+                self.auth_dialog.open_for_provider(
+                    None,
+                    &p.name,
+                    p.display_name(),
+                    &p.api_key_env,
+                    p.portal_url(),
+                );
+            }
         }
     }
 
@@ -2085,6 +2101,15 @@ pub fn open_url_detached(url: &str) {
             .stderr(std::process::Stdio::null())
             .spawn();
 
+        // `termux-open-url` ships with Termux (termux-tools) and hands the link to Android.
+        #[cfg(target_os = "android")]
+        let child = std::process::Command::new("termux-open-url")
+            .arg(&url_owned)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
         #[cfg(target_os = "macos")]
         let child = std::process::Command::new("open")
             .arg(&url_owned)
@@ -2101,7 +2126,7 @@ pub fn open_url_detached(url: &str) {
             .stderr(std::process::Stdio::null())
             .spawn();
 
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "windows"))]
         if let Ok(mut c) = child {
             let _ = c.wait();
         }
