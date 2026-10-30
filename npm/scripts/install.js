@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
-const VERSION = 'v0.8.3';
+const VERSION = 'v0.8.4';
 const REPO = 'sluisr/corex';
 
 const PLATFORM_MAP = {
@@ -35,6 +35,14 @@ const PLATFORM_MAP = {
     x64: {
       // Fallback for Intel macs or Rosetta
       archive: `corex-${VERSION}-x86_64-apple-darwin.tar.gz`,
+      binName: 'cx',
+      type: 'tar',
+      sha256: 'auto'
+    }
+  },
+  android: {
+    arm64: {
+      archive: `corex-${VERSION}-aarch64-linux-android.tar.gz`,
       binName: 'cx',
       type: 'tar',
       sha256: 'auto'
@@ -76,7 +84,7 @@ function getBinaryInfo() {
   const target = PLATFORM_MAP[platform] && PLATFORM_MAP[platform][arch];
   if (!target) {
     throw new Error(
-      `Unsupported operating system / architecture: ${platform}-${arch}. Supported: Linux (x64, arm64), macOS (arm64, x64), Windows (x64).`
+      `Unsupported operating system / architecture: ${platform}-${arch}. Supported: Linux (x64, arm64), macOS (arm64, x64), Android Termux (arm64), Windows (x64).`
     );
   }
   return target;
@@ -239,15 +247,14 @@ async function install() {
       execFileSync('tar', ['-xzf', archivePath, '-C', binDir], { stdio: 'inherit' });
     } else if (target.type === 'zip') {
       if (process.platform === 'win32') {
+        const psQuote = (s) => `'${s.replace(/'/g, "''")}'`;
         execFileSync(
           'powershell.exe',
           [
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            'Expand-Archive -Force -LiteralPath $args[0] -DestinationPath $args[1]',
-            archivePath,
-            binDir
+            `Expand-Archive -Force -LiteralPath ${psQuote(archivePath)} -DestinationPath ${psQuote(binDir)}`
           ],
           { stdio: 'inherit' }
         );

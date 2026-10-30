@@ -129,15 +129,18 @@ cat ~/.corex/logs/corex-forensic-$(date +%Y-%m-%d).log | tail -100
 
 ## 🔄 Context Too Long / Auto-Compact Triggered
 
-Corex auto-compacts at **95,000 tokens** by default. You'll see a `[INFO]` notice. This is normal behavior.
+Corex auto-compacts at **80% of the model's context window** by default (800,000 tokens for DeepSeek and Gemini, 160,000 for Claude, 102,400 for 128k models). You'll see a `[INFO]` notice. This is normal behavior.
 
-To change the threshold:
+To change the limits:
 ```json
 // ~/.corex/settings.json
 {
-  "compact_threshold_tokens": 120000
+  "context_window_tokens": 1000000,
+  "compact_threshold_tokens": 400000,
+  "history_token_limit": 900000
 }
 ```
+`context_window_tokens` is the window of the active model (set it if the default for your provider is wrong), `compact_threshold_tokens` triggers compaction, and `history_token_limit` is the point where the oldest turns are dropped from a request.
 
 To manually compact before hitting the limit:
 ```

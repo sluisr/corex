@@ -59,10 +59,11 @@ esac
 
 echo "[corex] Detecting latest version..."
 LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null | sed 's|.*/tag/||' | tr -d '\r\n')
-if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
-  LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4)
-fi
-VERSION="${LATEST_TAG:-v0.8.3}"
+case "$LATEST_TAG" in
+  v[0-9]*) ;;
+  *) LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4) ;;
+esac
+VERSION="${LATEST_TAG:-v0.8.4}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"
@@ -122,13 +123,16 @@ else
   SUDO=""
 fi
 
+# Copy next to the target and rename over it: a running binary cannot be overwritten in place.
+install_bin() {
+  $1 cp "$2" "$3.new.$$" && $1 chmod +x "$3.new.$$" && $1 mv -f "$3.new.$$" "$3"
+}
+
 echo "[corex] Installing binaries to $INSTALL_DIR..."
-$SUDO cp "$TMP_DIR/cx" "$INSTALL_DIR/cx"
-$SUDO chmod +x "$INSTALL_DIR/cx"
+install_bin "$SUDO" "$TMP_DIR/cx" "$INSTALL_DIR/cx"
 
 if [ -f "$TMP_DIR/corex" ]; then
-  $SUDO cp "$TMP_DIR/corex" "$INSTALL_DIR/corex"
-  $SUDO chmod +x "$INSTALL_DIR/corex"
+  install_bin "$SUDO" "$TMP_DIR/corex" "$INSTALL_DIR/corex"
 else
   $SUDO ln -sf "$INSTALL_DIR/cx" "$INSTALL_DIR/corex" 2>/dev/null || true
 fi
@@ -137,11 +141,12 @@ $SUDO ln -sf "$INSTALL_DIR/cx" "$INSTALL_DIR/cxs" 2>/dev/null || true
 # Synchronize any other cx/corex binaries in PATH to prevent older versions from shadowing
 if command -v which >/dev/null 2>&1; then
   for existing_bin in $(which -a cx corex 2>/dev/null | sort -u); do
-    if [ "$existing_bin" != "$INSTALL_DIR/cx" ] && [ "$existing_bin" != "$INSTALL_DIR/corex" ] && [ -f "$existing_bin" ] && [ ! -L "$existing_bin" ]; then
-      if [ -w "$existing_bin" ]; then
-        cp "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
+    if [ "$existing_bin" != "$INSTALL_DIR/cx" ] && [ "$existing_bin" != "$INSTALL_DIR/corex" ] && [ -f "$existing_bin" ] && [ ! -L "$existing_bin" ] \
+      && "$existing_bin" --version 2>/dev/null | grep -qE '^(cx|corex) [0-9]'; then
+      if [ -w "$(dirname "$existing_bin")" ]; then
+        install_bin "" "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
       elif [ -n "$SUDO" ]; then
-        $SUDO cp "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
+        install_bin "$SUDO" "$TMP_DIR/cx" "$existing_bin" 2>/dev/null || true
       fi
     fi
   done

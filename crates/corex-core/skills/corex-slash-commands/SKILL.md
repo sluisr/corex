@@ -67,10 +67,8 @@ cx --model deepseek-flash
 | `/fleet wide` | Open the 3-column wide Fleet layout (Nodes + Output/PTY + Chat) |
 | `/fleet list` | List all configured SSH fleet servers |
 | `/fleet connect <id>` | Connect directly to a fleet server and open an interactive SSH PTY |
-| `/fleet add <id> <user@host[:port]> [key]` | Add a server to `.corex/fleet.toml` |
-| `/fleet remove <id>` | Remove a server from `.corex/fleet.toml` |
-| `/fleet exec <id\|all> <cmd>` | Execute a remote command on one or all servers |
-| `/fleet reload` | Reload `.corex/fleet.toml` and `~/.ssh/config` |
+
+Servers are added by editing `fleet.toml` (`cxs init` writes a template) or `~/.ssh/config`.
 
 You can also launch directly into Fleet mode from the CLI via `cxs` (or `cx fleet`).
 
@@ -83,7 +81,7 @@ You can also launch directly into Fleet mode from the CLI via `cxs` (or `cx flee
 | `/compress` | Manually compress conversation history to save tokens |
 | `/compact` | Intelligently compact history into a structured memory block |
 
-Corex also auto-compacts at **95,000 tokens** by default (configurable via `compact_threshold_tokens` in `~/.corex/settings.json`).
+Corex also auto-compacts at **80% of the model's context window** by default (configurable via `compact_threshold_tokens` in `~/.corex/settings.json`).
 
 ---
 
@@ -91,7 +89,7 @@ Corex also auto-compacts at **95,000 tokens** by default (configurable via `comp
 
 | Command | Description |
 | :--- | :--- |
-| `/stats` | Session token metrics, KV cache hit rate, and USD cost summary |
+| `/stats` (alias `/context`) | Session token metrics, KV cache hit rate, USD cost summary, and the context in use against the auto-compact and history limits |
 | `/balance` | Live DeepSeek API account balance lookup (async, non-blocking) |
 | `/wallet` | Alias for `/balance` |
 
@@ -144,7 +142,6 @@ cx fetch "https://news.ycombinator.com"
 | `/yolo` | Toggle YOLO mode — auto-approves ALL tool executions |
 | `/yolo on` | Enable YOLO mode |
 | `/yolo off` | Disable YOLO mode |
-| `/allow [add\|remove <rule>]` | View or manage permanently allowed commands (`allowed_commands` whitelist; alias: `/whitelist`) |
 | `/sudo [clear]` | Configure or clear ephemeral in-memory sudo password for privileged commands |
 | `/tasks` | List all running background tasks |
 | `/tasks status <pid>` | Show status of a specific background task |
@@ -190,14 +187,16 @@ cx --yolo
 
 | Key | Action |
 | :--- | :--- |
-| `Enter` | Send message / confirm |
-| `Alt+Enter` / `Shift+Enter` | Insert newline in composer |
-| `Ctrl+C` | Cancel current generation |
+| `Enter` | Send message / confirm (queued while the agent works) |
+| `Alt+Enter` | While the agent works: deliver the message at the next safe point |
+| `Esc` | Cancel the generation / close popup / snap scroll to bottom; twice within 0.5 s clears the prompt |
+| `Ctrl+C` | Cancel the generation; twice within 2 s quits |
+| `Ctrl+Z` | Quit immediately |
 | `Ctrl+T` | Expand / collapse Chain-of-Thought reasoning blocks |
 | `Ctrl+O` | Expand / collapse full tool output & diff previews |
-| `F2` / `Ctrl+S` | Toggle Fleet SSH server pane |
-| `Ctrl+Z` | Undo last edit in composer |
-| `Ctrl+L` | Clear screen |
-| `↑ / ↓` | Navigate command autocomplete / history |
+| `Ctrl+L` | Repaint the screen |
+| `F2` | Toggle mouse reporting (wheel and selection in Corex vs. the terminal) |
+| `↑ / ↓` | Navigate command autocomplete / prompt history |
+| `Ctrl+P / Ctrl+N`, `Alt+↑ / Alt+↓` | Previous / next prompt in history |
+| `PageUp / PageDown`, `Shift+↑ / Shift+↓` | Scroll the conversation |
 | `Tab` | Select highlighted autocomplete suggestion / switch Fleet focus |
-| `Esc` | Close popup / snap scroll to bottom / cancel |

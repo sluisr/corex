@@ -30,6 +30,23 @@ pub enum ProviderKind {
     GenericOpenAi,
 }
 
+/// Context window, in tokens, assumed for a provider when nothing better is known: neither
+/// `context_window_tokens`, nor a model's `context_window`, nor a window the provider reported.
+/// Conservative where models differ inside one provider.
+pub fn default_context_window(kind: ProviderKind) -> usize {
+    match kind {
+        ProviderKind::DeepSeek | ProviderKind::Google => 1_000_000,
+        ProviderKind::Anthropic => 200_000,
+        ProviderKind::Local => 24_000,
+        ProviderKind::OpenAi
+        | ProviderKind::GitHub
+        | ProviderKind::Groq
+        | ProviderKind::OpenRouter
+        | ProviderKind::Mistral
+        | ProviderKind::GenericOpenAi => 128_000,
+    }
+}
+
 /// Which group of tunable settings a model exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -55,6 +72,10 @@ pub struct ModelProfile {
     pub reasoning: Vec<String>,
     #[serde(default)]
     pub family: ModelFamily,
+    /// Input window of this model, in tokens. Set it for a model whose provider does not report
+    /// one (see `model_info`); it wins over what the provider reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<usize>,
 }
 
 impl ModelProfile {
@@ -187,6 +208,7 @@ fn model(id: &str, label: &str, tags: &[&str], reasoning: &[&str], family: Model
         tags: tags.iter().map(|s| s.to_string()).collect(),
         reasoning: reasoning.iter().map(|s| s.to_string()).collect(),
         family,
+        context_window: None,
     }
 }
 

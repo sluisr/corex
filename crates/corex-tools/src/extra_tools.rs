@@ -337,7 +337,7 @@ impl Tool for ActivateSkillTool {
             return Ok(ToolOutput::error(format!("Invalid skill name '{}'.", name)));
         }
 
-        // Search precedence: 1. Workspace .agents/skills 2. Workspace .corex/skills 3. Global ~/.agents/skills 4. Global ~/.corex/skills 5. Fallback .gemini/skills
+        // Search precedence: 1. Workspace .agents/skills 2. Workspace .corex/skills 3. Global ~/.agents/skills 4. Global ~/.corex/skills
         let candidates = [
             context.workspace_dir.join(".agents").join("skills").join(name).join("SKILL.md"),
             context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
@@ -347,7 +347,6 @@ impl Tool for ActivateSkillTool {
             directories::BaseDirs::new()
                 .map(|b| b.home_dir().join(".corex").join("skills").join(name).join("SKILL.md"))
                 .unwrap_or_else(|| Path::new("").to_path_buf()),
-            context.workspace_dir.join(".gemini").join("skills").join(name).join("SKILL.md"),
         ];
 
         for path in &candidates {

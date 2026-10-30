@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use chrono::Utc;
 use directories::BaseDirs;
@@ -35,6 +36,27 @@ pub struct UpdateSummary {
     pub updated_version: String,
     pub target_triple: String,
     pub binary_path: PathBuf,
+}
+
+static UPDATE_CHECK_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turns the startup update check off for this process (`--no-update-check`).
+pub fn disable_update_check() {
+    UPDATE_CHECK_DISABLED.store(true, Ordering::Relaxed);
+}
+
+/// True when `COREX_NO_UPDATE_CHECK` holds anything other than empty, `0` or `false`.
+fn env_value_disables_check(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None => false,
+        Some(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false")),
+    }
+}
+
+/// True when the startup update check was turned off by flag or environment variable.
+pub fn update_check_disabled() -> bool {
+    UPDATE_CHECK_DISABLED.load(Ordering::Relaxed)
+        || env_value_disables_check(std::env::var("COREX_NO_UPDATE_CHECK").ok().as_deref())
 }
 
 fn get_cache_path() -> Option<PathBuf> {
@@ -109,6 +131,9 @@ pub fn is_newer_version(current: &str, candidate: &str) -> bool {
 
 /// Reads the local disk cache. If a cached version exists and is newer than current, returns Some(version).
 pub fn check_cached_update(current_version: &str) -> Option<String> {
+    if update_check_disabled() {
+        return None;
+    }
     let path = get_cache_path().filter(|p| p.exists())?;
 
     let content = fs::read_to_string(path).ok()?;
@@ -213,6 +238,9 @@ pub fn verify_checksum_from_text(
 
 /// Checks online for a newer release (CDN -> GitHub API -> GitHub web redirect) with a 3s timeout.
 pub async fn check_for_update_online(current_version: &str) -> Option<String> {
+    if update_check_disabled() {
+        return None;
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .user_agent(format!("corex/{}", current_version))
@@ -685,6 +713,19 @@ mod tests {
         assert_eq!(parse_semver("v0.2.1"), Some((0, 2, 1)));
         assert_eq!(parse_semver("1.0.0-rc1"), Some((1, 0, 0)));
         assert_eq!(parse_semver("0.6.4-rc1"), Some((0, 6, 4)));
+    }
+
+    #[test]
+    fn test_env_value_disables_check() {
+        assert!(!env_value_disables_check(None));
+        assert!(!env_value_disables_check(Some("")));
+        assert!(!env_value_disables_check(Some("  ")));
+        assert!(!env_value_disables_check(Some("0")));
+        assert!(!env_value_disables_check(Some("false")));
+        assert!(!env_value_disables_check(Some("FALSE")));
+        assert!(env_value_disables_check(Some("1")));
+        assert!(env_value_disables_check(Some("true")));
+        assert!(env_value_disables_check(Some("yes")));
     }
 
     #[test]

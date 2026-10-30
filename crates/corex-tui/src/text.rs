@@ -37,6 +37,23 @@ pub fn pad_right(s: &str, w: usize) -> String {
     format!("{}{}", fitted, " ".repeat(w.saturating_sub(used)))
 }
 
+/// `950` -> `950`, `120_000` -> `120k`, `1_000_000` -> `1M`, `1_250_000` -> `1.2M`.
+pub fn short_tokens(n: usize) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        let whole = n / 1_000_000;
+        let tenth = n % 1_000_000 / 100_000;
+        if tenth == 0 {
+            format!("{}M", whole)
+        } else {
+            format!("{}.{}M", whole, tenth)
+        }
+    }
+}
+
 /// `195373` -> `195,373`.
 pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -130,6 +147,16 @@ fn drop_single_emphasis(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_tokens_reads_at_a_glance() {
+        assert_eq!(super::short_tokens(0), "0");
+        assert_eq!(super::short_tokens(950), "950");
+        assert_eq!(super::short_tokens(120_000), "120k");
+        assert_eq!(super::short_tokens(128_000), "128k");
+        assert_eq!(super::short_tokens(1_000_000), "1M");
+        assert_eq!(super::short_tokens(1_250_000), "1.2M");
+    }
+
     use super::*;
 
     #[test]

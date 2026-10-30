@@ -428,9 +428,10 @@ pub fn build_tool_confirmation_lines(
             Style::default().fg(theme.dark_gray)
         };
 
+        let label_width = max_width.saturating_sub(21).clamp(16, 36);
         result.push(Line::from(vec![
             Span::styled(format!("    {} {}. ", bullet, num), num_style),
-            Span::styled(format!("{:<36}", opt), text_style),
+            Span::styled(format!("{:<label_width$} ", corex_core::truncate_ellipsis(opt, label_width)), text_style),
             Span::styled(*shortcut, shortcut_style),
         ]));
     }
@@ -745,5 +746,21 @@ mod tests {
         let text = lines[0].spans.iter().map(|s| s.content.as_ref()).collect::<String>();
         assert!(text.contains("whoami"));
         assert!(!text.contains("..."));
+    }
+
+    #[test]
+    fn approval_options_fit_a_phone_screen() {
+        let theme = Theme::default();
+        for width in [40usize, 46, 50, 80, 120] {
+            let lines = build_tool_confirmation_lines("edit", "+++ b/a.rs\n+x", 0, 1, 1, 1, width, &theme, false, false, "");
+            for line in &lines {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if text.trim_start().starts_with(['●', '○']) {
+                    let w = unicode_width::UnicodeWidthStr::width(text.as_str());
+                    assert!(w <= width.max(30), "width {width}: option row is {w} wide: {text:?}");
+                    assert!(text.contains('['), "the shortcut must stay visible: {text:?}");
+                }
+            }
+        }
     }
 }

@@ -84,7 +84,7 @@ fn print_help() {
     println!();
     println!("{}", "Configuration:".bold());
     println!("  Project: .corex/fleet.toml");
-    println!("  Global:  ~/.config/corex/fleet.toml or automatically from ~/.ssh/config\n");
+    println!("  Global:  ~/.corex/fleet.toml, ~/.config/corex/fleet.toml or automatically from ~/.ssh/config\n");
 }
 
 async fn show_status(workspace: &Path, check_online: bool) -> Result<()> {
@@ -419,4 +419,13 @@ async fn init_fleet_config(workspace: &Path) -> Result<()> {
     println!("{} Created template configuration at: {}", "✓ Success:".green().bold(), target.display().to_string().cyan());
     println!("Edit this file to add your VPS IP addresses, SSH keys, and clusters.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn init_template_loads() {
+        corex_fleet::FleetConfig::parse(super::DEFAULT_FLEET_TEMPLATE).expect("`cxs init` writes a valid fleet.toml");
+        corex_fleet::FleetConfig::parse(include_str!("../../../.corex/fleet.example.toml")).expect("the example is valid");
+    }
 }

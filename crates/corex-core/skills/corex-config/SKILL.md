@@ -22,7 +22,7 @@ Corex uses a clear, human-readable hierarchy of configuration files in **TOML** 
 | **`~/.corex/SYSTEM.md`** *(or `COREX.md`)* | **Global** | Markdown | **User Personality & Global Rules**: custom tone, role instructions, language, conventions applied to all projects and sessions. |
 | **`.corex/SYSTEM.md`** *(or `./COREX.md` / `./AGENTS.md`)* | **Project Local** | Markdown | **Project Instructions**: repository-specific architecture, build commands, and rules. |
 | **`~/.corex/fleet.toml`** *(or `.corex/fleet.toml`)* | **Global or Local** | TOML | **Remote Fleet & Allowed Commands**: SSH server inventory, `safe_commands` (auto-approved commands), and `dangerous_commands`. |
-| **`~/.corex/config.toml`** | **Global** | TOML | **Corex Engine Settings**: active model, reasoning effort, temperature, YOLO mode default, API keys. |
+| **`~/.corex/settings.json`** | **Global** | JSON | **Corex Engine Settings**: active model and provider, reasoning effort, temperature, YOLO mode default, API keys, allowed commands. |
 | **`~/.ssh/config`** | **System** | OpenSSH | Fallback server discovery for Fleet mode. |
 
 ---
@@ -122,18 +122,22 @@ tags = ["prod", "database"]
 
 ---
 
-## 3. ⚙️ Engine Settings (`~/.corex/config.toml`)
+## 3. ⚙️ Engine Settings (`~/.corex/settings.json`)
 
-Stored automatically when switching models via `/model` or running `/yolo`.
+Stored automatically when switching models via `/model`, saving a key with `/key` or running `/yolo`. A project `.corex/settings.json` may override the model, temperature, reasoning effort and compaction settings; keys, YOLO mode, the local LLM switch and MCP servers are only read from the global file.
 
-### Example `~/.corex/config.toml`:
-```toml
-model = "deepseek-flash"
-temperature = 0.7
-reasoning_effort = "medium"
-yolo_mode = false
-local_llm_enabled = false
-local_llm_url = "http://127.0.0.1:8080/v1"
+### Example `~/.corex/settings.json`:
+```json
+{
+  "model": "deepseek-v4-pro",
+  "active_provider": "deepseek",
+  "temperature": 0.7,
+  "reasoning_effort": "high",
+  "yolo_mode": false,
+  "local_llm_enabled": false,
+  "local_llm_url": "http://127.0.0.1:8080/v1",
+  "allowed_commands": ["cargo test"]
+}
 ```
 
 ---

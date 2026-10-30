@@ -179,6 +179,34 @@ fn has_dangerous_flags_on_safe_cmd(seg: &str, tokens: &[&str]) -> bool {
 }
 
 pub fn assess_command_risk(cmd: &str, safe_list: &[String], dangerous_list: &[String]) -> CommandRiskLevel {
+    // The shell joins `"re""start"` into `restart`: judge the command with its quotes removed too.
+    let dequoted: String = cmd.chars().filter(|c| *c != '"' && *c != '\'').collect();
+    let rank = |r: CommandRiskLevel| match r {
+        CommandRiskLevel::Safe => 0,
+        CommandRiskLevel::Mutating => 1,
+        CommandRiskLevel::Dangerous => 2,
+    };
+    let quoted = assess_raw(cmd, safe_list, dangerous_list);
+    let plain = assess_raw(&dequoted, safe_list, dangerous_list);
+    let risk = if rank(plain) > rank(quoted) { plain } else { quoted };
+    if risk == CommandRiskLevel::Safe && sed_writes_or_executes(&dequoted) {
+        return CommandRiskLevel::Mutating;
+    }
+    risk
+}
+
+/// `sed` scripts can write files (`w`) or run commands (`e`) without `-i`.
+fn sed_writes_or_executes(cmd: &str) -> bool {
+    cmd.split(['|', ';', '&']).any(|seg| {
+        let seg = seg.trim();
+        seg.starts_with("sed ")
+            && seg.split_whitespace().skip(1).filter(|a| !a.starts_with('-')).take(1).any(|script| {
+                script.starts_with('w') || script.starts_with('e') || script.contains("/w") || script.contains("/e")
+            })
+    })
+}
+
+fn assess_raw(cmd: &str, safe_list: &[String], dangerous_list: &[String]) -> CommandRiskLevel {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return CommandRiskLevel::Mutating;
@@ -732,5 +760,18 @@ mod tests {
         let sep_idx = args.iter().position(|a| a == "--").expect("Option separator -- must exist");
         let target = &args[sep_idx + 1];
         assert_eq!(target, "oBadUser@oProxyCommand=calc.exe");
+    }
+
+    #[test]
+    fn quotes_and_sed_scripts_do_not_hide_risk() {
+        let safe: Vec<String> = ["cat", "systemctl", "systemctl status", "sed"].map(String::from).to_vec();
+        let dangerous: Vec<String> = vec!["reboot".to_string()];
+        let risk = |c: &str| assess_command_risk(c, &safe, &dangerous);
+        assert_ne!(risk("cat /etc/\"shadow\""), CommandRiskLevel::Safe);
+        assert_ne!(risk("systemctl \"re\"\"start\" nginx"), CommandRiskLevel::Safe);
+        assert_ne!(risk("sed -n 'w /tmp/x' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_ne!(risk("sed 's/.*/id/e' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_eq!(risk("cat /etc/hostname"), CommandRiskLevel::Safe);
+        assert_eq!(risk("sed -n '1,5p' /etc/hosts"), CommandRiskLevel::Safe);
     }
 }

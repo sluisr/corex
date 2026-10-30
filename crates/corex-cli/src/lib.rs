@@ -82,6 +82,10 @@ struct Cli {
     #[arg(long = "upgrade", alias = "update")]
     upgrade: bool,
 
+    /// Skip the startup check for a newer release (also: COREX_NO_UPDATE_CHECK=1)
+    #[arg(long = "no-update-check")]
+    no_update_check: bool,
+
     /// Force update or reinstallation even if already on the latest version
     #[arg(long = "force", short = 'f')]
     force: bool,
@@ -101,6 +105,9 @@ pub async fn run() -> Result<()> {
         if (arg0.ends_with("cxs") || arg0.ends_with("cx-fleet")) && !cli.fleet {
             cli.fleet = true;
         }
+    }
+    if cli.no_update_check {
+        corex_core::update::disable_update_check();
     }
 
     let workspace_dir = cli
@@ -556,7 +563,8 @@ async fn run_headless(
                         s.stop().await;
                     }
                     let sys_prompt = messages.first().cloned();
-                    session.messages = compacted_messages.clone();
+                    let before = std::mem::replace(&mut session.messages, compacted_messages.clone());
+                    session.keep_history_before_compaction(&before);
                     messages.clear();
                     if let Some(sys) = sys_prompt {
                         messages.push(sys);
@@ -915,6 +923,9 @@ mod tests {
     fn test_cli_upgrade_flags() {
         let upgrade = Cli::try_parse_from(["cx", "--upgrade"]).unwrap();
         assert!(upgrade.upgrade);
+
+        assert!(Cli::try_parse_from(["cx", "--no-update-check"]).unwrap().no_update_check);
+        assert!(!Cli::try_parse_from(["cx"]).unwrap().no_update_check);
 
         let update_alias = Cli::try_parse_from(["cx", "--update", "-f"]).unwrap();
         assert!(update_alias.upgrade);

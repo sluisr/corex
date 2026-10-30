@@ -54,6 +54,9 @@ impl ApplyPatchTool {
 
         if lacks_final_newline && result.ends_with('\n') {
             result.pop();
+            if used_crlf && result.ends_with('\r') {
+                result.pop();
+            }
         }
 
         Ok(result)
@@ -200,7 +203,18 @@ fn sanitize_and_repair_patch(raw: &str) -> Result<(String, Vec<ParsedHunk>), Str
         let line_no_cr = line.trim_end_matches('\r');
         let trimmed_start = line_no_cr.trim_start();
 
-        if trimmed_start.starts_with("--- ") || trimmed_start.starts_with("+++ ") || trimmed_start.starts_with("diff --git ") {
+        // Inside a hunk `--- x` is a removed `-- x` line (an SQL or Lua comment): it only starts
+        // another file when a `+++ ` header follows it.
+        let is_file_header = if current_hunk.is_none() {
+            trimmed_start.starts_with("--- ") || trimmed_start.starts_with("+++ ") || trimmed_start.starts_with("diff --git ")
+        } else {
+            let next_is_plus_header = raw_lines
+                .get(start_idx + rel_idx + 1)
+                .is_some_and(|next| next.starts_with("+++ "));
+            line_no_cr.starts_with("diff --git ") || (line_no_cr.starts_with("--- ") && next_is_plus_header)
+        };
+
+        if is_file_header {
             if current_hunk.is_some() || !hunks.is_empty() {
                 return Err(
                     "Multi-file patches are not supported in a single apply_patch call; please patch one file at a time.".to_string(),
@@ -1032,6 +1046,42 @@ Hope this helps!
         assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nbeta\n");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    async fn patch_file(name: &str, original: &str, patch: &str) -> (bool, String) {
+        let dir = unique_temp_dir(name);
+        let target = dir.join("f.txt");
+        fs::write(&target, original).unwrap();
+        crate::fs_tools::observe_file(&target);
+        let context = ToolContext {
+            workspace_dir: dir.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+        let out = ApplyPatchTool
+            .execute(json!({ "patch": patch, "file_path": "f.txt" }), &context)
+            .await
+            .expect("execute must return ToolOutput");
+        let result = fs::read_to_string(&target).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        (out.is_error, result)
+    }
+
+    #[tokio::test]
+    async fn removing_a_double_dash_comment_is_not_a_second_file() {
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,2 @@\n SELECT 1;\n--- old comment\n SELECT 2;\n";
+        let (is_error, result) = patch_file("sql_comment", "SELECT 1;\n-- old comment\nSELECT 2;\n", patch).await;
+        assert!(!is_error);
+        assert_eq!(result, "SELECT 1;\nSELECT 2;\n");
+    }
+
+    #[tokio::test]
+    async fn crlf_file_without_final_newline_keeps_no_stray_cr() {
+        let patch = "--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA\n";
+        let (is_error, result) = patch_file("crlf_eof", "alpha\r\nbeta", patch).await;
+        assert!(!is_error);
+        assert_eq!(result, "alpha\r\nBETA");
     }
 
     #[tokio::test]

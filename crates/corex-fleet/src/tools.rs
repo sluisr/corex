@@ -199,7 +199,7 @@ impl Tool for FleetRunCommandTool {
             if node.sudo {
                 return true;
             }
-        } else if config.nodes.iter().any(|n| n.sudo) {
+        } else if config.nodes.iter().chain(config.clusters.values().flat_map(|c| &c.nodes)).any(|n| n.sudo) {
             return true;
         }
 

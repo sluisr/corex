@@ -985,9 +985,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     }
 
     let target_cache_count = if app.pending_confirmation.is_some() {
-        app.session.messages.len().saturating_sub(1)
+        app.session.display_messages().len().saturating_sub(1)
     } else {
-        app.session.messages.len()
+        app.session.display_messages().len()
     };
 
     if app.cached_message_count > target_cache_count {
@@ -1008,8 +1008,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         }
         let start_idx = app.cached_message_count;
         for msg_idx in start_idx..target_cache_count {
-            let msg = &app.session.messages[msg_idx];
-            let next_msg = app.session.messages[..target_cache_count].get(msg_idx + 1);
+            let msg = &app.session.display_messages()[msg_idx];
+            let next_msg = app.session.display_messages()[..target_cache_count].get(msg_idx + 1);
             let rendered = render_single_message_with_pending_and_thinking(
                 msg_idx,
                 msg,
@@ -1019,7 +1019,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 None,
                 app.logs_expanded,
                 app.thinking_state.is_expanded,
-                answered_tool_call(&app.session.messages, msg_idx),
+                answered_tool_call(&app.session.display_messages(), msg_idx),
             );
             if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
                 app.cached_has_collapsed_logs = true;
@@ -1046,10 +1046,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     // 3. Live tail (uncached pending message, confirmation dialog, streaming output, queue)
     let mut tail_lines: Vec<Line<'static>> = Vec::new();
 
-    if target_cache_count < app.session.messages.len() {
+    if target_cache_count < app.session.display_messages().len() {
         let msg_idx = target_cache_count;
-        let msg = &app.session.messages[msg_idx];
-        let next_msg = app.session.messages.get(msg_idx + 1);
+        let msg = &app.session.display_messages()[msg_idx];
+        let next_msg = app.session.display_messages().get(msg_idx + 1);
         let rendered = render_single_message_with_pending_and_thinking(
             msg_idx,
             msg,
@@ -1059,7 +1059,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.pending_confirmation.as_ref(),
             app.logs_expanded,
             app.thinking_state.is_expanded,
-            answered_tool_call(&app.session.messages, msg_idx),
+            answered_tool_call(&app.session.display_messages(), msg_idx),
         );
         tail_lines.extend(rendered);
     }
@@ -1512,6 +1512,26 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     if cfg.local_llm_enabled && !cfg.model.starts_with("local") {
         right_spans.push(Span::styled("+Local ", Style::default().fg(app.theme.accent_cyan)));
+    }
+
+    // Share of the model's window in use, so a compaction is never a surprise. The count comes from
+    // the API's last reported prompt size; the window is a per-provider default unless
+    // `context_window_tokens` is set, hence the "~". Yellow once the prompt is past the auto-compact limit.
+    if !is_mobile_portrait(size.width, size.height) && !app.session.messages.is_empty() {
+        let used = app.session.context_tokens();
+        let window = if cfg.model.starts_with("local") { 24_000 } else { cfg.context_window() };
+        let color = if cfg.auto_compact && used >= cfg.effective_compact_threshold() {
+            app.theme.accent_yellow
+        } else {
+            app.theme.muted
+        };
+        right_spans.insert(
+            0,
+            Span::styled(
+                format!("~{}% · ", (used * 100 / window.max(1)).min(100)),
+                Style::default().fg(color),
+            ),
+        );
     }
 
     // Center spans: Local LLM status indicator and Active Background Tasks badge

@@ -69,9 +69,19 @@ impl Tool for DelegateSubagentTool {
         })
     }
 
-    fn needs_confirmation(&self, _args: &serde_json::Value, _context: &ToolContext) -> bool {
-        // Delegating is not gated: what a subagent does is limited by `subagent_denial`.
-        false
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        // Worker and Tester run shell commands unattended, so the task itself is approved once.
+        // Scout and Researcher are read-only: `subagent_denial` already limits them.
+        if context.yolo_mode
+            || context
+                .allowed_commands
+                .iter()
+                .any(|c| matches!(c.as_str(), "delegate_subagent" | "invoke_subagent" | "subagent"))
+        {
+            return false;
+        }
+        let role = SubagentRole::parse(args.get("role").and_then(|r| r.as_str()).unwrap_or("worker"));
+        matches!(role, SubagentRole::Worker | SubagentRole::Tester)
     }
 
     fn format_diff(&self, args: &serde_json::Value, _workspace: &std::path::Path) -> Option<String> {
@@ -1919,7 +1929,7 @@ results = []
 for pkg in packages:
     info_dict = None
     try:
-        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.3'})
+        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.4'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             info = data.get('info', {})
@@ -3206,6 +3216,30 @@ impl Tool for ManageSubagentsTool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn delegating_a_worker_or_tester_needs_approval() {
+        let mut ctx = ToolContext {
+            workspace_dir: PathBuf::from("/tmp"),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+        };
+        let asks = |role: &str, ctx: &ToolContext| {
+            DelegateSubagentTool.needs_confirmation(&json!({ "role": role, "prompt": "x" }), ctx)
+        };
+        assert!(asks("worker", &ctx));
+        assert!(asks("tester", &ctx));
+        assert!(asks("anything-else", &ctx), "an unknown role runs as a worker");
+        assert!(!asks("scout", &ctx));
+        assert!(!asks("researcher", &ctx));
+
+        ctx.allowed_commands.push("delegate_subagent".to_string());
+        assert!(!asks("worker", &ctx));
+        ctx.allowed_commands.clear();
+        ctx.yolo_mode = true;
+        assert!(!asks("worker", &ctx));
+    }
 
     #[tokio::test]
     async fn test_delegate_and_manage_subagents() {

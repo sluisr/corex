@@ -124,6 +124,10 @@ pub fn write_askpass_credential(password: &str) -> Option<PathBuf> {
     }
 }
 
+const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
+    "$", "$(", "`", "<(", ">(", "${", "{", "}", "\n", "\r",
+];
+
 /// Checks if a shell command is known to be safe/read-only and does not require user confirmation.
 /// Matches deepseek-cli / Google Gemini CLI commandSafety.ts logic.
 ///
@@ -138,10 +142,7 @@ pub fn is_known_safe_command(cmd_str: &str) -> bool {
     }
 
     // Deny command substitutions, process substitutions, variable expansions ($VAR / ${VAR}),
-    // and multi-line or here-doc escapes.
-    const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
-        "$", "$(", "`", "<(", ">(", "${", "\n", "\r",
-    ];
+    // brace expansion, and multi-line or here-doc escapes.
     if DANGEROUS_SHELL_PATTERNS.iter().any(|p| trimmed.contains(p)) {
         return false;
     }
@@ -177,9 +178,6 @@ pub fn is_known_safe_command_with_allowed(cmd_str: &str, allowed: &HashSet<Strin
         return false;
     }
 
-    const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
-        "$", "$(", "`", "<(", ">(", "${", "\n", "\r",
-    ];
     if DANGEROUS_SHELL_PATTERNS.iter().any(|p| trimmed.contains(p)) {
         return false;
     }
@@ -613,8 +611,9 @@ fn token_references_sensitive_path(tok: &str) -> bool {
             return true;
         }
     }
-    if t.starts_with('-') {
-        return false;
+    if let Some(flag) = t.strip_prefix('-') {
+        // A short flag can carry its value glued on: `-f~/.ssh/id_rsa`.
+        return flag.find(['/', '~']).is_some_and(|i| check_val(&flag[i..]));
     }
     check_val(t)
 }
@@ -1217,22 +1216,25 @@ fn is_safe_git_branch(parts: &[&str]) -> bool {
 }
 
 fn is_safe_git_tag(parts: &[&str]) -> bool {
-    // bare `git tag` lists tags; only explicit list/query flags are safe.
-    if parts.len() == 2 {
-        return true;
-    }
-    matches!(
-        parts[2],
-        "-l" | "--list" | "-n" | "--column" | "--contains" | "--merged" | "--no-merged"
-    )
+    // bare `git tag` lists tags; every flag must be a list/query one, and a name only filters
+    // when such a flag is there (otherwise it creates a tag).
+    let args = &parts[2..];
+    let is_list_flag = |a: &str| {
+        matches!(a, "-l" | "--list" | "--contains" | "--merged" | "--no-merged" | "--points-at")
+            || a.starts_with("-n")
+            || a.starts_with("--column")
+            || a.starts_with("--sort=")
+            || a.starts_with("--format=")
+    };
+    let flags_ok = args.iter().filter(|a| a.starts_with('-')).all(|a| is_list_flag(a));
+    let names = args.iter().any(|a| !a.starts_with('-'));
+    flags_ok && (!names || args.iter().any(|a| is_list_flag(a)))
 }
 
 fn is_safe_git_remote(parts: &[&str]) -> bool {
     // bare `git remote` lists; `-v/--verbose`, `show`, `get-url` are read-only.
-    if parts.len() == 2 {
-        return true;
-    }
-    matches!(parts[2], "-v" | "--verbose" | "show" | "get-url")
+    let mut rest = parts[2..].iter().filter(|a| !matches!(**a, "-v" | "--verbose"));
+    rest.next().is_none_or(|sub| matches!(*sub, "show" | "get-url"))
 }
 
 fn is_safe_git_config(parts: &[&str]) -> bool {
@@ -1601,7 +1603,9 @@ impl Tool for ShellTool {
                     wait_res = child.wait() => {
                         if let Some(ref mut r) = reader_stdout {
                             let mut rest_bytes = Vec::new();
-                            if r.take(200_000).read_to_end(&mut rest_bytes).await.is_ok() && !rest_bytes.is_empty() {
+                            // A child left in the background keeps the pipe open: never wait for EOF.
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut rest_bytes)).await;
+                            if !rest_bytes.is_empty() {
                                 let rest = String::from_utf8_lossy(&rest_bytes);
                                 if let Ok(mut buf) = buf_clone.lock() {
                                     append_and_truncate_output(&mut buf, &rest, 200_000);
@@ -1610,7 +1614,8 @@ impl Tool for ShellTool {
                         }
                         if let Some(ref mut r) = reader_stderr {
                             let mut rest_bytes = Vec::new();
-                            if r.take(200_000).read_to_end(&mut rest_bytes).await.is_ok() && !rest_bytes.is_empty() {
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut rest_bytes)).await;
+                            if !rest_bytes.is_empty() {
                                 let rest = String::from_utf8_lossy(&rest_bytes);
                                 if let Ok(mut buf) = buf_clone.lock() {
                                     append_and_truncate_output(&mut buf, &rest, 200_000);
@@ -2085,6 +2090,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_leaving_a_child_in_background_still_finishes() {
+        let ctx = ToolContext {
+            workspace_dir: std::env::current_dir().unwrap(),
+            yolo_mode: true,
+            allowed_commands: vec![],
+            sudo_password: None,
+        };
+        let start = std::time::Instant::now();
+        let res = ShellTool
+            .execute(json!({ "command": "sleep 5 & echo started", "wait_ms_before_async": 4000 }), &ctx)
+            .await
+            .unwrap();
+        assert!(res.output.contains("started"));
+        assert!(!res.output.contains("[COMMAND SENT TO BACKGROUND]"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[tokio::test]
     async fn test_shell_tool_slow_command_auto_background() {
         let tool = ShellTool;
         let ctx = ToolContext {
@@ -2237,6 +2260,22 @@ mod tests {
         let allowed: HashSet<String> = ["cargo test"].iter().map(|s| s.to_string()).collect();
         assert!(!is_known_safe_command_with_allowed("cargo test $(rm -rf /)", &allowed));
         assert!(!is_known_safe_command_with_allowed("cargo test\nrm -rf /", &allowed));
+    }
+
+    #[test]
+    fn audit_bypasses_need_approval() {
+        assert!(!is_known_safe_command("cat ~/.{ssh,ssh}/id_rsa"));
+        assert!(!is_known_safe_command("head /etc/{shadow,passwd}"));
+        assert!(command_references_sensitive_or_protected_path("grep -f~/.ssh/id_rsa x"));
+        assert!(command_references_sensitive_or_protected_path("rg -f~/.ssh/id_rsa x"));
+        assert!(!command_references_sensitive_or_protected_path("grep -rn TODO src"));
+        assert!(!is_known_safe_command("git tag -n -d v1.0"));
+        assert!(!is_known_safe_command("git tag v1.0"));
+        assert!(is_known_safe_command("git tag -n"));
+        assert!(is_known_safe_command("git tag -l v1.*"));
+        assert!(!is_known_safe_command("git remote -v remove origin"));
+        assert!(is_known_safe_command("git remote -v"));
+        assert!(is_known_safe_command("git remote show origin"));
     }
 }
 

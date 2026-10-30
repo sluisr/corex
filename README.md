@@ -20,7 +20,7 @@
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.4 ms (`cx --version`) and draws its first frame in about 3 ms, ships as one native binary per platform, and idles at about 11.7 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
-> **Release Status:** Active Development / Beta (`v0.8.3`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development / Beta (`v0.8.4`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 
@@ -29,7 +29,7 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 - **Server & Fleet Automation (`cxs`):** Built-in remote VPS cluster management and SysAdmin console (`cxs` or `cx --fleet`). Inspect remote CPU/RAM/Disk metrics, broadcast commands across node clusters, and open interactive SSH sessions in an embedded terminal. Fleet mode drives the OpenSSH `ssh` client, which must be installed.
 - **Native Systems Architecture:** One native Rust binary per platform (6.3 – 8.1 MB) that needs no Node.js, Python or other runtime to run. On Linux it links dynamically against `libc`, `libm` and `libgcc_s`. Startup in about 1.4 ms and about 11.7 MB of resident memory when idle, of which 1.9 MB is anonymous (heap and stacks).
 - **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash with Thought Signatures), Anthropic Claude (Opus, Sonnet and Haiku 5.5, and Fable 5.1, via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq, GitHub Models, OpenRouter, and Mistral AI.
-- **Local Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1`: prompts, code and responses stay on your machine and inference costs $0.00. Corex still checks for a newer release at startup (see [Offline Sovereign Local LLM](#2-offline-sovereign-local-llm-air-gapped--private)).
+- **Local Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1`: prompts, code and responses stay on your machine and inference costs $0.00. Corex checks for a newer release at startup unless you turn it off with `--no-update-check` or `COREX_NO_UPDATE_CHECK=1` (see [Offline Sovereign Local LLM](#2-offline-sovereign-local-llm-air-gapped--private)).
 - **Mobile Vertical / Termux Responsive UX:** Auto-detection for Android Termux portrait screens, native tap-to-keyboard, non-overlapping 2-column status bar, and stacked modals for narrow terminals.
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
@@ -103,7 +103,7 @@ Corex supports three unified execution paradigms:
 
 ### 2. Offline Sovereign Local LLM (Air-Gapped & Private)
 - **Engines:** Any GGUF model served via `llama-server` (llama.cpp) or `Ollama` on `http://127.0.0.1:8080/v1`.
-- **Behavior:** Inference runs entirely on your machine: prompts, code and responses are never sent to a provider, and API cost is $0.00. At startup Corex makes a background request to find out whether a newer release exists (`corex.sluisr.com`, then GitHub), plain `GET` requests with a `corex/<version>` user agent and no conversation data (the GitHub API request adds your `GITHUB_TOKEN` or `GH_TOKEN` when one is set, to avoid rate limits). There is currently no setting to turn it off, so a fully air-gapped machine will see that request fail silently.
+- **Behavior:** Inference runs entirely on your machine: prompts, code and responses are never sent to a provider, and API cost is $0.00. At startup Corex makes a background request to find out whether a newer release exists (`corex.sluisr.com`, then GitHub), plain `GET` requests with a `corex/<version>` user agent and no conversation data (the GitHub API request adds your `GITHUB_TOKEN` or `GH_TOKEN` when one is set, to avoid rate limits). To turn it off, run `cx --no-update-check` or set `COREX_NO_UPDATE_CHECK=1`; no request is made then. Without it, a fully air-gapped machine will see the request fail silently.
 - **Best For:** Proprietary codebases, classified perimeters, air-gapped environments, and offline development.
 
 ### 3. Fleet & SysAdmin Remote Infrastructure (`cxs`)
@@ -253,17 +253,15 @@ cxs
 # or
 cx --fleet
 
-# Ping all nodes or a specific cluster
+# Ping all nodes
 cxs ping
-cxs ping --cluster production
 
 # View live top metrics (CPU, RAM, Disk, Load) across fleet
 cxs top
-cxs top --cluster production
 
-# Execute command on a specific node or broadcast across entire cluster
+# Execute command on a specific node or broadcast (all, cluster:<name>, tag:<name>, node1,node2)
 cxs run prod-web-01 "systemctl status nginx"
-cxs broadcast production "uptime && free -h"
+cxs broadcast cluster:production "uptime && free -h"
 
 # Initialize template fleet configuration in current workspace (.corex/fleet.toml)
 cxs init
@@ -323,7 +321,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/compact` / `/compress` | Compress session context to conserve token limits. |
 | `/mcp` | Interactive Model Context Protocol server catalog (`/mcp catalog`, `/mcp add`, `/mcp reload`). |
 | `/tasks` | Manage background tasks (`status`, `kill`, `send_input`). |
-| `/stats` | View session metrics, KV Cache hit rates, and financial cost. |
+| `/stats` (alias `/context`) | View session metrics, KV Cache hit rates, financial cost, and the context in use against the compaction limit. |
 | `/info` | Display system telemetry, version, and links. |
 | `/update` | Check for updates or apply in-place atomically (`/update apply` / `/update force`). |
 | `/clear` | Clear the terminal viewport. |
@@ -355,14 +353,41 @@ Configuration and logs are stored globally in `~/.corex/` and can be overridden 
 | :--- | :--- |
 | `~/.corex/fleet.toml` | Global Fleet configuration: VPS nodes, clusters, SSH keys, jump hosts, and command whitelist. |
 | `.corex/fleet.toml` | Workspace-level Fleet overrides for project-specific infrastructure nodes. |
-| `~/.corex/system.md` | Global AI personality, operational rules, and behavioral guidelines injected into all sessions. |
-| `.corex/system.md` | Workspace-level AI instructions and coding constraints. |
+| `~/.corex/SYSTEM.md` | Global AI personality, operational rules, and behavioral guidelines injected into all sessions. |
+| `.corex/SYSTEM.md` | Workspace-level AI instructions and coding constraints (`COREX.md` and `AGENTS.md` at the project root work too). |
 | `~/.corex/settings.json` | Global provider credentials, base URLs, default model, and allowed commands. |
 | `.corex/settings.json` | Project-level workspace settings overrides (secrets automatically stripped before git). |
 | `~/.corex/flash_settings.json` | CoT reasoning depth configuration for Flash. |
 | `~/.corex/pro_settings.json` | Deep reasoning configuration for Pro. |
 | `~/.corex/logs/` | Daily forensic audit logs (`corex-forensic-YYYY-MM-DD.log`, 7-day retention). |
 | `~/.corex/locks/` | Advisory per-path concurrency file locks (`<hash>.lock`). |
+
+Corex reads only `.corex/` and `~/.corex/` (plus the legacy `~/.deepseek/` for settings). It never reads `~/.gemini`, so it can run next to Gemini CLI without sharing its settings or skills.
+
+### Context window and compaction
+
+Corex sizes its limits from the active model's context window instead of a fixed number:
+
+| Setting (`settings.json`) | Default | Meaning |
+| :--- | :--- | :--- |
+| `context_window_tokens` | What the provider reports for the model; else a default by provider: DeepSeek and Google 1,000,000; Anthropic 200,000; OpenAI, GitHub Models, Groq, OpenRouter, Mistral and custom endpoints 128,000; local 24,000 | Context window of the active model. Set it when your model differs and the provider does not say. |
+| `compact_threshold_tokens` | 80% of the window | Prompt size that triggers auto-compaction. |
+| `history_token_limit` | 90% of the window, never below the compaction threshold | Above this, the oldest turns are dropped from a request. |
+
+When you pick a model, Corex asks its provider for the window in the background (DeepSeek, Anthropic, Google, OpenRouter, Groq, Mistral and OpenAI-compatible servers that list it; OpenAI and GitHub Models do not report one). Order of precedence: `context_window_tokens`, then a `context_window` on the model in your `providers` list, then what the provider reported, then the default above. Anthropic's answer is capped at 200,000, since the 1M window needs a beta header Corex does not send.
+
+The status bar shows the share of the window in use (`~13%`) and turns yellow once the prompt passes the auto-compact limit. The size is the prompt size the API reported for the last request plus an estimate of what was added since. `/stats` (or `/context`) lists the limits in force and where the window comes from, and the compaction notice says at how many tokens it ran.
+
+Earlier versions saved `"compact_threshold_tokens": 95000` to `settings.json`; that exact value is treated as unset. Use `95001` to keep a threshold that low.
+
+### Command-line flags and environment variables
+
+| Flag / variable | Effect |
+| :--- | :--- |
+| `--no-update-check` / `COREX_NO_UPDATE_CHECK=1` | Skip the startup request that looks for a newer release, and hide the cached "new version" notice. `cx --upgrade` still works. An empty value, `0` or `false` leaves the check on. |
+| `COREX_API_KEY` | API key for the active provider (see [Authentication](#authentication--configuration)). |
+| `COREX_LOCAL_LLM_URL` | Endpoint of the local model server. |
+| `COREX_MODEL` | Default model. |
 
 ---
 

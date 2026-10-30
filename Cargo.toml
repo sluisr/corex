@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.3"
+version = "0.8.4"
 edition = "2021"
 authors = ["sluisr <contact@sluisr.com>"]
 license = "AGPL-3.0-only"
@@ -51,11 +51,11 @@ zip = { version = "9.1", default-features = false, features = ["deflate-flate2"]
 toml = "0.8"
 
 # Internal crates
-corex-core = { path = "crates/corex-core", version = "0.8.3" }
-corex-tools = { path = "crates/corex-tools", version = "0.8.3" }
-corex-prompt = { path = "crates/corex-prompt", version = "0.8.3" }
-corex-tui = { path = "crates/corex-tui", version = "0.8.3" }
-corex-fleet = { path = "crates/corex-fleet", version = "0.8.3" }
+corex-core = { path = "crates/corex-core", version = "0.8.4" }
+corex-tools = { path = "crates/corex-tools", version = "0.8.4" }
+corex-prompt = { path = "crates/corex-prompt", version = "0.8.4" }
+corex-tui = { path = "crates/corex-tui", version = "0.8.4" }
+corex-fleet = { path = "crates/corex-fleet", version = "0.8.4" }
 
 [profile.release]
 opt-level = "s"

@@ -102,8 +102,8 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "/stats",
         args: "",
-        description: "Session token metrics and KV cache discount",
-        aliases: &[],
+        description: "Session token metrics, context in use and limits",
+        aliases: &["/context"],
         group: MODEL,
     },
     // --- Context ---

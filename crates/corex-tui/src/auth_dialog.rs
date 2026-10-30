@@ -99,7 +99,7 @@ pub fn render_auth_dialog(
     let dialog_width = if is_mobile {
         area.width.saturating_sub(2).max(20)
     } else {
-        72.min(area.width.saturating_sub(4)).max(44)
+        72.min(area.width.saturating_sub(4)).max(44).min(area.width)
     };
     let dialog_height = 11.min(area.height.saturating_sub(2));
 
@@ -197,5 +197,22 @@ mod tests {
     fn env_override_note_only_for_deepseek_with_a_different_env_key() {
         // Only the DeepSeek key is overridden by the environment at load time.
         assert_eq!(env_override_note("openai", "sk-new"), None);
+    }
+
+    #[test]
+    fn dialogs_fit_tiny_terminals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = Theme::default();
+        let mut auth = AuthDialogState::new();
+        auth.open();
+        let mut sudo = crate::sudo_dialog::SudoDialogState::new();
+        sudo.open(corex_core::types::ToolCall::new("1", "run_shell_command", "{}"), "sudo ls".to_string());
+        for (w, h) in [(30, 24), (43, 24), (10, 5), (80, 2), (80, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| render_auth_dialog(f, f.area(), &auth, &theme)).unwrap();
+            terminal.draw(|f| crate::sudo_dialog::render_sudo_dialog(f, f.area(), &sudo, &theme)).unwrap();
+        }
     }
 }

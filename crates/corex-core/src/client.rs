@@ -119,12 +119,30 @@ impl LlmClient {
             &config.local_llm_model,
         );
 
-        Self {
+        let client = Self {
             http,
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(Mutex::new(config.clone())),
             reasoning_cache: ReasoningCache::new(),
             local_client: Arc::new(Mutex::new(local_client)),
+        };
+        client.look_up_context_window(&config);
+        client
+    }
+
+    /// Asks the provider, in the background, for the active model's window, unless something
+    /// more specific already sets it. Config reads it once the answer is in.
+    fn look_up_context_window(&self, cfg: &Config) {
+        let kind = cfg.provider_kind();
+        if kind == crate::providers::ProviderKind::Local
+            || !matches!(
+                cfg.context_window_with_source().1,
+                crate::config::WindowSource::Provider | crate::config::WindowSource::Default
+            )
+        {
+            return;
         }
+        let (base_url, api_key) = cfg.endpoint();
+        crate::model_info::spawn_lookup(self.http.clone(), kind, base_url, api_key, cfg.model.clone());
     }
 
     pub fn get_config(&self) -> Config {
@@ -141,6 +159,7 @@ impl LlmClient {
         if let Ok(mut l) = self.local_client.lock() {
             *l = local;
         }
+        self.look_up_context_window(&new_config);
         if let Ok(mut g) = self.config.lock() {
             *g = new_config;
         }
@@ -495,7 +514,7 @@ impl LlmClient {
     }
 
     /// Rough total token estimate for a message list (prompt side only).
-    fn estimate_messages_tokens(messages: &[Message]) -> usize {
+    pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
         messages.iter().map(|m| {
             let content_toks = match &m.content {
                 Some(MessageContent::Text(s)) => Self::estimate_tokens(s),
@@ -528,9 +547,9 @@ impl LlmClient {
         let current_tokens = Self::estimate_messages_tokens(messages);
 
         let effective_threshold = if cfg.model.starts_with("local") {
-            cfg.compact_threshold_tokens.min(24_000)
+            cfg.effective_compact_threshold().min(24_000)
         } else {
-            cfg.compact_threshold_tokens
+            cfg.effective_compact_threshold()
         };
 
         if !force && (!cfg.auto_compact || current_tokens <= effective_threshold) {
@@ -784,10 +803,17 @@ impl LlmClient {
 
         let new_tokens = Self::estimate_messages_tokens(messages);
         let saved_tokens = current_tokens.saturating_sub(new_tokens);
-        let notice = format!(
-            "Context compacted: preserved initial user prompt + active window (saved ~{} tokens).",
-            saved_tokens
-        );
+        let notice = if force {
+            format!(
+                "Context compacted: preserved initial user prompt + active window (saved ~{} tokens).",
+                saved_tokens
+            )
+        } else {
+            format!(
+                "Context compacted at ~{} tokens (auto-compact limit {}): preserved initial user prompt + active window (saved ~{} tokens). Change the limit with `compact_threshold_tokens` in ~/.corex/settings.json, or turn it off with `auto_compact: false`.",
+                current_tokens, effective_threshold, saved_tokens
+            )
+        };
 
         Ok(Some(notice))
     }
@@ -795,12 +821,7 @@ impl LlmClient {
     /// If the estimated prompt token count is above the threshold, drop the oldest
     /// intermediate messages (preserving system prompt, root user prompt when possible,
     /// and atomic tool-call groups) until we are back under the limit.
-    const HISTORY_TOKEN_LIMIT: usize = 120_000;
     const LOCAL_HISTORY_TOKEN_LIMIT: usize = 24_000;
-
-    pub fn cap_history_if_needed(messages: &mut Vec<Message>) {
-        Self::cap_history_with_limit(messages, Self::HISTORY_TOKEN_LIMIT);
-    }
 
     pub fn cap_history_with_limit(messages: &mut Vec<Message>, token_limit: usize) {
         if Self::estimate_messages_tokens(messages) <= token_limit {
@@ -1025,7 +1046,7 @@ impl LlmClient {
         let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
         Self::sanitize_tool_call_sequences(&mut messages);
         // Capture compacted session messages before wire-only mutations
-        // (cap_history_if_needed, sanitize_for_google_tool_calls, truncate_tool_outputs).
+        // (cap_history_with_limit, sanitize_for_google_tool_calls, truncate_tool_outputs).
         let auto_compact_event = compact_notice.map(|notice| {
             let compacted_session_messages = if messages.len() > 1 {
                 messages[1..].to_vec()
@@ -1034,7 +1055,7 @@ impl LlmClient {
             };
             (compacted_session_messages, notice)
         });
-        Self::cap_history_if_needed(&mut messages);
+        Self::cap_history_with_limit(&mut messages, cfg.effective_history_limit());
         Self::sanitize_tool_call_sequences(&mut messages);
         if cfg.provider_kind() == crate::providers::ProviderKind::Google {
             Self::sanitize_for_google_tool_calls(&mut messages);
@@ -2055,6 +2076,8 @@ mod image_fallback_tests {
             base_url: addr,
             api_key: "test-key".to_string(),
             model: "some-text-model".to_string(),
+            // Pinned, so no window lookup takes the mock server's first connection.
+            context_window_tokens: Some(128_000),
             ..Config::default()
         };
         let client = LlmClient::new(cfg);

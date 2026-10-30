@@ -9,6 +9,7 @@ pub mod history;
 pub mod json_repair;
 pub mod language;
 pub mod local_client;
+pub mod model_info;
 pub mod providers;
 pub mod reasoning_cache;
 pub mod repeat_guard;
@@ -59,7 +60,7 @@ pub use client::{
     get_sudo_password, is_truncated_finish, parse_openai_sse_data, set_sudo_password, LlmClient,
     StreamEvent, TRUNCATED_TOOL_CALL_ERROR,
 };
-pub use config::{Config, McpServerConfig};
+pub use config::{Config, McpServerConfig, WindowSource};
 pub use file_lock::lock_path;
 pub use forensic::ForensicLogger;
 pub use history::HistoryStore;

@@ -112,6 +112,8 @@ impl NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
+    /// Defaults to the table key (`[clusters.<id>]`).
+    #[serde(default)]
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -256,41 +258,41 @@ impl FleetConfig {
         for node in &mut self.nodes {
             node.normalize_paths();
         }
-        for cluster in self.clusters.values_mut() {
+        for (key, cluster) in self.clusters.iter_mut() {
+            if cluster.id.is_empty() {
+                cluster.id = key.clone();
+            }
             for node in &mut cluster.nodes {
                 node.normalize_paths();
             }
         }
     }
 
-    /// Loads configuration prioritizing workspace `.corex/fleet.toml`, then `~/.config/corex/fleet.toml`.
-    pub fn load(workspace: Option<&Path>) -> Result<Self> {
-        let mut searched_paths = Vec::new();
-
+    /// Where `fleet.toml` is looked for, first match wins: the workspace `.corex/`, then
+    /// `~/.corex/`, then `~/.config/corex/`.
+    fn candidate_paths(workspace: Option<&Path>) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
         if let Some(ws) = workspace {
-            let ws_path = ws.join(".corex").join("fleet.toml");
-            searched_paths.push(ws_path.clone());
-            if ws_path.exists() {
-                let content = fs::read_to_string(&ws_path)
-                    .with_context(|| format!("Failed to read {}", ws_path.display()))?;
-                let mut cfg: FleetConfig = toml::from_str(&content)
-                    .with_context(|| format!("Failed to parse TOML in {}", ws_path.display()))?;
-                cfg.normalize();
-                return Ok(cfg);
-            }
+            paths.push(ws.join(".corex").join("fleet.toml"));
         }
-
         if let Some(base) = BaseDirs::new() {
-            let user_path = base.config_dir().join("corex").join("fleet.toml");
-            searched_paths.push(user_path.clone());
-            if user_path.exists() {
-                let content = fs::read_to_string(&user_path)
-                    .with_context(|| format!("Failed to read {}", user_path.display()))?;
-                let mut cfg: FleetConfig = toml::from_str(&content)
-                    .with_context(|| format!("Failed to parse TOML in {}", user_path.display()))?;
-                cfg.normalize();
-                return Ok(cfg);
-            }
+            paths.push(base.home_dir().join(".corex").join("fleet.toml"));
+            paths.push(base.config_dir().join("corex").join("fleet.toml"));
+        }
+        paths
+    }
+
+    pub fn parse(content: &str) -> Result<Self> {
+        let mut cfg: FleetConfig = toml::from_str(content)?;
+        cfg.normalize();
+        Ok(cfg)
+    }
+
+    pub fn load(workspace: Option<&Path>) -> Result<Self> {
+        if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            return Self::parse(&content).with_context(|| format!("Failed to parse TOML in {}", path.display()));
         }
 
         let mut default_cfg = FleetConfig::default();
@@ -307,27 +309,9 @@ impl FleetConfig {
     /// Fast config loader for safety checks that only reads fleet.toml if present,
     /// avoiding ~/.ssh/config auto-discovery overhead.
     pub fn load_fast(workspace: Option<&Path>) -> Self {
-        if let Some(ws) = workspace {
-            let ws_path = ws.join(".corex").join("fleet.toml");
-            if ws_path.exists() {
-                if let Ok(content) = fs::read_to_string(&ws_path) {
-                    if let Ok(mut cfg) = toml::from_str::<FleetConfig>(&content) {
-                        cfg.normalize();
-                        return cfg;
-                    }
-                }
-            }
-        }
-
-        if let Some(base) = BaseDirs::new() {
-            let user_path = base.config_dir().join("corex").join("fleet.toml");
-            if user_path.exists() {
-                if let Ok(content) = fs::read_to_string(&user_path) {
-                    if let Ok(mut cfg) = toml::from_str::<FleetConfig>(&content) {
-                        cfg.normalize();
-                        return cfg;
-                    }
-                }
+        if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
+            if let Some(cfg) = fs::read_to_string(&path).ok().and_then(|c| Self::parse(&c).ok()) {
+                return cfg;
             }
         }
 
@@ -706,5 +690,14 @@ Host db-prod
         assert_eq!(nodes[2].host, "10.20.0.10");
         assert_eq!(nodes[2].user, "postgres");
         assert_eq!(nodes[2].port, 22);
+    }
+
+    #[test]
+    fn cluster_id_defaults_to_its_table_key() {
+        let cfg = FleetConfig::parse(
+            "[clusters.production]\nname = \"Prod\"\n\n[[clusters.production.nodes]]\nid = \"web\"\nhost = \"10.0.0.1\"\nuser = \"root\"\n",
+        )
+        .expect("a cluster without `id` parses");
+        assert_eq!(cfg.clusters["production"].id, "production");
     }
 }

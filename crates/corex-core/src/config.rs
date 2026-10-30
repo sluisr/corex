@@ -65,9 +65,35 @@ struct LocalOverrides {
     reasoning_effort: Option<String>,
     auto_compact: Option<bool>,
     compact_threshold_tokens: Option<usize>,
+    history_token_limit: Option<usize>,
+    context_window_tokens: Option<usize>,
     local_prompt_lite: Option<bool>,
     yolo_mode: Option<bool>,
     local_llm_enabled: Option<bool>,
+}
+
+/// Where `Config::context_window` got its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowSource {
+    /// `context_window_tokens` in `settings.json`.
+    Settings,
+    /// The model's `context_window` in the provider list.
+    Catalog,
+    /// The provider's own models API.
+    Provider,
+    /// A guess per provider; the model may differ.
+    Default,
+}
+
+impl WindowSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Settings => "settings.json",
+            Self::Catalog => "provider list",
+            Self::Provider => "reported by the provider",
+            Self::Default => "default for this provider, not confirmed for this model",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,8 +128,19 @@ pub struct Config {
     pub local_llm_model: String,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
-    #[serde(default = "default_compact_threshold_tokens")]
-    pub compact_threshold_tokens: usize,
+    /// Estimated prompt size that triggers auto-compaction. Unset: 80% of the context window.
+    /// (`95000`, the old fixed default that earlier versions wrote to `settings.json`, also
+    /// counts as unset.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_threshold_tokens: Option<usize>,
+    /// Hard cap on the history sent per request; older turns are dropped above it.
+    /// Unset: 90% of the context window, and never below the compaction threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_token_limit: Option<usize>,
+    /// Context window of the active model. Unset: the provider's default
+    /// (see `providers::default_context_window`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
     /// Use a reduced system prompt for small local models (Gemma 2B, Llama 3B, etc.).
     /// Lite mode strips complex tool enforcement instructions that confuse SLMs.
     #[serde(default)]
@@ -128,9 +165,8 @@ fn default_auto_compact() -> bool {
     true
 }
 
-fn default_compact_threshold_tokens() -> usize {
-    95_000
-}
+/// Compaction threshold that earlier versions applied to every model and saved to `settings.json`.
+const LEGACY_COMPACT_THRESHOLD_TOKENS: usize = 95_000;
 
 fn default_local_llm_enabled() -> bool {
     false
@@ -265,7 +301,9 @@ impl Default for Config {
             local_llm_url: default_local_llm_url(),
             local_llm_model: default_local_llm_model(),
             auto_compact: default_auto_compact(),
-            compact_threshold_tokens: default_compact_threshold_tokens(),
+            compact_threshold_tokens: None,
+            history_token_limit: None,
+            context_window_tokens: None,
             local_prompt_lite: false,
             allowed_commands: Vec::new(),
             providers: Vec::new(),
@@ -276,6 +314,53 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Context window of the active model, in tokens.
+    pub fn context_window(&self) -> usize {
+        self.context_window_with_source().0
+    }
+
+    /// The window and where it comes from, most specific first: `context_window_tokens`, the
+    /// model's `context_window` in the provider list, what the provider reported
+    /// (see `model_info`), and finally the provider's default.
+    pub fn context_window_with_source(&self) -> (usize, WindowSource) {
+        if let Some(tokens) = self.context_window_tokens.filter(|&t| t > 0) {
+            return (tokens, WindowSource::Settings);
+        }
+        if let Some(tokens) = self.catalog_context_window() {
+            return (tokens, WindowSource::Catalog);
+        }
+        if let Some(tokens) = crate::model_info::detected_window(&self.endpoint().0, &self.model) {
+            return (tokens, WindowSource::Provider);
+        }
+        (crate::providers::default_context_window(self.provider_kind()), WindowSource::Default)
+    }
+
+    fn catalog_context_window(&self) -> Option<usize> {
+        self.all_providers()
+            .into_iter()
+            .filter(|p| self.active_provider.as_ref().is_none_or(|name| *name == p.name))
+            .flat_map(|p| p.models)
+            .find(|m| m.id == self.model && m.context_window.is_some_and(|t| t > 0))
+            .and_then(|m| m.context_window)
+    }
+
+    /// Prompt size, in tokens, above which auto-compaction runs.
+    pub fn effective_compact_threshold(&self) -> usize {
+        match self.compact_threshold_tokens {
+            Some(t) if t > 0 && t != LEGACY_COMPACT_THRESHOLD_TOKENS => t,
+            _ => self.context_window() / 10 * 8,
+        }
+    }
+
+    /// Prompt size, in tokens, above which the oldest turns are dropped from a request.
+    /// Never below the compaction threshold, so compaction gets to summarize first.
+    pub fn effective_history_limit(&self) -> usize {
+        self.history_token_limit
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| self.context_window() / 10 * 9)
+            .max(self.effective_compact_threshold())
+    }
+
     /// All providers: built-ins merged with user-defined ones.
     pub fn all_providers(&self) -> Vec<crate::providers::ProviderConfig> {
         crate::providers::merge_providers(&self.providers)
@@ -594,7 +679,13 @@ impl Config {
                             config.auto_compact = a;
                         }
                         if let Some(t) = o.compact_threshold_tokens {
-                            config.compact_threshold_tokens = t;
+                            config.compact_threshold_tokens = Some(t);
+                        }
+                        if let Some(t) = o.history_token_limit {
+                            config.history_token_limit = Some(t);
+                        }
+                        if let Some(t) = o.context_window_tokens {
+                            config.context_window_tokens = Some(t);
                         }
                         if let Some(l) = o.local_prompt_lite {
                             config.local_prompt_lite = l;
@@ -763,6 +854,93 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    fn config_for(provider: &str) -> Config {
+        Config {
+            model: "some-model".to_string(),
+            active_provider: Some(provider.to_string()),
+            local_llm_enabled: false,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn context_limits_follow_the_provider_window() {
+        let deepseek = config_for(crate::providers::DEEPSEEK_ID);
+        assert_eq!(deepseek.context_window(), 1_000_000);
+        assert_eq!(deepseek.effective_compact_threshold(), 800_000);
+        assert_eq!(deepseek.effective_history_limit(), 900_000);
+
+        let anthropic = config_for(crate::providers::ANTHROPIC_ID);
+        assert_eq!(anthropic.effective_compact_threshold(), 160_000);
+        assert_eq!(anthropic.effective_history_limit(), 180_000);
+    }
+
+    #[test]
+    fn the_window_comes_from_the_most_specific_source() {
+        use crate::providers::{ModelProfile, ProviderConfig};
+        let mut cfg = Config {
+            model: "acme-1".into(),
+            active_provider: Some("acme".into()),
+            providers: vec![ProviderConfig {
+                name: "acme".into(),
+                label: String::new(),
+                base_url: "https://acme.test/v1".into(),
+                api_key_env: String::new(),
+                models: vec![ModelProfile {
+                    id: "acme-1".into(),
+                    label: String::new(),
+                    tags: Vec::new(),
+                    reasoning: Vec::new(),
+                    family: Default::default(),
+                    context_window: Some(64_000),
+                }],
+            }],
+            local_llm_enabled: false,
+            ..Config::default()
+        };
+        assert_eq!(cfg.context_window_with_source(), (64_000, WindowSource::Catalog));
+
+        cfg.context_window_tokens = Some(32_000);
+        assert_eq!(cfg.context_window_with_source(), (32_000, WindowSource::Settings));
+
+        cfg.context_window_tokens = None;
+        cfg.model = "acme-2".into();
+        assert_eq!(cfg.context_window_with_source().1, WindowSource::Default);
+    }
+
+    #[test]
+    fn explicit_context_settings_win() {
+        let mut cfg = config_for(crate::providers::DEEPSEEK_ID);
+        cfg.context_window_tokens = Some(128_000);
+        assert_eq!(cfg.effective_compact_threshold(), 102_400);
+
+        cfg.compact_threshold_tokens = Some(50_000);
+        cfg.history_token_limit = Some(70_000);
+        assert_eq!(cfg.effective_compact_threshold(), 50_000);
+        assert_eq!(cfg.effective_history_limit(), 70_000);
+
+        // The history cap never sits below the compaction threshold.
+        cfg.history_token_limit = Some(10_000);
+        assert_eq!(cfg.effective_history_limit(), 50_000);
+    }
+
+    #[test]
+    fn the_old_fixed_threshold_counts_as_unset() {
+        let cfg: Config = serde_json::from_str(r#"{"compact_threshold_tokens": 95000}"#).unwrap();
+        let mut cfg = Config { active_provider: Some(crate::providers::GOOGLE_ID.into()), model: "m".into(), ..cfg };
+        assert_eq!(cfg.effective_compact_threshold(), 800_000);
+        cfg.compact_threshold_tokens = Some(95_001);
+        assert_eq!(cfg.effective_compact_threshold(), 95_001);
+    }
+
+    #[test]
+    fn unset_context_keys_are_not_written_back() {
+        let json = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!json.contains("compact_threshold_tokens"));
+        assert!(!json.contains("history_token_limit"));
+        assert!(!json.contains("context_window_tokens"));
+    }
+
     use super::*;
 
     #[test]

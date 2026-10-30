@@ -236,10 +236,7 @@ impl RemoteSession {
     /// Queries the remote bash environment for autocompletion candidates matching `input`.
     /// Handles commands, subcommands, and paths/files relative to `self.current_dir`.
     pub async fn complete(&self, input: &str) -> Vec<String> {
-        let (cmd_prefix, token) = match input.rfind(char::is_whitespace) {
-            Some(pos) => (&input[..=pos], &input[pos + 1..]),
-            None => ("", input),
-        };
+        let (cmd_prefix, token) = split_last_word(input);
 
         let first_word = input.split_whitespace().next().unwrap_or("");
 
@@ -294,10 +291,7 @@ impl RemoteSession {
 
     /// Autocompletes the given command line input, returning the advanced line and candidates.
     pub async fn complete_line(&self, input: &str) -> CompletionResult {
-        let (cmd_prefix, token) = match input.rfind(char::is_whitespace) {
-            Some(pos) => (&input[..=pos], &input[pos + 1..]),
-            None => ("", input),
-        };
+        let (cmd_prefix, token) = split_last_word(input);
 
         let candidates = self.complete(input).await;
         if candidates.is_empty() {
@@ -347,6 +341,16 @@ impl RemoteSession {
             }
         }
     }
+}
+
+/// Splits `input` after its last whitespace: (everything up to it, the word being completed).
+fn split_last_word(input: &str) -> (&str, &str) {
+    let end = input
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    input.split_at(end)
 }
 
 /// Result of an autocompletion attempt on a command line.
@@ -456,6 +460,13 @@ pub fn global_session_manager() -> &'static FleetSessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_word_split_handles_multibyte_spaces() {
+        assert_eq!(split_last_word("ls /et"), ("ls ", "/et"));
+        assert_eq!(split_last_word("ls\u{00A0}/et"), ("ls\u{00A0}", "/et"));
+        assert_eq!(split_last_word("ls"), ("", "ls"));
+    }
 
     fn sample_node() -> NodeConfig {
         let mut node = NodeConfig::new("test-node", "127.0.0.1");

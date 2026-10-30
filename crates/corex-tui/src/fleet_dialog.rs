@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use corex_fleet::{FleetConfig, NodeConfig, NodeTelemetry, RemoteSession};
+use corex_fleet::session::CompletionResult;
+use corex_fleet::{FleetConfig, NodeConfig, NodeTelemetry, RemoteCommandRecord, RemoteSession};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -22,6 +23,29 @@ pub struct PendingRemoteApproval {
     pub edited_command: String,
     pub instructions_mode: bool,
     pub instructions_text: String,
+}
+
+/// A remote command the SysAdmin approved, and what came of running it.
+pub struct ApprovedCommand {
+    pub pending: PendingRemoteApproval,
+    pub command: String,
+    pub edited: bool,
+    /// The turn that asked: a cancelled turn must not start another one.
+    pub generation: u64,
+    pub result: Result<(RemoteSession, RemoteCommandRecord), String>,
+}
+
+/// The outcome of work the console runs in the background so the interface never waits on SSH.
+pub enum FleetTask {
+    Connected {
+        node_id: String,
+        result: Result<Box<RemoteSession>, String>,
+    },
+    Approved(Box<ApprovedCommand>),
+    Completed {
+        input: String,
+        result: CompletionResult,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +79,10 @@ pub struct FleetDialogState {
     pub cmd_done_rx: UnboundedReceiver<(String, RemoteSession)>,
     pub telemetry_tx: UnboundedSender<(String, NodeTelemetry)>,
     pub telemetry_rx: UnboundedReceiver<(String, NodeTelemetry)>,
+    pub task_tx: UnboundedSender<FleetTask>,
+    pub task_rx: UnboundedReceiver<FleetTask>,
+    /// The node a background connection is being made to.
+    pub connecting: Option<String>,
     last_refresh: Option<Instant>,
     refresh_inflight: Arc<AtomicBool>,
 }
@@ -69,6 +97,7 @@ impl FleetDialogState {
     pub fn new() -> Self {
         let (telemetry_tx, telemetry_rx) = unbounded_channel();
         let (cmd_done_tx, cmd_done_rx) = unbounded_channel();
+        let (task_tx, task_rx) = unbounded_channel();
         Self {
             is_open: false,
             selected_idx: 0,
@@ -89,6 +118,9 @@ impl FleetDialogState {
             cmd_done_rx,
             telemetry_tx,
             telemetry_rx,
+            task_tx,
+            task_rx,
+            connecting: None,
             last_refresh: None,
             refresh_inflight: Arc::new(AtomicBool::new(false)),
         }

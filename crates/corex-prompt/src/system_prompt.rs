@@ -192,11 +192,10 @@ impl PromptBuilder {
         skill_dirs.push(self.workspace_dir.join(".agents").join("skills"));
         skill_dirs.push(self.workspace_dir.join(".corex").join("skills"));
 
-        // User global ~/.agents/skills, ~/.corex/skills, ~/.gemini/skills
+        // User global ~/.agents/skills, ~/.corex/skills
         if let Some(dirs) = BaseDirs::new() {
             skill_dirs.push(dirs.home_dir().join(".agents").join("skills"));
             skill_dirs.push(dirs.home_dir().join(".corex").join("skills"));
-            skill_dirs.push(dirs.home_dir().join(".gemini").join("skills"));
         }
 
         for dir in skill_dirs {
@@ -406,10 +405,10 @@ impl PromptBuilder {
    - Available servers in inventory: [{nodes}].
    - **MANDATORY AI BEHAVIOR**:
      - **DO NOT attempt to call `fleet_run_command` blindly or guess a server when no server is connected.**
-     - If the user asks a question about the server or requests a command (e.g. "qué cpu tiene", "revisa el vps", "cómo está la memoria", "mira los discos", "cómo está el server"):
+     - If the user asks a question about the server or requests a command (e.g. "what CPU does it have", "check the vps", "qué cpu tiene", "cómo está la memoria"):
        **DO NOT call any tool.**
-       Immediately answer the user in Spanish explaining that no server is currently connected, and ask them which server they want to connect to:
-       "No has seleccionado ni conectado ningún servidor activo en la consola Fleet. Por favor selecciona y conecta uno en el panel de la derecha (o indícame si deseas conectar a uno de los servidores disponibles: {nodes})."
+       Immediately answer in the user's language that no server is currently connected, and ask which server they want to connect to, for example:
+       "No server is connected in the Fleet console. Select and connect one in the right pane, or tell me which of the available servers to connect to: {nodes}."
      - Only if the user explicitly asks to connect or inspect the inventory, assist them with that."#,
                 nodes = nodes_str
             )
@@ -600,7 +599,8 @@ description: >-
 
         assert!(prompt.contains("NO SERVER CURRENTLY CONNECTED"));
         assert!(prompt.contains("CRITICAL: NO SERVER IS CURRENTLY CONNECTED OR ACTIVE"));
-        assert!(prompt.contains("No has seleccionado ni conectado ningún servidor activo"));
+        assert!(prompt.contains("answer in the user's language that no server is currently connected"));
+        assert!(prompt.contains("2001:db8::10") || prompt.contains("node-ipv6"));
     }
 
     #[test]

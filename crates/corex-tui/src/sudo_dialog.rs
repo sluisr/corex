@@ -83,7 +83,7 @@ pub fn render_sudo_dialog(
     let min_content_width = 58;
     let title_min_width = (title_str.chars().count() + 6) as u16;
     let dialog_width = min_content_width.max(title_min_width).min(area.width.saturating_sub(4));
-    let dialog_height = 3;
+    let dialog_height = 3.min(area.height);
 
     let x = (area.width.saturating_sub(dialog_width)) / 2;
     let y = area.height.saturating_sub(7);

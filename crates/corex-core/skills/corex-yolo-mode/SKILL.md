@@ -71,14 +71,7 @@ When a tool requires approval, Corex presents a **5-option confirmation selector
 
 ## ✅ Allowed Commands (Granular Whitelist)
 
-Instead of full YOLO, you can whitelist specific commands that never require confirmation using `/allow` (or `/whitelist`) inside the TUI:
-```
-/allow
-/allow add cargo test
-/allow remove cargo test
-```
-
-Or in `~/.corex/settings.json`:
+Instead of full YOLO, you can whitelist specific commands that never require confirmation. In the approval dialog, `[s]` allows the command for the session and `[p]` saves it permanently. Or edit `~/.corex/settings.json`:
 
 ```json
 // ~/.corex/settings.json

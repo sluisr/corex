@@ -23,6 +23,7 @@ use crate::model_dialog::{DialogAction, ModelDialogState};
 use crate::session_dialog::SessionDialogState;
 use crate::slash_commands::ALL_COMMANDS;
 use crate::sudo_dialog::SudoDialogState;
+use crate::text::group_thousands;
 use crate::theme::Theme;
 use crate::thinking_view::ThinkingState;
 use crate::user_dialog::UserDialogState;
@@ -952,7 +953,7 @@ impl App {
 
         match name {
             "/clear" => {
-                self.session.messages.clear();
+                self.session.clear_messages();
                 self.invalidate_message_cache();
                 self.clear_selection();
                 self.thinking_state.reset();
@@ -965,7 +966,7 @@ impl App {
                 self.session.add_message(Message::system(format!("Architectural Plan Mode {}", status)));
                 true
             }
-            "/stats" => {
+            "/stats" | "/context" => {
                 let u = &self.session.total_usage;
                 let ratio = u.cache_hit_percentage();
                 let cfg = self.llm_client.get_config();
@@ -973,6 +974,22 @@ impl App {
                     "Session Usage Metrics:\n- Prompt Tokens: {}\n- Cached Prompt Tokens: {} ({:.1}% KV Cache Hit)\n- Completion Tokens: {}\n- Total Tokens: {}",
                     u.prompt_tokens, u.prompt_cache_hit_tokens, ratio, u.completion_tokens, u.total_tokens
                 );
+                let used = self.session.context_tokens();
+                let (window, window_source) = if cfg.model.starts_with("local") {
+                    (24_000, corex_core::WindowSource::Default)
+                } else {
+                    cfg.context_window_with_source()
+                };
+                msg.push_str(&format!(
+                    "\n\nContext:\n- In use: ~{} of {} tokens ({:.1}%)\n- Window: {}\n- Auto-compact: {} at {} tokens\n- History cap (oldest turns dropped above): {} tokens\n- Change with `context_window_tokens`, `compact_threshold_tokens` and `history_token_limit` in ~/.corex/settings.json",
+                    group_thousands(used as u64),
+                    group_thousands(window as u64),
+                    used as f64 * 100.0 / window.max(1) as f64,
+                    window_source.label(),
+                    if cfg.auto_compact { "on" } else { "off" },
+                    group_thousands(cfg.effective_compact_threshold() as u64),
+                    group_thousands(cfg.effective_history_limit() as u64),
+                ));
                 if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled && u.total_tokens > 0 {
                     let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
                     let (cached_rate, miss_rate, comp_rate) = if is_pro {
@@ -1228,6 +1245,12 @@ impl App {
                     cfg.model = new_model.to_string();
                     if !new_model.contains("local") {
                         cfg.local_llm_enabled = false;
+                        // A model outside the catalog leaves the provider to be inferred from its name.
+                        cfg.active_provider = cfg
+                            .all_providers()
+                            .into_iter()
+                            .find(|p| !p.is_local() && p.models.iter().any(|m| m.id == new_model))
+                            .map(|p| p.name);
                     }
                     let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg.clone());
@@ -1245,7 +1268,7 @@ impl App {
                 true
             }
             "/sudo" => {
-                if parts.len() > 1 {
+                if parts.len() > 1 && !(parts.len() == 2 && parts[1] == "clear") {
                     let pwd = parts[1..].join(" ");
                     set_sudo_password(Some(pwd));
                     self.session.add_message(Message::system("Sudo password stored in session RAM (silent AskPass enabled)."));
@@ -1296,13 +1319,7 @@ impl App {
                 if self.session.messages.is_empty() {
                     self.session.add_message(Message::system("Conversation history is already empty."));
                 } else {
-                    let mut found_user = false;
-                    while let Some(msg) = self.session.messages.pop() {
-                        if msg.role == "user" {
-                            found_user = true;
-                            break;
-                        }
-                    }
+                    let found_user = self.session.rewind_last_turn();
                     self.invalidate_message_cache();
                     let _ = self.session.save();
                     if found_user {
@@ -1314,8 +1331,10 @@ impl App {
                 true
             }
             "/compact" | "/compress" => {
+                let before = self.session.messages.clone();
                 match self.llm_client.compact_messages(&mut self.session.messages, true).await {
                     Ok(Some(notice)) => {
+                        self.session.keep_history_before_compaction(&before);
                         self.invalidate_message_cache();
                         let _ = self.session.save();
                         self.session.add_message(Message::system(notice));
