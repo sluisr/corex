@@ -57,14 +57,14 @@ Corex is built with Link-Time Optimization (`lto = "fat"`), a single codegen uni
 | **First frame** of the interactive TUI | median 3.2 ms (min 3.0, max 3.4; 10 runs) |
 | **Resident memory**, TUI idle | 11.7 MB, of which 1.9 MB anonymous (heap and stacks); peak 11.7 MB |
 | **CPU**, TUI idle | 0.10% over 10 s |
-| **Linking** | Dynamic: `libc`, `libm` and `libgcc_s`. The official x86_64 build needs glibc 2.43 or newer |
+| **Linking** | Dynamic: `libc`, `libm` and `libgcc_s`. Since `v0.8.5` the official x86_64 build is linked against glibc 2.17 with `cargo-zigbuild` and runs on Debian, Ubuntu, Linux Mint and Fedora out of the box. |
 
 ### Binaries by platform (v0.8.1)
 
 | Platform | Download | Binary | Notes |
 | :--- | ---: | ---: | :--- |
-| Linux x86_64 | 7.23 MB | 8.09 MB | glibc 2.43 or newer |
-| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.39 or newer |
+| Linux x86_64 | 7.23 MB | 8.09 MB | glibc 2.17 or newer |
+| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.39 or newer in `v0.8.5`; 2.17 or newer from the next release |
 | macOS Apple Silicon | 6.39 MB | 6.31 MB | |
 | macOS Intel | 6.88 MB | 7.02 MB | |
 | Windows x86_64 | 6.77 MB | 6.91 MB | |
