@@ -63,7 +63,7 @@ case "$LATEST_TAG" in
   v[0-9]*) ;;
   *) LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4) ;;
 esac
-VERSION="${LATEST_TAG:-v0.8.4}"
+VERSION="${LATEST_TAG:-v0.8.5}"
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"

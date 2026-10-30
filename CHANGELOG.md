@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.5] - 2026-10-30
+
+### Fixed
+- **The Linux x86_64 binary did not start on most distributions**: The v0.8.4 release was built against glibc 2.43 (Arch), and `log10f` was linked as `GLIBC_2.43`, so `ld.so` refused it with `version 'GLIBC_2.43' not found` on Debian 12, Ubuntu 22.04 and 24.04, Linux Mint 22 and Fedora 41. The release is now linked against glibc 2.17 with `cargo-zigbuild`, and the release workflow fails if the binary requires a newer glibc. Reported by Francisco Vera (kbdd23). If you are on v0.8.4 and cannot run `cx update`, reinstall with `install.sh`, or build from source with `cargo install corex-cli --locked`.
+
+---
+
 ## [0.8.4] - 2026-10-30
 
 ### Fixed
