@@ -27,12 +27,15 @@ jobs:
             use_zigbuild: true
             glibc_floor: "2.17"
 
-          # Linux ARM64 (Raspberry Pi 4/5 64-bit, AWS Graviton, Hetzner ARM, Docker)
+          # Linux ARM64 (Raspberry Pi 4/5 64-bit, AWS Graviton, Hetzner ARM, Docker).
+          # Same glibc 2.17 floor as x86_64, so the ARM build does not inherit the
+          # glibc of the runner either.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             bin_name: cx
             archive_suffix: aarch64-unknown-linux-gnu.tar.gz
-            use_cross: true
+            use_zigbuild: true
+            glibc_floor: "2.17"
 
           # Windows x86_64
           - os: windows-latest
