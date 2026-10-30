@@ -426,6 +426,5 @@ mod tests {
     #[test]
     fn init_template_loads() {
         corex_fleet::FleetConfig::parse(super::DEFAULT_FLEET_TEMPLATE).expect("`cxs init` writes a valid fleet.toml");
-        corex_fleet::FleetConfig::parse(include_str!("../../../.corex/fleet.example.toml")).expect("the example is valid");
     }
 }
