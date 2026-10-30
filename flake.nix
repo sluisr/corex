@@ -14,7 +14,7 @@
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname = "corex";
-          version = "0.8.4";
+          version = "0.8.5";
 
           src = ./.;
 

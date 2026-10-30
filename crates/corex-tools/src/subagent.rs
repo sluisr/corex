@@ -1929,7 +1929,7 @@ results = []
 for pkg in packages:
     info_dict = None
     try:
-        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.4'})
+        req = urllib.request.Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent': 'Corex-Researcher/0.8.5'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             info = data.get('info', {})
