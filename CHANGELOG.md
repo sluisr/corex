@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`@path` workspace autocompletion**: Typing `@` in the prompt opens an interactive, gitignore-aware popup that lists workspace files and directories in real time.
 - **Persistent Project & Global Memory (`/memory`)**: Added the `/memory` command and the `save_memory` tool. Custom rules and notes can be saved per project (`.corex/memory.json`) or globally (`~/.corex/memory.json`) and are injected dynamically into the system prompt. Global memory updates require explicit user confirmation.
 - **Interactive File Rewind (`/rewind`)**: Tool file edits are snapshotted turn-by-turn. Running `/rewind` opens an interactive dialog showing modified files and diff summaries, allowing you to selectively revert changes.
+- **Session-scoped Allowed Directories (`/directory`, `/dir`)**: Added `/directory add <path>[,<path>...]` and `/directory show` to grant read-only access to external directories without confirmation for the current session, while write operations always require approval.
 - **Terminal-native mouse selection**:
   - Releasing a drag copies the text to the clipboard while keeping the highlight visible until the next click or `Esc`.
   - Completed selections survive window focus loss (compatible with focus-follows-mouse window managers).
