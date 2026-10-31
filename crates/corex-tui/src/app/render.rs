@@ -1664,14 +1664,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 left_spans.push(Span::styled(branch_str, Style::default().fg(app.theme.accent_cyan)));
             }
             left_spans.extend(mode_badges(app));
-            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.gray)));
         } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + warning_width && !branch_str.is_empty() {
             // Medium space: prioritize branch and the exit warning so it is never truncated
             left_spans.push(Span::styled(format!(" {} ", branch_str.trim()), Style::default().fg(app.theme.accent_cyan)));
-            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.gray)));
         } else {
             // Narrow space (e.g. /fleet split mode on narrower terminals): show complete exit warning
-            left_spans.push(Span::styled(format!(" {warning}"), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+            left_spans.push(Span::styled(format!(" {warning}"), Style::default().fg(app.theme.gray)));
         }
     } else {
         left_spans.push(Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)));
