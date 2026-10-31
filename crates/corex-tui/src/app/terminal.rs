@@ -43,12 +43,35 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Set after the process comes back from a suspend, so the loop repaints the whole screen.
+pub static RESUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hands the terminal back to the shell and stops the process, as Ctrl+Z does in any program;
+/// `fg` resumes it with the TUI restored.
+#[cfg(unix)]
+pub fn suspend() {
+    use crossterm::event::{EnableBracketedPaste, EnableFocusChange};
+    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+
+    restore_terminal();
+
+    // SAFETY: `raise` only signals the calling process; it has no memory-safety preconditions.
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+
+    let _ = enable_raw_mode();
+    let mut out = stdout();
+    let _ = out.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let _ = execute!(out, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange);
+    let _ = out.flush();
+    RESUMED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Sets up POSIX signal listeners for clean terminal teardown on hangup/terminate/quit,
 /// and proper terminal suspension (SIGSTOP/SIGCONT) when sent to background via Ctrl+Z.
 #[cfg(unix)]
-pub fn setup_signal_handlers(resumed_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    use crossterm::event::{EnableBracketedPaste, EnableFocusChange};
-    use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+pub fn setup_signal_handlers() {
     use tokio::signal::unix::{signal, SignalKind};
 
     // Closing the terminal window (SIGHUP), `kill` (SIGTERM), or quit (SIGQUIT) skips Drop; restore
@@ -72,10 +95,7 @@ pub fn setup_signal_handlers(resumed_flag: std::sync::Arc<std::sync::atomic::Ato
         std::process::exit(128 + signo);
     });
 
-    // Suspend signals (SIGTSTP, SIGTTIN, SIGTTOU):
-    // Clean up terminal modes so mouse escape codes don't leak into the shell,
-    // then pause via SIGSTOP. On resume (SIGCONT), restore TUI terminal state.
-    let resumed_clone = resumed_flag;
+    // Suspend signals sent from outside (`kill -TSTP`): same teardown as Ctrl+Z.
     tokio::spawn(async move {
         let (Ok(mut tstp), Ok(mut ttin), Ok(mut ttou)) = (
             signal(SignalKind::from_raw(libc::SIGTSTP)),
@@ -91,24 +111,7 @@ pub fn setup_signal_handlers(resumed_flag: std::sync::Arc<std::sync::atomic::Ato
                 _ = ttin.recv() => {}
                 _ = ttou.recv() => {}
             }
-
-            restore_terminal();
-
-            // SAFETY: `libc::raise(SIGSTOP)` sends the stop signal strictly to the calling
-            // process/thread itself. It has no memory-safety preconditions and cleanly yields
-            // execution to the parent shell process group after terminal attributes have been restored.
-            unsafe {
-                libc::raise(libc::SIGSTOP);
-            }
-
-            // Resumed by SIGCONT from shell.
-            let _ = enable_raw_mode();
-            let mut out = stdout();
-            let _ = out.write_all(MOUSE_REPORTING_OFF.as_bytes());
-            let _ = execute!(out, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange);
-            let _ = out.write_all(MOUSE_REPORTING_ON.as_bytes());
-            let _ = out.flush();
-            resumed_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            suspend();
         }
     });
 }

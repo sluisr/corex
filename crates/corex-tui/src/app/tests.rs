@@ -204,6 +204,43 @@ use corex_core::types::ToolCall;
     }
 
     #[tokio::test]
+    async fn test_a_selection_fills_primary_and_only_ctrl_c_replaces_the_clipboard() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+        app.selection_lines.tail = vec!["/home/me/projects/corex/src/main.rs".to_string()];
+        app.app_start_time = Instant::now() - Duration::from_secs(5);
+        app.inside_tmux = false;
+        crate::clipboard::TEST_CLIPBOARD.with(|c| *c.borrow_mut() = None);
+
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 0, row: 0, modifiers: KeyModifiers::NONE });
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 7, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(600));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 7, row: 0, modifiers: KeyModifiers::NONE });
+
+        assert_eq!(crate::clipboard::TEST_PRIMARY.with(|c| c.borrow().clone()).as_deref(), Some("/home/me"));
+        assert!(crate::clipboard::TEST_CLIPBOARD.with(|c| c.borrow().is_none()));
+        assert!(app.selection.is_some());
+
+        assert!(app.copy_selection());
+        assert_eq!(crate::clipboard::TEST_CLIPBOARD.with(|c| c.borrow().clone()).as_deref(), Some("/home/me"));
+        assert!(app.selection.is_none());
+        assert!(!app.copy_selection(), "without a selection Ctrl+C keeps cancelling");
+    }
+
+    #[tokio::test]
+    async fn test_an_absolute_path_never_opens_the_command_menu() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+        app.input_buffer = "/home/me/projects/corex".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        assert!(app.matching_slash_commands().is_empty());
+        app.input_buffer = "/mod".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        assert!(!app.matching_slash_commands().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_click_on_non_url_text_does_not_open_link() {
         let client = LlmClient::new(corex_core::config::Config::default());
         let mut app = App::new(client, PathBuf::from("/tmp"), false);

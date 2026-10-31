@@ -2,7 +2,8 @@
 //!
 //! While mouse reporting is on, the terminal stops offering its native drag-to-select, so the TUI
 //! owns the drag it consumes and is responsible for pushing the copied text to the real system
-//! clipboard itself.
+//! clipboard itself. As in any Linux terminal, a selection fills the primary selection and only an
+//! explicit copy (Ctrl+C) replaces the clipboard.
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -36,12 +37,26 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// What `copy_primary` would have put in the primary selection.
+    pub static TEST_PRIMARY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 fn remember_for_tests(text: &str) {
     TEST_CLIPBOARD.with(|c| *c.borrow_mut() = Some(text.to_string()));
 }
 
 #[cfg(not(test))]
 fn remember_for_tests(_text: &str) {}
+
+#[cfg(test)]
+fn remember_primary_for_tests(text: &str) {
+    TEST_PRIMARY.with(|c| *c.borrow_mut() = Some(text.to_string()));
+}
+
+#[cfg(not(test))]
+fn remember_primary_for_tests(_text: &str) {}
 
 /// Copies `text` to the system clipboard, trying every route available in this session.
 ///
@@ -73,6 +88,31 @@ pub fn copy(text: &str) -> Result<Route, String> {
     // with `set-clipboard on`.
     write_osc52(text)?;
     Ok(Route::Osc52)
+}
+
+/// Puts `text` in the primary selection (middle-click paste), where a mouse selection goes on
+/// Linux, leaving the clipboard alone. `None` when the session has no primary selection.
+pub fn copy_primary(text: &str) -> Option<Route> {
+    if text.is_empty() {
+        return None;
+    }
+    if cfg!(test) {
+        remember_primary_for_tests(text);
+        return Some(Route::Wayland);
+    }
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && pipe_to("wl-copy", &["--primary"], text).is_ok() {
+        return Some(Route::Wayland);
+    }
+    if std::env::var_os("DISPLAY").is_some()
+        && (pipe_to("xclip", &["-selection", "primary"], text).is_ok()
+            || pipe_to("xsel", &["--primary", "--input"], text).is_ok())
+    {
+        return Some(Route::X11);
+    }
+    None
 }
 
 /// An image taken from the system clipboard.

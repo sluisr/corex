@@ -1,11 +1,15 @@
 //! Mobile / Termux responsive layout and keyboard routines.
 
 /// True if running inside an Android or Termux environment.
+/// Probed once: it is asked several times per frame and the last check touches the disk.
 pub fn is_android_or_termux() -> bool {
-    std::env::var("TERMUX_VERSION").is_ok()
-        || std::env::var("PREFIX").map(|p| p.contains("com.termux")).unwrap_or(false)
-        || std::env::var("ANDROID_ROOT").is_ok()
-        || std::path::Path::new("/data/data/com.termux").exists()
+    static DETECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DETECTED.get_or_init(|| {
+        std::env::var("TERMUX_VERSION").is_ok()
+            || std::env::var("PREFIX").map(|p| p.contains("com.termux")).unwrap_or(false)
+            || std::env::var("ANDROID_ROOT").is_ok()
+            || std::path::Path::new("/data/data/com.termux").exists()
+    })
 }
 
 /// Returns true if the TUI is running in a mobile vertical (portrait) viewport.

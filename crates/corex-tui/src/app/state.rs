@@ -318,6 +318,7 @@ pub struct App {
     pub last_slash_filter: String,
     /// Workspace paths offered while an `@path` is typed; rebuilt when stale.
     pub file_index: Option<crate::file_completion::FileIndex>,
+    pub file_index_rx: Option<std::sync::mpsc::Receiver<crate::file_completion::FileIndex>>,
     /// The `@path` query the popup last showed, kept so it can close smoothly.
     pub last_file_query: Option<String>,
     pub local_llm_online: Arc<AtomicBool>,

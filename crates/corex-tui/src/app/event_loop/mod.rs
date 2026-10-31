@@ -41,6 +41,9 @@ type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 /// Stream and tool events, tagged with the generation (turn) that produced them.
 type EventTx = mpsc::Sender<(u64, StreamEvent)>;
 
+/// Input events applied before a frame is drawn; caps the stall a flood of them could cause.
+const MAX_EVENTS_PER_FRAME: usize = 64;
+
 /// What happens after an input handler looked at an event.
 enum Flow {
     /// The event was used; nothing else sees it.
@@ -67,12 +70,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
     let _guard = TerminalGuard;
 
-    let resumed_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     // Closing the terminal window (SIGHUP), `kill` (SIGTERM), quit (SIGQUIT), or suspend (SIGTSTP/SIGCONT)
     // are cleanly managed by signal handlers to ensure terminal modes never leak to shell.
     #[cfg(unix)]
-    crate::app::terminal::setup_signal_handlers(resumed_flag.clone());
+    crate::app::terminal::setup_signal_handlers();
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -89,13 +90,16 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
     loop {
         #[cfg(unix)]
-        if resumed_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if crate::app::terminal::RESUMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             let _ = terminal.clear();
             mouse_capture_applied = false;
             needs_redraw = true;
         }
 
         app.poll_local_health_check();
+        if app.poll_file_index() {
+            needs_redraw = true;
+        }
 
         app.tap_keyboard.resume_if_due(Instant::now(), &mut app.mouse_capture);
 
@@ -179,8 +183,20 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         if event::poll(timeout)? {
             needs_redraw = true;
             app.last_interaction = Instant::now();
-            let ev = event::read()?;
-            if let Flow::Quit = handle_terminal_event(&mut app, ev, &event_tx, &mut terminal).await? {
+            // Key repeat (holding Backspace) queues events faster than a frame draws; apply every
+            // one already waiting and draw once, instead of trailing behind one frame per key.
+            let mut quit = false;
+            for _ in 0..MAX_EVENTS_PER_FRAME {
+                let ev = event::read()?;
+                if let Flow::Quit = handle_terminal_event(&mut app, ev, &event_tx, &mut terminal).await? {
+                    quit = true;
+                    break;
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+            if quit {
                 break;
             }
         } else if is_animating || app.is_streaming {
@@ -316,9 +332,18 @@ fn model_key(app: &mut App, key: KeyEvent) -> Flow {
 fn early_key(app: &mut App, key: KeyEvent) -> Flow {
     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // Force quit.
     if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
-        return Flow::Quit;
+        #[cfg(unix)]
+        crate::app::terminal::suspend();
+        return Flow::Handled;
+    }
+
+    // With text highlighted, Ctrl+C copies it, as in a terminal; the next one cancels or exits.
+    if is_ctrl
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('\x03'))
+        && app.copy_selection()
+    {
+        return Flow::Handled;
     }
 
     // Mouse reporting toggle. Reclaims native click-drag selection/copy on demand without

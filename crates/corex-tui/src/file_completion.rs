@@ -1,6 +1,7 @@
 //! `@path` completion in the prompt: a gitignore-aware index of the workspace and the popup that
 //! lists its matches while a path is typed.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,11 @@ pub struct FileIndex {
     root: PathBuf,
     built: Instant,
     paths: Vec<String>,
+    /// `paths` lowercased once, so matching on every keystroke allocates nothing per entry.
+    lower: Vec<String>,
+    /// The last query and its matches: the prompt, the popup height and the render all ask for
+    /// the same query several times per frame.
+    last: RefCell<Option<(String, Vec<String>)>>,
 }
 
 impl FileIndex {
@@ -42,11 +48,16 @@ impl FileIndex {
             .take(MAX_ENTRIES)
             .collect();
         paths.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
-        Self { root: root.to_path_buf(), built: Instant::now(), paths }
+        let lower = paths.iter().map(|p| p.to_lowercase()).collect();
+        Self { root: root.to_path_buf(), built: Instant::now(), paths, lower, last: RefCell::new(None) }
     }
 
     pub fn is_fresh_for(&self, root: &Path) -> bool {
         self.root == root && self.built.elapsed() < STALE_AFTER
+    }
+
+    pub fn is_for(&self, root: &Path) -> bool {
+        self.root == root
     }
 
     pub fn is_empty(&self) -> bool {
@@ -55,28 +66,38 @@ impl FileIndex {
 
     /// Paths matching `query`: prefix of the path, then prefix of the file name, then anywhere.
     pub fn matches(&self, query: &str) -> Vec<String> {
-        let query = query.to_lowercase();
-        let rank = |path: &str| -> Option<u8> {
-            let lower = path.to_lowercase();
+        if let Some((q, hits)) = self.last.borrow().as_ref() {
+            if q == query {
+                return hits.clone();
+            }
+        }
+        let needle = query.to_lowercase();
+        let rank = |lower: &str| -> Option<u8> {
             let name = lower.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-            if lower.starts_with(&query) {
+            if lower.starts_with(&needle) {
                 Some(0)
-            } else if name.starts_with(&query) {
+            } else if name.starts_with(&needle) {
                 Some(1)
-            } else if lower.contains(&query) {
+            } else if lower.contains(&needle) {
                 Some(2)
             } else {
                 None
             }
         };
         let mut ranked: Vec<(u8, usize)> = self
-            .paths
+            .lower
             .iter()
             .enumerate()
             .filter_map(|(i, p)| rank(p).map(|r| (r, i)))
             .collect();
-        ranked.sort();
-        ranked.into_iter().take(MAX_MATCHES).map(|(_, i)| self.paths[i].clone()).collect()
+        if ranked.len() > MAX_MATCHES {
+            ranked.select_nth_unstable(MAX_MATCHES);
+            ranked.truncate(MAX_MATCHES);
+        }
+        ranked.sort_unstable();
+        let hits: Vec<String> = ranked.into_iter().map(|(_, i)| self.paths[i].clone()).collect();
+        *self.last.borrow_mut() = Some((query.to_string(), hits.clone()));
+        hits
     }
 }
 
@@ -90,11 +111,19 @@ pub fn at_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
     (starts_word && !query.contains(char::is_whitespace)).then_some((start, query))
 }
 
+/// What the popup says when nothing matches.
+#[derive(Clone, Copy)]
+pub enum IndexState {
+    Building,
+    Empty,
+    Ready,
+}
+
 pub fn render_file_popup(
     frame: &mut Frame,
     query: &str,
     matches: &[String],
-    index_empty: bool,
+    index: IndexState,
     selected_idx: usize,
     area: Rect,
     theme: &Theme,
@@ -107,10 +136,10 @@ pub fn render_file_popup(
     let inner_w = popup_area.width.saturating_sub(4) as usize;
 
     let lines: Vec<Line> = if matches.is_empty() {
-        let note = if index_empty {
-            "No files found in the workspace".to_string()
-        } else {
-            format!("No files match '{}'", query)
+        let note = match index {
+            IndexState::Building => "Indexing the workspace…".to_string(),
+            IndexState::Empty => "No files found in the workspace".to_string(),
+            IndexState::Ready => format!("No files match '{}'", query),
         };
         vec![Line::from(Span::styled(format!("  {}", note), Style::default().fg(theme.gray)))]
     } else {
@@ -173,5 +202,6 @@ mod tests {
         assert_eq!(index.matches("main"), ["src/main.rs", "src/app/mainline.rs", "domain.txt"]);
         assert_eq!(index.matches("")[..3], ["README.md", "domain.txt", "src/"]);
         assert!(index.matches("zzz").is_empty());
+        assert_eq!(index.matches("MAIN"), index.matches("main"), "a cached query must not leak into another");
     }
 }

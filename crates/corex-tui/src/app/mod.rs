@@ -129,6 +129,7 @@ impl App {
             slash_popup_clock: None,
             last_slash_filter: String::new(),
             file_index: None,
+            file_index_rx: None,
             last_file_query: None,
             local_llm_online: is_online,
             last_local_check: None,
@@ -181,7 +182,7 @@ impl App {
         self.mouse_capture = enabled;
         self.tap_keyboard.cancel();
         let msg = if enabled {
-            "Mouse reporting ENABLED: the wheel scrolls the feed, and dragging over it selects text, which is copied to the clipboard on release. F2 gives the mouse back to the terminal."
+            "Mouse reporting ENABLED: the wheel scrolls the feed, and dragging over it selects text and Ctrl+C copies it (inside tmux, release copies). F2 gives the mouse back to the terminal."
         } else {
             "Mouse reporting DISABLED: the terminal owns the mouse again and its native selection is back. Scroll with PageUp/PageDown or Shift+Up/Shift+Down."
         };
@@ -298,16 +299,42 @@ impl App {
         }
     }
 
-    /// Copies the active selection to the system clipboard; a short notice in the prompt confirms
-    /// it. The highlight stays until the next click or Esc, as in a plain terminal, except inside
-    /// tmux, whose own selection ends on release.
+    /// Ends the drag: the highlight stays, as in a plain terminal, and fills the primary selection.
+    /// Inside tmux, whose own selection copies and ends on release, it copies to the clipboard.
     pub fn commit_selection(&mut self) {
         self.commit_selection_with_click(0, 0, None, None);
     }
 
+    /// Copies the highlighted text to the clipboard and drops the highlight; false when nothing
+    /// is selected, so the key keeps its usual meaning.
+    pub fn copy_selection(&mut self) -> bool {
+        let Some(selection) = self.selection else { return false };
+        let text = self.selection_text();
+        if selection.is_empty() || text.trim().is_empty() {
+            return false;
+        }
+        self.clear_selection();
+        self.copy_to_clipboard(&text);
+        true
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) {
+        match clipboard::copy(text) {
+            Ok(clipboard::Route::Osc52) => {
+                // Many terminals (GNOME Terminal among them) ignore OSC 52 without saying so.
+                self.copy_notice = Some((
+                    Instant::now(),
+                    "Copied via the terminal (OSC 52). Paste empty? Install xclip or wl-clipboard, or use /mouse",
+                ));
+            }
+            Ok(_) => self.copy_notice = Some((Instant::now(), "Copied to clipboard")),
+            Err(err) => self.session.add_message(Message::system(format!("Clipboard unavailable: {err}"))),
+        }
+    }
+
     /// Commits active selection. If the gesture is a clean, intentional point click directly
     /// on a URL (and not an accidental window-focus click or drag), opens the link in the background.
-    /// Otherwise, if text was selected, copies it to the system clipboard silently.
+    /// Otherwise, if text was selected, keeps it for Ctrl+C (see [`App::commit_selection`]).
     pub fn commit_selection_with_click(
         &mut self,
         up_col: u16,
@@ -370,16 +397,11 @@ impl App {
             return;
         }
 
-        match clipboard::copy(&text) {
-            Ok(clipboard::Route::Osc52) => {
-                // Many terminals (GNOME Terminal among them) ignore OSC 52 without saying so.
-                self.copy_notice = Some((
-                    Instant::now(),
-                    "Copied via the terminal (OSC 52). Paste empty? Install xclip or wl-clipboard, or use /mouse",
-                ));
-            }
-            Ok(_) => self.copy_notice = Some((Instant::now(), "Copied to clipboard")),
-            Err(err) => self.session.add_message(Message::system(format!("Clipboard unavailable: {err}"))),
+        if self.inside_tmux {
+            self.copy_to_clipboard(&text);
+        } else {
+            clipboard::copy_primary(&text);
+            self.copy_notice = Some((Instant::now(), "Ctrl+C copies the selection"));
         }
     }
 
@@ -489,6 +511,10 @@ impl App {
         if self.history_idx.is_some() || !self.input_buffer.starts_with('/') || self.file_query().is_some() {
             return Vec::new();
         }
+        // `/home/me/x` is a path, not a command: no command name holds a second slash.
+        if self.input_buffer.split_whitespace().next().is_some_and(|w| w[1..].contains('/')) {
+            return Vec::new();
+        }
 
         crate::slash_commands::match_commands(&self.input_buffer)
             .into_iter()
@@ -510,11 +536,41 @@ impl App {
         Some(self.file_index.as_ref().map(|index| index.matches(&query)).unwrap_or_default())
     }
 
-    /// Builds the workspace index the first time an `@path` is typed, and again once stale.
+    /// Builds the workspace index the first time an `@path` is typed, and again once stale. The
+    /// walk runs on its own thread (a large tree takes long enough to freeze typing); the stale
+    /// index keeps answering until the new one lands in [`App::poll_file_index`].
     pub fn refresh_file_index(&mut self) {
         let fresh = self.file_index.as_ref().is_some_and(|i| i.is_fresh_for(&self.workspace_dir));
-        if self.file_query().is_some() && !fresh {
-            self.file_index = Some(crate::file_completion::FileIndex::build(&self.workspace_dir));
+        if fresh || self.file_index_rx.is_some() || self.file_query().is_none() {
+            return;
+        }
+        if self.file_index.as_ref().is_some_and(|i| !i.is_for(&self.workspace_dir)) {
+            self.file_index = None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.workspace_dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::file_completion::FileIndex::build(&root));
+        });
+        self.file_index_rx = Some(rx);
+    }
+
+    /// Takes a finished background index build; true when one arrived and the popup must redraw.
+    pub fn poll_file_index(&mut self) -> bool {
+        let Some(rx) = &self.file_index_rx else { return false };
+        match rx.try_recv() {
+            Ok(index) => {
+                self.file_index_rx = None;
+                if index.is_for(&self.workspace_dir) {
+                    self.file_index = Some(index);
+                }
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.file_index_rx = None;
+                false
+            }
         }
     }
 

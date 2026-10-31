@@ -17,7 +17,7 @@ use crate::fleet_dialog::render_fleet_dialog;
 use crate::markdown::render_markdown;
 use crate::model_dialog::render_model_dialog;
 use crate::session_dialog::render_session_dialog;
-use crate::file_completion::render_file_popup;
+use crate::file_completion::{render_file_popup, IndexState};
 use crate::slash_commands::render_command_popup;
 use crate::sudo_dialog::render_sudo_dialog;
 use crate::theme::Theme;
@@ -1415,8 +1415,12 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     // Render the `@path` or slash command popup if active
     if let (Some(p_chunk), Some(query)) = (popup_chunk, app.last_file_query.as_deref()) {
         let matches = app.file_index.as_ref().map(|i| i.matches(query)).unwrap_or_default();
-        let index_empty = app.file_index.as_ref().is_none_or(|i| i.is_empty());
-        render_file_popup(frame, query, &matches, index_empty, app.slash_selected_idx, p_chunk, &app.theme);
+        let index = match &app.file_index {
+            None if app.file_index_rx.is_some() => IndexState::Building,
+            Some(i) if !i.is_empty() => IndexState::Ready,
+            _ => IndexState::Empty,
+        };
+        render_file_popup(frame, query, &matches, index, app.slash_selected_idx, p_chunk, &app.theme);
     } else if let Some(p_chunk) = popup_chunk {
         let filter_text = if app.input_buffer.starts_with('/') {
             &app.input_buffer

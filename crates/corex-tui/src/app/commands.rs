@@ -998,7 +998,7 @@ impl App {
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
                 help.push_str("\nKeyboard Shortcuts:\n  Enter: Submit | Ctrl+T: Toggle Thought Box | Ctrl+C: Cancel/Exit | Up/Down: History / Command Nav");
                 help.push_str("\n  Scroll chat: Mouse wheel | PageUp / PageDown | Shift+Up / Shift+Down");
-                help.push_str("\n  Copy text: drag to select, release to copy and clear the highlight");
+                help.push_str("\n  Copy text: drag to select, then Ctrl+C (inside tmux, release copies)");
                 self.session.add_message(Message::system(help));
                 true
             }

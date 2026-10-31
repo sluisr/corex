@@ -618,9 +618,6 @@ fn token_references_sensitive_path(tok: &str) -> bool {
         if v.is_empty() {
             return false;
         }
-        if v == "~" || v == "~/" {
-            return true;
-        }
         let lower = v.to_lowercase();
         let has_glob = v.contains('*') || v.contains('?') || v.contains('[');
         if has_glob {
@@ -645,11 +642,7 @@ fn token_references_sensitive_path(tok: &str) -> bool {
                 }
             }
         }
-        let resolved = resolve_token_path(v);
-        if BaseDirs::new().is_some_and(|b| resolved == b.home_dir()) {
-            return true;
-        }
-        crate::fs_tools::is_sensitive_system_path(&resolved)
+        crate::fs_tools::is_sensitive_system_path(&resolve_token_path(v))
     };
     if let Some((_, value)) = t.split_once('=') {
         if check_val(value) {
@@ -666,6 +659,27 @@ fn token_references_sensitive_path(tok: &str) -> bool {
     check_val(t)
 }
 
+/// True when a shell token is the home directory itself (`~`, `$HOME`, `/home/me`). Not a secret
+/// on its own, so YOLO runs it, but a recursive tool over it reaches every credential inside.
+fn token_is_home_root(tok: &str) -> bool {
+    let t = tok.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
+    let v = t.split_once('=').map_or(t, |(_, v)| v).trim_matches(|c| c == '\'' || c == '"');
+    if v.is_empty() || v.starts_with('-') {
+        return false;
+    }
+    let v = v.trim_end_matches('/');
+    let v = if v.is_empty() { "/" } else { v };
+    BaseDirs::new().is_some_and(|b| resolve_token_path(v) == b.home_dir())
+}
+
+/// `rm` aimed at the home directory itself: wipes every project and credential at once.
+fn removes_home(cmd: &str) -> bool {
+    split_segments(cmd).iter().any(|seg| {
+        let mut parts = seg.split_whitespace();
+        parts.next().is_some_and(|c| c.rsplit('/').next() == Some("rm")) && parts.any(token_is_home_root)
+    })
+}
+
 /// True when `cmd` references sensitive credentials, protected shell/git/cargo files, or system-wide destructive patterns.
 pub fn command_references_sensitive_or_protected_path(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
@@ -676,6 +690,7 @@ pub fn command_references_sensitive_or_protected_path(cmd: &str) -> bool {
         || lower.starts_with("reboot")
         || lower.starts_with("poweroff")
         || lower.starts_with("shutdown")
+        || removes_home(cmd)
     {
         return true;
     }
@@ -784,7 +799,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
 
     // A command is never auto-approved when it targets a credential/auth path: read-only tools
     // such as `cat` or `xxd` would otherwise exfiltrate secrets with no confirmation prompt.
-    if parts.iter().skip(1).any(|t| token_references_sensitive_path(t)) {
+    if parts.iter().skip(1).any(|t| token_references_sensitive_path(t) || token_is_home_root(t)) {
         return false;
     }
 
@@ -1381,6 +1396,7 @@ fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
         let clean = stripped_redir
             .trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
         token_references_sensitive_path(t)
+            || token_is_home_root(t)
             || (!stripped_redir.is_empty() && token_references_sensitive_path(stripped_redir))
             || (!clean.is_empty()
                 && !clean.starts_with('-')
@@ -2469,6 +2485,21 @@ mod tests {
         assert!(!is_known_safe_command("cat .?nv"));
         assert!(!is_known_safe_command("rg secret ~"));
         assert!(!is_known_safe_command("grep -rn token ~/"));
+    }
+
+    #[test]
+    fn yolo_runs_commands_on_the_home_root_but_not_on_its_secrets() {
+        let fetch = r#"cd "$HOME"; curl -s "https://api.github.com/repos/x/y/commits" -o cx_all.json; wc -l cx_dates.txt"#;
+        assert!(!command_references_sensitive_or_protected_path(fetch));
+        assert!(!command_references_sensitive_or_protected_path("cd ~ && ls"));
+        assert!(!command_references_sensitive_or_protected_path("ls ${HOME}/"));
+        assert!(!is_known_safe_command("ls ~"));
+        assert!(command_references_sensitive_or_protected_path("rm -rf ~"));
+        assert!(command_references_sensitive_or_protected_path("cd /tmp && rm -rf \"$HOME\"/"));
+        assert!(command_references_sensitive_or_protected_path("/bin/rm -r ${HOME}"));
+        assert!(command_references_sensitive_or_protected_path("tar czf x.tgz ~/.ssh"));
+        assert!(command_references_sensitive_or_protected_path("cat ~/.corex/settings.json"));
+        assert!(command_references_sensitive_or_protected_path("ls ~/.*"));
     }
 
     #[test]
