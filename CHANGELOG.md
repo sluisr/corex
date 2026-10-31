@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.1] - 2026-11-01
+
+### Changed
+- **Ctrl+Z suspends instead of quitting**: Like any terminal program, Ctrl+Z hands the terminal back to the shell and `fg` resumes the session where it was. It used to close Corex at once, which a reflexive "undo" after a paste turned into a lost session.
+- **Mouse selection no longer overwrites the clipboard**: Releasing a drag fills the primary selection (middle-click paste) on Linux and keeps the highlight; `Ctrl+C` with text highlighted copies it to the clipboard, and the next `Ctrl+C` cancels or exits as before. Inside tmux, release still copies, as tmux itself does.
+
+### Fixed
+- **YOLO mode stopping on the home directory**: A command that merely names `~` or `$HOME` (`cd "$HOME"; curl ...`) no longer waits for approval in YOLO mode. Credential paths below it still do, and `rm` aimed at the home directory itself now does too.
+- **Lag while editing long paths**: Held keys are applied in one batch per frame instead of one frame each; `@path` matches are computed once per query with no per-entry allocation instead of five times per keystroke; the workspace index is built on a background thread instead of freezing the prompt; the Termux probe no longer touches the disk every frame; and absolute paths such as `/home/...` no longer open the command menu.
+
+---
+
 ## [0.9.0] - 2026-10-31
 
 ### Added
