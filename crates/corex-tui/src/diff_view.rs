@@ -293,50 +293,51 @@ pub fn build_tool_confirmation_lines(
     let remaining_all_str = format!("Allow all remaining ({})", batch_count);
     let options: [(&str, &str); 5] = if total_count > 1 {
         [
-            ("Allow this change", "[y]"),
-            (&remaining_all_str, "[a]"),
-            ("Allow for this session", "[s]"),
-            ("Deny this change", "[n / esc]"),
-            ("Deny and provide instructions...", "[w]"),
+            ("Allow this change", "y"),
+            (&remaining_all_str, "a"),
+            ("Allow for this session", "s"),
+            ("Deny this change", "n / esc"),
+            ("Deny with instructions…", "w"),
         ]
     } else {
         [
-            ("Allow once", "[y]"),
-            ("Allow for this session", "[s]"),
-            ("Deny execution", "[n / esc]"),
-            ("Always allow & save to config", "[p]"),
-            ("Deny and provide instructions...", "[w]"),
+            ("Allow once", "y"),
+            ("Allow for this session", "s"),
+            ("Always allow (saves to config)", "p"),
+            ("Deny", "n / esc"),
+            ("Deny with instructions…", "w"),
         ]
     };
 
+    let label_width = max_width.saturating_sub(21).clamp(16, 36);
+    let row_width = label_width + 1 + 7;
     for (i, (opt, shortcut)) in options.iter().enumerate() {
+        if i == 3 {
+            result.push(Line::from(Span::styled(
+                format!("    {}", "─".repeat(row_width)),
+                Style::default().fg(theme.border_dim),
+            )));
+        }
         let is_selected = i == selected_option;
-        let bullet = if is_selected { "●" } else { "○" };
-        let num = i + 1;
+        let persists = !is_subagent && total_count <= 1 && i == 2;
+        let row_bg = if is_selected { theme.selected_bg } else { Color::Reset };
 
-        let num_style = if is_selected {
-            Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.gray)
-        };
-
+        let marker_style = Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD).bg(row_bg);
         let text_style = if is_selected {
-            Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD).bg(row_bg)
+        } else if persists {
+            Style::default().fg(theme.accent_yellow)
         } else {
             Style::default().fg(theme.foreground)
         };
+        let shortcut_style = Style::default().fg(if is_selected { theme.accent_cyan } else { theme.dark_gray }).bg(row_bg);
 
-        let shortcut_style = if is_selected {
-            Style::default().fg(theme.accent_cyan)
-        } else {
-            Style::default().fg(theme.dark_gray)
-        };
-
-        let label_width = max_width.saturating_sub(21).clamp(16, 36);
+        let truncated = corex_core::truncate_ellipsis(opt, label_width);
+        let pad = label_width.saturating_sub(unicode_width::UnicodeWidthStr::width(truncated.as_str()));
         result.push(Line::from(vec![
-            Span::styled(format!("    {} {}. ", bullet, num), num_style),
-            Span::styled(format!("{:<label_width$} ", corex_core::truncate_ellipsis(opt, label_width)), text_style),
-            Span::styled(*shortcut, shortcut_style),
+            Span::styled(if is_selected { "   ▸ " } else { "     " }, marker_style),
+            Span::styled(format!("{truncated}{} ", " ".repeat(pad)), text_style),
+            Span::styled(format!("{:<7}", shortcut), shortcut_style),
         ]));
     }
 
@@ -616,13 +617,14 @@ mod tests {
         let theme = Theme::default();
         for width in [40usize, 46, 50, 80, 120] {
             let lines = build_tool_confirmation_lines("edit", "+++ b/a.rs\n+x", 0, 1, 1, 1, width, &theme, false, false, "");
-            for line in &lines {
-                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                if text.trim_start().starts_with(['●', '○']) {
-                    let w = unicode_width::UnicodeWidthStr::width(text.as_str());
-                    assert!(w <= width.max(30), "width {width}: option row is {w} wide: {text:?}");
-                    assert!(text.contains('['), "the shortcut must stay visible: {text:?}");
-                }
+            let rows: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+            let question = rows.iter().position(|t| t.contains("Apply this change?")).unwrap();
+            let options: Vec<&String> = rows[question + 1..].iter().filter(|t| !t.trim().is_empty() && !t.contains('─')).collect();
+            assert_eq!(options.len(), 5, "{rows:#?}");
+            for text in options {
+                let w = unicode_width::UnicodeWidthStr::width(text.as_str());
+                assert!(w <= width.max(30), "width {width}: option row is {w} wide: {text:?}");
+                assert!(text.trim_end().ends_with(['y', 's', 'p', 'n', 'w', 'c']), "the shortcut must stay visible: {text:?}");
             }
         }
     }

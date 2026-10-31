@@ -252,8 +252,8 @@ impl ApprovalAnswer {
             allow_single: chosen('1', &['y', 'Y'], 0),
             allow_all: is_multi && chosen('2', &['a', 'A'], 1),
             allow_session: if is_multi { chosen('3', &['s', 'S'], 2) } else { chosen('2', &['s', 'S'], 1) },
-            allow_always: !is_multi && chosen('4', &['p', 'P'], 3),
-            deny: code == KeyCode::Esc || if is_multi { chosen('4', &['n', 'N'], 3) } else { chosen('3', &['n', 'N'], 2) },
+            allow_always: !is_multi && chosen('3', &['p', 'P'], 2),
+            deny: code == KeyCode::Esc || chosen('4', &['n', 'N'], 3),
             feedback: chosen('5', &['w', 'W'], 4),
         }
     }
