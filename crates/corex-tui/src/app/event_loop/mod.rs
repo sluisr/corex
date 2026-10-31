@@ -218,12 +218,12 @@ async fn handle_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, ter
             app.last_focus_gained = Some(Instant::now());
             app.mouse_down_time = None;
             app.mouse_down_pos = None;
-            app.clear_selection();
+            app.cancel_drag();
         }
         Event::FocusLost => {
             app.mouse_down_time = None;
             app.mouse_down_pos = None;
-            app.clear_selection();
+            app.cancel_drag();
         }
         Event::Mouse(mouse) => handle_mouse(app, mouse, terminal).await,
         Event::Key(key) if key.kind == KeyEventKind::Press => return handle_key(app, key, event_tx, terminal).await,
@@ -297,6 +297,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, event_tx: &EventTx, terminal: 
     offer!(model_key(app, key));
     offer!(dialogs::confirmation_key(app, key, event_tx));
     offer!(dialogs::ask_user_key(app, key, event_tx));
+    offer!(dialogs::rewind_key(app, key));
     offer!(global_hotkey(app, key, terminal)?);
     Ok(prompt::prompt_key(app, key, event_tx).await)
 }

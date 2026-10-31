@@ -148,15 +148,12 @@ pub fn check_cached_update(current_version: &str) -> Option<String> {
 /// Saves the latest discovered version to disk cache.
 fn save_cache(latest_version: &str) {
     if let Some(path) = get_cache_path() {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
         let cache = UpdateCache {
             last_checked_sec: Utc::now().timestamp(),
             latest_version: latest_version.to_string(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&cache) {
-            let _ = fs::write(path, json);
+            let _ = crate::secure_fs::write_private_atomic(&path, &json);
         }
     }
 }
@@ -426,6 +423,26 @@ fn newest_release(first: Option<ReleaseInfo>, second: Option<ReleaseInfo>) -> Op
 /// Maximum extracted binary size (200 MB) to guard against decompression bombs.
 const MAX_EXTRACTED_BINARY_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Verifies that a release asset URL uses HTTPS and points to a trusted release host.
+pub fn is_trusted_release_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let path = parsed.path();
+    match host.to_ascii_lowercase().as_str() {
+        "github.com" => path.starts_with("/sluisr/corex/releases/"),
+        "api.github.com" => path.starts_with("/repos/sluisr/corex/releases/"),
+        "objects.githubusercontent.com" | "release-assets.githubusercontent.com" | "corex.sluisr.com" => true,
+        _ => false,
+    }
+}
+
 /// Extracts the target binary bytes from a tar.gz or zip archive in memory.
 pub fn extract_binary_from_archive(archive_bytes: &[u8], is_zip: bool, bin_name: &str) -> Result<Vec<u8>, String> {
     if is_zip {
@@ -608,6 +625,10 @@ where
         )
     };
 
+    if !is_trusted_release_url(&download_url) {
+        return Err(format!("Untrusted release download URL: {}", download_url));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!("corex/{}", current_version))
@@ -629,11 +650,21 @@ where
         ));
     }
 
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_EXTRACTED_BINARY_BYTES)
+    {
+        return Err("Release archive exceeds maximum allowed size (200 MB)".to_string());
+    }
+
     let archive_bytes = resp
         .bytes()
         .await
         .map_err(|e| format!("Failed to read archive payload: {}", e))?
         .to_vec();
+    if archive_bytes.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
+        return Err("Release archive exceeds maximum allowed size (200 MB)".to_string());
+    }
 
     progress(&format!(
         "Downloaded {} KB. Verifying SHA-256 signature...",
@@ -648,6 +679,10 @@ where
     let sha_url = sha_asset
         .map(|a| a.browser_download_url.clone())
         .unwrap_or_else(|| format!("{}.sha256", download_url));
+
+    if !is_trusted_release_url(&sha_url) {
+        return Err(format!("Untrusted release checksum URL: {}", sha_url));
+    }
 
     let sha_resp = client
         .get(&sha_url)
@@ -852,6 +887,18 @@ mod tests {
         assert_eq!(newest_release(Some(release("v0.9.0", 6)), Some(release("v0.8.1", 0))).unwrap().tag_name, "v0.9.0");
         assert_eq!(newest_release(None, Some(release("v0.8.1", 0))).unwrap().tag_name, "v0.8.1");
         assert!(newest_release(None, None).is_none());
+    }
+
+    #[test]
+    fn only_corex_release_urls_are_trusted() {
+        assert!(is_trusted_release_url("https://github.com/sluisr/corex/releases/download/v0.9.0/corex.tar.gz"));
+        assert!(is_trusted_release_url("https://objects.githubusercontent.com/github-production-release-asset/123"));
+        assert!(is_trusted_release_url("https://corex.sluisr.com/releases/corex.tar.gz"));
+        assert!(!is_trusted_release_url("http://github.com/sluisr/corex/releases/download/v0.9.0/corex.tar.gz"));
+        assert!(!is_trusted_release_url("https://evil.example.com/corex.tar.gz"));
+        assert!(!is_trusted_release_url("https://github.com/attacker/corex/releases/download/v9/corex.tar.gz"));
+        assert!(!is_trusted_release_url("https://raw.githubusercontent.com/attacker/x/main/corex.tar.gz"));
+        assert!(!is_trusted_release_url("file:///etc/passwd"));
     }
 }
 

@@ -3,186 +3,101 @@ use ratatui::text::{Line, Span};
 
 use crate::theme::Theme;
 
-/// Formats a single content row enclosed within rounded box borders with 100% width precision.
-#[allow(clippy::too_many_arguments)]
-fn format_boxed_row(
+/// The bar that marks a block (a command, a diff, a running tool) instead of boxing it in.
+const RAIL: &str = "  ▎ ";
+
+/// One row of a railed block; content that does not fit is cut with "...".
+fn format_rail_row(
     prefix: &str,
     prefix_style: Style,
     content: &str,
     content_style: Style,
     cursor: Option<Span<'static>>,
     inner_width: usize,
-    left_border_color: Color,
-    right_border_color: Color,
+    rail: Color,
 ) -> Line<'static> {
-    let cursor_len = if cursor.is_some() { 1 } else { 0 };
+    let cursor_len = usize::from(cursor.is_some());
     let prefix_len = unicode_width::UnicodeWidthStr::width(prefix);
-    let avail_for_content = inner_width.saturating_sub(prefix_len + cursor_len);
+    let avail = inner_width.saturating_sub(prefix_len + cursor_len);
 
-    let (display_content, content_len) = if unicode_width::UnicodeWidthStr::width(content) > avail_for_content {
-        let mut truncated = String::new();
-        let mut current_width = 0;
-        let target_width = avail_for_content.saturating_sub(3);
+    let display = if unicode_width::UnicodeWidthStr::width(content) > avail {
+        let mut cut = String::new();
+        let mut width = 0;
         for c in content.chars() {
-            let char_w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if current_width + char_w > target_width {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if width + w > avail.saturating_sub(3) {
                 break;
             }
-            truncated.push(c);
-            current_width += char_w;
+            cut.push(c);
+            width += w;
         }
-        truncated.push_str("...");
-        let len = unicode_width::UnicodeWidthStr::width(truncated.as_str());
-        (truncated, len)
+        cut.push_str("...");
+        cut
     } else {
-        let len = unicode_width::UnicodeWidthStr::width(content);
-        (content.to_string(), len)
+        content.to_string()
     };
 
-    let total_used = prefix_len + content_len + cursor_len;
-    let pad_len = inner_width.saturating_sub(total_used);
-    let padding = " ".repeat(pad_len);
-
     let mut spans = vec![
-        Span::styled("  │ ", Style::default().fg(left_border_color)),
+        Span::styled(RAIL, Style::default().fg(rail)),
         Span::styled(prefix.to_string(), prefix_style),
-        Span::styled(display_content, content_style),
+        Span::styled(display, content_style),
     ];
     if let Some(c) = cursor {
         spans.push(c);
     }
-    spans.push(Span::raw(padding));
-    spans.push(Span::styled(" │", Style::default().fg(right_border_color)));
-
     Line::from(spans)
 }
 
-/// Formats a content row, wrapping across multiple boxed lines if it exceeds the available width,
-/// ensuring that commands and parameters are never truncated with '...'.
-fn format_boxed_wrapped(
+/// A railed row that wraps onto more rows instead of cutting, so a command is always shown whole.
+fn format_rail_wrapped(
     prefix: &str,
     prefix_style: Style,
     content: &str,
     content_style: Style,
     inner_width: usize,
-    left_border_color: Color,
-    right_border_color: Color,
+    rail: Color,
 ) -> Vec<Line<'static>> {
     let prefix_w = unicode_width::UnicodeWidthStr::width(prefix);
-    let avail_first = inner_width.saturating_sub(prefix_w);
-    if avail_first == 0 || content.is_empty() {
-        return vec![format_boxed_row(
-            prefix,
-            prefix_style,
-            content,
-            content_style,
-            None,
-            inner_width,
-            left_border_color,
-            right_border_color,
-        )];
+    if inner_width <= prefix_w || unicode_width::UnicodeWidthStr::width(content) <= inner_width - prefix_w {
+        return vec![format_rail_row(prefix, prefix_style, content, content_style, None, inner_width, rail)];
     }
 
-    if unicode_width::UnicodeWidthStr::width(content) <= avail_first {
-        return vec![format_boxed_row(
-            prefix,
-            prefix_style,
-            content,
-            content_style,
-            None,
-            inner_width,
-            left_border_color,
-            right_border_color,
-        )];
-    }
-
-    let continuation_prefix = " ".repeat(prefix_w);
+    let continuation = " ".repeat(prefix_w);
+    let avail = inner_width - prefix_w;
     let mut lines = Vec::new();
     let mut remaining = content;
-    let mut is_first = true;
-
     while !remaining.is_empty() {
-        let current_prefix = if is_first { prefix } else { &continuation_prefix };
-        let current_style = if is_first { prefix_style } else { Style::default() };
-        let current_avail = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix));
-
-        if current_avail == 0 {
-            break;
-        }
-
-        if unicode_width::UnicodeWidthStr::width(remaining) <= current_avail {
-            let chunk_w = unicode_width::UnicodeWidthStr::width(remaining);
-            let pad = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix) + chunk_w);
-            let spans = vec![
-                Span::styled("  │ ", Style::default().fg(left_border_color)),
-                Span::styled(current_prefix.to_string(), current_style),
-                Span::styled(remaining.to_string(), content_style),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(" │", Style::default().fg(right_border_color)),
-            ];
-            lines.push(Line::from(spans));
-            break;
-        }
-
-        // Search for the best split point within `current_avail` width
-        let mut take_bytes = 0;
-        let mut cur_w = 0;
-        let mut last_space_bytes = None;
-
+        let first = lines.is_empty();
+        let mut take = 0;
+        let mut width = 0;
+        let mut last_space = None;
         for (idx, ch) in remaining.char_indices() {
-            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + ch_w > current_avail {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > avail {
                 break;
             }
-            cur_w += ch_w;
-            take_bytes = idx + ch.len_utf8();
+            width += w;
+            take = idx + ch.len_utf8();
             if ch.is_whitespace() {
-                last_space_bytes = Some(take_bytes);
+                last_space = Some(take);
             }
         }
-
-        let split_at = if let Some(sp) = last_space_bytes {
-            if sp > current_avail / 3 {
-                sp
-            } else {
-                take_bytes
-            }
-        } else {
-            take_bytes
-        };
-
-        if split_at == 0 {
+        if take == remaining.len() {
+            last_space = None;
+        }
+        // Prefer breaking at a space, unless that would leave a very short row.
+        let split = last_space.filter(|&sp| sp > avail / 3).unwrap_or(take);
+        if split == 0 {
             break;
         }
-
-        let chunk = remaining[..split_at].trim_end();
-        remaining = remaining[split_at..].trim_start();
-        let chunk_w = unicode_width::UnicodeWidthStr::width(chunk);
-        let pad = inner_width.saturating_sub(unicode_width::UnicodeWidthStr::width(current_prefix) + chunk_w);
-        let spans = vec![
-            Span::styled("  │ ", Style::default().fg(left_border_color)),
-            Span::styled(current_prefix.to_string(), current_style),
-            Span::styled(chunk.to_string(), content_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(" │", Style::default().fg(right_border_color)),
-        ];
-        lines.push(Line::from(spans));
-        is_first = false;
+        let (chunk, rest) = remaining.split_at(split);
+        lines.push(Line::from(vec![
+            Span::styled(RAIL, Style::default().fg(rail)),
+            Span::styled(if first { prefix.to_string() } else { continuation.clone() }, if first { prefix_style } else { Style::default() }),
+            Span::styled(chunk.trim_end().to_string(), content_style),
+        ]));
+        remaining = rest.trim_start();
     }
-
-    if lines.is_empty() {
-        lines.push(format_boxed_row(
-            prefix,
-            prefix_style,
-            content,
-            content_style,
-            None,
-            inner_width,
-            left_border_color,
-            right_border_color,
-        ));
-    }
-
     lines
 }
 
@@ -204,17 +119,22 @@ pub fn build_tool_confirmation_lines(
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
     let is_subagent = tool_name == "delegate_subagent";
 
-    let border_color = theme.border_dim;
+    // The rail's colour says what kind of action waits: a command, an edit, a delegation.
+    let rail = if is_shell {
+        theme.accent_yellow
+    } else if is_edit {
+        theme.accent_blue
+    } else if is_subagent {
+        theme.accent_cyan
+    } else {
+        theme.border_dim
+    };
     let box_width = max_width.clamp(30, 105);
     let inner_width = box_width.saturating_sub(6);
 
     let mut result = Vec::new();
 
-    // 1. Top border
-    let top_border = format!("  ╭{}╮", "─".repeat(inner_width + 2));
-    result.push(Line::from(Span::styled(top_border, Style::default().fg(border_color))));
-
-    // 2. Body lines (truncated to 12 unless the user expands with Ctrl+O)
+    // Body lines: 12 at most unless the user expands them with Ctrl+O.
     let all_diff_lines: Vec<&str> = diff_or_cmd.lines().collect();
     let total_diff_lines = all_diff_lines.len();
     let shown_diff_lines: Vec<&str> = if expanded {
@@ -228,110 +148,94 @@ pub fn build_tool_confirmation_lines(
         } else if is_shell {
             ("$ ", "(no arguments provided)", theme.accent_yellow)
         } else {
-            ("⚙ ", "(no arguments provided)", theme.accent_purple)
+            ("· ", "(no arguments provided)", theme.accent_purple)
         };
-        result.push(format_boxed_row(
+        result.push(format_rail_row(
             prefix,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
             body,
             Style::default().fg(theme.gray),
             None,
             inner_width,
-            border_color,
-            border_color,
+            rail,
         ));
     } else {
         for line in shown_diff_lines {
         if is_edit {
             if line.starts_with('+') && !line.starts_with("+++") {
-                result.push(format_boxed_row(
+                result.push(format_rail_row(
                     "+ ",
                     Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD),
                     &line[1..],
                     Style::default().fg(theme.diff_added_fg),
                     None,
                     inner_width,
-                    border_color,
-                    border_color,
+                    rail,
                 ));
             } else if line.starts_with('-') && !line.starts_with("---") {
-                result.push(format_boxed_row(
+                result.push(format_rail_row(
                     "- ",
                     Style::default().fg(theme.diff_removed_fg).add_modifier(Modifier::BOLD),
                     &line[1..],
                     Style::default().fg(theme.diff_removed_fg),
                     None,
                     inner_width,
-                    border_color,
-                    border_color,
+                    rail,
                 ));
             } else if line.starts_with("@@") {
-                result.push(format_boxed_row(
+                result.push(format_rail_row(
                     "",
                     Style::default(),
                     line,
                     Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD),
                     None,
                     inner_width,
-                    border_color,
-                    border_color,
+                    rail,
                 ));
             } else if line.starts_with("---") || line.starts_with("+++") {
-                result.push(format_boxed_row(
+                result.push(format_rail_row(
                     "",
                     Style::default(),
                     line,
                     Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD),
                     None,
                     inner_width,
-                    border_color,
-                    border_color,
+                    rail,
                 ));
             } else {
-                result.push(format_boxed_row(
+                result.push(format_rail_row(
                     "  ",
                     Style::default(),
                     line,
                     Style::default().fg(theme.foreground),
                     None,
                     inner_width,
-                    border_color,
-                    border_color,
+                    rail,
                 ));
             }
         } else {
             let is_sub = is_subagent || line.starts_with("Subagent");
+            let is_command = !is_sub && (is_shell || line.trim_start().starts_with('$'));
             let (prefix, prefix_style, body) = if is_sub {
-                ("◆ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), line.trim_start())
-            } else if is_shell || line.trim_start().starts_with('$') {
-                let b = if line.trim_start().starts_with('$') {
-                    line.trim_start()[1..].trim_start()
-                } else {
-                    line.trim_start()
-                };
-                ("$ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD), b)
+                ("◆ ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD), line.trim_start().to_string())
+            } else if is_command {
+                let b = line.trim_start().strip_prefix('$').unwrap_or(line.trim_start()).trim_start();
+                // The command sits on a shaded chip, padded so the shade frames it.
+                (" $ ", Style::default().fg(theme.accent_yellow).bg(theme.code_bg).add_modifier(Modifier::BOLD), format!("{b} "))
             } else {
-                ("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), line.trim_start())
+                ("› ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD), line.trim_start().to_string())
+            };
+            let body_style = if is_command {
+                Style::default().fg(theme.text_strong).bg(theme.code_bg)
+            } else {
+                Style::default().fg(theme.text_strong)
             };
 
-            result.extend(format_boxed_wrapped(
-                prefix,
-                prefix_style,
-                body,
-                Style::default().fg(theme.text_strong),
-                inner_width,
-                border_color,
-                border_color,
-            ));
+            result.extend(format_rail_wrapped(prefix, prefix_style, &body, body_style, inner_width, rail));
         }
     }
     }
 
-    // 3. Bottom border
-    let bottom_border = format!("  ╰{}╯", "─".repeat(inner_width + 2));
-    result.push(Line::from(Span::styled(bottom_border, Style::default().fg(border_color))));
-
-    // 3.5 Hint when the diff was truncated (or is fully expanded)
     if total_diff_lines > 12 {
         let hint = if expanded {
             format!("(Ctrl+O to collapse — {} lines)", total_diff_lines)
@@ -343,8 +247,9 @@ pub fn build_tool_confirmation_lines(
             Style::default().fg(theme.gray),
         )));
     }
+    // Without a box around it, a blank line keeps the block apart from the question.
+    result.push(Line::from(""));
 
-    // 4. Question line
     let step_label = if total_count > 1 {
         format!("[{} of {}] ", current_idx, total_count)
     } else {
@@ -385,7 +290,6 @@ pub fn build_tool_confirmation_lines(
     };
     result.push(question_line);
 
-    // 5. Options (Modern CLI style without emojis)
     let remaining_all_str = format!("Allow all remaining ({})", batch_count);
     let options: [(&str, &str); 5] = if total_count > 1 {
         [
@@ -436,7 +340,7 @@ pub fn build_tool_confirmation_lines(
         ]));
     }
 
-    // 6. Interactive Instructions Input for Option 5
+    // Free-text instructions typed after choosing "Deny and provide instructions".
     if input_mode {
         result.push(Line::from(""));
         result.push(Line::from(vec![
@@ -469,50 +373,20 @@ pub fn build_streaming_tool_preview_lines(
     max_width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
-    let dim_border = theme.border_dim;
-    let beam_color = theme.accent_cyan;
-    let box_width = max_width.clamp(30, 105);
-    let inner_width = box_width.saturating_sub(6);
-    let bar_len = inner_width + 2;
-    let num_rows = calls.len().max(1);
-
-    // Full 360-degree perimeter mapping (clockwise: Top -> Right -> Bottom -> Left)
-    let total_p = ((bar_len + num_rows + 2) * 2) as f32;
-    let cycle_time = 2.2; // 2.2 seconds for full perimeter circuit
-    let head_pos = ((elapsed_secs % cycle_time) / cycle_time) * total_p;
-    let beam_len = (total_p / 4.0).clamp(6.0, 20.0);
-
-    let get_color_for_offset = |offset: f32| -> Color {
-        let diff = (offset - head_pos).abs();
-        let dist = diff.min(total_p - diff);
-        if dist < beam_len * 0.45 {
-            beam_color
-        } else if dist < beam_len {
+    let inner_width = max_width.clamp(30, 105).saturating_sub(6);
+    // A soft pulse runs down the rail while the model is still writing the calls.
+    let rail_at = |row: usize| -> Color {
+        let phase = (elapsed_secs * 1.4 - row as f32 * 0.25).rem_euclid(1.0);
+        if phase < 0.35 {
+            theme.accent_cyan
+        } else if phase < 0.6 {
             Color::Rgb(70, 110, 160)
         } else {
-            dim_border
+            theme.border_dim
         }
     };
 
     let mut result = Vec::new();
-
-    // 1. Top border with traveling light (left-to-right)
-    let mut top_spans = vec![
-        Span::styled("  ╭", Style::default().fg(get_color_for_offset(0.0))),
-    ];
-    for i in 0..bar_len {
-        let c = get_color_for_offset(i as f32);
-        let style = if c == beam_color {
-            Style::default().fg(c).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(c)
-        };
-        top_spans.push(Span::styled("─", style));
-    }
-    top_spans.push(Span::styled("╮", Style::default().fg(get_color_for_offset(bar_len as f32))));
-    result.push(Line::from(top_spans));
-
-    // 2. Format currently streaming calls with dynamic left and right vertical border colors
     for (idx, call) in calls.iter().enumerate() {
         let is_last = idx == calls.len().saturating_sub(1);
         let tool_name = &call.function.name;
@@ -651,41 +525,19 @@ pub fn build_streaming_tool_preview_lines(
             None
         };
 
-        // Calculate offsets along perimeter for right side (going down) and left side (going up)
-        let right_offset = (bar_len + 1 + idx) as f32;
-        let left_offset = (bar_len * 2 + num_rows + 3 + (num_rows.saturating_sub(1 + idx))) as f32;
+        let rail = rail_at(idx);
 
-        let right_border_color = get_color_for_offset(right_offset);
-        let left_border_color = get_color_for_offset(left_offset);
-
-        result.push(format_boxed_row(
+        result.push(format_rail_row(
             prefix,
             Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD),
             clean_body,
             Style::default().fg(theme.foreground),
             cursor_span,
             inner_width,
-            left_border_color,
-            right_border_color,
+            rail,
         ));
     }
 
-    // 3. Bottom border with traveling light (right-to-left)
-    let mut bot_spans = vec![
-        Span::styled("  ╰", Style::default().fg(get_color_for_offset((bar_len * 2 + num_rows + 2) as f32))),
-    ];
-    for i in 0..bar_len {
-        let offset = (bar_len + num_rows + 2 + (bar_len.saturating_sub(1 + i))) as f32;
-        let c = get_color_for_offset(offset);
-        let style = if c == beam_color {
-            Style::default().fg(c).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(c)
-        };
-        bot_spans.push(Span::styled("─", style));
-    }
-    bot_spans.push(Span::styled("╯", Style::default().fg(get_color_for_offset((bar_len + num_rows + 1) as f32))));
-    result.push(Line::from(bot_spans));
     result.push(Line::from(""));
 
     result
@@ -696,16 +548,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_boxed_wrapped_preserves_full_long_command() {
+    fn long_commands_wrap_instead_of_being_cut() {
         let long_cmd = "uptime && echo \"---\" && free -h && echo \"---\" && df -h / /home 2>/dev/null";
         let inner_width = 40;
-        let lines = format_boxed_wrapped(
+        let lines = format_rail_wrapped(
             "$ ",
             Style::default(),
             long_cmd,
             Style::default(),
             inner_width,
-            Color::White,
             Color::White,
         );
 
@@ -729,16 +580,15 @@ mod tests {
     }
 
     #[test]
-    fn test_format_boxed_wrapped_short_command() {
+    fn short_commands_stay_on_one_row() {
         let short_cmd = "whoami";
         let inner_width = 40;
-        let lines = format_boxed_wrapped(
+        let lines = format_rail_wrapped(
             "$ ",
             Style::default(),
             short_cmd,
             Style::default(),
             inner_width,
-            Color::White,
             Color::White,
         );
 
@@ -746,6 +596,19 @@ mod tests {
         let text = lines[0].spans.iter().map(|s| s.content.as_ref()).collect::<String>();
         assert!(text.contains("whoami"));
         assert!(!text.contains("..."));
+    }
+
+    #[test]
+    fn blocks_are_marked_by_a_rail_not_boxed_in() {
+        let theme = Theme::default();
+        let lines = build_tool_confirmation_lines("run_shell_command", "$ uname -a", 0, 1, 1, 1, 80, &theme, false, false, "");
+        let text: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(text.iter().any(|t| t.starts_with("  ▎  $ uname -a ")), "{text:#?}");
+        let command = lines.iter().flat_map(|l| &l.spans).find(|s| s.content.contains("uname")).unwrap();
+        assert_eq!(command.style.bg, Some(theme.code_bg), "the command sits on a shaded chip");
+        assert!(!text.iter().any(|t| t.contains(['╭', '╮', '╰', '╯', '│'])), "{text:#?}");
+        let rail = lines.iter().flat_map(|l| &l.spans).find(|s| s.content.as_ref() == RAIL).unwrap();
+        assert_eq!(rail.style.fg, Some(theme.accent_yellow), "a shell command gets the shell colour");
     }
 
     #[test]

@@ -1,7 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use corex_core::memory::{self, Memory, MemoryScope};
 use directories::BaseDirs;
+
+/// How long skills and memory read from disk are reused between prompt builds.
+const CACHE_TTL: Duration = Duration::from_secs(15);
+
+struct CacheEntry {
+    built: Instant,
+    memory_generation: u64,
+    skills: String,
+    memory: String,
+}
+
+fn prompt_fs_cache() -> &'static Mutex<HashMap<PathBuf, CacheEntry>> {
+    static PROMPT_FS_CACHE: OnceLock<Mutex<HashMap<PathBuf, CacheEntry>>> = OnceLock::new();
+    PROMPT_FS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub const CORE_TOOL_ENFORCEMENT: &str = r#"
 TOOL USAGE RULES (mandatory):
@@ -10,6 +28,7 @@ TOOL USAGE RULES (mandatory):
 - If you are unsure whether data exists or what it contains, call a tool. Prefer real data over assumptions every time.
 - After receiving tool output, synthesize a concise answer. Do not repeat or dump the raw output unless asked.
 - WEB SEARCH & CITATIONS: When the user asks to search the web, starts with '/web <query>' or '/search <query>', or asks about real-time/online facts, IMMEDIATELY call the 'web_search' tool with the query. When the user asks to inspect, read, or summarize a web page or URL, or starts with '/fetch <url>', IMMEDIATELY call the 'web_fetch' tool with the url. After receiving search results or fetched content, ALWAYS synthesize a direct, clear, well-structured answer in natural language with source links. NEVER output raw tool responses, raw JSON, or unformatted search text.
+- FILE REFERENCES: `@path` in a user message names a file or directory relative to the workspace. Read it (`read_file`, `list_directory`) before answering about it.
 - TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search, web_fetch) before run_shell_command.
 - CLEAN COMMAND EXECUTION: When using run_shell_command, execute direct, clean, atomic shell commands. NEVER prepend decorative echo banners, section titles, or dividers (e.g. echo '=== STEP 1 ===' or echo '######' or echo '══════'). Never combine benign echo with sudo. Run the exact binary or command needed.
 - TASK EXECUTION & BACKGROUNDING:
@@ -105,6 +124,7 @@ pub struct PromptBuilder {
     workspace_dir: std::path::PathBuf,
     has_sudo_password: bool,
     is_plan_mode: bool,
+    extra_dirs: Vec<PathBuf>,
 }
 
 impl PromptBuilder {
@@ -113,6 +133,7 @@ impl PromptBuilder {
             workspace_dir: workspace_dir.as_ref().to_path_buf(),
             has_sudo_password: false,
             is_plan_mode: false,
+            extra_dirs: Vec::new(),
         }
     }
 
@@ -121,58 +142,42 @@ impl PromptBuilder {
         self
     }
 
+    pub fn with_extra_dirs(mut self, dirs: &[PathBuf]) -> Self {
+        self.extra_dirs = dirs.to_vec();
+        self
+    }
+
+    fn extra_dirs_line(&self) -> String {
+        if self.extra_dirs.is_empty() {
+            return String::new();
+        }
+        let dirs: Vec<String> = self.extra_dirs.iter().map(|d| d.display().to_string()).collect();
+        format!(
+            "- Additional Directories (read them like the workspace, no confirmation needed; writing there still needs approval): {}\n",
+            dirs.join(", ")
+        )
+    }
+
     pub fn with_plan_mode(mut self, plan_mode: bool) -> Self {
         self.is_plan_mode = plan_mode;
         self
     }
 
-    fn read_memory(&self) -> String {
-        const MAX_MEMORY_CHARS: usize = 20_000;
+    /// The memory section exactly as it is appended to the system prompt.
+    pub fn memory_prompt(&self) -> String {
         let mut memory = String::new();
-
-        if let Some(dirs) = BaseDirs::new() {
-            let global_candidates = [
-                dirs.home_dir().join(".corex").join("SYSTEM.md"),
-                dirs.home_dir().join(".corex").join("COREX.md"),
-                dirs.home_dir().join(".deepseek").join("DEEPSEEK.md"),
-            ];
-            for path in &global_candidates {
-                if path.exists() {
-                    if let Ok(c) = fs::read_to_string(path) {
-                        let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("SYSTEM.md");
-                        memory.push_str(&format!(
-                            "\n# USER GLOBAL PERSONALITY & INSTRUCTIONS (~/.corex/{})\nThe following guidelines and personality instructions were configured globally by the user. You MUST adhere to them across all sessions and projects:\n{}\n",
-                            name, bounded
-                        ));
-                        break;
-                    }
-                }
+        for file in Memory::new(&self.workspace_dir).files() {
+            match file.scope {
+                MemoryScope::Global => memory.push_str(&format!(
+                    "\n# USER GLOBAL PERSONALITY & INSTRUCTIONS ({})\nThe following guidelines and personality instructions were configured globally by the user. You MUST adhere to them across all sessions and projects:\n{}\n",
+                    file.display, file.content
+                )),
+                MemoryScope::Project => memory.push_str(&format!(
+                    "\n# PROJECT INSTRUCTIONS & CONTEXT ({})\n{}\n",
+                    file.display, file.content
+                )),
             }
         }
-
-        let local_candidates = [
-            self.workspace_dir.join(".corex").join("SYSTEM.md"),
-            self.workspace_dir.join("COREX.md"),
-            self.workspace_dir.join("AGENTS.md"),
-            self.workspace_dir.join("DEEPSEEK.md"),
-        ];
-        for path in &local_candidates {
-            if path.exists() {
-                if let Ok(c) = fs::read_to_string(path) {
-                    let bounded = corex_core::safe_truncate_str(&c, MAX_MEMORY_CHARS);
-                    let rel_display = path.strip_prefix(&self.workspace_dir)
-                        .map(|p| format!("./{}", p.display()))
-                        .unwrap_or_else(|_| path.display().to_string());
-                    memory.push_str(&format!(
-                        "\n# PROJECT INSTRUCTIONS & CONTEXT ({})\n{}\n",
-                        rel_display, bounded
-                    ));
-                    break;
-                }
-            }
-        }
-
         memory
     }
 
@@ -241,9 +246,10 @@ impl PromptBuilder {
         ));
 
         prompt.push_str(&format!(
-            "CURRENT ENVIRONMENT:\n- OS: {}\n- Workspace Directory: {}\n- Date: {}\n- Communication Language: Dynamically and autonomously match the exact language used by the user in their prompt (Spanish, English, German, French, Portuguese, Italian, Japanese, etc.). Strict anti-drift mandate: NEVER drift into Chinese or output Chinese characters unless the user explicitly queried in Chinese.\n\n",
+            "CURRENT ENVIRONMENT:\n- OS: {}\n- Workspace Directory: {}\n{}- Date: {}\n- Communication Language: Dynamically and autonomously match the exact language used by the user in their prompt (Spanish, English, German, French, Portuguese, Italian, Japanese, etc.). Strict anti-drift mandate: NEVER drift into Chinese or output Chinese characters unless the user explicitly queried in Chinese.\n\n",
             std::env::consts::OS,
             self.workspace_dir.display(),
+            self.extra_dirs_line(),
             chrono::Utc::now().format("%Y-%m-%d")
         ));
 
@@ -260,6 +266,7 @@ impl PromptBuilder {
             prompt.push_str("\n\n# PLANNING MODE ACTIVE\n");
             prompt.push_str("- You are in architectural planning mode. Focus on reading and analyzing the codebase.\n");
             prompt.push_str("- Propose clear step-by-step plans before making any destructive edits.\n");
+            prompt.push_str("- File-writing, memory, subagent and MCP tools are unavailable; shell commands that are not read-only, and killing or driving background tasks, wait for the user's approval.\n");
         }
 
         let (skills, memory) = self.cached_skills_and_memory();
@@ -273,35 +280,31 @@ impl PromptBuilder {
         prompt
     }
 
+    /// Makes the next prompt re-read skills and memory from disk.
+    pub fn invalidate_cache(&self) {
+        memory::mark_changed();
+    }
+
     fn cached_skills_and_memory(&self) -> (String, String) {
-        use std::collections::HashMap;
-        use std::path::PathBuf;
-        use std::sync::{Mutex, OnceLock};
-        use std::time::{Duration, Instant};
-
-        type CacheMap = HashMap<PathBuf, (Instant, String, String)>;
-        static PROMPT_FS_CACHE: OnceLock<Mutex<CacheMap>> = OnceLock::new();
-        const CACHE_TTL: Duration = Duration::from_secs(15);
-
-        let cache_mutex = PROMPT_FS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(guard) = cache_mutex.lock() {
-            if let Some((ts, skills, memory)) = guard.get(&self.workspace_dir) {
-                if ts.elapsed() < CACHE_TTL {
-                    return (skills.clone(), memory.clone());
+        if let Ok(guard) = prompt_fs_cache().lock() {
+            if let Some(entry) = guard.get(&self.workspace_dir) {
+                if entry.built.elapsed() < CACHE_TTL && entry.memory_generation == memory::generation() {
+                    return (entry.skills.clone(), entry.memory.clone());
                 }
             }
         }
 
+        let memory_generation = memory::generation();
         let skills = self.discover_skills();
-        let memory = self.read_memory();
+        let memory = self.memory_prompt();
 
-        if let Ok(mut guard) = cache_mutex.lock() {
+        if let Ok(mut guard) = prompt_fs_cache().lock() {
             if guard.len() >= 8 {
                 guard.clear();
             }
             guard.insert(
                 self.workspace_dir.clone(),
-                (Instant::now(), skills.clone(), memory.clone()),
+                CacheEntry { built: Instant::now(), memory_generation, skills: skills.clone(), memory: memory.clone() },
             );
         }
 
@@ -344,12 +347,16 @@ impl PromptBuilder {
             prompt.push_str("sudo is pre-authenticated for this session. Use it freely when root is needed.\n\n");
         }
 
+        if self.is_plan_mode {
+            prompt.push_str("# PLANNING MODE ACTIVE\n- You are in architectural planning mode (read-only exploration). Focus on reading and analyzing.\n- Propose clear step-by-step plans before making any destructive edits.\n- File-writing, memory, subagent and MCP tools are unavailable; shell commands that are not read-only, and killing or driving background tasks, wait for the user's approval.\n\n");
+        }
+
         let skills = self.discover_skills();
         if !skills.is_empty() {
             prompt.push_str(&skills);
         }
 
-        let memory = self.read_memory();
+        let memory = self.memory_prompt();
         if !memory.is_empty() {
             prompt.push_str(&memory);
         }
@@ -442,6 +449,10 @@ You are managing remote Linux servers and VPS nodes directly through persistent 
             target_node_id = target_node_id,
             connection_rule = connection_rule,
         ));
+
+        if self.is_plan_mode {
+            prompt.push_str("\n# PLANNING MODE ACTIVE\n- You are in architectural planning mode (read-only exploration). Focus on reading and analyzing.\n- Propose clear step-by-step plans before making any destructive changes.\n");
+        }
 
         let (skills, memory) = self.cached_skills_and_memory();
         if !skills.is_empty() {
@@ -617,5 +628,34 @@ description: >-
 
         assert!(prompt.contains("PROJECT INSTRUCTIONS & CONTEXT"));
         assert!(prompt.contains("Respond always like a Senior SRE"));
+    }
+
+    #[test]
+    fn test_invalidate_cache_picks_up_edits() {
+        let temp_dir = std::env::temp_dir().join(format!("corex_test_memory_reload_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let _ = std::fs::write(temp_dir.join("AGENTS.md"), "before edit");
+
+        let builder = PromptBuilder::new(&temp_dir);
+        let first = builder.build();
+        let _ = std::fs::write(temp_dir.join("AGENTS.md"), "after edit");
+        let cached = builder.build();
+        builder.invalidate_cache();
+        let reloaded = builder.build();
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(first.contains("before edit"));
+        assert!(cached.contains("before edit"));
+        assert!(reloaded.contains("after edit"));
+    }
+
+    #[test]
+    fn plan_mode_reaches_lite_and_fleet_prompts() {
+        let builder = PromptBuilder::new("/tmp/test-workspace").with_plan_mode(true);
+        let lite = builder.build_lite();
+        let fleet = builder.build_fleet(None, &[]);
+        assert!(lite.contains("PLANNING MODE ACTIVE"));
+        assert!(fleet.contains("PLANNING MODE ACTIVE"));
     }
 }

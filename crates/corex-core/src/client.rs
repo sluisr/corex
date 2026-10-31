@@ -19,6 +19,15 @@ pub fn get_sudo_password() -> Option<String> {
 
 pub fn set_sudo_password(pwd: Option<String>) {
     if let Ok(mut g) = GLOBAL_SUDO_PASSWORD.lock() {
+        if let Some(mut old) = g.take() {
+            // SAFETY: writing 0x00 bytes (valid UTF-8) into the String's existing buffer before drop.
+            unsafe {
+                for b in old.as_bytes_mut() {
+                    std::ptr::write_volatile(b, 0);
+                }
+            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        }
         *g = pwd;
     }
 }
@@ -64,6 +73,61 @@ pub fn is_truncated_finish(finish_reason: Option<&str>) -> bool {
 }
 
 /// True when an API error message says the request did not fit the model's context window.
+/// Waits before each new attempt when a request fails for a reason that usually passes.
+const RETRY_DELAYS_SECS: [u64; 3] = [3, 8, 20];
+
+/// Longer than this, a provider's "retry after" means the quota is spent rather than a burst
+/// limit, and retrying within the same request is pointless.
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+
+/// Seconds from a `Retry-After` header given in seconds.
+fn retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Seconds from a Google-style `"retryDelay": "44632s"` in an error body.
+fn retry_delay_in_body(body: &str) -> Option<u64> {
+    let rest = &body[body.find("\"retryDelay\"")? + 12..];
+    let value = rest.split('"').nth(1)?;
+    value.trim_end_matches('s').split('.').next()?.parse().ok()
+}
+
+fn rate_limit_message(provider: &str, retry_after: Option<u64>) -> String {
+    match retry_after {
+        Some(secs) if secs > MAX_RETRY_AFTER_SECS => {
+            let wait = if secs >= 3600 {
+                format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+            } else {
+                format!("{}m", secs.div_ceil(60))
+            };
+            format!(
+                "Quota exhausted (429 Too Many Requests) from {provider}: it asks to wait {wait} before the next request. \
+                 Switch provider or model with /model, or use a paid key."
+            )
+        }
+        _ => format!("Rate limit or quota exceeded (429 Too Many Requests) from {provider}."),
+    }
+}
+
+/// True for failures worth retrying unchanged: rate limits, overloaded or briefly unavailable
+/// servers, and dropped connections. Bad keys, bad requests and context overflow are not.
+pub fn is_transient_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    if m.starts_with("quota exhausted") {
+        return false;
+    }
+    m.contains("429")
+        || m.contains("rate limit")
+        || m.contains("overloaded")
+        || ["(500", "(502", "(503", "(504", "(529", "code 500", "code 502", "code 503", "code 504", "code 529"]
+            .iter()
+            .any(|code| m.contains(code))
+        || m.contains("error sending request")
+        || m.contains("connection reset")
+        || m.contains("connection closed")
+        || m.contains("timed out")
+}
+
 pub fn is_context_overflow_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
     [
@@ -196,14 +260,17 @@ impl LlmClient {
             } else {
                 format!("{}/v1/messages", trimmed_base)
             };
-            let request_body = serde_json::json!({
+            let profile = crate::anthropic::model_profile(&cfg.model);
+            let mut request_body = serde_json::json!({
                 "model": cfg.model,
                 "max_tokens": 2048,
-                "temperature": 0.1,
                 "messages": [
                     {"role": "user", "content": prompt}
                 ]
             });
+            if profile.accepts_temperature {
+                request_body["temperature"] = serde_json::json!(0.1);
+            }
             let resp = self.http
                 .post(&url)
                 .header("x-api-key", &api_key)
@@ -221,14 +288,20 @@ impl LlmClient {
                 .ok_or_else(|| anyhow::anyhow!("Empty Anthropic translation response"))?;
             return Ok(translated);
         }
-        let request_body = serde_json::json!({
-            "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
+        let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
+        let supports_temp = !target_model.starts_with("o1")
+            && !target_model.starts_with("o3")
+            && !target_model.contains("reasoner");
+        let mut request_body = serde_json::json!({
+            "model": target_model,
             "messages": [
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.1,
             "max_tokens": 2048
         });
+        if supports_temp {
+            request_body["temperature"] = serde_json::json!(0.1);
+        }
         let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let resp = self.http
             .post(&url)
@@ -578,8 +651,15 @@ impl LlmClient {
         // Root user prompt anchor (first non-system message).
         let first_non_system = messages.iter().position(|m| m.role != "system").unwrap_or(0);
 
-        // Locate the last user message (active directive that initiated the current work).
-        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+        // Locate the last real user message (active directive that initiated the current work),
+        // skipping synthetic tool-image or task-report user messages.
+        let last_user_idx = messages.iter().rposition(|m| {
+            m.role == "user"
+                && !crate::tool_images::is_tool_image_message(m)
+                && !m
+                    .text_content()
+                    .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+        });
 
         // Determine the middle slice to compact while preserving both `first_non_system`
         // (session anchor) and `last_user_idx` (active directive).
@@ -703,15 +783,18 @@ impl LlmClient {
                 } else {
                     format!("{}/v1/messages", trimmed_base)
                 };
-                let request_body = serde_json::json!({
+                let profile = crate::anthropic::model_profile(&cfg.model);
+                let mut request_body = serde_json::json!({
                     "model": cfg.model,
                     "max_tokens": 600,
-                    "temperature": 0.3,
                     "system": summary_system,
                     "messages": [
                         {"role": "user", "content": digest}
                     ]
                 });
+                if profile.accepts_temperature {
+                    request_body["temperature"] = serde_json::json!(0.3);
+                }
                 if let Ok(resp) = self.http
                     .post(&url)
                     .header("x-api-key", &ep_api_key)
@@ -732,15 +815,21 @@ impl LlmClient {
                     }
                 }
             } else {
-                let request_body = serde_json::json!({
-                    "model": if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() },
+                let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
+                let supports_temp = !target_model.starts_with("o1")
+                    && !target_model.starts_with("o3")
+                    && !target_model.contains("reasoner");
+                let mut request_body = serde_json::json!({
+                    "model": target_model,
                     "messages": [
                         {"role": "system", "content": summary_system},
                         {"role": "user", "content": digest}
                     ],
-                    "max_tokens": 600,
-                    "temperature": 0.3
+                    "max_tokens": 600
                 });
+                if supports_temp {
+                    request_body["temperature"] = serde_json::json!(0.3);
+                }
 
                 let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
                 if let Ok(resp) = self.http
@@ -838,7 +927,13 @@ impl LlmClient {
         while messages.len() > first_non_system + 2
             && Self::estimate_messages_tokens(messages) > token_limit
         {
-            let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+            let last_user_idx = messages.iter().rposition(|m| {
+                m.role == "user"
+                    && !crate::tool_images::is_tool_image_message(m)
+                    && !m
+                        .text_content()
+                        .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+            });
             let mut drop_idx = if messages.len() > first_non_system + 3 {
                 first_non_system + 1
             } else {
@@ -882,19 +977,45 @@ impl LlmClient {
         tools: Option<Vec<ToolDefinition>>,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let mut rx = self
-            .stream_chat_once(messages.clone(), tools.clone(), cancel_token.clone())
-            .await?;
-
-        // Look at the first real event. A context-overflow rejection arrives before any content, so
-        // this is the one moment where compacting and retrying is invisible to the consumer.
-        let mut prefix = Vec::new();
-        let first = loop {
-            match rx.recv().await {
-                Some(ev @ StreamEvent::ContextCompacted { .. }) => prefix.push(ev),
-                other => break other,
+        // Look at the first real event. Rejections (context overflow, rate limits, overloaded
+        // servers) arrive before any content, so this is the one moment where retrying is
+        // invisible to the consumer: nothing has been shown or run yet.
+        let mut notices = Vec::new();
+        let mut attempt = 0;
+        let (mut rx, mut prefix, first) = loop {
+            let mut rx = self
+                .stream_chat_once(messages.clone(), tools.clone(), cancel_token.clone())
+                .await?;
+            let mut prefix = Vec::new();
+            let first = loop {
+                match rx.recv().await {
+                    Some(ev @ StreamEvent::ContextCompacted { .. }) => prefix.push(ev),
+                    other => break other,
+                }
+            };
+            let transient = match &first {
+                Some(StreamEvent::Error(m)) if is_transient_error(m) => Some(m.clone()),
+                _ => None,
+            };
+            match (transient, RETRY_DELAYS_SECS.get(attempt)) {
+                (Some(reason), Some(&delay)) if !cancel_token.is_cancelled() => {
+                    attempt += 1;
+                    notices.push(StreamEvent::Notice(format!(
+                        "{} Retried after {}s (attempt {}/{}).",
+                        reason.trim_end_matches('.'),
+                        delay,
+                        attempt + 1,
+                        RETRY_DELAYS_SECS.len() + 1
+                    )));
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+                        _ = cancel_token.cancelled() => break (rx, prefix, first),
+                    }
+                }
+                _ => break (rx, prefix, first),
             }
         };
+        prefix.splice(0..0, notices);
         let overflow = matches!(&first, Some(StreamEvent::Error(m)) if is_context_overflow_error(m));
         let image_rejected = matches!(&first, Some(StreamEvent::Error(m)) if is_image_rejection_error(m))
             && messages.iter().any(Self::has_images);
@@ -1432,12 +1553,13 @@ impl LlmClient {
                                 crate::forensic::ForensicLogger::log_error("stream_chat_sse", &err.to_string());
                                 let friendly_err = match err {
                                     reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let retry_header = retry_after_header(resp.headers());
                                         let body_text = resp.text().await.unwrap_or_default();
                                         crate::forensic::ForensicLogger::log_error("stream_chat_sse_body", &body_text);
                                         if status == reqwest::StatusCode::UNAUTHORIZED {
                                             format!("Authentication error (401 Unauthorized): Invalid or missing API key for {}. Run /key to enter a new one, press E in /model to change another provider's key, or fix the environment variable that supplies it.", provider_label_clone)
                                         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                                            format!("Rate limit or quota exceeded (429 Too Many Requests) from {}.", provider_label_clone)
+                                            rate_limit_message(&provider_label_clone, retry_header.or_else(|| retry_delay_in_body(&body_text)))
                                         } else if !body_text.is_empty() {
                                             format!("API error ({}): {}", status, body_text)
                                         } else {
@@ -1636,12 +1758,13 @@ impl LlmClient {
                                 crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse", &err.to_string());
                                 let friendly_err = match err {
                                     reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let retry_header = retry_after_header(resp.headers());
                                         let body_text = resp.text().await.unwrap_or_default();
                                         crate::forensic::ForensicLogger::log_error("stream_chat_anthropic_sse_body", &body_text);
                                         if status == reqwest::StatusCode::UNAUTHORIZED {
                                             "Authentication error (401 Unauthorized): Invalid or missing Anthropic API key. Run /key to enter a new one, or fix ANTHROPIC_API_KEY.".to_string()
                                         } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                                            "Rate limit or quota exceeded (429 Too Many Requests) from Anthropic API.".to_string()
+                                            rate_limit_message("Anthropic API", retry_header.or_else(|| retry_delay_in_body(&body_text)))
                                         } else if !body_text.is_empty() {
                                             format!("Anthropic API error ({}): {}", status, body_text)
                                         } else {
@@ -1886,6 +2009,42 @@ mod tests {
         // The latest user prompt should still be in messages
         let last_user = messages.iter().filter(|m| m.role == "user").last().unwrap();
         assert_eq!(last_user.text_content().unwrap(), "ACTIVE DIRECTIVE: Fix the database connection pool leak!");
+    }
+
+    #[tokio::test]
+    async fn compaction_ignores_synthetic_image_messages() {
+        let client = LlmClient::new(Config::default());
+        let mut messages = vec![
+            Message::system("System prompt instructions"),
+            Message::user("Initial anchor request"),
+            Message::assistant("Initial answer", None),
+            Message::user("ACTIVE DIRECTIVE: Inspect the screenshot and fix layout"),
+        ];
+        for i in 1..=6 {
+            let call_id = format!("call_{}", i);
+            messages.push(Message::assistant_with_tools(
+                None,
+                None,
+                vec![ToolCall::new(&call_id, "run_shell_command", "{\"command\":\"ls\"}")],
+            ));
+            messages.push(Message::tool_response(&call_id, format!("Output {}", i)));
+        }
+        messages.push(Message::user_parts(vec![
+            crate::types::ContentPart::text("[Image(s) loaded by the read_image tool: a.png]"),
+            crate::types::ContentPart::image_url("data:image/png;base64,QUJD"),
+        ]));
+
+        let _ = client.compact_messages(&mut messages, true).await.unwrap();
+        let has_active_directive = messages.iter().any(|m| {
+            m.role == "user"
+                && m.text_content()
+                    .unwrap_or("")
+                    .contains("ACTIVE DIRECTIVE: Inspect the screenshot and fix layout")
+        });
+        assert!(
+            has_active_directive,
+            "Compaction must not mistake a synthetic tool-image user message for the active user directive"
+        );
     }
 
     #[test]

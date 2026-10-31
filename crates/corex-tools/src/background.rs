@@ -18,6 +18,7 @@ pub struct BackgroundProcess {
     pub is_running: Arc<Mutex<bool>>,
     pub is_background: Arc<Mutex<bool>>,
     pub stdin_tx: Option<mpsc::Sender<String>>,
+    pub reported: bool,
 }
 
 impl BackgroundProcess {
@@ -77,6 +78,13 @@ const GRACE_POLLS: u32 = 10;
 #[cfg(unix)]
 const GRACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+pub struct FinishedTask {
+    pub pid: u32,
+    pub exit_code: Option<i32>,
+    pub duration: String,
+    pub output: String,
+}
+
 pub struct TaskManager {
     processes: HashMap<u32, BackgroundProcess>,
 }
@@ -111,7 +119,7 @@ impl TaskManager {
         if self.processes.len() >= MAX_TRACKED {
             let mut stopped: Vec<(u32, DateTime<Utc>)> = self.processes
                 .iter()
-                .filter(|(_, p)| !p.is_active())
+                .filter(|(_, p)| !p.is_active() && (p.reported || !p.is_backgrounded()))
                 .map(|(pid, p)| {
                     let ts = p.finished_at.lock().ok().and_then(|g| *g).unwrap_or(p.started_at);
                     (*pid, ts)
@@ -136,8 +144,30 @@ impl TaskManager {
                 is_running,
                 is_background,
                 stdin_tx,
+                reported: false,
             },
         );
+    }
+
+    pub fn drain_unreported(&mut self) -> Vec<FinishedTask> {
+        let mut finished: Vec<&mut BackgroundProcess> = self
+            .processes
+            .values_mut()
+            .filter(|p| !p.reported && p.is_backgrounded() && !p.is_active())
+            .collect();
+        finished.sort_by_key(|p| p.started_at);
+        finished
+            .into_iter()
+            .map(|p| {
+                p.reported = true;
+                FinishedTask {
+                    pid: p.pid,
+                    exit_code: p.get_exit_code(),
+                    duration: p.duration_str(),
+                    output: p.output_buffer.lock().map(|b| b.clone()).unwrap_or_default(),
+                }
+            })
+            .collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -470,6 +500,10 @@ impl Tool for KillBackgroundProcessTool {
         })
     }
 
+    fn needs_confirmation(&self, _args: &serde_json::Value, context: &ToolContext) -> bool {
+        !context.yolo_mode && !context.allowed_commands.iter().any(|c| c == self.name())
+    }
+
     async fn execute(&self, args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
         let pid = match args.get("pid").and_then(|v| v.as_u64()) {
             Some(p) => p as u32,
@@ -516,6 +550,10 @@ impl Tool for WriteBackgroundInputTool {
             },
             "required": ["pid", "input"]
         })
+    }
+
+    fn needs_confirmation(&self, _args: &serde_json::Value, context: &ToolContext) -> bool {
+        !context.yolo_mode && !context.allowed_commands.iter().any(|c| c == self.name())
     }
 
     async fn execute(&self, args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
@@ -572,6 +610,18 @@ impl Tool for ManageTaskTool {
             },
             "required": ["action"]
         })
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        if context.yolo_mode || context.allowed_commands.iter().any(|c| c == self.name()) {
+            return false;
+        }
+        let action = args
+            .get("action")
+            .or_else(|| args.get("Action"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        matches!(action.to_ascii_lowercase().as_str(), "send_input" | "kill")
     }
 
     async fn execute(&self, args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
@@ -714,6 +764,50 @@ mod tests {
         assert!(st.contains("Line 1"));
     }
 
+    fn register_task(mgr: &mut TaskManager, pid: u32, running: bool, background: bool) -> Arc<Mutex<bool>> {
+        let is_running = Arc::new(Mutex::new(running));
+        mgr.register(
+            pid,
+            "cargo build".to_string(),
+            Arc::new(Mutex::new("Finished".to_string())),
+            is_running.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(if running { None } else { Some(0) })),
+            Arc::new(Mutex::new(background)),
+            None,
+        );
+        is_running
+    }
+
+    #[test]
+    fn test_drain_unreported_returns_each_finished_task_once() {
+        let mut mgr = TaskManager::new();
+        let running = register_task(&mut mgr, 99993, true, true);
+        assert!(mgr.drain_unreported().is_empty());
+
+        *running.lock().unwrap() = false;
+        let drained = mgr.drain_unreported();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].pid, 99993);
+        assert!(mgr.drain_unreported().is_empty());
+    }
+
+    #[test]
+    fn test_drain_unreported_includes_tasks_never_seen_running() {
+        let mut mgr = TaskManager::new();
+        register_task(&mut mgr, 99994, false, true);
+        let drained = mgr.drain_unreported();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn test_drain_unreported_skips_foreground_commands() {
+        let mut mgr = TaskManager::new();
+        register_task(&mut mgr, 99995, false, false);
+        assert!(mgr.drain_unreported().is_empty());
+    }
+
     #[tokio::test]
     async fn test_manage_task_tool_list() {
         let tool = ManageTaskTool;
@@ -722,10 +816,28 @@ mod tests {
             yolo_mode: false,
             allowed_commands: vec![],
             sudo_password: None,
+            extra_dirs: Vec::new(),
         };
 
         let res = tool.execute(json!({ "action": "list" }), &ctx).await.unwrap();
         assert!(!res.is_error);
+    }
+
+    #[test]
+    fn background_input_and_kill_need_confirmation() {
+        let ctx = ToolContext {
+            workspace_dir: std::env::current_dir().unwrap(),
+            yolo_mode: false,
+            allowed_commands: vec![],
+            sudo_password: None,
+            extra_dirs: Vec::new(),
+        };
+        assert!(WriteBackgroundInputTool.needs_confirmation(&json!({"pid": 123, "input": "rm -rf /\n"}), &ctx));
+        assert!(KillBackgroundProcessTool.needs_confirmation(&json!({"pid": 123}), &ctx));
+        assert!(ManageTaskTool.needs_confirmation(&json!({"action": "send_input", "task_id": 123, "input": "x"}), &ctx));
+        assert!(ManageTaskTool.needs_confirmation(&json!({"action": "kill", "task_id": 123}), &ctx));
+        assert!(!ManageTaskTool.needs_confirmation(&json!({"action": "list"}), &ctx));
+        assert!(!ManageTaskTool.needs_confirmation(&json!({"action": "status", "task_id": 123}), &ctx));
     }
 }
 

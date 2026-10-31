@@ -15,7 +15,7 @@ Corex automatically saves every conversation. Sessions are stored in `~/.corex/s
 
 ---
 
-## 📋 Listing Sessions
+## Listing Sessions
 
 **From the TUI:**
 ```
@@ -40,7 +40,7 @@ Sessions are sorted **most recent first** and scoped to your current project dir
 
 ---
 
-## 💾 Saving a Session Checkpoint
+## Saving a Session Checkpoint
 
 **From TUI — tag the current session:**
 ```
@@ -52,7 +52,7 @@ This sets a human-readable tag on the session so you can resume it by name inste
 
 ---
 
-## ▶️ Resuming a Session
+## ▶ Resuming a Session
 
 **From TUI:**
 ```
@@ -74,7 +74,7 @@ Corex will restore the full conversation history, model, temperature, and reason
 
 ---
 
-## 🔄 Starting a New Session
+## Starting a New Session
 
 ```
 /chat new
@@ -84,19 +84,24 @@ Or simply open a new terminal and run `cx` — each `cx` invocation starts fresh
 
 ---
 
-## ↩️ Rewinding the Last Turn
-
-Undo just the last user message + assistant response (does not create a new session):
+## ↩ Rewinding to a Checkpoint
 
 ```
 /rewind
 ```
 
-Useful when the model gave a bad answer and you want to try again with a different prompt.
+Lists every message you sent, each with the files the agent changed from it on (`3 files changed +37 -4`). Pick one (↑/↓, Enter) and choose:
+
+1. **Rewind conversation and revert code changes**
+2. **Rewind conversation**: the files stay as they are
+3. **Revert code changes**: the conversation stays
+4. **Do nothing** (Esc goes back to the list; "Stay at current position" closes it)
+
+Rewinding drops that message and everything after it, and puts the message back in the prompt so you can edit and resend it. Reverting undoes the edits made by `write_file`, `edit` and `apply_patch` (also a subagent's), newest first; if you changed a file afterwards, only the agent's edit is reversed, and a conflicting file is left untouched with a warning. Shell commands (`rm`, `mv`, builds, `git`) are not undone. Edits are saved with the session, so `/rewind` still works after `/resume`.
 
 ---
 
-## 🗂️ Where Sessions Are Stored
+## Where Sessions Are Stored
 
 ```
 ~/.corex/sessions/
@@ -114,25 +119,25 @@ Each file is a JSON object containing:
 
 ---
 
-## 🏷️ Session Title
+## Session Title
 
 Corex automatically sets the session title from the **first line of your first message** (up to 50 characters). No manual action needed.
 
 ---
 
-## 🔍 Searching Sessions
+## Searching Sessions
 
 Sessions can be resumed by:
-| Method | Example |
-| :--- | :--- |
-| **Index** (1-based) | `cx -r 1` |
-| **Tag** (exact, case-insensitive) | `cx -r auth-fix` |
-| **UUID prefix** | `cx -r a3f9c7` |
-| **Full UUID** | `cx -r a3f9c7b2-1234-...` |
+|Method | Example |
+|:--- | :--- |
+|**Index** (1-based) | `cx -r 1` |
+|**Tag** (exact, case-insensitive) | `cx -r auth-fix` |
+|**UUID prefix** | `cx -r a3f9c7` |
+|**Full UUID** | `cx -r a3f9c7b2-1234-...` |
 
 ---
 
-## ⚠️ Notes
+## Notes
 
 - Sessions are **global** (stored in `~/.corex/sessions/`) but the `/chat list` TUI view filters by current workspace directory
 - Use `cx -l` (no workspace filter) to see all sessions across all projects

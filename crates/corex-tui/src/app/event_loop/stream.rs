@@ -115,6 +115,8 @@ pub(super) fn waiting_for_user(app: &App) -> bool {
 
 async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: &EventTx) {
     app.in_flight_tool_calls = app.in_flight_tool_calls.saturating_sub(1);
+    let turn = app.session.user_turns().len().max(1);
+    app.session.file_edits.extend(corex_core::file_history::drain(turn));
     if output.contains("incorrect password attempt")
         || output.contains("sudo: a password is required")
         || output.contains("sudo: PAM authentication")
@@ -290,7 +292,7 @@ fn finish_answer(app: &mut App, assistant_text: Option<String>, reasoning: Optio
     let _ = app.session.save();
     corex_core::trim_memory();
 
-    // Automatically dequeue and run the next queued prompt or synthesize a finished task.
+    // Automatically dequeue and run the next queued prompt.
     // A "send now" message goes first: it was meant to be read before the queue.
     if app.deliver_steer() {
         app.scroll_to_bottom();
@@ -300,10 +302,6 @@ fn finish_answer(app: &mut App, assistant_text: Option<String>, reasoning: Optio
         let message = app.user_message(next_prompt);
         app.session.add_message(message);
         app.scroll_to_bottom();
-        app.start_stream_turn(event_tx.clone());
-    } else if app.session.messages.last().is_some_and(|m| {
-        m.role == "system" && m.text_content().is_some_and(|t| t.starts_with("TASK_DONE|"))
-    }) {
         app.start_stream_turn(event_tx.clone());
     }
 }

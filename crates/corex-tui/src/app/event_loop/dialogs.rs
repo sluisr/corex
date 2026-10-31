@@ -505,6 +505,37 @@ fn describe_rules(rules: &[String]) -> String {
     }
 }
 
+pub(super) fn rewind_key(app: &mut App, key: KeyEvent) -> Flow {
+    if !app.rewind_dialog.is_open {
+        return Flow::Pass;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            if app.rewind_dialog.back() {
+                app.rewind_dialog.close();
+            }
+        }
+        KeyCode::Up => app.rewind_dialog.up(),
+        KeyCode::Down => app.rewind_dialog.down(),
+        KeyCode::Char(c) if app.rewind_dialog.confirming.is_some() && c.is_ascii_digit() => {
+            let n = c.to_digit(10).unwrap_or(0) as usize;
+            if (1..=app.rewind_dialog.options().len()).contains(&n) {
+                app.rewind_dialog.option = n - 1;
+                if let Some((action, turn)) = app.rewind_dialog.enter() {
+                    app.apply_rewind(action, turn);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Some((action, turn)) = app.rewind_dialog.enter() {
+                app.apply_rewind(action, turn);
+            }
+        }
+        _ => {}
+    }
+    Flow::Handled
+}
+
 pub(super) fn ask_user_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Flow {
     if !app.user_dialog.is_open {
         return Flow::Pass;

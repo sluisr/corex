@@ -12,52 +12,15 @@ const SUBAGENT_DONE_MAX_BYTES: usize = 16_000;
 /// Reports finished background tasks and subagents, applies the balance answer and, when
 /// nothing else is going on, sends the next queued message. Returns true when the screen changed.
 pub(super) fn poll_background_work(app: &mut App, event_tx: &EventTx) -> bool {
-    let mut changed = false;
-    let mut has_finished_tasks = false;
+    let mut changed = refresh_active_tasks(app);
 
-    for (pid, exit_code, dur, output) in drain_finished_tasks(app) {
-        let code_str = match exit_code {
-            Some(c) => c.to_string(),
-            None => "stopped".to_string(),
-        };
-        let mut msg_text = format!("TASK_DONE|{}|{}|{}\n", pid, code_str, dur);
-        let trimmed = output.trim_end();
-        if trimmed.len() > TASK_DONE_TAIL_BYTES {
-            let mut cut = trimmed.len() - TASK_DONE_TAIL_BYTES;
-            while !trimmed.is_char_boundary(cut) {
-                cut += 1;
-            }
-            msg_text.push_str(&format!("[... {} earlier bytes omitted; use manage_task status for more ...]\n", cut));
-            msg_text.push_str(&trimmed[cut..]);
-        } else {
-            msg_text.push_str(trimmed);
+    if !app.is_streaming && app.in_flight_tool_calls == 0 {
+        for msg_text in finished_task_reports().into_iter().chain(finished_subagent_reports()) {
+            app.session.add_message(Message::system(msg_text));
+            app.invalidate_message_cache();
+            app.pending_task_wakeup = true;
+            changed = true;
         }
-        app.session.add_message(Message::system(msg_text));
-        app.invalidate_message_cache();
-        changed = true;
-        if exit_code.is_some() {
-            has_finished_tasks = true;
-        }
-    }
-
-    // Finished subagents (reactive wakeup with isolated, clean IPC).
-    let newly_finished_subagents = corex_core::subagent::get_subagent_manager()
-        .lock()
-        .map(|mut mgr| mgr.drain_unacknowledged())
-        .unwrap_or_default();
-    for (sub_id, role, dur, output) in newly_finished_subagents {
-        let mut msg_text = format!("SUBAGENT_DONE|{}|{}|{}\n", sub_id, role.as_str().to_uppercase(), dur);
-        let trimmed = output.trim_end();
-        if trimmed.len() > SUBAGENT_DONE_MAX_BYTES {
-            msg_text.push_str(corex_core::safe_truncate_str(trimmed, SUBAGENT_DONE_MAX_BYTES));
-            msg_text.push_str("\n[... report truncated; use manage_subagents status/log for the full output ...]");
-        } else {
-            msg_text.push_str(trimmed);
-        }
-        app.session.add_message(Message::system(msg_text));
-        app.invalidate_message_cache();
-        changed = true;
-        has_finished_tasks = true;
     }
 
     if poll_balance(app) {
@@ -75,8 +38,7 @@ pub(super) fn poll_background_work(app: &mut App, event_tx: &EventTx) -> bool {
             app.session.add_message(message);
             app.start_stream_turn(event_tx.clone());
             changed = true;
-        } else if has_finished_tasks {
-            // Resume turn when background tasks complete while idle.
+        } else if app.pending_task_wakeup {
             app.start_stream_turn(event_tx.clone());
             changed = true;
         }
@@ -99,43 +61,74 @@ fn is_idle(app: &App) -> bool {
         && app.in_flight_tool_calls == 0
         && app.pending_confirmation.is_none()
         && !app.user_dialog.is_open
+        && !app.rewind_dialog.is_open
         && !app.sudo_dialog.is_open
         && app.fleet_dialog.pending_approval.is_none()
         && !app.is_checking_balance
 }
 
-/// Backgrounded tasks that ended since the last call, as `(pid, exit code, duration, output)`.
-/// Also refreshes the set of tasks still running.
-fn drain_finished_tasks(app: &mut App) -> Vec<(u32, Option<i32>, String, String)> {
+fn finished_task_reports() -> Vec<String> {
     let manager = corex_tools::background::get_task_manager();
-    let Ok(mgr) = manager.lock() else {
+    let Ok(mut mgr) = manager.lock() else {
         return Vec::new();
     };
-    let mut finished = Vec::new();
-    let mut still_active = std::collections::HashSet::new();
+    mgr.drain_unreported().into_iter().map(task_report).collect()
+}
 
-    for &pid in &app.active_background_pids {
-        if let Some(proc) = mgr.get_process(pid) {
-            if proc.is_active() && proc.is_backgrounded() {
-                still_active.insert(pid);
-            } else if proc.is_backgrounded() {
-                let dur = proc.duration_str();
-                let output = proc.output_buffer.lock().map(|b| b.clone()).unwrap_or_default();
-                finished.push((pid, proc.get_exit_code(), dur, output));
+fn task_report(task: corex_tools::background::FinishedTask) -> String {
+    let code_str = match task.exit_code {
+        Some(c) => c.to_string(),
+        None => "stopped".to_string(),
+    };
+    let mut msg_text = format!("TASK_DONE|{}|{}|{}\n", task.pid, code_str, task.duration);
+    let trimmed = task.output.trim_end();
+    if trimmed.len() > TASK_DONE_TAIL_BYTES {
+        let mut cut = trimmed.len() - TASK_DONE_TAIL_BYTES;
+        while !trimmed.is_char_boundary(cut) {
+            cut += 1;
+        }
+        msg_text.push_str(&format!("[... {} earlier bytes omitted; use manage_task status for more ...]\n", cut));
+        msg_text.push_str(&trimmed[cut..]);
+    } else {
+        msg_text.push_str(trimmed);
+    }
+    msg_text
+}
+
+fn finished_subagent_reports() -> Vec<String> {
+    corex_core::subagent::get_subagent_manager()
+        .lock()
+        .map(|mut mgr| mgr.drain_unacknowledged())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(sub_id, role, dur, output)| {
+            let mut msg_text = format!("SUBAGENT_DONE|{}|{}|{}\n", sub_id, role.as_str().to_uppercase(), dur);
+            let trimmed = output.trim_end();
+            if trimmed.len() > SUBAGENT_DONE_MAX_BYTES {
+                msg_text.push_str(corex_core::safe_truncate_str(trimmed, SUBAGENT_DONE_MAX_BYTES));
+                msg_text.push_str("\n[... report truncated; use manage_subagents status/log for the full output ...]");
+            } else {
+                msg_text.push_str(trimmed);
             }
-        } else {
-            finished.push((pid, None, String::new(), String::new()));
-        }
-    }
+            msg_text
+        })
+        .collect()
+}
 
-    for (pid, proc) in mgr.all_processes() {
-        if proc.is_active() && proc.is_backgrounded() {
-            still_active.insert(*pid);
-        }
-    }
-
+fn refresh_active_tasks(app: &mut App) -> bool {
+    let manager = corex_tools::background::get_task_manager();
+    let Ok(mgr) = manager.lock() else {
+        return false;
+    };
+    let still_active: std::collections::HashSet<u32> = mgr
+        .all_processes()
+        .iter()
+        .filter(|(_, p)| p.is_active() && p.is_backgrounded())
+        .map(|(pid, _)| *pid)
+        .collect();
+    let changed = still_active != app.active_background_pids;
     app.active_background_pids = still_active;
-    finished
+    changed
 }
 
 /// Puts the answer of a `/balance` query in place of its placeholder message.

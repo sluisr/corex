@@ -12,11 +12,16 @@ description: >-
 
 # Corex YOLO Mode & Tool Execution Control
 
-By default, Corex asks for confirmation before executing any **mutating or potentially dangerous** action (writing files, running shell commands, applying patches). YOLO mode disables this entirely.
+By default, Corex asks for confirmation before executing any **mutating or potentially dangerous** action (writing files, running shell commands, applying patches). YOLO mode skips those prompts, with a few exceptions that always ask:
+
+- shell commands that read or write credentials (`~/.ssh`, `~/.aws`, `~/.corex/settings.json`…) or files that run code by themselves (`.git/hooks/`, `~/.bashrc` and other shell startup files, `crontab`);
+- notes saved to the global memory (`~/.corex/COREX.md`), which every future session loads.
+
+Editing a sensitive file with the file tools is refused outright, YOLO or not.
 
 ---
 
-## ⚡ Enabling YOLO Mode
+## Enabling YOLO Mode
 
 ### Option 1 — From inside the TUI
 ```
@@ -46,7 +51,7 @@ This makes YOLO permanent across all sessions until changed.
 
 ---
 
-## 🛡️ What Requires Confirmation (without YOLO)
+## What Requires Confirmation (without YOLO)
 
 Corex asks before:
 - **Writing files** (`write_file`, `edit_file`, `apply_patch`)
@@ -69,7 +74,7 @@ When a tool requires approval, Corex presents a **5-option confirmation selector
 
 ---
 
-## ✅ Allowed Commands (Granular Whitelist)
+## Allowed Commands (Granular Whitelist)
 
 Instead of full YOLO, you can whitelist specific commands that never require confirmation. In the approval dialog, `[s]` allows the command for the session and `[p]` saves it permanently. Or edit `~/.corex/settings.json`:
 
@@ -93,7 +98,7 @@ Instead of full YOLO, you can whitelist specific commands that never require con
 
 ---
 
-## 🚨 YOLO + sudo
+## YOLO + sudo
 
 Corex has native **Silent Sudo** support. If a command needs `sudo`, Corex will:
 1. Show a sudo password dialog in the TUI (first time)
@@ -104,20 +109,20 @@ The password is stored only in RAM and cleared when the session ends.
 
 ---
 
-## 💡 Recommended Usage
+## Recommended Usage
 
-| Scenario | Recommended setting |
-| :--- | :--- |
-| Quick one-shot task | `cx -y -p "do the thing"` |
-| Trusted project, long session | `yolo_mode: true` in project `.corex/settings.json` |
-| Shared machine / sensitive repo | Keep YOLO off, use `allowed_commands` whitelist |
-| CI/CD pipeline | `cx --yolo -p "..."` — YOLO required for non-interactive mode |
+|Scenario | Recommended setting |
+|:--- | :--- |
+|Quick one-shot task | `cx -y -p "do the thing"` |
+|Trusted project, long session | `yolo_mode: true` in project `.corex/settings.json` |
+|Shared machine / sensitive repo | Keep YOLO off, use `allowed_commands` whitelist |
+|CI/CD pipeline | `cx --yolo -p "..."` — YOLO required for non-interactive mode |
 
-> ⚠️ YOLO mode skips ALL confirmation dialogs. Commands execute instantly. Use with care on production systems.
+>  YOLO mode skips ALL confirmation dialogs. Commands execute instantly. Use with care on production systems.
 
 ---
 
-## 🔍 Check Current Mode
+## Check Current Mode
 
 ```
 /stats     ← shows current YOLO status in session info

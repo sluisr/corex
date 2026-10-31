@@ -183,10 +183,23 @@ use corex_core::types::ToolCall;
         app.handle_mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
         app.mouse_down_time = Some(Instant::now() - Duration::from_millis(600));
 
+        app.inside_tmux = false;
         app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
 
-        // Must NOT open link because it's a drag selection!
+        // Must NOT open link because it's a drag selection! In a plain terminal the copied text
+        // stays highlighted; under tmux it is released like tmux's own selection.
         assert!(app.last_url_open.is_none());
+        assert!(app.selection.is_some());
+        assert!(app.drag_point.is_none());
+        // Leaving the window (focus follows the mouse) keeps a finished selection.
+        app.cancel_drag();
+        assert!(app.selection.is_some());
+
+        app.inside_tmux = true;
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 22, row: 0, modifiers: KeyModifiers::NONE });
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
+        app.mouse_down_time = Some(Instant::now() - Duration::from_millis(600));
+        app.handle_mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 40, row: 0, modifiers: KeyModifiers::NONE });
         assert!(app.selection.is_none());
     }
 
@@ -248,7 +261,6 @@ use corex_core::types::ToolCall;
         // Releasing the button ends it: nothing scrolls on its own any more.
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 1));
         assert!(!app.autoscroll_selection());
-        assert!(app.selection.is_none());
     }
 
     #[tokio::test]
@@ -520,10 +532,25 @@ use corex_core::types::ToolCall;
         );
     }
 
+    #[tokio::test]
+    async fn only_the_focused_field_shows_a_caret() {
+        let theme = Theme::default();
+        let mut app = App::new(LlmClient::new(Config::default()), PathBuf::from("/tmp"), false);
+        assert!(!app.dialog_has_focus());
+        app.sudo_dialog.open(ToolCall::new("c", "run_shell_command", r#"{"command":"sudo id"}"#), "sudo id".into());
+        assert!(app.dialog_has_focus());
+
+        let (spans, col) = format_input_with_cursor("cargo check", 5, &theme, false);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "cargo check", "no caret glyph and no highlighted character");
+        assert!(spans.iter().all(|s| s.style.bg.is_none() || s.style.bg == Some(Color::Reset)));
+        assert_eq!(col, 5);
+    }
+
     #[test]
     fn test_format_input_with_cursor_empty() {
         let theme = Theme::default();
-        let (spans, col) = format_input_with_cursor("", 0, &theme);
+        let (spans, col) = format_input_with_cursor("", 0, &theme, true);
         assert_eq!(col, 0);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "█");
@@ -532,7 +559,7 @@ use corex_core::types::ToolCall;
     #[test]
     fn test_format_input_with_cursor_end() {
         let theme = Theme::default();
-        let (spans, col) = format_input_with_cursor("cargo check", 11, &theme);
+        let (spans, col) = format_input_with_cursor("cargo check", 11, &theme, true);
         assert_eq!(col, 11);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "cargo check");
@@ -542,7 +569,7 @@ use corex_core::types::ToolCall;
     #[test]
     fn test_format_input_with_cursor_middle() {
         let theme = Theme::default();
-        let (spans, col) = format_input_with_cursor("cargo check", 5, &theme);
+        let (spans, col) = format_input_with_cursor("cargo check", 5, &theme, true);
         assert_eq!(col, 5);
         // Spans: "cargo" (before), " " (cursor highlighted), "check" (after)
         assert_eq!(spans.len(), 3);
@@ -555,7 +582,7 @@ use corex_core::types::ToolCall;
     fn test_format_input_with_cursor_paste_tag() {
         let theme = Theme::default();
         let text = "run [Pasted text #1 +5 lines] now";
-        let (spans, col) = format_input_with_cursor(text, 4, &theme);
+        let (spans, col) = format_input_with_cursor(text, 4, &theme, true);
         assert_eq!(col, 4);
         assert_eq!(spans[0].content, "run ");
         assert_eq!(spans[1].content, "[Pasted text #1 +5 lines]");
@@ -928,7 +955,8 @@ use corex_core::types::ToolCall;
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
         assert!(!joined.contains('›'), "Must not contain chevron: {}", joined);
-        assert_eq!(joined, "$ cargo build");
+        assert_eq!(joined, " $ cargo build ");
+        assert!(spans.iter().all(|s| s.style.bg == Some(theme.code_bg)), "the command sits on a shaded chip");
 
         let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme);
         let search_joined: String = search_spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1137,11 +1165,10 @@ use corex_core::types::ToolCall;
     fn test_arrows_are_never_swipes_with_mouse_reporting() {
         use crate::app::mobile::arrows_may_be_swipes;
 
-        // With mouse reporting on, Termux sends swipes as wheel events, so arrows are keys.
+        // With mouse reporting on, wheel and swipes are mouse events, so arrows are keys. Off, only
+        // Termux turns a swipe into arrows; a desktop arrow is always a key.
         assert!(!arrows_may_be_swipes(true));
-        if !crate::app::mobile::is_android_or_termux() {
-            assert!(!arrows_may_be_swipes(false));
-        }
+        assert_eq!(arrows_may_be_swipes(false), crate::app::mobile::is_android_or_termux());
     }
 
     #[tokio::test]
@@ -1541,16 +1568,6 @@ use corex_core::types::ToolCall;
     }
 
 #[test]
-fn mouse_reporting_default_follows_the_platform() {
-    use crate::app::mobile::{is_android_or_termux, mouse_capture_default};
-    // A wide terminal always gets it; Android keeps it on in portrait so swipes arrive as wheel events.
-    assert!(mouse_capture_default(120, 30));
-    if is_android_or_termux() {
-        assert!(mouse_capture_default(48, 90));
-    }
-}
-
-#[test]
 fn tap_pauses_mouse_reporting_then_resumes_it() {
     use crate::app::mobile::TapKeyboardGate;
     use std::time::{Duration, Instant};
@@ -1596,4 +1613,79 @@ fn arrows_right_after_a_tap_count_as_a_swipe_only_inside_the_window() {
     gate.request_keyboard(t0, &mut capture);
     assert!(!capture);
     assert!(!gate.in_tap_window(t0 + Duration::from_millis(100)));
+}
+
+#[tokio::test]
+async fn test_directory_add_validates_and_lists_roots() {
+    let base = std::env::temp_dir().join(format!("corex-dir-add-{}", std::process::id()));
+    let (ws, data) = (base.join("ws"), base.join("data"));
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("notes.txt"), "x").unwrap();
+    let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), ws.clone(), false);
+
+    let added = app.add_directory("../data");
+    let file = app.add_directory("../data/notes.txt");
+    let inside = app.add_directory("src");
+    let again = app.add_directory(&data.display().to_string());
+    let missing = app.add_directory("../nope");
+    let report = app.directory_report();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(added, Ok(data.canonicalize().unwrap_or(data.clone())));
+    assert!(file.is_err());
+    assert_eq!(inside, Err("it is already readable".to_string()));
+    assert_eq!(again, Err("it is already readable".to_string()));
+    assert!(missing.is_err());
+    assert_eq!(app.extra_dirs.len(), 1);
+    assert!(report.contains("Additional directories"));
+}
+
+#[tokio::test]
+async fn test_losing_focus_mid_drag_drops_the_selection() {
+    let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+    app.last_chat_rect = Some(Rect::new(0, 0, 80, 10));
+    app.selection_lines.tail = vec!["some text to select".to_string()];
+    app.begin_selection(2, 0);
+    app.extend_selection(10, 0);
+
+    app.cancel_drag();
+
+    assert!(app.selection.is_none());
+}
+
+#[tokio::test]
+async fn test_rewind_reverts_files_and_returns_the_prompt() {
+    use crate::rewind_dialog::RewindAction;
+    use corex_core::file_history::FileEdit;
+
+    let ws = std::env::temp_dir().join(format!("corex-rewind-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).unwrap();
+    let (kept, created) = (ws.join("kept.rs"), ws.join("created.rs"));
+    std::fs::write(&kept, "v3\n").unwrap();
+    std::fs::write(&created, "new\n").unwrap();
+
+    let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), ws.clone(), false);
+    for t in ["make v2", "make v3 and a new file"] {
+        app.session.add_message(Message::user(t));
+        app.session.add_message(Message::assistant("done", None));
+    }
+    app.session.file_edits = vec![
+        FileEdit { turn: 1, path: kept.clone(), before: Some("v1\n".into()), after: Some("v2\n".into()) },
+        FileEdit { turn: 2, path: kept.clone(), before: Some("v2\n".into()), after: Some("v3\n".into()) },
+        FileEdit { turn: 2, path: created.clone(), before: None, after: Some("new\n".into()) },
+    ];
+
+    app.apply_rewind(RewindAction::RewindAndRevert, 2);
+    let kept_now = std::fs::read_to_string(&kept).unwrap();
+    let created_exists = created.exists();
+    let _ = std::fs::remove_dir_all(&ws);
+
+    assert_eq!(kept_now, "v2\n");
+    assert!(!created_exists);
+    assert_eq!(app.input_buffer, "make v3 and a new file");
+    assert_eq!(app.session.user_turns().len(), 1);
+    assert_eq!(app.session.file_edits.len(), 1, "turn 1 can still be rewound later");
+    assert!(!app.rewind_dialog.is_open);
 }

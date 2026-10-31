@@ -31,7 +31,6 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
     for line in text.lines() {
         let trimmed = line.trim();
 
-        // 1. Code Fence Start / End
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             flush_table(&mut table_buffer, &mut result_lines, theme, effective_width);
             if in_code_block {
@@ -67,7 +66,6 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             flush_table(&mut table_buffer, &mut result_lines, theme, effective_width);
         }
 
-        // 2. Horizontal Rule
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             result_lines.push(Line::from(Span::styled(
                 "  ────────────────────────────────────────────────────",
@@ -76,7 +74,6 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             continue;
         }
 
-        // 3. Headers
         if let Some(h1) = line.strip_prefix("# ") {
             if !result_lines.is_empty() && !result_lines.last().map(|l| l.width() == 0).unwrap_or(false) {
                 result_lines.push(Line::from(""));
@@ -110,14 +107,12 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             continue;
         }
 
-        // 4. Blockquotes
         if let Some(quote) = line.strip_prefix("> ") {
             let spans = parse_inline_spans(quote, theme, Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC));
             result_lines.extend(wrap_spans_with_indent(spans, effective_width, "  ▎ ", "  ▎ "));
             continue;
         }
 
-        // 5. Unordered List Items
         let bullet_prefixes = ["- ", "* ", "+ "];
         let mut is_bullet = false;
         for prefix in bullet_prefixes {
@@ -140,7 +135,6 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             continue;
         }
 
-        // 6. Ordered List Items (e.g. "1. ", "2. ")
         let trimmed_lead = line.trim_start();
         if let Some(dot_idx) = trimmed_lead.find(". ") {
             if let Ok(num) = trimmed_lead[..dot_idx].parse::<usize>() {
@@ -160,7 +154,6 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             }
         }
 
-        // 7. Regular Paragraph Text
         if trimmed.is_empty() {
             result_lines.push(Line::from(""));
             continue;
@@ -199,68 +192,25 @@ fn flush_code_block(
     if buf.is_empty() {
         return;
     }
-
-    let title = if lang.is_empty() {
-        "code".to_string()
-    } else {
-        format!(" {} ", lang)
-    };
-    let title_w = title.chars().count();
-    let content_w = buf
-        .iter()
-        .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()))
-        .max()
-        .unwrap_or(0);
-
-    // Box width = widest content + "  │ " / " │" margins, at least as wide as
-    // the title frame, capped by the available terminal width.
-    let box_w = (content_w + 6).max(title_w + 5).min(max_width).max(6);
-
-    // Top border
-    let fill = box_w.saturating_sub(5).saturating_sub(title_w);
-    let top = format!("  ╭─{}{}╮", title, "─".repeat(fill));
-    result.push(Line::from(Span::styled(
-        top,
-        Style::default().fg(theme.dark_gray),
-    )));
-
-    // Code lines (each closes with a right border, wrapping long lines across multiple rows)
-    let inner = box_w.saturating_sub(6);
-    for line in buf.iter() {
-        let code_spans = colorize_code_line(line, lang, theme);
-        let wrapped_sub_lines = wrap_cell_spans(code_spans, inner);
-        if wrapped_sub_lines.is_empty() {
-            let mut spans = vec![
-                Span::styled("  │ ", Style::default().fg(theme.dark_gray)),
-            ];
-            spans.push(Span::styled(
-                format!("{} │", " ".repeat(inner)),
-                Style::default().fg(theme.dark_gray),
-            ));
+    let rail = || Span::styled("  ▎ ", Style::default().fg(theme.dark_gray));
+    if !lang.is_empty() {
+        result.push(Line::from(vec![
+            rail(),
+            Span::styled(lang.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC)),
+        ]));
+    }
+    let inner = max_width.saturating_sub(4).max(1);
+    for line in buf {
+        let rows = wrap_code_spans(colorize_code_line(line, lang, theme), inner);
+        if rows.is_empty() {
+            result.push(Line::from(rail()));
+        }
+        for row in rows {
+            let mut spans = vec![rail()];
+            spans.extend(row);
             result.push(Line::from(spans));
-        } else {
-            for sub_line in wrapped_sub_lines {
-                let mut spans = vec![
-                    Span::styled("  │ ", Style::default().fg(theme.dark_gray)),
-                ];
-                let sub_w: usize = sub_line.iter().map(|s| s.width()).sum();
-                spans.extend(sub_line);
-                let pad = inner.saturating_sub(sub_w);
-                spans.push(Span::styled(
-                    format!("{} │", " ".repeat(pad)),
-                    Style::default().fg(theme.dark_gray),
-                ));
-                result.push(Line::from(spans));
-            }
         }
     }
-
-    // Bottom border
-    let bottom = format!("  ╰{}╯", "─".repeat(box_w.saturating_sub(4)));
-    result.push(Line::from(Span::styled(
-        bottom,
-        Style::default().fg(theme.dark_gray),
-    )));
 }
 
 /// Wraps a list of spans with distinct first-line and continuation indents (hanging indent),
@@ -361,7 +311,6 @@ fn parse_inline_spans(
     let mut buffer = String::new();
 
     while let Some(ch) = chars.next() {
-        // 1. Inline Code: `code`
         if ch == '`' {
             if !buffer.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
@@ -381,7 +330,6 @@ fn parse_inline_spans(
             continue;
         }
 
-        // 2. Bold: **text** or __text__
         if (ch == '*' && chars.peek() == Some(&'*')) || (ch == '_' && chars.peek() == Some(&'_')) {
             chars.next(); // consume second delimiter
             if !buffer.is_empty() {
@@ -405,7 +353,6 @@ fn parse_inline_spans(
             continue;
         }
 
-        // 3. Italic: *text* or _text_
         if (ch == '*' || ch == '_') && chars.peek() != Some(&' ') {
             if !buffer.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut buffer), base_style));
@@ -425,7 +372,6 @@ fn parse_inline_spans(
             continue;
         }
 
-        // 4. Markdown Links: [label](url)
         if ch == '[' {
             let mut lookahead = chars.clone();
             let mut label = String::new();
@@ -499,7 +445,6 @@ fn parse_inline_spans(
             }
         }
 
-        // 5. Standalone URL: https:// or http://
         if ch == 'h' {
             let mut lookahead = chars.clone();
             let mut prefix = String::from("h");
@@ -540,7 +485,6 @@ fn parse_inline_spans(
             }
         }
 
-        // 6. Standalone Email (e.g. contact@sluisr.com)
         if ch == '@' && !buffer.is_empty() {
             let user_part_bytes: usize = buffer
                 .chars()
@@ -614,8 +558,8 @@ fn colorize_code_line(line: &str, lang: &str, theme: &Theme) -> Vec<Span<'static
 
     if (lang == "bash" || lang == "sh" || lang == "shell")
         && trimmed.starts_with('$') {
-            spans.push(Span::styled("$ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)));
-            spans.push(Span::styled(trimmed[1..].to_string(), Style::default().fg(theme.foreground)));
+            spans.push(Span::styled("$ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(trimmed[1..].trim_start().to_string(), Style::default().fg(theme.text_strong)));
             return spans;
         }
 
@@ -668,6 +612,39 @@ fn split_markdown_row(line: &str) -> Vec<String> {
     }
 
     cells
+}
+
+/// Hard-wraps a code line at `max_width` columns. Unlike prose, every character counts:
+/// indentation and runs of spaces are kept, since dropping them changes what the code means.
+fn wrap_code_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Vec<Span<'static>>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut width = 0usize;
+    for span in spans {
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + w > max_width && width > 0 {
+                if !chunk.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut chunk), span.style));
+                }
+                lines.push(std::mem::take(&mut current));
+                width = 0;
+            }
+            chunk.push(ch);
+            width += w;
+        }
+        if !chunk.is_empty() {
+            current.push(Span::styled(chunk, span.style));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn wrap_cell_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Vec<Span<'static>>> {
@@ -1077,57 +1054,31 @@ mod tests {
         assert!(table_str.contains("ignored"), "ignored was crushed: {}", table_str);
     }
 
+    fn plain(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     #[test]
-    fn test_markdown_code_block_borders() {
+    fn code_blocks_carry_a_rail_and_their_language() {
         let theme = Theme::default();
-        let text = "```rust\nlet first_line = content.lines().next().unwrap_or(\"Done\").replace('\\t', \"    \");\nlet short = 1;\n```\n";
-        let max_width: usize = 60;
-        let lines = render_markdown(text, &theme, max_width);
-        assert!(lines.len() >= 4, "expected >= 4 lines, got {}", lines.len());
-
-        let top: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        let bottom: String = lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(top.starts_with("  ╭─"), "top border malformed: {}", top);
-        assert!(top.ends_with('╮'), "top border does not close: {}", top);
-        assert!(bottom.starts_with("  ╰"), "bottom border malformed: {}", bottom);
-        assert!(bottom.ends_with('╯'), "bottom border does not close: {}", bottom);
-
-        // Every border and code line must span exactly the effective width.
-        for (i, line) in lines.iter().enumerate() {
-            let w = line.width();
-            assert_eq!(w, max_width, "line {} has width {}, expected {}", i, w, max_width);
-        }
-
-        // Code lines must always close with a right border.
-        let n = lines.len();
-        for line in &lines[1..n - 1] {
-            let s: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-            assert!(s.ends_with("│"), "code line lacks right border: {}", s);
+        let text = "```rust\nlet first_line = content.lines().next();\nlet short = 1;\n```\n";
+        let lines = render_markdown(text, &theme, 60);
+        assert_eq!(lines.len(), 3, "label + two code rows");
+        assert_eq!(plain(&lines[0]), "  ▎ rust");
+        assert!(plain(&lines[1]).starts_with("  ▎ let first_line"));
+        for line in &lines {
+            let text = plain(line);
+            assert!(text.starts_with("  ▎ "), "every row hangs off the rail: {text:?}");
+            assert!(!text.contains(['╭', '╮', '╰', '╯', '│']), "no box: {text:?}");
+            assert!(line.width() <= 60);
         }
     }
 
     #[test]
-    fn test_markdown_code_block_autosizes() {
-        let theme = Theme::default();
-        let text = "```bash\n~/.cargo/bin/cx\n```\n";
-        let max_width: usize = 120;
-        let lines = render_markdown(text, &theme, max_width);
-
-        assert_eq!(lines.len(), 3, "expected top + content + bottom");
-        let top: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        let content: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        let bottom: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
-
-        // The box must be compact (much narrower than max_width) and closed.
-        let w = lines[0].width();
-        assert!(w < max_width, "box {} should be narrower than {} (autosize)", w, max_width);
-        assert!(top.ends_with('╮'), "top border does not close: {}", top);
-        assert!(bottom.ends_with('╯'), "bottom border does not close: {}", bottom);
-        assert!(content.ends_with("│"), "content line lacks right border: {}", content);
-        // Top, content and bottom must all have the same width.
-        for line in &lines {
-            assert_eq!(line.width(), w, "mismatched box width: {:?}", line.spans);
-        }
+    fn a_block_without_language_has_no_label_row() {
+        let lines = render_markdown("```\n~/.cargo/bin/cx\n```\n", &Theme::default(), 120);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(plain(&lines[0]), "  ▎ ~/.cargo/bin/cx");
     }
 
     #[test]
@@ -1138,18 +1089,12 @@ mod tests {
         let max_width: usize = 50;
         let lines = render_markdown(&text, &theme, max_width);
 
-        // Entire content must be preserved across wrapped lines without ellipsis
-        let full_text: String = lines.iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.as_ref())
-            .collect();
+        let full_text: String = lines.iter().map(plain).collect();
         assert!(!full_text.contains('…'), "code block truncated with ellipsis: {}", full_text);
         assert!(full_text.contains("postmaster"), "end of log line missing: {}", full_text);
         assert!(full_text.contains("marketing"), "start of log line missing: {}", full_text);
-
-        // Every line must have the exact boxed width
         for line in &lines {
-            assert_eq!(line.width(), max_width);
+            assert!(line.width() <= max_width);
         }
     }
 
@@ -1237,5 +1182,33 @@ mod tests {
         assert!(spans.iter().any(|s| s.content == "josé@empresa.es"));
         assert!(spans.iter().any(|s| s.content == "ñoño@dominio.com"));
         assert!(spans.iter().any(|s| s.content == "張三@example.org"));
+    }
+}
+
+
+#[cfg(test)]
+mod code_block_tests {
+    use super::*;
+
+    fn rows(md: &str, width: usize) -> Vec<String> {
+        render_markdown(md, &Theme::detect(), width)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn code_blocks_keep_their_indentation() {
+        let out = rows("```python\ndef add(a, b):\n    if a:\n        return a + b\n```", 80);
+        assert!(out.iter().any(|r| r == "  ▎     if a:"), "{out:#?}");
+        assert!(out.iter().any(|r| r == "  ▎         return a + b"), "{out:#?}");
+    }
+
+    #[test]
+    fn long_code_lines_wrap_without_losing_characters() {
+        let line = format!("    x = \"{}\"", "a".repeat(60));
+        let out = rows(&format!("```\n{line}\n```"), 40);
+        let body: String = out.iter().filter_map(|r| r.strip_prefix("  ▎ ")).collect();
+        assert_eq!(body.trim_end(), line, "{out:#?}");
     }
 }

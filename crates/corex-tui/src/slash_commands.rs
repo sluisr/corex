@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, BorderType};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::text::{fit_text, pad_right};
@@ -17,6 +17,12 @@ pub struct CommandItem {
     /// Alternative names handled by the same command (matched while typing, never listed twice).
     pub aliases: &'static [&'static str],
     pub group: &'static str,
+    /// Fixed first arguments offered by the menu once the command and a space are typed.
+    pub subcommands: &'static [CommandItem],
+}
+
+const fn sub(name: &'static str, args: &'static str, description: &'static str) -> CommandItem {
+    CommandItem { name, args, description, aliases: &[], group: "", subcommands: &[] }
 }
 
 const SESSION: &str = "Session";
@@ -34,6 +40,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Manage chat sessions",
         aliases: &[],
         group: SESSION,
+        subcommands: &[
+            sub("list", "", "List saved sessions for this project"),
+            sub("save", "<tag>", "Save the conversation under a tag"),
+            sub("resume", "<tag|id>", "Resume a saved session"),
+            sub("delete", "<tag|id>", "Delete a saved session"),
+            sub("new", "", "Start a fresh chat session"),
+        ],
     },
     CommandItem {
         name: "/resume",
@@ -41,6 +54,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Resume a previous session or checkpoint",
         aliases: &[],
         group: SESSION,
+        subcommands: &[],
     },
     CommandItem {
         name: "/save",
@@ -48,6 +62,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Save a conversation checkpoint",
         aliases: &[],
         group: SESSION,
+        subcommands: &[],
     },
     CommandItem {
         name: "/new",
@@ -55,13 +70,15 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Start a fresh chat session",
         aliases: &[],
         group: SESSION,
+        subcommands: &[],
     },
     CommandItem {
         name: "/rewind",
         args: "",
-        description: "Undo the last query and response",
+        description: "Go back to a message, undoing the agent's file edits",
         aliases: &[],
         group: SESSION,
+        subcommands: &[],
     },
     CommandItem {
         name: "/clear",
@@ -69,6 +86,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Clear the conversation view",
         aliases: &[],
         group: SESSION,
+        subcommands: &[],
     },
     // --- Model ---
     CommandItem {
@@ -77,6 +95,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Pick provider, model and reasoning settings",
         aliases: &[],
         group: MODEL,
+        subcommands: &[],
     },
     CommandItem {
         name: "/key",
@@ -84,6 +103,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Set or replace the API key of the active provider",
         aliases: &["/auth"],
         group: MODEL,
+        subcommands: &[],
     },
     CommandItem {
         name: "/local",
@@ -91,6 +111,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Ask the local LLM directly ($0.00 cost)",
         aliases: &[],
         group: MODEL,
+        subcommands: &[sub("status", "", "Check that the local LLM server is reachable")],
     },
     CommandItem {
         name: "/balance",
@@ -98,6 +119,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Show API account balance and token credits",
         aliases: &["/wallet"],
         group: MODEL,
+        subcommands: &[],
     },
     CommandItem {
         name: "/stats",
@@ -105,6 +127,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Session token metrics, context in use and limits",
         aliases: &["/context"],
         group: MODEL,
+        subcommands: &[],
     },
     // --- Context ---
     CommandItem {
@@ -113,6 +136,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Toggle plan mode (read-only discovery)",
         aliases: &[],
         group: CONTEXT,
+        subcommands: &[],
     },
     CommandItem {
         name: "/compact",
@@ -120,6 +144,31 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Compact history into a structured memory block",
         aliases: &["/compress"],
         group: CONTEXT,
+        subcommands: &[],
+    },
+    CommandItem {
+        name: "/directory",
+        args: "add|show",
+        description: "Let the agent read directories outside the workspace",
+        aliases: &["/dir"],
+        group: CONTEXT,
+        subcommands: &[
+            sub("add", "<path>[,<path>]", "Read another directory without confirmation"),
+            sub("show", "", "The workspace and the added directories"),
+        ],
+    },
+    CommandItem {
+        name: "/memory",
+        args: "list|show|add|reload",
+        description: "Inspect, extend or reload the instruction files in the prompt",
+        aliases: &[],
+        group: CONTEXT,
+        subcommands: &[
+            sub("list", "", "Instruction files loaded, in order"),
+            sub("show", "", "The memory block the model receives"),
+            sub("add", "[--project] <text>", "Save a note (global, or private to this project)"),
+            CommandItem { aliases: &["refresh"], ..sub("reload", "", "Re-read the files after editing one") },
+        ],
     },
     CommandItem {
         name: "/prefix",
@@ -127,6 +176,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Force an exact response prefix",
         aliases: &[],
         group: CONTEXT,
+        subcommands: &[],
     },
     // --- Tools ---
     CommandItem {
@@ -135,6 +185,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Search the live internet",
         aliases: &["/search"],
         group: TOOLS,
+        subcommands: &[],
     },
     CommandItem {
         name: "/fetch",
@@ -142,6 +193,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Fetch web page content as Markdown",
         aliases: &[],
         group: TOOLS,
+        subcommands: &[],
     },
     CommandItem {
         name: "/fim",
@@ -149,6 +201,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Fill-in-the-Middle code completion for a file",
         aliases: &[],
         group: TOOLS,
+        subcommands: &[],
     },
     CommandItem {
         name: "/mcp",
@@ -156,6 +209,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Manage MCP servers, discover catalog templates, or add tools",
         aliases: &[],
         group: TOOLS,
+        subcommands: &[
+            sub("status", "", "Configured servers and their tools"),
+            sub("catalog", "", "Browse vetted server templates"),
+            sub("add", "<id|name cmd>", "Add a catalog or custom server"),
+            sub("remove", "<name>", "Remove a server"),
+            sub("reload", "", "Reconnect all servers"),
+        ],
     },
     CommandItem {
         name: "/tasks",
@@ -163,6 +223,12 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "List and manage background tasks",
         aliases: &[],
         group: TOOLS,
+        subcommands: &[
+            sub("list", "", "Running background tasks"),
+            sub("status", "<pid>", "Status and output of a task"),
+            sub("kill", "<pid>", "Stop a task"),
+            sub("send", "<pid> <input>", "Send input to a task"),
+        ],
     },
     CommandItem {
         name: "/yolo",
@@ -170,6 +236,10 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Toggle auto-approval of all tool executions",
         aliases: &[],
         group: TOOLS,
+        subcommands: &[
+            sub("on", "", "Auto-approve every tool execution"),
+            sub("off", "", "Ask before mutating or dangerous tools"),
+        ],
     },
     CommandItem {
         name: "/fleet",
@@ -177,6 +247,13 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "SysAdmin console: interactive live SSH session, server dashboard & AI supervisor",
         aliases: &["/sysadmin", "/vps"],
         group: TOOLS,
+        subcommands: &[
+            sub("list", "", "Open the server dashboard"),
+            sub("connect", "<node>", "Open a live SSH session on a server"),
+            sub("wide", "", "Toggle the 3-column layout"),
+            sub("resume", "", "Resume a Fleet session"),
+            sub("off", "", "Leave Fleet mode"),
+        ],
     },
     // --- App ---
     CommandItem {
@@ -185,6 +262,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Version, credits, links and session telemetry",
         aliases: &[],
         group: APP,
+        subcommands: &[],
     },
     CommandItem {
         name: "/update",
@@ -192,6 +270,10 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Check or apply in-place Corex updates",
         aliases: &[],
         group: APP,
+        subcommands: &[
+            sub("apply", "", "Install the latest version"),
+            sub("force", "", "Reinstall even if up to date"),
+        ],
     },
     CommandItem {
         name: "/help",
@@ -199,6 +281,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Show commands and keyboard shortcuts",
         aliases: &[],
         group: APP,
+        subcommands: &[],
     },
     CommandItem {
         name: "/mouse",
@@ -206,6 +289,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Toggle mouse reporting (wheel/drag vs native touch)",
         aliases: &[],
         group: APP,
+        subcommands: &[],
     },
     CommandItem {
         name: "/keyboard",
@@ -213,6 +297,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Pause the mouse so the next tap raises the keyboard (Termux)",
         aliases: &[],
         group: APP,
+        subcommands: &[],
     },
     CommandItem {
         name: "/quit",
@@ -220,28 +305,46 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         description: "Exit the Corex session",
         aliases: &[],
         group: APP,
+        subcommands: &[],
     },
 ];
 
-/// Commands matching what the user typed, best matches first.
+/// What the menu is completing: top-level commands, or the subcommands of a command
+/// followed by a space. Returns the candidates, the text typed for them, and the parent command.
+fn completion_scope(input: &str) -> Option<(&'static [CommandItem], &str, Option<&'static CommandItem>)> {
+    let typed = input.strip_prefix('/')?;
+    let Some((cmd, rest)) = input.split_once(char::is_whitespace) else {
+        return Some((ALL_COMMANDS, typed, None));
+    };
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let parent = ALL_COMMANDS
+        .iter()
+        .find(|c| c.name == cmd || c.aliases.contains(&cmd))?;
+    Some((parent.subcommands, rest, Some(parent)))
+}
+
+/// Commands, or subcommands once a command and a space are typed, best matches first.
 ///
 /// Rank 0: name or alias starts with the query. Rank 1: name or alias contains it
 /// (so `/sess` finds nothing noisy, but `/ume` finds `/resume`). A bare `/` returns everything
-/// in group order. Input with arguments (a space) never matches, which closes the menu.
+/// in group order. Free-form arguments (a second space, or a command without subcommands)
+/// never match, which closes the menu.
 pub fn match_commands(input: &str) -> Vec<&'static CommandItem> {
-    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+    let Some((candidates, typed, _)) = completion_scope(input) else {
         return Vec::new();
-    }
-    let query = input[1..].to_lowercase();
+    };
+    let query = typed.to_lowercase();
     if query.is_empty() {
-        return ALL_COMMANDS.iter().collect();
+        return candidates.iter().collect();
     }
 
     let rank = |c: &CommandItem| -> Option<u8> {
         let names = std::iter::once(c.name).chain(c.aliases.iter().copied());
         let mut best: Option<u8> = None;
         for n in names {
-            let n = n[1..].to_lowercase();
+            let n = n.trim_start_matches('/').to_lowercase();
             let r = if n.starts_with(&query) {
                 0
             } else if n.contains(&query) {
@@ -254,13 +357,21 @@ pub fn match_commands(input: &str) -> Vec<&'static CommandItem> {
         best
     };
 
-    let mut ranked: Vec<(u8, usize, &'static CommandItem)> = ALL_COMMANDS
+    let mut ranked: Vec<(u8, usize, &'static CommandItem)> = candidates
         .iter()
         .enumerate()
         .filter_map(|(i, c)| rank(c).map(|r| (r, i, c)))
         .collect();
     ranked.sort_by_key(|(r, i, _)| (*r, *i));
     ranked.into_iter().map(|(_, _, c)| c).collect()
+}
+
+/// The prompt text once `item`, a row of the menu for `input`, is picked.
+pub fn completion(input: &str, item: &CommandItem) -> String {
+    match input.split_once(char::is_whitespace) {
+        Some((cmd, _)) => format!("{} {}", cmd, item.name),
+        None => item.name.to_string(),
+    }
 }
 
 /// Splits `text` so the part matching `query` (case-insensitive) is highlighted.
@@ -307,9 +418,13 @@ pub fn render_command_popup(
     let popup_area = Rect::new(area.x, area.y, popup_width, area.height);
 
     let selected = selected_idx % count;
-    let query = input[1..].to_lowercase();
+    let Some((_, typed, parent)) = completion_scope(input) else {
+        return;
+    };
+    let query = typed.to_lowercase();
     // Group headers only when browsing everything (bare `/`): filtered lists are flat and ranked.
-    let show_groups = query.is_empty();
+    let show_groups = parent.is_none() && query.is_empty();
+    let needle = if parent.is_some() { query.clone() } else { format!("/{}", query) };
 
     let inner_w = popup_width.saturating_sub(2) as usize;
     let name_w = 11usize;
@@ -328,7 +443,7 @@ pub fn render_command_popup(
             last_group = cmd.group;
             header_lines.push(lines.len());
             lines.push(Line::from(Span::styled(
-                format!(" ── {} ", cmd.group),
+                format!("  {}", cmd.group),
                 Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD),
             )));
         }
@@ -338,12 +453,8 @@ pub fn render_command_popup(
             selected_line = lines.len();
         }
         command_lines.push(lines.len());
-        let prefix = if is_selected { "› " } else { "  " };
-
         let style = if is_selected {
-            Style::default()
-                .fg(theme.accent_blue)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
         };
@@ -353,12 +464,12 @@ pub fn render_command_popup(
         let alias_hit = cmd
             .aliases
             .iter()
-            .find(|a| !query.is_empty() && a[1..].to_lowercase().contains(&query))
-            .filter(|_| !cmd.name[1..].to_lowercase().contains(&query));
+            .find(|a| !query.is_empty() && a.trim_start_matches('/').to_lowercase().contains(&query))
+            .filter(|_| !cmd.name.trim_start_matches('/').to_lowercase().contains(&query));
 
-        let mut spans = vec![Span::styled(prefix, style)];
+        let mut spans = vec![Span::styled(if is_selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue))];
         let name_text = format!("{:<w$}", cmd.name, w = name_w);
-        spans.extend(highlighted(&name_text, &format!("/{}", query), style, hit));
+        spans.extend(highlighted(&name_text, &needle, style, hit));
         spans.push(Span::styled(
             format!("{}  ", pad_right(cmd.args, args_w)),
             Style::default().fg(theme.dark_gray),
@@ -367,7 +478,7 @@ pub fn render_command_popup(
             Some(a) => format!("{} (alias {})", cmd.description, a),
             None => cmd.description.to_string(),
         };
-        spans.push(Span::styled(fit_text(&desc, desc_w), Style::default().fg(theme.gray)));
+        spans.push(Span::styled(pad_right(&fit_text(&desc, desc_w), desc_w + 1), Style::default().fg(theme.gray)));
         lines.push(Line::from(spans));
     }
 
@@ -389,29 +500,31 @@ pub fn render_command_popup(
     let hidden_above = command_lines.iter().filter(|&&l| l < scroll_offset).count();
     let hidden_below = command_lines.iter().filter(|&&l| l > last_visible).count();
 
-    let mut block = Block::default()
-        .title(" Slash Commands ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(theme.accent_blue));
+    // No fill and no frame, so a transparent terminal shows through: title on top, scroll
+    // position at the bottom.
+    let title = parent.map_or("Commands", |p| p.name);
+    let header = Rect::new(popup_area.x, popup_area.y, popup_area.width, 1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(format!("  {title}"), Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))),
+        header,
+    );
+    let body = Rect::new(popup_area.x + 1, popup_area.y + 1, popup_area.width.saturating_sub(2), popup_area.height.saturating_sub(2));
+    frame.render_widget(Paragraph::new(lines).scroll((scroll_offset as u16, 0)), body);
     if hidden_above > 0 || hidden_below > 0 {
-        let mut hint = format!(" {}/{}", selected + 1, count);
+        let mut hint = format!("{}/{}", selected + 1, count);
         if hidden_above > 0 {
             hint.push_str(&format!(" · ↑ {}", hidden_above));
         }
         if hidden_below > 0 {
             hint.push_str(&format!(" · ↓ {} more", hidden_below));
         }
-        hint.push(' ');
-        block = block.title_bottom(
-            Line::from(Span::styled(hint, Style::default().fg(theme.dark_gray))).right_aligned(),
+        hint.push_str("  ");
+        let footer = Rect::new(popup_area.x, popup_area.bottom().saturating_sub(1), popup_area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(theme.dark_gray))).alignment(ratatui::layout::Alignment::Right),
+            footer,
         );
     }
-
-    let widget = Paragraph::new(lines)
-        .block(block)
-        .scroll((scroll_offset as u16, 0));
-    frame.render_widget(widget, popup_area);
 }
 
 #[cfg(test)]
@@ -452,8 +565,20 @@ mod tests {
     }
 
     #[test]
+    fn a_space_after_a_command_lists_its_subcommands() {
+        assert_eq!(names("/memory "), vec!["list", "show", "add", "reload"]);
+        assert_eq!(names("/memory sho"), vec!["show"]);
+        assert_eq!(names("/memory ref"), vec!["reload"]);
+        assert_eq!(names("/vps c"), vec!["connect"]);
+        assert_eq!(completion("/memory sh", match_commands("/memory sh")[0]), "/memory show");
+        assert_eq!(completion("/mem", match_commands("/mem")[0]), "/memory");
+    }
+
+    #[test]
     fn arguments_close_the_menu() {
         assert!(match_commands("/save tag").is_empty());
+        assert!(match_commands("/mcp add github").is_empty());
+        assert!(match_commands("/memory zzz").is_empty());
         assert!(match_commands("hello").is_empty());
         assert!(match_commands("/zzz").is_empty());
     }
@@ -488,7 +613,7 @@ mod tests {
         }).unwrap();
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Slash Commands"));
+        assert!(text.contains("Commands"));
         assert!(text.contains("/model"));
     }
 
@@ -524,7 +649,8 @@ mod tests {
             let rows = popup_rows("/", 0, height);
             let body = &rows[1..rows.len() - 1];
             let last = body.last().unwrap();
-            assert!(!last.contains("──") || last.trim_matches(|c| c == '│' || c == ' ').is_empty(), "height {height}: {last:?}");
+            let is_header = ALL_COMMANDS.iter().any(|c| last.trim() == c.group);
+            assert!(!is_header, "height {height}: {last:?}");
         }
     }
 
@@ -559,8 +685,9 @@ mod tests {
         // `/resume`'s description is the longest one: it gets cut, but not against the border.
         let rows = popup_rows("/resume", 0, 6);
         let row = rows.iter().find(|r| r.contains("/resume")).expect("row");
-        let border = row.rfind('│').expect("right border");
-        let before = row[..border].chars().last().unwrap();
-        assert_eq!(before, ' ', "{row:?}");
+        // The panel is 75 columns wide: its last column stays empty.
+        let chars: Vec<char> = row.chars().collect();
+        assert!(chars[..74].contains(&'…'), "the description is cut: {row:?}");
+        assert_eq!(chars[74], ' ', "{row:?}");
     }
 }

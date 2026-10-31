@@ -6,14 +6,15 @@ description: >-
   blank output, key not found, rate limits, or anything not working as expected.
   Trigger phrases: 'not working', 'error', 'API error', 'connection refused',
   'slow', 'key not found', 'unauthorized', '401', '429', 'rate limit',
-  'blank output', 'hangs', 'crashes', 'local llm not connecting'.
+  'blank output', 'hangs', 'crashes', 'local llm not connecting',
+  'ignores my SYSTEM.md', 'no toma mis instrucciones'.
 ---
 
 # Corex Troubleshooting Guide
 
 ---
 
-## 🔑 Authentication & API Key Problems
+## Authentication & API Key Problems
 
 ### "Unauthorized" / 401 error
 ```bash
@@ -44,7 +45,7 @@ Get your key at: [platform.deepseek.com/api_keys](https://platform.deepseek.com/
 
 ---
 
-## 🌐 Connection & Network Errors
+## Connection & Network Errors
 
 ### "Connection refused" / timeout
 ```bash
@@ -67,7 +68,7 @@ cx --base-url https://api.deepseek.com -p "test"
 
 ---
 
-## ⚡ Rate Limits (429 Too Many Requests)
+## Rate Limits (429 Too Many Requests)
 
 - DeepSeek free tier has rate limits — wait a few seconds and retry
 - Check your account balance: `/balance` inside TUI or [platform.deepseek.com](https://platform.deepseek.com)
@@ -76,7 +77,7 @@ cx --base-url https://api.deepseek.com -p "test"
 
 ---
 
-## 🤖 Local LLM Not Connecting
+## Local LLM Not Connecting
 
 ### Check if server is running
 ```bash
@@ -105,7 +106,7 @@ cat ~/.corex/settings.json | grep local_url
 
 ---
 
-## 🐢 Slow Responses
+## Slow Responses
 
 1. **Check TTFT** — type `/stats` to see Time-To-First-Token per turn
 2. **Use Flash model** — `deepseek-flash` is much faster than `deepseek-v4-pro`
@@ -115,10 +116,10 @@ cat ~/.corex/settings.json | grep local_url
 
 ---
 
-## 📭 Blank / Empty Output
+## Blank / Empty Output
 
 - Verify the model finished: check `/stats` for `finish_reason`
-- Try `/rewind` to undo the last turn and retry
+- Try `/rewind` to go back to an earlier message (optionally reverting the agent's file edits) and retry
 - If using `deepseek-v4-pro` with CoT, it might still be reasoning — wait for the spinner
 - Check forensic log for raw API response:
 ```bash
@@ -127,7 +128,7 @@ cat ~/.corex/logs/corex-forensic-$(date +%Y-%m-%d).log | tail -100
 
 ---
 
-## 🔄 Context Too Long / Auto-Compact Triggered
+## Context Too Long / Auto-Compact Triggered
 
 Corex auto-compacts at **80% of the model's context window** by default (800,000 tokens for DeepSeek and Gemini, 160,000 for Claude, 102,400 for 128k models). You'll see a `[INFO]` notice. This is normal behavior.
 
@@ -150,7 +151,16 @@ To manually compact before hitting the limit:
 
 ---
 
-## 🔍 Read the Forensic Log
+## Instructions in SYSTEM.md / AGENTS.md Are Ignored
+
+1. Run `/memory list` and check the file is marked ``. Project files are only read from the directory where `cx` was started, so starting it in a subdirectory misses the repository root's `AGENTS.md`.
+2. If you just edited the file, run `/memory reload`; otherwise the change applies within 15 seconds.
+3. If the list says `truncated`, the file is over 20,000 bytes and its end is cut. Shorten it or split it across `SYSTEM.md` and the project files.
+4. Run `/memory show` to read exactly what the model receives.
+
+---
+
+## Read the Forensic Log
 
 Every session is fully logged with raw API payloads, telemetry, and errors:
 
@@ -167,7 +177,7 @@ grep -i "error\|fail\|401\|429" ~/.corex/logs/corex-forensic-$(date +%Y-%m-%d).l
 
 ---
 
-## 🗑️ Reset Configuration
+## Reset Configuration
 
 ```bash
 # Back up and reset settings
@@ -181,7 +191,7 @@ cx
 
 ---
 
-## 📬 Still Not Working?
+## Still Not Working?
 
 - **GitHub Issues:** [github.com/sluisr/corex/issues](https://github.com/sluisr/corex/issues)
   - Attach the relevant section of `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`

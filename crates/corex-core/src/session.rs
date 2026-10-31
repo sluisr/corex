@@ -29,6 +29,9 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     history: Vec<Message>,
     pub total_usage: Usage,
+    /// Files the agent's tools changed, by user turn, for `/rewind`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_edits: Vec<crate::file_history::FileEdit>,
     /// Prompt size the API reported for its latest request, with the length `messages` had then.
     /// Not saved: it only describes the request in flight in this run.
     #[serde(skip)]
@@ -110,6 +113,7 @@ impl Session {
             messages: Vec::new(),
             history: Vec::new(),
             total_usage: Usage::default(),
+            file_edits: Vec::new(),
             last_prompt: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -154,19 +158,52 @@ impl Session {
         self.history.clear();
     }
 
+    /// Indices in `display_messages` of the prompts the user typed, oldest first. Reports the app
+    /// sends as a user turn (finished tasks and subagents, tool images) are not turns.
+    pub fn user_turns(&self) -> Vec<usize> {
+        self.display_messages()
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "user" && !crate::is_tool_image_message(m))
+            .filter(|(_, m)| {
+                m.display_text()
+                    .is_none_or(|t| !t.starts_with("TASK_DONE|") && !t.starts_with("SUBAGENT_DONE|"))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Drops user turn `turn` (1-based, see `user_turns`) and everything after it.
+    pub fn rewind_to_turn(&mut self, turn: usize) -> bool {
+        let Some(idx) = turn.checked_sub(1).and_then(|i| self.user_turns().get(i).copied()) else {
+            return false;
+        };
+        self.last_prompt = None;
+        if self.history.is_empty() {
+            self.messages.truncate(idx);
+            return true;
+        }
+        let dropped = self.history.len() - idx;
+        if dropped <= self.messages.len() {
+            let keep = self.messages.len() - dropped;
+            self.messages.truncate(keep);
+            self.history.truncate(idx);
+        } else {
+            // Back past the compaction: its summary covers turns that no longer exist.
+            self.history.truncate(idx);
+            self.messages = std::mem::take(&mut self.history);
+        }
+        true
+    }
+
     /// Removes messages from the end up to and including the last user prompt.
     /// Returns whether a user prompt was found.
     pub fn rewind_last_turn(&mut self) -> bool {
-        let pop_turn = |list: &mut Vec<Message>| {
-            while let Some(msg) = list.pop() {
-                if msg.role == "user" {
-                    return true;
-                }
-            }
-            false
-        };
-        pop_turn(&mut self.history);
-        pop_turn(&mut self.messages)
+        let last = self.user_turns().len();
+        if last == 0 {
+            return false;
+        }
+        self.rewind_to_turn(last)
     }
 
     pub fn sessions_dir() -> PathBuf {
@@ -551,6 +588,39 @@ mod history_tests {
     }
 
     #[test]
+    fn user_turns_skip_app_reports() {
+        let mut session = five_turns();
+        session.add_message(Message::assistant("ok", None));
+        session.add_message(Message::user("TASK_DONE|42|0|1s\nbuilt"));
+        let typed: Vec<_> = session.user_turns().iter().map(|&i| session.display_messages()[i].text_content().unwrap()).collect();
+        assert_eq!(typed, vec!["one", "two", "three", "four", "five"]);
+    }
+
+    #[test]
+    fn rewind_to_turn_drops_that_turn_and_later_ones() {
+        let mut session = five_turns();
+        assert!(session.rewind_to_turn(3));
+        let shown: Vec<_> = session.display_messages().iter().filter_map(|m| m.text_content()).collect();
+        assert_eq!(shown, vec!["one", "two"]);
+        assert!(!session.rewind_to_turn(9));
+    }
+
+    #[test]
+    fn rewind_to_turn_after_compaction_keeps_both_lists_in_step() {
+        let mut session = five_turns();
+        compacted(&mut session);
+        session.add_message(Message::user("six"));
+        assert!(session.rewind_to_turn(6));
+        assert_eq!(session.display_messages().len(), 5);
+        assert_eq!(session.messages.len(), 3);
+        // Back past the compaction the summary no longer fits: the raw turns come back.
+        assert!(session.rewind_to_turn(2));
+        let shown: Vec<_> = session.display_messages().iter().filter_map(|m| m.text_content()).collect();
+        assert_eq!(shown, vec!["one"]);
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
     fn without_compaction_the_history_is_the_messages() {
         let session = five_turns();
         assert_eq!(session.display_messages().len(), 5);
@@ -587,5 +657,28 @@ mod history_tests {
         session.keep_history_before_compaction(&session.messages.clone());
         assert!(session.display_messages()[1].text_content().unwrap().len() < 10_000);
         assert_eq!(session.messages[1].text_content().unwrap().len(), big.len());
+    }
+
+    #[test]
+    fn rewind_skips_synthetic_image_and_task_messages() {
+        let mut session = Session::new();
+        session.add_message(Message::user("first real turn"));
+        session.add_message(Message::assistant("ok 1", None));
+        session.add_message(Message::user("second real turn"));
+        session.add_message(Message::assistant("reading image", None));
+        session.add_message(Message::user_parts(vec![
+            crate::types::ContentPart::text("[Image(s) loaded by the read_image tool: a.png]"),
+            crate::types::ContentPart::image_url("data:image/png;base64,QUJD"),
+        ]));
+        session.add_message(Message::user("TASK_DONE|1|0|1s\ndone"));
+        session.add_message(Message::assistant("final answer", None));
+
+        assert!(session.rewind_last_turn());
+        let remaining: Vec<_> = session
+            .display_messages()
+            .iter()
+            .filter_map(|m| m.text_content())
+            .collect();
+        assert_eq!(remaining, vec!["first real turn", "ok 1"]);
     }
 }

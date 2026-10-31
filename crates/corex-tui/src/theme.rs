@@ -75,9 +75,9 @@ impl Theme {
             dark_gray: Color::Rgb(140, 140, 140),
             border: Color::Rgb(135, 175, 255),
             border_dim: Color::Rgb(95, 95, 95),
-            // A quiet lift over the terminal's own background: the text keeps its colour, so a
-            // selection reads like a native one instead of a slab of accent colour.
-            selection_bg: Color::Rgb(58, 58, 68),
+            // The accent blue at about 30% over a dark background, a stand-in for a translucent
+            // highlight (terminals have no alpha): the text keeps its colour and stays readable.
+            selection_bg: Color::Rgb(44, 66, 110),
             error: Color::Rgb(225, 105, 105),
             success: Color::Rgb(105, 185, 135),
             warning: Color::Rgb(220, 180, 90),
@@ -113,7 +113,7 @@ impl Theme {
             dark_gray: Color::Rgb(105, 105, 105),
             border: Color::Rgb(25, 80, 190),
             border_dim: Color::Rgb(185, 185, 185),
-            selection_bg: Color::Rgb(205, 218, 240),
+            selection_bg: Color::Rgb(190, 210, 245),
             error: Color::Rgb(180, 35, 35),
             success: Color::Rgb(20, 115, 50),
             warning: Color::Rgb(150, 95, 0),

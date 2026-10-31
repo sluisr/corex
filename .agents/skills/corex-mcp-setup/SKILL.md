@@ -15,7 +15,7 @@ MCP lets Corex connect to external tool servers — giving it capabilities beyon
 
 ---
 
-## 📁 Configuration Location
+## Configuration Location
 
 MCP servers are configured inside **`~/.corex/settings.json`** under the `mcp_servers` key:
 
@@ -44,7 +44,7 @@ Corex spawns the server as a subprocess and communicates via **JSON-RPC over std
 
 ---
 
-## 🔌 Common MCP Server Examples
+## Common MCP Server Examples
 
 ### GitHub Tools
 ```json
@@ -107,22 +107,22 @@ Corex spawns the server as a subprocess and communicates via **JSON-RPC over std
 
 ---
 
-## 🛠️ Managing MCP from Inside the TUI
+## Managing MCP from Inside the TUI
 
-| Command | What it does |
-| :--- | :--- |
-| `/mcp` or `/mcp status` | List all configured servers, connection status, and discovered tools |
-| `/mcp catalog` | Browse the built-in catalog of vetted community templates |
-| `/mcp add <catalog-id>` | Instantly add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
-| `/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
-| `/mcp remove <name>` | Remove an MCP server from configuration and reload tools |
-| `/mcp reload` | Reconnect and rediscover all configured MCP servers |
+|Command | What it does |
+|:--- | :--- |
+|`/mcp` or `/mcp status` | List all configured servers, connection status, and discovered tools |
+|`/mcp catalog` | Browse the built-in catalog of vetted community templates |
+|`/mcp add <catalog-id>` | Instantly add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
+|`/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
+|`/mcp remove <name>` | Remove an MCP server from configuration and reload tools |
+|`/mcp reload` | Reconnect and rediscover all configured MCP servers |
 
 MCP servers can be added in one command via `/mcp add <id>` or configured manually in `~/.corex/settings.json`. Dynamic tool discovery registers tools immediately without needing a full restart.
 
 ---
 
-## 🏷️ How Corex Names MCP Tools
+## How Corex Names MCP Tools
 
 When Corex connects to a server named `github` and it exposes a tool called `create_issue`, Corex registers it internally as:
 
@@ -136,7 +136,7 @@ The model can call these tools naturally — just describe what you want and Cor
 
 ---
 
-## ✅ Verification
+## Verification
 
 After adding a server, verify it's connected:
 
@@ -152,7 +152,7 @@ If a server fails to connect, Corex logs the error but continues running with ju
 
 ---
 
-## 📦 Finding MCP Servers
+## Finding MCP Servers
 
 - **Official:** [github.com/modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers)
 - **Community:** [mcp.so](https://mcp.so) — MCP server registry

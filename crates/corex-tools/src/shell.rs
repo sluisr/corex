@@ -76,7 +76,7 @@ pub fn get_or_create_askpass_script() -> PathBuf {
             // backticks in the home path expand inside the helper.
             let quoted_cred = format!("'{}'", cred_path.to_string_lossy().replace('\'', "'\\''"));
             let script_content = format!(
-                "#!/bin/sh\nCRED={}\nif [ -f \"$CRED\" ]; then\n    cat \"$CRED\"\n    exit 0\nfi\nexit 1\n",
+                "#!/bin/sh\nCRED={}\nif [ -f \"$CRED\" ]; then\n    cat \"$CRED\"\n    rm -f \"$CRED\"\n    exit 0\nfi\nexit 1\n",
                 quoted_cred
             );
 
@@ -108,6 +108,7 @@ pub fn clean_askpass_credential() {
     let dir = askpass_dir();
     let cred_path = dir.join(".askpass_cred");
     if cred_path.exists() {
+        let _ = corex_core::write_private(&cred_path, [0u8; 64]);
         let _ = fs::remove_file(cred_path);
     }
 }
@@ -406,7 +407,7 @@ fn split_segments(cmd: &str) -> Vec<&str> {
             '"' if !in_single => {
                 in_double = !in_double;
             }
-            ';' | '&' | '|' if !in_single && !in_double => {
+            ';' | '&' | '|' | '\n' | '\r' if !in_single && !in_double => {
                 let seg = cmd[start..idx].trim();
                 if !seg.is_empty() {
                     segments.push(seg);
@@ -445,6 +446,7 @@ fn is_safe_env_assignment(tok: &str) -> bool {
                     )
                 })
         }
+        Some(("GIT_PAGER" | "PAGER", value)) => value == "cat",
         Some((name, value)) => {
             SAFE_ENV.contains(&name)
                 && !value.contains('/')
@@ -464,7 +466,8 @@ fn is_dangerous_env_assignment(tok: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if upper.starts_with("LD_")
         || upper.starts_with("DYLD_")
-        || upper.starts_with("GIT_") && upper != "GIT_PAGER"
+        || upper.starts_with("GIT_") && (upper != "GIT_PAGER" || val != "cat")
+        || upper == "PAGER" && val != "cat"
         || matches!(
             upper.as_str(),
             "BASH_ENV"
@@ -486,6 +489,22 @@ fn is_dangerous_env_assignment(tok: &str) -> bool {
                 | "CARGO_BUILD_RUSTC_WRAPPER"
                 | "EDITOR"
                 | "VISUAL"
+                | "OPENSSL_CONF"
+                | "OPENSSL_ENGINES"
+                | "GCONV_PATH"
+                | "JAVA_TOOL_OPTIONS"
+                | "_JAVA_OPTIONS"
+                | "JDK_JAVA_OPTIONS"
+                | "DOTNET_STARTUP_HOOKS"
+                | "COR_PROFILER_PATH"
+                | "CORECLR_PROFILER_PATH"
+                | "GOFLAGS"
+                | "CGO_CFLAGS"
+                | "CGO_LDFLAGS"
+                | "MAKEFLAGS"
+                | "MFLAGS"
+                | "LESSOPEN"
+                | "LESSCLOSE"
         )
     {
         return true;
@@ -546,7 +565,7 @@ fn is_env_assignment(tok: &str) -> bool {
 fn is_wrapper(cmd: &str) -> bool {
     matches!(
         cmd,
-        "env" | "command" | "time" | "nice" | "nohup" | "setsid" | "timeout" | "stdbuf" | "watch"
+        "env" | "command" | "time" | "nice" | "setsid" | "timeout" | "stdbuf"
     )
 }
 
@@ -554,11 +573,15 @@ fn is_wrapper(cmd: &str) -> bool {
 /// through the home shortcut (`~/.ssh/id_rsa`) or a symlink pointing at a credential file.
 fn resolve_token_path(tok: &str) -> PathBuf {
     let t = tok.trim_matches(|c| c == '\'' || c == '"');
-    let p = if t == "~" {
+    let p = if matches!(t, "~" | "$HOME" | "${HOME}") {
         BaseDirs::new()
             .map(|d| d.home_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from(t))
-    } else if let Some(rest) = t.strip_prefix("~/") {
+    } else if let Some(rest) = t
+        .strip_prefix("~/")
+        .or_else(|| t.strip_prefix("$HOME/"))
+        .or_else(|| t.strip_prefix("${HOME}/"))
+    {
         BaseDirs::new()
             .map(|d| d.home_dir().join(rest))
             .unwrap_or_else(|| PathBuf::from(t))
@@ -568,10 +591,25 @@ fn resolve_token_path(tok: &str) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
+/// True when a glob path component could expand to a credential store's name (`.?nv`,
+/// `.c?rex`, `id_*`). A component of wildcards alone (`*`) says nothing about its target, so it
+/// does not count.
+fn glob_could_match_secret(part: &str) -> bool {
+    const SECRETS: &[&str] = &[
+        ".env", ".ssh", ".aws", ".gnupg", ".kube", ".corex", ".netrc", ".git-credentials",
+        ".docker", ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "id_ecdsa", "credentials",
+    ];
+    if !part.contains(['*', '?', '[']) || !part.chars().any(|c| c.is_alphanumeric()) {
+        return false;
+    }
+    let options = glob::MatchOptions { require_literal_leading_dot: true, ..Default::default() };
+    glob::Pattern::new(part).is_ok_and(|p| SECRETS.iter().any(|name| p.matches_with(name, options)))
+}
+
 /// True when a shell token references a credential/auth path. `--flag=value` is unwrapped so
 /// `--file=~/.ssh/id_rsa` is caught too.
 fn token_references_sensitive_path(tok: &str) -> bool {
-    let t = tok.trim_matches(|c| c == '\'' || c == '"');
+    let t = tok.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
     if t.is_empty() {
         return false;
     }
@@ -579,6 +617,9 @@ fn token_references_sensitive_path(tok: &str) -> bool {
         let v = v.trim_matches(|c| c == '\'' || c == '"');
         if v.is_empty() {
             return false;
+        }
+        if v == "~" || v == "~/" {
+            return true;
         }
         let lower = v.to_lowercase();
         let has_glob = v.contains('*') || v.contains('?') || v.contains('[');
@@ -592,19 +633,23 @@ fn token_references_sensitive_path(tok: &str) -> bool {
                 || lower.contains(".kube")
                 || lower.contains(".corex")
                 || lower.contains(".env")
+                // A hidden-dir glob on an absolute path can expand into any user's home.
+                || (v.starts_with('/') && v.contains("/."))
+                || v.split('/').any(glob_could_match_secret)
             {
                 return true;
             }
-            // A glob aimed at a hidden directory under $HOME (`~/.?sh/*`, `~/.*/credentials`)
-            // can expand onto a credential store that the literal checks above miss, because
-            // the wildcard hides the real name. Treat any hidden-dir glob in $HOME as sensitive.
             if let Some(rest) = v.strip_prefix("~/").or_else(|| v.strip_prefix("~")) {
                 if rest.starts_with('.') || rest.contains("/.") {
                     return true;
                 }
             }
         }
-        crate::fs_tools::is_sensitive_system_path(&resolve_token_path(v))
+        let resolved = resolve_token_path(v);
+        if BaseDirs::new().is_some_and(|b| resolved == b.home_dir()) {
+            return true;
+        }
+        crate::fs_tools::is_sensitive_system_path(&resolved)
     };
     if let Some((_, value)) = t.split_once('=') {
         if check_val(value) {
@@ -612,8 +657,11 @@ fn token_references_sensitive_path(tok: &str) -> bool {
         }
     }
     if let Some(flag) = t.strip_prefix('-') {
-        // A short flag can carry its value glued on: `-f~/.ssh/id_rsa`.
-        return flag.find(['/', '~']).is_some_and(|i| check_val(&flag[i..]));
+        // A short flag can carry its value glued on: `-f~/.ssh/id_rsa` or `-f.env`.
+        if !flag.starts_with('-') {
+            return flag.find(['/', '~', '.']).is_some_and(|i| check_val(&flag[i..]));
+        }
+        return false;
     }
     check_val(t)
 }
@@ -631,11 +679,23 @@ pub fn command_references_sensitive_or_protected_path(cmd: &str) -> bool {
     {
         return true;
     }
+    // `crontab <file>` / `crontab -` installs jobs that run on their own; only listing is harmless.
+    if split_segments(cmd).iter().any(|seg| {
+        let mut parts = seg.split_whitespace();
+        parts.next() == Some("crontab") && parts.next() != Some("-l")
+    }) {
+        return true;
+    }
     for tok in cmd.split_whitespace() {
-        if token_references_sensitive_path(tok) {
+        let stripped_redir =
+            tok.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '>' | '<' | '&'));
+        if token_references_sensitive_path(tok)
+            || (!stripped_redir.is_empty() && token_references_sensitive_path(stripped_redir))
+        {
             return true;
         }
-        let clean = tok.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
+        let clean = stripped_redir
+            .trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
         if !clean.is_empty() && !clean.starts_with('-') {
             if crate::fs_tools::is_protected_write_path(&resolve_token_path(clean)) {
                 return true;
@@ -703,8 +763,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
         while j < parts.len()
             && (parts[j].starts_with('-') || parts[j].chars().all(|c| c.is_ascii_digit()))
         {
-            // `env -S ...` / `env -i ...` can alter command splitting or environment security
-            if cmd == "env" && parts[j].starts_with('-') {
+            if parts[j].starts_with('-') {
                 return false;
             }
             j += 1;
@@ -733,7 +792,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
     static SAFE_TOOLS: OnceLock<HashSet<&'static str>> = OnceLock::new();
     let safe_tools = SAFE_TOOLS.get_or_init(|| {
         [
-            "cat", "ls", "dir", "tree", "grep", "egrep", "fgrep", "head", "tail",
+            "cat", "ls", "dir", "grep", "egrep", "fgrep", "head", "tail",
             "wc", "cut", "tr", "tac", "nl", "echo", "printf", "stat",
             "file", "strings", "column", "pwd", "which", "whereis", "whoami", "id",
             "uname", "uptime", "lscpu", "free", "df", "du", "lsblk", "nproc", "arch",
@@ -743,7 +802,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
             // Read-only inspection / text-processing additions
             "ss", "netstat", "lsof", "diff", "cmp", "basename", "dirname",
             "readlink", "realpath", "md5sum", "sha1sum", "sha224sum", "sha256sum",
-            "sha384sum", "sha512sum", "cksum", "sum", "od", "hexdump", "xxd",
+            "sha384sum", "sha512sum", "cksum", "sum", "od", "hexdump",
             "vmstat", "iostat", "pgrep", "pidof", "pstree", "bc", "factor", "zipinfo",
             "apt-cache", "dpkg-query", "who", "w", "last", "groups", "getfacl", "lsattr",
             "blkid", "findmnt", "mountpoint", "zcat", "zgrep", "zless", "bzcat", "xzcat",
@@ -755,6 +814,20 @@ fn is_single_segment_safe(segment: &str) -> bool {
 
     if safe_tools.contains(cmd) {
         return true;
+    }
+
+    if cmd == "tree" {
+        return !parts[1..].iter().any(|&p| {
+            short_cluster_contains(p, 'o') || is_dangerous_long_abbrev(p, &["--output"])
+        });
+    }
+
+    if cmd == "xxd" {
+        let has_revert = parts[1..].iter().any(|&p| {
+            short_cluster_contains(p, 'r') || p.starts_with("-r") || p.starts_with("--r")
+        });
+        let operands = parts.iter().skip(1).filter(|p| !p.starts_with('-')).count();
+        return !has_revert && operands <= 1;
     }
 
     // `sort` writes with `-o`/`--output` and runs a program with `--compress-program`; the long
@@ -770,7 +843,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
     // `rg` can execute a preprocessor (`--pre`) or decompress-and-run (`-z`); `--search-zip` too.
     if cmd == "rg" {
         return !parts.iter().any(|&p| {
-            p == "-z"
+            short_cluster_contains(p, 'z')
                 || is_dangerous_long_abbrev(p, &["--pre", "--search-zip", "--pre-glob", "--hostname-bin"])
         });
     }
@@ -876,6 +949,9 @@ fn is_single_segment_safe(segment: &str) -> bool {
     // Safe Cargo/Rust inspection commands (excluding check, test, clippy which execute build scripts)
     if cmd == "cargo" {
         if parts.len() > 1 {
+            if parts[2..].iter().any(|p| p.starts_with("--config") || p.starts_with("-Z")) {
+                return false;
+            }
             let subcommand = parts[1];
             let safe_cargo_subcommands: HashSet<&str> = [
                 "--version", "-V", "tree", "locate-project", "verify-project"
@@ -897,6 +973,11 @@ fn is_single_segment_safe(segment: &str) -> bool {
             let subcommand = parts[1];
             if subcommand == "config" {
                 return matches!(parts.get(2).copied(), Some("list") | Some("get"));
+            }
+            if subcommand == "audit"
+                && parts[2..].iter().any(|&p| p == "fix" || p.starts_with("--fix"))
+            {
+                return false;
             }
             let safe_subcommands: HashSet<&str> = [
                 "--version", "-v", "list", "ls", "outdated", "audit", "info", "view", "help"
@@ -954,6 +1035,13 @@ fn is_single_segment_safe(segment: &str) -> bool {
                 return !parts[2..]
                     .iter()
                     .any(|p| p.starts_with("-w") || p.starts_with("-u"));
+            }
+            if subcommand == "list"
+                && parts[2..]
+                    .iter()
+                    .any(|p| p.starts_with("-toolexec") || p.starts_with("--toolexec"))
+            {
+                return false;
             }
             let safe_go_subcommands: HashSet<&str> = [
                 "version", "list", "help"
@@ -1287,7 +1375,17 @@ fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
             return true;
         }
     }
-    if parts.iter().skip(1).any(|t| token_references_sensitive_path(t)) {
+    if parts.iter().skip(1).any(|t| {
+        let stripped_redir =
+            t.trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '>' | '<' | '&'));
+        let clean = stripped_redir
+            .trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == ')' || c == '(');
+        token_references_sensitive_path(t)
+            || (!stripped_redir.is_empty() && token_references_sensitive_path(stripped_redir))
+            || (!clean.is_empty()
+                && !clean.starts_with('-')
+                && crate::fs_tools::is_protected_write_path(&resolve_token_path(clean)))
+    }) {
         return false;
     }
     let clean_first = strip_outer_quotes(parts[0]);
@@ -1299,7 +1397,9 @@ fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
     allowed.iter().any(|entry| {
         let e = entry.trim();
         !e.is_empty()
-            && (clean_seg == e || clean_seg.starts_with(&format!("{} ", e)) || base == e)
+            && (clean_seg == e
+                || clean_seg.starts_with(&format!("{} ", e))
+                || (!clean_first.contains('/') && base == e))
     })
 }
 
@@ -1319,7 +1419,7 @@ fn append_and_truncate_output(buf: &mut String, text: &str, max_len: usize) {
     if !text.contains('\r') {
         buf.push_str(text);
     } else {
-        // Step 1: Normalize CRLF → LF.  After this, every remaining \r is a
+        // Normalize CRLF to LF, so every remaining \r is a
         // genuine terminal overwrite (column-zero reset).
         let normalized = text.replace("\r\n", "\n");
 
@@ -1345,13 +1445,27 @@ fn append_and_truncate_output(buf: &mut String, text: &str, max_len: usize) {
     }
 
     if buf.len() > max_len {
-        let mut cut = buf.len() - max_len;
+        let marker = if max_len > OUTPUT_TRUNCATED_MARKER.len() * 4 { OUTPUT_TRUNCATED_MARKER } else { "" };
+        if !marker.is_empty() && buf.starts_with(marker) {
+            buf.drain(..marker.len());
+        }
+        let mut cut = buf.len().saturating_sub(max_len - marker.len());
         while cut < buf.len() && !buf.is_char_boundary(cut) {
             cut += 1;
         }
+        // Start at a line boundary so the model never sees half a line as if it were whole.
+        if !marker.is_empty() {
+            if let Some(nl) = buf[cut..].find('\n') {
+                cut += nl + 1;
+            }
+        }
         buf.drain(..cut);
+        buf.insert_str(0, marker);
     }
 }
+
+/// Put in front of a command's output once its beginning has been dropped to stay in budget.
+const OUTPUT_TRUNCATED_MARKER: &str = "[... earlier output truncated, only the last part is shown ...]\n";
 
 /// Remove everything after the last `\n` in `buf` (i.e. the current
 /// incomplete line), so the next append effectively overwrites it — just
@@ -1518,7 +1632,7 @@ impl Tool for ShellTool {
                 }
             }
         }
-        let _askpass_guard = AskpassGuard(requires_sudo);
+        let mut askpass_guard = AskpassGuard(requires_sudo);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1680,6 +1794,7 @@ impl Tool for ShellTool {
         }
 
         if wait_ms == 0 {
+            askpass_guard.0 = false;
             return Ok(ToolOutput::success_with_summary(
                 format!(
                     "[BACKGROUND TASK LAUNCHED]\n\
@@ -1719,6 +1834,7 @@ impl Tool for ShellTool {
                 }
             }
             Err(_) => {
+                askpass_guard.0 = false;
                 if let Ok(mut bg) = is_background.lock() {
                     *bg = true;
                 }
@@ -2071,6 +2187,7 @@ mod tests {
             yolo_mode: true,
             allowed_commands: vec![],
             sudo_password: None,
+            extra_dirs: Vec::new(),
         };
 
         let res = tool
@@ -2096,6 +2213,7 @@ mod tests {
             yolo_mode: true,
             allowed_commands: vec![],
             sudo_password: None,
+            extra_dirs: Vec::new(),
         };
         let start = std::time::Instant::now();
         let res = ShellTool
@@ -2115,6 +2233,7 @@ mod tests {
             yolo_mode: true,
             allowed_commands: vec![],
             sudo_password: None,
+            extra_dirs: Vec::new(),
         };
 
         let res = tool
@@ -2131,6 +2250,47 @@ mod tests {
         assert!(!res.is_error);
         assert!(res.output.contains("[COMMAND SENT TO BACKGROUND]"));
         assert!(res.display_summary.is_some());
+    }
+
+    #[test]
+    fn workspace_globs_over_hidden_dirs_are_not_secrets() {
+        // Excluding .git is routine; only hidden globs under $HOME can land on a credential store.
+        assert!(!command_references_sensitive_or_protected_path(r#"find . -type f -not -path "*/.git/*""#));
+        assert!(!command_references_sensitive_or_protected_path("ls ./.github/*"));
+        assert!(command_references_sensitive_or_protected_path("cat ~/.?sh/id_rsa"));
+        assert!(command_references_sensitive_or_protected_path("cat */.env"));
+        assert!(command_references_sensitive_or_protected_path("ls /root/.*"));
+    }
+
+    #[test]
+    fn relative_hook_paths_and_crontab_installs_are_protected() {
+        for cmd in [
+            "echo x >.git/hooks/pre-commit",
+            "echo x > .git/hooks/pre-commit",
+            "cp evil .git/hooks/pre-commit",
+            "tee .git/hooks/post-merge",
+            "echo '* * * * * sh x' | crontab -",
+            "crontab jobs.txt",
+        ] {
+            assert!(command_references_sensitive_or_protected_path(cmd), "{cmd}");
+        }
+        assert!(!command_references_sensitive_or_protected_path("crontab -l"));
+        assert!(!command_references_sensitive_or_protected_path("git log --oneline"));
+    }
+
+    #[test]
+    fn truncated_output_says_so_and_starts_on_a_whole_line() {
+        let mut buf = String::new();
+        let lines: String = (1..=50_000).map(|i| format!("{i}\n")).collect();
+        append_and_truncate_output(&mut buf, &lines, 10_000);
+        append_and_truncate_output(&mut buf, "tail\n", 10_000);
+        assert!(buf.len() <= 10_000);
+        assert!(buf.starts_with(OUTPUT_TRUNCATED_MARKER));
+        assert_eq!(buf.matches("earlier output truncated").count(), 1);
+        let first = buf[OUTPUT_TRUNCATED_MARKER.len()..].lines().next().unwrap();
+        let n: usize = first.parse().unwrap();
+        assert!(lines.contains(&format!("\n{n}\n")), "first kept line {first:?} must be whole");
+        assert!(buf.ends_with("50000\ntail\n"));
     }
 
     #[test]
@@ -2276,6 +2436,73 @@ mod tests {
         assert!(!is_known_safe_command("git remote -v remove origin"));
         assert!(is_known_safe_command("git remote -v"));
         assert!(is_known_safe_command("git remote show origin"));
+    }
+
+    #[test]
+    fn safe_list_bypasses_need_confirmation() {
+        assert!(!is_known_safe_command("GIT_PAGER=sh git log"));
+        assert!(!is_known_safe_command("PAGER=sh git log"));
+        assert!(is_known_safe_command("GIT_PAGER=cat git log"));
+        assert!(!is_known_safe_command("xxd -r -p input.hex out.bin"));
+        assert!(!is_known_safe_command("xxd input.bin out.hex"));
+        assert!(is_known_safe_command("xxd README.md"));
+        assert!(!is_known_safe_command("tree -o out.txt"));
+        assert!(!is_known_safe_command("tree --output=out.txt"));
+        assert!(is_known_safe_command("tree src"));
+        assert!(!is_known_safe_command("rg -nz pattern src"));
+        assert!(!is_known_safe_command("time -o out.txt ls"));
+        assert!(!is_known_safe_command("nohup ls"));
+        assert!(!is_known_safe_command("npm audit fix"));
+        assert!(!is_known_safe_command("pnpm audit --fix"));
+        assert!(is_known_safe_command("npm audit"));
+        assert!(!is_known_safe_command("go list -toolexec=sh ./..."));
+        assert!(is_known_safe_command("go list ./..."));
+    }
+
+    #[test]
+    fn sensitive_paths_in_flags_globs_and_home_are_caught() {
+        assert!(command_references_sensitive_or_protected_path("grep -f.env root"));
+        assert!(!is_known_safe_command("grep -f.env root"));
+        assert!(!is_known_safe_command("rg -f.env pattern"));
+        assert!(!is_known_safe_command("cat /home/*/.?sh/id_rsa"));
+        assert!(!is_known_safe_command("cat /home/user/.c?rex/settings.json"));
+        assert!(!is_known_safe_command("cat .?nv"));
+        assert!(!is_known_safe_command("rg secret ~"));
+        assert!(!is_known_safe_command("grep -rn token ~/"));
+    }
+
+    #[test]
+    fn allowed_commands_reject_path_binaries_dangerous_env_and_protected_paths() {
+        let allowed: HashSet<String> = ["cargo", "cp"].into_iter().map(String::from).collect();
+        assert!(!is_known_safe_command_with_allowed("./cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("/tmp/evil/cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("GIT_PAGER=sh cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("PAGER=sh cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("OPENSSL_CONF=/tmp/x.cnf cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("JAVA_TOOL_OPTIONS=-javaagent:x.jar cargo test", &allowed));
+        assert!(!is_known_safe_command_with_allowed("cp foo ~/.bashrc", &allowed));
+        assert!(is_known_safe_command_with_allowed("cargo test", &allowed));
+    }
+
+    #[test]
+    fn multiline_sudo_and_glued_redirects_are_caught() {
+        assert!(command_requires_sudo("echo ok\nsudo id"));
+        assert!(command_requires_sudo("echo ok\r\ndoas id"));
+        assert!(command_references_sensitive_or_protected_path("echo x >.bashrc"));
+        assert!(command_references_sensitive_or_protected_path("echo x 2>>.git/config"));
+        assert!(command_references_sensitive_or_protected_path("cat <.env"));
+        assert!(command_references_sensitive_or_protected_path("cat $HOME/.ssh/id_rsa"));
+        assert!(command_references_sensitive_or_protected_path("echo x > ${HOME}/.bashrc"));
+    }
+
+    #[test]
+    fn askpass_script_deletes_the_credential_once_read() {
+        let script_path = get_or_create_askpass_script();
+        let script = fs::read_to_string(&script_path).unwrap();
+        assert!(
+            script.contains("rm -f \"$CRED\""),
+            "askpass.sh must unlink $CRED immediately after reading it"
+        );
     }
 }
 

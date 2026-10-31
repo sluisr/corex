@@ -472,16 +472,21 @@ impl Tool for WebSearchTool {
 fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
-            ipv4.octets()[0] == 0 // 0.0.0.0/8 ("this network"; reaches local services on Linux)
+            let o = ipv4.octets();
+            o[0] == 0 // 0.0.0.0/8 ("this network"; reaches local services on Linux)
                 || ipv4.is_loopback()
                 || ipv4.is_private()
                 || ipv4.is_link_local()
                 || ipv4.is_unspecified()
                 || ipv4.is_broadcast()
                 || ipv4.is_multicast()
-                || (ipv4.octets()[0] == 169 && ipv4.octets()[1] == 254) // Cloud metadata (AWS, GCP, Azure)
-                || (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64) // Carrier-grade NAT
-                || (ipv4.octets()[0] == 198 && (ipv4.octets()[1] & 0xFE) == 18) // Benchmarking (198.18.0.0/15)
+                || (o[0] & 0xF0) == 240 // 240.0.0.0/4 Class E reserved
+                || (o[0] == 169 && o[1] == 254) // Cloud metadata (AWS, GCP, Azure)
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // Carrier-grade NAT (100.64.0.0/10)
+                || (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2)) // 192.0.0.0/24 IETF + 192.0.2.0/24 TEST-NET-1
+                || (o[0] == 198 && (o[1] & 0xFE) == 18) // Benchmarking (198.18.0.0/15)
+                || (o[0] == 198 && o[1] == 51 && o[2] == 100) // TEST-NET-2 (198.51.100.0/24)
+                || (o[0] == 203 && o[1] == 0 && o[2] == 113) // TEST-NET-3 (203.0.113.0/24)
         }
         std::net::IpAddr::V6(ipv6) => {
             if let Some(mapped_v4) = ipv6.to_ipv4_mapped() {
@@ -490,13 +495,14 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
                 }
             }
             // IPv6 forms that embed an IPv4 address the network may route to it:
-            // IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::/96) carry it in the low 32 bits;
-            // 6to4 (2002::/16) carries it in the next 32.
+            // IPv4-compatible (::a.b.c.d), SIIT (::ffff:0:a.b.c.d), and NAT64 (64:ff9b::/96)
+            // carry it in the low 32 bits; 6to4 (2002::/16) carries it in the next 32.
             let seg = ipv6.segments();
             let v4_from = |hi: u16, lo: u16| {
                 std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
             };
             let embedded = if (seg[..6] == [0, 0, 0, 0, 0, 0] && !ipv6.is_loopback() && !ipv6.is_unspecified())
+                || seg[..6] == [0, 0, 0, 0, 0xffff, 0]
                 || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0])
             {
                 Some(v4_from(seg[6], seg[7]))
@@ -511,8 +517,13 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
             ipv6.is_loopback()
                 || ipv6.is_unspecified()
                 || ipv6.is_multicast()
-                || (ipv6.segments()[0] & 0xfe00) == 0xfc00 // Unique local address (fc00::/7)
-                || (ipv6.segments()[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
+                || (seg[0] & 0xfe00) == 0xfc00 // Unique local address (fc00::/7)
+                || (seg[0] & 0xffc0) == 0xfe80 // Link-local (fe80::/10)
+                || (seg[0] & 0xffc0) == 0xfec0 // Site-local deprecated (fec0::/10)
+                || (seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1) // RFC 8215 NAT64 local-use (64:ff9b:1::/48)
+                || (seg[0] == 0x2001 && seg[1] == 0x0000) // Teredo (2001::/32)
+                || (seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0x0000) // Benchmarking (2001:2::/48)
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8) // Documentation (2001:db8::/32)
         }
     }
 }
@@ -827,6 +838,19 @@ mod tests {
         assert!(!blocked("64:ff9b::5db8:d822"));   // NAT64 of a public address
     }
 
+    #[test]
+    fn reserved_and_ipv6_transition_ranges_are_blocked() {
+        let blocked = |s: &str| is_blocked_ip(s.parse().unwrap());
+        assert!(blocked("240.0.0.1"), "240.0.0.0/4 Class E must be blocked");
+        assert!(blocked("192.0.0.1"), "192.0.0.0/24 IETF protocol assignments must be blocked");
+        assert!(blocked("::ffff:0:127.0.0.1"), "SIIT ::ffff:0:0/96 must be blocked");
+        assert!(blocked("64:ff9b:1::1"), "NAT64 local-use 64:ff9b:1::/48 must be blocked");
+        assert!(blocked("2001::1"), "Teredo 2001::/32 must be blocked");
+        assert!(blocked("2001:2::1"), "Benchmarking 2001:2::/48 must be blocked");
+        assert!(blocked("2001:db8::1"), "Documentation 2001:db8::/32 must be blocked");
+        assert!(blocked("fec0::1"), "Site-local fec0::/10 must be blocked");
+    }
+
     #[tokio::test]
     async fn resolver_rejects_hosts_that_resolve_internally() {
         use reqwest::dns::Resolve;
@@ -843,6 +867,7 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         assert!(!WebFetchTool.needs_confirmation(&json!({ "url": "https://docs.rs/serde" }), &ctx));
         assert!(!WebFetchTool.needs_confirmation(&json!({ "prompt": "read https://example.org/page please" }), &ctx));
@@ -999,6 +1024,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         let out = WebFetchTool.execute(json!({ "url": url }), &ctx).await.unwrap();
         assert!(out.is_error && out.output.contains("forbidden"), "{}", out.output);

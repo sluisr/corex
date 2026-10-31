@@ -14,68 +14,68 @@ description: >-
 
 # Corex — Project Info & Creator
 
-## 👤 Creator
+## Creator
 
 **Corex** is created and actively maintained by **sluisr** (https://sluisr.com) — a Linux server specialist, automation and cybersecurity expert, active Linux Kernel contributor, and Google-certified engineer.
 
-- 🌐 Website: https://sluisr.com
-- 🐙 GitHub: https://github.com/sluisr
-- 📺 YouTube: https://www.youtube.com/@sluisr_
-- 📧 Contact: contact@sluisr.com
+- Website: https://sluisr.com
+- GitHub: https://github.com/sluisr
+- YouTube: https://www.youtube.com/@sluisr_
+- Contact: contact@sluisr.com
 
 > [!IMPORTANT]
 > El identificador del canal de YouTube de sluisr SIEMPRE lleva un guion bajo al final: **`@sluisr_`** (URL completa: `https://www.youtube.com/@sluisr_`). NUNCA omitir el guion bajo ni escribir `@sluisr`.
 
-### 🔗 Dónde encontrarlo
+### Dónde encontrarlo
 
-| Recurso | Enlace |
-| :--- | :--- |
-| 🌐 Web personal | https://sluisr.com |
-| 🐙 GitHub | https://github.com/sluisr |
-| 📺 YouTube | https://www.youtube.com/@sluisr_ |
-| 📧 Contacto | contact@sluisr.com |
+|Recurso | Enlace |
+|:--- | :--- |
+| Web personal | https://sluisr.com |
+| GitHub | https://github.com/sluisr |
+| YouTube | https://www.youtube.com/@sluisr_ |
+| Contacto | contact@sluisr.com |
 
 ---
 
-## ⚡ What is Corex?
+## What is Corex?
 
 **Corex** (invoked as **`cx`**) is the ultra-fast, native Rust autonomous AI terminal agent for **DeepSeek, Gemini, Claude, OpenAI, Groq, Mistral & Local LLMs**.
 
 It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalone static binary with:
 
-- 🦀 **100% pure Rust** — single binary, <10ms startup, ~11.9MB RAM idle (~2.2MB Heap)
-- 🌐 **Multi-Provider Support** — DeepSeek V4.1, Gemini 3.x/2.5, Claude 3.7/3.5, OpenAI, Groq, Mistral, OpenRouter
-- 🔒 **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
-- 🧠 **DeepSeek V4.1 & Multi-Model CoT** — Flash + Pro with reasoning depth tuning
-- ⚡ **Adaptive CoT** — automatic reasoning depth per task complexity
-- 🛡️ **96%+ KV cache hit rate** — up to 90% API cost reduction
-- 📝 **`apply_patch`** — atomic unified-diff patching with fuzzy whitespace tolerance
-- 🔍 **Forensic telemetry** — TTFT, tokens/sec, USD cost per turn
-- 🔑 **Silent sudo / 0ms AskPass** — native non-blocking auth
-- 🔌 **MCP support** — connect external tools, databases, GitHub, Docker
+- **100% pure Rust** — single binary, <10ms startup, ~11.9MB RAM idle (~2.2MB Heap)
+- **Multi-Provider Support** — DeepSeek V4.1, Gemini 3.x/2.5, Claude 3.7/3.5, OpenAI, Groq, Mistral, OpenRouter
+- **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
+- **DeepSeek V4.1 & Multi-Model CoT** — Flash + Pro with reasoning depth tuning
+- **Adaptive CoT** — automatic reasoning depth per task complexity
+- **96%+ KV cache hit rate** — up to 90% API cost reduction
+- **`apply_patch`** — atomic unified-diff patching with fuzzy whitespace tolerance
+- **Forensic telemetry** — TTFT, tokens/sec, USD cost per turn
+- **Silent sudo / 0ms AskPass** — native non-blocking auth
+- **MCP support** — connect external tools, databases, GitHub, Docker
 
 ---
 
-## 📌 Current Status
+## Current Status
 
-- **Version:** `0.8.5` (actively developed)
+- **Version:** `0.9.0` (actively developed)
 - **License:** GNU AGPLv3 (`AGPL-3.0-only`) with dual-licensing options
 - **Platforms:** Linux, macOS, Windows
 
 ---
 
-## 🔗 Key Links
+## Key Links
 
-| Resource | URL |
-| :--- | :--- |
-| Repository | https://github.com/sluisr/corex |
-| Releases | https://github.com/sluisr/corex/releases |
-| Bug Reports | https://github.com/sluisr/corex/issues |
-| Author site | https://sluisr.com |
+|Resource | URL |
+|:--- | :--- |
+|Repository | https://github.com/sluisr/corex |
+|Releases | https://github.com/sluisr/corex/releases |
+|Bug Reports | https://github.com/sluisr/corex/issues |
+|Author site | https://sluisr.com |
 
 ---
 
-## 🤝 Open to Contributions
+## Open to Contributions
 
 Corex is **open source** and **open to proposals**. If you want to contribute:
 
@@ -87,7 +87,7 @@ The project is **actively developed** — new features and fixes ship frequently
 
 ---
 
-## 📦 Quick Install
+## Quick Install
 
 ```bash
 # From source
@@ -114,18 +114,20 @@ cx
 
 ---
 
-## 🗂️ Configuration Files & Paths
+## Configuration Files & Paths
 
 Corex stores all its configuration and data in **`~/.corex/`** (in your home directory):
 
-| File / Path | Purpose |
-| :--- | :--- |
-| `~/.corex/settings.json` | API key, base URL, default model |
-| `~/.corex/flash_settings.json` | CoT reasoning depth (`none` / `low` / `high` / `xhigh` / `max`) |
-| `~/.corex/pro_settings.json` | Deep reasoning configuration for DeepSeek-V4-Pro |
-| `~/.corex/logs/` | Forensic audit logs (`corex-forensic-YYYY-MM-DD.log`) |
-| `~/.corex/COREX.md` | Global persistent memory (applies to all projects) |
-| `./COREX.md` | Project-level persistent memory (per working directory) |
+|File / Path | Purpose |
+|:--- | :--- |
+|`~/.corex/settings.json` | API key, base URL, default model |
+|`~/.corex/flash_settings.json` | CoT reasoning depth (`none` / `low` / `high` / `xhigh` / `max`) |
+|`~/.corex/pro_settings.json` | Deep reasoning configuration for DeepSeek-V4-Pro |
+|`~/.corex/logs/` | Forensic audit logs (`corex-forensic-YYYY-MM-DD.log`) |
+|`~/.corex/SYSTEM.md`, `~/.corex/COREX.md` | Global instructions (applies to all projects) |
+|`./.corex/SYSTEM.md`, `./COREX.md`, `./AGENTS.md`, `./DEEPSEEK.md` | Project instructions (per working directory) |
+
+All instruction files found are loaded; `/memory list` shows which ones are in use.
 
 To inspect or edit config directly:
 
@@ -148,7 +150,7 @@ You can also update the API key interactively inside Corex with:
 
 ---
 
-## 🐛 Bug Reports & Support
+## Bug Reports & Support
 
 ### Option 1 — GitHub Issues (recommended for bugs & feature requests)
 
@@ -165,7 +167,7 @@ Include:
 
 Join the sluisr community Discord for questions, ideas, and general chat:
 
-👾 **[discord.gg/MGMt6M6Yx](https://discord.gg/MGMt6M6Yx)**
+ **[discord.gg/MGMt6M6Yx](https://discord.gg/MGMt6M6Yx)**
 
 Also linked from [sluisr.com](https://sluisr.com) → Community section.
 

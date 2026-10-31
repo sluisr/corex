@@ -248,6 +248,8 @@ pub struct App {
     pub tool_registry: ToolRegistry,
     pub theme: Theme,
     pub workspace_dir: PathBuf,
+    /// Read-only roots added with `/directory add`, for this session.
+    pub extra_dirs: Vec<PathBuf>,
 
     pub input_buffer: String,
     pub input_history: Vec<String>,
@@ -269,6 +271,7 @@ pub struct App {
 
     pub pending_confirmation: Option<PendingToolBatch>,
     pub user_dialog: UserDialogState,
+    pub rewind_dialog: crate::rewind_dialog::RewindDialog,
     pub model_dialog: ModelDialogState,
     pub session_dialog: SessionDialogState,
     pub auth_dialog: AuthDialogState,
@@ -294,6 +297,10 @@ pub struct App {
     pub selection_lines: SelectionLines,
     /// Last cell the pointer was seen at while the left button is down.
     pub drag_point: Option<(u16, u16)>,
+    /// Shown in the empty prompt for a moment after a selection is copied.
+    pub copy_notice: Option<(Instant, &'static str)>,
+    /// Under tmux a selection ends on release, as tmux's own does.
+    pub inside_tmux: bool,
     pub app_start_time: Instant,
     pub last_focus_gained: Option<Instant>,
     pub mouse_down_time: Option<Instant>,
@@ -309,6 +316,10 @@ pub struct App {
     /// Time of the last easing step; `None` while the popup is at rest.
     pub slash_popup_clock: Option<Instant>,
     pub last_slash_filter: String,
+    /// Workspace paths offered while an `@path` is typed; rebuilt when stale.
+    pub file_index: Option<crate::file_completion::FileIndex>,
+    /// The `@path` query the popup last showed, kept so it can close smoothly.
+    pub last_file_query: Option<String>,
     pub local_llm_online: Arc<AtomicBool>,
     pub last_local_check: Option<Instant>,
     pub cached_message_lines: Vec<Line<'static>>,
@@ -325,6 +336,7 @@ pub struct App {
     pub streaming_md_cache_len: usize,
     pub streaming_md_cache_width: usize,
     pub active_background_pids: HashSet<u32>,
+    pub pending_task_wakeup: bool,
     pub current_generation_id: u64,
     pub update_available: Arc<std::sync::Mutex<Option<String>>>,
     pub active_status: Option<String>,

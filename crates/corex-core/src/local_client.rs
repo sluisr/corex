@@ -121,6 +121,8 @@ impl LocalLlmClient {
             let mut total_chars = 0;
             let mut final_usage: Option<crate::types::Usage> = None;
             let final_reason: Option<String> = None;
+            let mut active_zero_tc_slot: Option<usize> = None;
+            let mut next_tc_slot: usize = 0;
 
             loop {
                 tokio::select! {
@@ -186,9 +188,31 @@ impl LocalLlmClient {
                                             if !tc_deltas.is_empty() && first_token_time.is_none() {
                                                 first_token_time = Some(start_time.elapsed().as_millis());
                                             }
-                                            for tc in tc_deltas {
+                                            for (pos, tc) in tc_deltas.iter().enumerate() {
+                                                let is_new_call = tc.id.is_some()
+                                                    || tc
+                                                        .function
+                                                        .as_ref()
+                                                        .and_then(|f| f.name.as_ref())
+                                                        .is_some();
+                                                let effective_index = if tc.index > 0 {
+                                                    next_tc_slot = next_tc_slot.max(tc.index + 1);
+                                                    tc.index
+                                                } else if pos > 0 || (is_new_call && active_zero_tc_slot.is_some()) {
+                                                    let slot = next_tc_slot;
+                                                    next_tc_slot += 1;
+                                                    active_zero_tc_slot = Some(slot);
+                                                    slot
+                                                } else if let Some(slot) = active_zero_tc_slot {
+                                                    slot
+                                                } else {
+                                                    let slot = next_tc_slot;
+                                                    next_tc_slot += 1;
+                                                    active_zero_tc_slot = Some(slot);
+                                                    slot
+                                                };
                                                 let _ = tx.send(StreamEvent::ToolCallDelta {
-                                                    index: tc.index,
+                                                    index: effective_index,
                                                     id: tc.id.clone(),
                                                     name: tc.function.as_ref().and_then(|f| f.name.clone()),
                                                     arguments: tc.function.as_ref().and_then(|f| f.arguments.clone()),

@@ -92,12 +92,13 @@ impl ForensicLogger {
         };
 
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let redacted_details = Self::redact_secrets(details.trim());
         let formatted = format!(
             "\n[{}][{:<12}] --- {} ---\n{}\n{}\n",
             timestamp,
             category.to_uppercase(),
             title,
-            details.trim(),
+            redacted_details,
             "-".repeat(80)
         );
 
@@ -249,6 +250,21 @@ impl ForensicLogger {
             PathBuf::from(".corex").join("logs").join("subagents")
         };
         let _ = crate::secure_fs::ensure_private_dir(&base);
+        if let Ok(entries) = fs::read_dir(&base) {
+            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400);
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if modified < cutoff {
+                                let _ = fs::remove_file(&p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         base
     }
 
@@ -298,20 +314,101 @@ impl ForensicLogger {
         content.push_str("\n");
 
         content.push_str("--- OUTPUT ---\n");
-        content.push_str(final_output.trim());
+        let capped_final_output = if final_output.len() > 256 * 1024 {
+            format!(
+                "{}\n... [{} bytes truncated]",
+                crate::types::safe_truncate_str(final_output, 256 * 1024),
+                final_output.len() - 256 * 1024
+            )
+        } else {
+            final_output.trim().to_string()
+        };
+        content.push_str(&capped_final_output);
         content.push_str("\n");
 
+        let redacted_content = Self::redact_secrets(&content);
         if let Ok(mut file) = crate::secure_fs::open_private(&log_file, true) {
-            let _ = file.write_all(content.as_bytes());
+            let _ = file.write_all(redacted_content.as_bytes());
             let _ = file.flush();
         }
 
         let details = format!(
             "Task ID:   {}\nRole:      {}\nStatus:    {}\nDuration:  {}\nLog File:  {}\nPrompt:    {}\nSteps:     {}\nOutput:\n{}",
-            task_id, role, status, duration_str, log_file.display(), prompt, steps.len(), final_output
+            task_id, role, status, duration_str, log_file.display(), prompt, steps.len(), capped_final_output
         );
         Self::log_event("SUBAGENT", &format!("SUBAGENT: {} [{}] ({})", role, task_id, status), &details);
 
         log_file
+    }
+
+    pub fn redact_secrets(input: &str) -> String {
+        const PREFIXES: &[&str] = &[
+            "sk-",
+            "ghp_",
+            "github_pat_",
+            "AIza",
+            "glpat-",
+            "xoxb-",
+            "xoxp-",
+        ];
+        let mut out = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if input[i..].starts_with("$sudo:") {
+                out.push_str("$sudo:[REDACTED]");
+                i += "$sudo:".len();
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+                continue;
+            }
+            let mut matched_prefix = None;
+            for &prefix in PREFIXES {
+                if input[i..].starts_with(prefix) {
+                    let after = i + prefix.len();
+                    let mut token_end = after;
+                    while token_end < bytes.len()
+                        && (bytes[token_end].is_ascii_alphanumeric()
+                            || bytes[token_end] == b'_'
+                            || bytes[token_end] == b'-')
+                    {
+                        token_end += 1;
+                    }
+                    if token_end - after >= 12 {
+                        matched_prefix = Some((prefix, token_end));
+                        break;
+                    }
+                }
+            }
+            if let Some((prefix, token_end)) = matched_prefix {
+                out.push_str(prefix);
+                out.push_str("[REDACTED]");
+                i = token_end;
+                continue;
+            }
+            if let Some(ch) = input[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forensic_logs_redact_secrets() {
+        let raw = "Bearer sk-proj-1234567890abcdefghijklmnop and ghp_1234567890abcdefghijklmnop and $sudo:my_secret_pw\nnext line";
+        let redacted = ForensicLogger::redact_secrets(raw);
+        assert!(!redacted.contains("sk-proj-1234567890abcdefghijklmnop"));
+        assert!(!redacted.contains("ghp_1234567890abcdefghijklmnop"));
+        assert!(!redacted.contains("my_secret_pw"));
+        assert!(redacted.contains("[REDACTED]"));
     }
 }

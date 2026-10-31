@@ -238,6 +238,15 @@ pub async fn run() -> Result<()> {
         }
     }
     if let Some(u) = cli.base_url {
+        if let Err(e) = corex_core::config::validate_base_url(&u) {
+            anyhow::bail!("{}", e);
+        }
+        if cli.api_key.is_none()
+            && !corex_core::config::is_deepseek_base_url(&u)
+            && !corex_core::config::same_host(&u, &config.base_url)
+        {
+            config.api_key.clear();
+        }
         config.base_url = u;
     }
     if let Some(k) = cli.api_key {
@@ -366,6 +375,50 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Puts the ask_user questions to whoever is on stdin and returns their answers. With nobody to
+/// answer (stdin closed), says so plainly so the model goes on with a stated assumption instead
+/// of waiting for a reply that never comes in a one-shot run.
+fn ask_user_on_stdin(args: &serde_json::Value) -> String {
+    let questions: Vec<(String, Vec<String>)> = match args.get("questions").and_then(|q| q.as_array()) {
+        Some(list) => list
+            .iter()
+            .filter_map(|q| {
+                let text = q.get("question")?.as_str()?.to_string();
+                let options = q
+                    .get("options")
+                    .and_then(|o| o.as_array())
+                    .map(|o| o.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                Some((text, options))
+            })
+            .collect(),
+        None => args.get("question").and_then(|q| q.as_str()).map(|q| vec![(q.to_string(), Vec::new())]).unwrap_or_default(),
+    };
+    if questions.is_empty() {
+        return "ask_user was called without any question.".to_string();
+    }
+    let mut answers = Vec::new();
+    for (question, options) in &questions {
+        println!("\n\x1b[1m?\x1b[0m {}", corex_core::sanitize_for_terminal(question));
+        if !options.is_empty() {
+            println!("  ({})", corex_core::sanitize_for_terminal(&options.join(" / ")));
+        }
+        print!("> ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(n) if n > 0 && !line.trim().is_empty() => answers.push(format!("- {}: {}", question, line.trim())),
+            _ => {
+                return "No user is available to answer (non-interactive run with no input). Do not wait for a reply: \
+                        choose the most reasonable option, say which one you assumed, and continue."
+                    .to_string()
+            }
+        }
+    }
+    format!("The user answered:\n{}", answers.join("\n"))
+}
+
 async fn run_headless(
     client: LlmClient,
     workspace_dir: PathBuf,
@@ -414,6 +467,7 @@ async fn run_headless(
         yolo_mode: yolo,
         sudo_password: get_sudo_password(),
         allowed_commands: client.get_config().allowed_commands.clone(),
+        extra_dirs: Vec::new(),
     };
 
     use std::io::IsTerminal;
@@ -595,6 +649,7 @@ async fn run_headless(
                         s.stop().await;
                     }
                     eprintln!("\nError: {}", err);
+                    corex_tools::background::shutdown_all_tasks();
                     let _ = session.save();
                     return Ok(());
                 }
@@ -691,9 +746,11 @@ async fn run_headless(
 
                 let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(target_detail), 70);
 
-                if !context.yolo_mode {
+                {
                     if let Some(tool) = tool_registry.get(&call.function.name) {
-                        if tool.needs_confirmation(&args_json, &context) {
+                        let must_ask = corex_tools::policy::verdict(&tool_registry, &call.function.name, &args_json, &context, false)
+                            == corex_tools::policy::Verdict::Ask;
+                        if must_ask {
                             if is_tty {
                                 print!("\r\x1b[2K");
                                 use std::io::Write;
@@ -724,6 +781,14 @@ async fn run_headless(
                             }
                         }
                     }
+                }
+
+                if call.function.name == "ask_user" {
+                    let answer = ask_user_on_stdin(&args_json);
+                    let msg = Message::tool_response(call.id.clone(), answer);
+                    messages.push(msg.clone());
+                    session.add_message(msg);
+                    continue;
                 }
 
                 let mut tool_spinner = StatusSpinner::start(
@@ -781,6 +846,7 @@ async fn run_headless(
         break;
     }
 
+    corex_tools::background::shutdown_all_tasks();
     let _ = session.save();
     Ok(())
 }

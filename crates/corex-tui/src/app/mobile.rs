@@ -100,23 +100,14 @@ pub(crate) fn wheel_lines() -> i32 {
 
 /// Whether the TUI should request mouse reporting from the terminal.
 ///
-/// Android / Termux always asks for it: with reporting off, Termux turns a finger swipe on the
-/// alternate screen into bare Up/Down keys (`TerminalView.doScroll`), indistinguishable from the
-/// arrow keys that browse the message history. With it on, a swipe is a wheel event and the arrows
-/// are always keys. A narrow desktop window (`COREX_MOBILE=1`) still leaves the mouse to the terminal.
-///
-/// Set `COREX_MOUSE=1` to force mouse reporting on, or `COREX_MOUSE=0` to force it off everywhere.
+/// Always, unless `COREX_MOUSE` turns it off. With reporting off, terminals send the wheel (and
+/// Termux a finger swipe) as bare Up/Down keys, indistinguishable from the arrows that browse the
+/// prompt history, and tmux drops it altogether. With it on, the wheel is a mouse event and the
+/// arrows are always keys. Shift+drag still gives the terminal's own selection.
 pub(crate) fn mouse_capture_enabled() -> bool {
-    if let Ok(v) = std::env::var("COREX_MOUSE") {
-        return !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off");
-    }
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    mouse_capture_default(cols, rows)
-}
-
-/// Mouse reporting default for a `cols` x `rows` terminal when `COREX_MOUSE` is unset.
-pub(crate) fn mouse_capture_default(cols: u16, rows: u16) -> bool {
-    is_android_or_termux() || !is_mobile_portrait(cols, rows)
+    std::env::var("COREX_MOUSE")
+        .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 /// Longest gap between two bare arrows that still counts as one finger swipe.

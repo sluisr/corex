@@ -12,6 +12,7 @@ description = "High-performance Ratatui terminal user interface, mouse selection
 [dependencies]
 corex-core = { workspace = true }
 corex-tools = { workspace = true }
+ignore = { workspace = true }
 corex-prompt = { workspace = true }
 corex-fleet = { workspace = true }
 tokio = { workspace = true }

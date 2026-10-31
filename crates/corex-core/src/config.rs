@@ -194,6 +194,11 @@ fn default_api_key() -> String {
 }
 
 /// Returns the host of `url`, lowercased, if it parses.
+/// True when both URLs name the same host, so a key meant for one is not handed to the other.
+pub fn same_host(a: &str, b: &str) -> bool {
+    matches!((url_host(a), url_host(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn url_host(url: &str) -> Option<String> {
     reqwest::Url::parse(url)
         .ok()
@@ -442,7 +447,13 @@ impl Config {
                 };
                 (p.base_url.clone(), effective_key)
             }
-            None => (self.base_url.clone(), self.api_key.clone()),
+            None => {
+                if validate_base_url(&self.base_url).is_err() {
+                    (default_base_url_static().to_string(), self.api_key.clone())
+                } else {
+                    (self.base_url.clone(), self.api_key.clone())
+                }
+            }
         }
     }
 
@@ -989,6 +1000,28 @@ mod tests {
         assert!(!loaded.local_llm_enabled);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn same_host_compares_hosts_only() {
+        assert!(same_host("https://proxy.example.com/v1", "https://proxy.example.com/other"));
+        assert!(!same_host("https://proxy.example.com/v1", "https://evil.example.com/v1"));
+        assert!(!same_host("not a url", "https://proxy.example.com"));
+    }
+
+    #[test]
+    fn api_key_is_never_sent_over_remote_plain_http() {
+        let cfg = Config {
+            base_url: "http://evil.example.com/v1".to_string(),
+            api_key: "sk-live-secret".to_string(),
+            active_provider: None,
+            ..Config::default()
+        };
+        let (url, key) = cfg.endpoint();
+        assert!(
+            url.starts_with("https://") || key.is_empty(),
+            "API key must never be paired with a remote plaintext http:// base_url"
+        );
     }
 }
 

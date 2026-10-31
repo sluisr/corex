@@ -29,12 +29,31 @@ impl Route {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// What `copy` would have put on the clipboard, for tests to inspect.
+    pub static TEST_CLIPBOARD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn remember_for_tests(text: &str) {
+    TEST_CLIPBOARD.with(|c| *c.borrow_mut() = Some(text.to_string()));
+}
+
+#[cfg(not(test))]
+fn remember_for_tests(_text: &str) {}
+
 /// Copies `text` to the system clipboard, trying every route available in this session.
 ///
 /// Returns the route that took it, or the reason every route failed.
 pub fn copy(text: &str) -> Result<Route, String> {
     if text.is_empty() {
         return Err("nothing to copy".to_string());
+    }
+    // Tests drive real selections; they must never reach the developer's own clipboard.
+    if cfg!(test) {
+        remember_for_tests(text);
+        return Ok(Route::Wayland);
     }
 
     // Wayland first: it reaches the real session clipboard even from inside tmux, which is
@@ -161,7 +180,11 @@ fn pick_image_type(listing: &str) -> Option<&'static str> {
 /// Runs a clipboard utility and returns what it printed, giving up after [`READ_TIMEOUT`].
 #[cfg(unix)]
 fn capture(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
-    let child = Command::new(program)
+    use std::io::Read;
+    const MAX_CLIPBOARD_CAPTURE_BYTES: u64 =
+        corex_tools::fs_tools::READ_IMAGE_MAX_BYTES + 1024 * 1024;
+
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -169,15 +192,36 @@ fn capture(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
         .spawn()
         .map_err(|err| format!("{program}: {err}"))?;
 
+    let stdout = child.stdout.take();
+    let shared_child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let worker_child = std::sync::Arc::clone(&shared_child);
+
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        let mut buf = Vec::new();
+        let read_res = match stdout {
+            Some(out) => out
+                .take(MAX_CLIPBOARD_CAPTURE_BYTES)
+                .read_to_end(&mut buf),
+            None => Ok(0),
+        };
+        let wait_res = worker_child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wait();
+        let _ = tx.send((read_res, wait_res, buf));
     });
     match rx.recv_timeout(READ_TIMEOUT) {
-        Ok(Ok(output)) if output.status.success() => Ok(output.stdout),
-        Ok(Ok(_)) => Err(format!("{program} could not read the clipboard")),
-        Ok(Err(err)) => Err(format!("{program}: {err}")),
-        Err(_) => Err(format!("{program} did not answer in time")),
+        Ok((Ok(_), Ok(status), stdout)) if status.success() => Ok(stdout),
+        Ok((_, Ok(_), _)) => Err(format!("{program} could not read the clipboard")),
+        Ok((Err(err), _, _)) | Ok((_, Err(err), _)) => Err(format!("{program}: {err}")),
+        Err(_) => {
+            if let Ok(mut c) = shared_child.lock() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            Err(format!("{program} did not answer in time"))
+        }
     }
 }
 
@@ -242,6 +286,12 @@ fn osc52_payload(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tests_never_touch_the_real_clipboard() {
+        assert_eq!(copy("from a test"), Ok(Route::Wayland));
+        assert_eq!(TEST_CLIPBOARD.with(|c| c.borrow().clone()).as_deref(), Some("from a test"));
+    }
 
     #[test]
     fn empty_selection_never_touches_the_clipboard() {

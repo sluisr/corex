@@ -121,7 +121,11 @@ impl Tool for GrepTool {
 
         for entry in walker.flatten() {
             let path = entry.path();
-            if !path.is_file() || crate::fs_tools::is_sensitive_system_path(path) || is_binary_file(path) {
+            if !path.is_file()
+                || !crate::fs_tools::is_within_workspace(path, &root_dir)
+                || crate::fs_tools::is_sensitive_system_path(path)
+                || is_binary_file(path)
+            {
                 continue;
             }
 

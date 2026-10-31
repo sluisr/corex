@@ -18,9 +18,9 @@ pub enum CommandRiskLevel {
 impl CommandRiskLevel {
     pub fn badge(&self) -> &'static str {
         match self {
-            CommandRiskLevel::Safe => "🟢 SAFE",
-            CommandRiskLevel::Mutating => "🟡 MUTATING",
-            CommandRiskLevel::Dangerous => "🔴 DANGEROUS",
+            CommandRiskLevel::Safe => "SAFE",
+            CommandRiskLevel::Mutating => "MUTATING",
+            CommandRiskLevel::Dangerous => "DANGEROUS",
         }
     }
 }
@@ -32,8 +32,13 @@ pub fn shell_quote_single(s: &str) -> String {
 const SENSITIVE_PATHS: &[&str] = &[
     "/etc/shadow",
     "/etc/gshadow",
+    "/proc/self/environ",
+    "/environ",
     ".ssh/",
     ".ssh",
+    ".gnupg",
+    ".kube",
+    ".aws",
     ".corex/",
     ".corex",
     ".deepseek/",
@@ -104,6 +109,10 @@ fn has_dangerous_flags_on_safe_cmd(seg: &str, tokens: &[&str]) -> bool {
                 || t.starts_with("-i")
                 || *t == "--in-place"
                 || t.starts_with("--in-place=")
+                || *t == "-f"
+                || t.starts_with("-f")
+                || *t == "--file"
+                || t.starts_with("--file=")
         }),
         "git" => args.iter().any(|t| {
             *t == "--output"
@@ -197,12 +206,62 @@ pub fn assess_command_risk(cmd: &str, safe_list: &[String], dangerous_list: &[St
 
 /// `sed` scripts can write files (`w`) or run commands (`e`) without `-i`.
 fn sed_writes_or_executes(cmd: &str) -> bool {
+    let script_is_unsafe = |script: &str| -> bool {
+        let s = script.trim().trim_start_matches(|c: char| {
+            c.is_ascii_digit() || matches!(c, ',' | '$' | '!' | ' ' | '\t')
+        });
+        if s.starts_with('e') || s.starts_with('w') {
+            return true;
+        }
+        if let Some(rest) = s.strip_prefix('s') {
+            if let Some(delim) = rest.chars().next() {
+                if let Some((_, tail)) = rest.rsplit_once(delim) {
+                    if tail.contains('e') || tail.contains('w') {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+
     cmd.split(['|', ';', '&']).any(|seg| {
         let seg = seg.trim();
-        seg.starts_with("sed ")
-            && seg.split_whitespace().skip(1).filter(|a| !a.starts_with('-')).take(1).any(|script| {
-                script.starts_with('w') || script.starts_with('e') || script.contains("/w") || script.contains("/e")
-            })
+        if !seg.starts_with("sed ") {
+            return false;
+        }
+        let tokens: Vec<&str> = seg.split_whitespace().skip(1).collect();
+        let mut i = 0;
+        let mut checked_script = false;
+        while i < tokens.len() {
+            let t = tokens[i];
+            if t == "-e" {
+                if let Some(&next) = tokens.get(i + 1) {
+                    if script_is_unsafe(next) {
+                        return true;
+                    }
+                    checked_script = true;
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(inline) = t.strip_prefix("-e").or_else(|| t.strip_prefix("--expression=")) {
+                if script_is_unsafe(inline) {
+                    return true;
+                }
+                checked_script = true;
+                i += 1;
+                continue;
+            }
+            if !t.starts_with('-') && !checked_script {
+                if script_is_unsafe(t) {
+                    return true;
+                }
+                checked_script = true;
+            }
+            i += 1;
+        }
+        false
     })
 }
 
@@ -278,7 +337,18 @@ fn assess_raw(cmd: &str, safe_list: &[String], dangerous_list: &[String]) -> Com
     }
 
     // Reject commands referencing sensitive paths from being Safe
-    if SENSITIVE_PATHS.iter().any(|p| lower.contains(p)) {
+    if SENSITIVE_PATHS.iter().any(|p| lower.contains(p))
+        || lower.split_whitespace().any(|tok| {
+            let t = tok.trim_matches(|c| c == '\'' || c == '"');
+            let has_glob = t.contains('*') || t.contains('?') || t.contains('[');
+            has_glob
+                && (t.starts_with('.')
+                    || t.contains("/.")
+                    || t.starts_with("/etc/")
+                    || t.starts_with("/proc/")
+                    || t.starts_with("/root"))
+        })
+    {
         return CommandRiskLevel::Mutating;
     }
 
@@ -773,5 +843,26 @@ mod tests {
         assert_ne!(risk("sed 's/.*/id/e' /etc/hosts"), CommandRiskLevel::Safe);
         assert_eq!(risk("cat /etc/hostname"), CommandRiskLevel::Safe);
         assert_eq!(risk("sed -n '1,5p' /etc/hosts"), CommandRiskLevel::Safe);
+    }
+
+    #[test]
+    fn sed_printenv_and_sensitive_globs_need_confirmation() {
+        let cfg = crate::config::FleetConfig::default();
+        let default_risk = |c: &str| assess_command_risk(c, &cfg.safe_commands, &cfg.dangerous_commands);
+        assert_ne!(default_risk("printenv"), CommandRiskLevel::Safe);
+        assert_ne!(default_risk("cat /proc/self/environ"), CommandRiskLevel::Safe);
+        assert_ne!(default_risk("cat /proc/1/environ"), CommandRiskLevel::Safe);
+        assert_ne!(default_risk("cat ~/.?sh/id_rsa"), CommandRiskLevel::Safe);
+        assert_ne!(default_risk("cat /home/*/.?sh/id_rsa"), CommandRiskLevel::Safe);
+        assert_ne!(default_risk("cat .?nv"), CommandRiskLevel::Safe);
+
+        let safe_with_sed: Vec<String> = ["cat", "sed"].map(String::from).to_vec();
+        let sed_risk = |c: &str| assess_command_risk(c, &safe_with_sed, &cfg.dangerous_commands);
+        assert_ne!(sed_risk("sed '1e id' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_ne!(sed_risk("sed 's#.*#id#e' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_ne!(sed_risk("sed -e's/.*/id/e' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_ne!(sed_risk("sed -e 's/.*/id/e' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_ne!(sed_risk("sed '1w /tmp/out' /etc/hosts"), CommandRiskLevel::Safe);
+        assert_eq!(sed_risk("sed -n '1,5p' /etc/hosts"), CommandRiskLevel::Safe);
     }
 }

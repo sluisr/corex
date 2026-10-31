@@ -15,7 +15,7 @@ Corex supports running a 100% standalone local LLM via any OpenAI-compatible end
 
 ---
 
-## 🔒 Standalone Offline Local LLM
+## Standalone Offline Local LLM
 
 All queries go directly to your local model with zero Cloud API calls and zero telemetry.
 
@@ -67,7 +67,7 @@ cx
 
 ---
 
-## 🏥 Health Check
+## Health Check
 
 Corex performs a fast health check on startup to verify if the local server is reachable.
 
@@ -79,12 +79,12 @@ curl http://127.0.0.1:8080/v1/models
 
 ---
 
-## 💡 Recommended Models
+## Recommended Models
 
-| Model | Size | Best for |
-| :--- | :--- | :--- |
-| `Llama-3.2-3B-Instruct-Q4_K_M.gguf` | ~2GB | Fast responses, chat, Q&A |
-| `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` | ~4GB | Code understanding, refactoring |
-| `Mistral-7B-Instruct-v0.3-Q4_K_M.gguf` | ~4GB | General purpose |
+|Model | Size | Best for |
+|:--- | :--- | :--- |
+|`Llama-3.2-3B-Instruct-Q4_K_M.gguf` | ~2GB | Fast responses, chat, Q&A |
+|`Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` | ~4GB | Code understanding, refactoring |
+|`Mistral-7B-Instruct-v0.3-Q4_K_M.gguf` | ~4GB | General purpose |
 
 > For small models (Gemma 2B, Llama 3B), set `"local_prompt_lite": true` in `settings.json` to use a reduced system prompt that strips complex tool enforcement instructions.

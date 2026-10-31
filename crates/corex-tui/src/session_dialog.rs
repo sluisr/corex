@@ -3,11 +3,11 @@ use corex_core::session::{Session, SessionSummary};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlay::{begin_modal, set_junction};
+use crate::overlay::{begin_modal, key_hints, panel_rules};
 use crate::text::{fit_text, group_thousands, pad_right, strip_inline_markdown};
 use crate::theme::Theme;
 
@@ -184,41 +184,25 @@ pub fn render_session_dialog(
     // Soft dimmed background + perimeter breathing
     begin_modal(frame, area, dialog_area, 2, 1);
 
-    let scroll_hint = if !state.sessions.is_empty() {
-        format!(" ({} saved) ", state.sessions.len())
-    } else {
-        String::new()
-    };
-    let title = if state.is_fleet {
-        format!("  Fleet / SysAdmin Sessions{} ", scroll_hint)
-    } else {
-        format!("  Session Explorer{} ", scroll_hint)
-    };
+    // No fill, so a transparent terminal shows through; thin rules mark the top and bottom.
+    let panel = Block::default().padding(Padding::new(1, 1, 1, 1));
+    let inner = panel.inner(dialog_area);
+    frame.render_widget(panel, dialog_area);
+    panel_rules(frame, dialog_area, theme);
 
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(theme.accent_blue));
-
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-
-    // Layout vertical: Search bar (1) + Divider (1) + Main Split (Min) + Divider (1) + Footer (1)
+    // Title and filter, a gap, the list beside its preview, a gap, the shortcuts.
     let vert_chunks = Layout::vertical([
-        Constraint::Length(1), // Search input
-        Constraint::Length(1), // Divider
-        Constraint::Min(8),    // Split (List vs Preview)
-        Constraint::Length(1), // Divider
-        Constraint::Length(1), // Footer keys
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(8),
+        Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .split(inner);
 
-    // 1. Search Bar Header
-    let search_label_style = Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD);
+    let title = if state.is_fleet { "Fleet sessions" } else { "Sessions" };
     let mut search_spans = vec![
-        Span::raw(" "),
-        Span::styled("Filter: ", search_label_style),
+        Span::styled(format!("   {title}   "), Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)),
         Span::styled(
             if state.search_query.is_empty() {
                 "type to search by topic, #tag or model...".to_string()
@@ -237,15 +221,6 @@ pub fn render_session_dialog(
     }
     frame.render_widget(Paragraph::new(Line::from(search_spans)), vert_chunks[0]);
 
-    // Divider 1
-    let div_style = Style::default().fg(theme.rule);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("─".repeat(inner.width as usize), div_style))),
-        vert_chunks[1],
-    );
-
-    // 2. Main Content Split
-    let mut divider_x = None;
     let filtered = state.filtered_sessions();
     if filtered.is_empty() {
         let empty_msg = if state.sessions.is_empty() {
@@ -308,37 +283,13 @@ pub fn render_session_dialog(
             .split(vert_chunks[2]);
 
             render_session_list(frame, split_h[0], &filtered, state.selected_idx, &columns, theme);
-
-            let v_sep: Vec<Line> = (0..split_h[1].height)
-                .map(|_| Line::from(Span::styled("│", div_style)))
-                .collect();
-            frame.render_widget(Paragraph::new(v_sep), split_h[1]);
-            divider_x = Some(split_h[1].x);
-
             render_session_preview(frame, split_h[2], state.cached_preview_session.as_ref(), theme);
         }
     }
     let total = state.filtered_sessions().len();
     let position = (total > 0).then(|| state.selected_idx.min(total - 1) + 1);
 
-    // Divider 2
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("─".repeat(inner.width as usize), div_style))),
-        vert_chunks[3],
-    );
-
-    // 3. Contextual Footer
-    let key_badge = |key: &'static str, desc: &'static str, color: Color| -> Vec<Span<'static>> {
-        vec![
-            Span::styled("[", Style::default().fg(theme.border_dim)),
-            Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled("] ", Style::default().fg(theme.border_dim)),
-            Span::styled(desc, Style::default().fg(theme.gray)),
-            Span::raw(" "),
-        ]
-    };
-
-    let mut footer = vec![Span::raw(" ")];
+    let mut footer = vec![Span::raw("  ")];
     if let Some(pending) = state.pending_delete.as_ref() {
         let title = state
             .sessions
@@ -348,24 +299,15 @@ pub fn render_session_dialog(
             .unwrap_or("this session");
         let room = (inner.width as usize).saturating_sub(34).max(10);
         footer.push(Span::styled(
-            format!("Delete \"{}\"? ", fit_text(title, room)),
+            format!("Delete \"{}\"?  ", fit_text(title, room)),
             Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
         ));
-        footer.extend(key_badge("y", "Yes", theme.accent_red));
-        footer.extend(key_badge("n", "No", theme.gray));
+        footer.extend(key_hints(&[("y", "yes"), ("n", "no")], theme));
     } else if is_mobile {
-        footer.extend(key_badge("Enter", "Open", theme.accent_blue));
-        footer.extend(key_badge("^X", "Del", theme.accent_red));
-        footer.extend(key_badge("Esc", "Close", theme.gray));
+        footer.extend(key_hints(&[("Enter", "open"), ("^X", "delete"), ("Esc", "close")], theme));
     } else {
-        footer.extend(key_badge("Enter", "Resume", theme.accent_blue));
-        footer.extend(key_badge("Del", "Delete", theme.accent_red));
-        footer.extend(key_badge("↑/↓", "Navigate", theme.accent_cyan));
-        if !state.search_query.is_empty() {
-            footer.extend(key_badge("Esc", "Clear Filter", theme.accent_yellow));
-        } else {
-            footer.extend(key_badge("Esc", "Close", theme.gray));
-        }
+        let esc = if state.search_query.is_empty() { ("Esc", "close") } else { ("Esc", "clear filter") };
+        footer.extend(key_hints(&[("Enter", "resume"), ("Del", "delete"), ("↑↓", "navigate"), esc], theme));
     }
     // Where the cursor is in the list: only a screenful of sessions is ever visible.
     if let Some(pos) = position {
@@ -378,18 +320,6 @@ pub fn render_session_dialog(
         }
     }
     frame.render_widget(Paragraph::new(Line::from(footer)), vert_chunks[4]);
-
-    // Join the rules to the frame so the lines read as one drawing. Done last: the rules and
-    // panes above would otherwise paint over the junctions.
-    let (left_x, right_x) = (dialog_area.x, dialog_area.right().saturating_sub(1));
-    for rule_y in [vert_chunks[1].y, vert_chunks[3].y] {
-        set_junction(frame, left_x, rule_y, '├', theme.accent_blue);
-        set_junction(frame, right_x, rule_y, '┤', theme.accent_blue);
-    }
-    if let Some(x) = divider_x {
-        set_junction(frame, x, vert_chunks[1].y, '┬', theme.rule);
-        set_junction(frame, x, vert_chunks[3].y, '┴', theme.rule);
-    }
 }
 
 /// Which optional columns the session list draws.
@@ -411,7 +341,6 @@ fn render_session_list(
     columns: &ListColumns,
     theme: &Theme,
 ) {
-    let selected_bg = theme.selected_bg;
     let inner_w = area.width as usize;
     let max_visible = area.height as usize;
 
@@ -432,10 +361,9 @@ fn render_session_list(
     let mut lines = Vec::new();
     for (i, &s) in sessions.iter().enumerate().take(end_idx).skip(start_idx) {
         let is_selected = i == selected;
-        let row_bg = if is_selected { selected_bg } else { Color::Reset };
 
-        let cursor = if is_selected { " › " } else { "   " };
-        let cursor_style = Style::default().fg(theme.accent_blue).bg(row_bg).add_modifier(Modifier::BOLD);
+        let cursor = if is_selected { " ▎ " } else { "   " };
+        let cursor_style = Style::default().fg(theme.accent_blue);
 
         let mut row = vec![Span::styled(cursor, cursor_style)];
 
@@ -446,7 +374,7 @@ fn render_session_list(
             };
             row.push(Span::styled(
                 chip,
-                Style::default().fg(theme.accent_green).bg(row_bg).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD),
             ));
         }
 
@@ -454,24 +382,24 @@ fn render_session_list(
             let (label, fg) = model_badge(&s.model);
             row.push(Span::styled(
                 format!("{} ", pad_right(label, BADGE_WIDTH)),
-                Style::default().fg(fg).bg(row_bg).add_modifier(Modifier::BOLD),
+                Style::default().fg(fg).add_modifier(Modifier::BOLD),
             ));
         }
 
         // A session without messages has nothing to resume: it stays listed but recedes.
         let title_style = if s.message_count == 0 {
-            Style::default().fg(theme.dark_gray).bg(row_bg)
+            Style::default().fg(theme.dark_gray)
         } else if is_selected {
-            Style::default().fg(theme.text_on_selected).bg(row_bg).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text_on_selected).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.foreground)
         };
         row.push(Span::styled(pad_right(&s.title, title_w), title_style));
         row.push(Span::styled(
             format!("{:>w$} ", list_time(s.updated_at), w = TIME_WIDTH),
-            Style::default().fg(theme.dark_gray).bg(row_bg),
+            Style::default().fg(theme.dark_gray),
         ));
-        row.push(Span::styled(" ", Style::default().bg(row_bg)));
+        row.push(Span::styled(" ", Style::default()));
         lines.push(Line::from(row));
     }
 
@@ -531,7 +459,7 @@ fn render_session_preview(
     let value_w = w.saturating_sub(13).max(8);
 
     lines.push(Line::from(vec![
-        Span::styled(" PREVIEW", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+        Span::styled(" Preview", Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · ID: {}", corex_core::types::safe_truncate_str(&s.id, 8)),
             Style::default().fg(theme.dark_gray),
@@ -649,8 +577,8 @@ mod tests {
         s.request_delete();
         let rows = screen(&mut s, 120).join("\n");
         assert!(rows.contains("Delete \"clean up logs\"?"), "{rows}");
-        assert!(rows.contains("[y] Yes") && rows.contains("[n] No"));
-        assert!(!rows.contains("Resume"));
+        assert!(rows.contains("y yes") && rows.contains("n no"), "{rows}");
+        assert!(!rows.contains("Enter resume"));
     }
 
     #[test]
@@ -662,7 +590,7 @@ mod tests {
         let rows = screen(&mut s, 120);
         let row = rows.iter().find(|r| r.contains("first session")).expect("row");
         assert!(!row.contains("[Flash]"), "one model only: the badge adds nothing: {row}");
-        let cursor = row.find('›').unwrap();
+        let cursor = row.find('▎').unwrap();
         let title = row.find("first").unwrap();
         assert!(title - cursor <= 8, "title sits next to the cursor, no reserved tag column: {row}");
 
@@ -706,14 +634,14 @@ mod tests {
     }
 
     #[test]
-    fn counter_and_frame_junctions_are_drawn() {
+    fn counter_is_drawn_on_a_frameless_panel() {
         let mut s = state_with((0..30).map(|i| summary(&format!("id{i:06}"), &format!("session {i}"), None, "deepseek-flash", 2)).collect());
         s.selected_idx = 11;
         let rows = screen(&mut s, 120);
         let all = rows.join("\n");
         assert!(all.contains("12/30"), "position counter");
-        assert!(all.contains("┬") && all.contains("┴"), "pane divider meets both rules");
-        assert!(all.contains("├") && all.contains("┤"), "rules meet the side borders");
+        assert!(all.contains("Sessions") && all.contains("Enter resume · Del delete"), "{all}");
+        assert!(!all.contains(['┌', '┐', '└', '┘', '┬', '┴', '├', '┤', '│']), "no box, only rules:\n{all}");
     }
 
     #[test]
@@ -725,7 +653,8 @@ mod tests {
         let rows = screen(&mut s, 120);
         let a = rows.iter().find(|r| r.contains("café menu")).unwrap();
         let b = rows.iter().find(|r| r.contains("hello")).unwrap();
-        // Both rows end in the same column: the time column lines up.
-        assert_eq!(a.trim_end().chars().count(), b.trim_end().chars().count());
+        // The time column lines up whatever the title holds.
+        let time_col = |r: &str| r[..r.find("just now").unwrap()].chars().count();
+        assert_eq!(time_col(a), time_col(b), "{a:?}\n{b:?}");
     }
 }

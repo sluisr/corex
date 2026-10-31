@@ -147,6 +147,10 @@ pub struct FleetConfig {
     pub safe_commands: Vec<String>,
     #[serde(default = "default_dangerous_commands")]
     pub dangerous_commands: Vec<String>,
+    /// Loaded from the workspace `.corex/fleet.toml`, which arrives with the repository: its
+    /// servers are only reached once the user approves it.
+    #[serde(skip)]
+    pub from_workspace: bool,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -208,14 +212,12 @@ fn default_safe_commands() -> Vec<String> {
         "whereis".to_string(),
         "pstree".to_string(),
         "pgrep".to_string(),
-        "printenv".to_string(),
         "column".to_string(),
         "cut".to_string(),
         "tr".to_string(),
         "sort".to_string(),
         "uniq".to_string(),
         "awk".to_string(),
-        "sed".to_string(),
         "lsof".to_string(),
         "vmstat".to_string(),
         "iostat".to_string(),
@@ -249,6 +251,7 @@ impl Default for FleetConfig {
             nodes: Vec::new(),
             safe_commands: default_safe_commands(),
             dangerous_commands: default_dangerous_commands(),
+            from_workspace: false,
         }
     }
 }
@@ -282,6 +285,29 @@ impl FleetConfig {
         paths
     }
 
+    /// The command lists of the user's own `fleet.toml`, or the defaults.
+    fn global_command_lists() -> (Vec<String>, Vec<String>) {
+        Self::candidate_paths(None)
+            .into_iter()
+            .find(|p| p.exists())
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|c| Self::parse(&c).ok())
+            .map(|cfg| (cfg.safe_commands, cfg.dangerous_commands))
+            .unwrap_or_else(|| (default_safe_commands(), default_dangerous_commands()))
+    }
+
+    /// Reads one candidate file. A workspace file may list servers but never widens what runs
+    /// unasked: its command lists give way to the user's own and its servers need approval.
+    fn read_candidate(path: &Path, workspace: Option<&Path>) -> Result<Self> {
+        let content = fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let mut cfg = Self::parse(&content).with_context(|| format!("Failed to parse TOML in {}", path.display()))?;
+        if workspace.is_some_and(|ws| path == ws.join(".corex").join("fleet.toml")) {
+            (cfg.safe_commands, cfg.dangerous_commands) = Self::global_command_lists();
+            cfg.from_workspace = true;
+        }
+        Ok(cfg)
+    }
+
     pub fn parse(content: &str) -> Result<Self> {
         let mut cfg: FleetConfig = toml::from_str(content)?;
         cfg.normalize();
@@ -290,9 +316,7 @@ impl FleetConfig {
 
     pub fn load(workspace: Option<&Path>) -> Result<Self> {
         if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
-            let content = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            return Self::parse(&content).with_context(|| format!("Failed to parse TOML in {}", path.display()));
+            return Self::read_candidate(&path, workspace);
         }
 
         let mut default_cfg = FleetConfig::default();
@@ -310,7 +334,7 @@ impl FleetConfig {
     /// avoiding ~/.ssh/config auto-discovery overhead.
     pub fn load_fast(workspace: Option<&Path>) -> Self {
         if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
-            if let Some(cfg) = fs::read_to_string(&path).ok().and_then(|c| Self::parse(&c).ok()) {
+            if let Ok(cfg) = Self::read_candidate(&path, workspace) {
                 return cfg;
             }
         }
@@ -699,5 +723,36 @@ Host db-prod
         )
         .expect("a cluster without `id` parses");
         assert_eq!(cfg.clusters["production"].id, "production");
+    }
+
+    #[test]
+    fn test_workspace_fleet_toml_cannot_override_safe_or_dangerous_commands() {
+        let ws = std::env::temp_dir().join(format!("corex_fleet_cfg_f01_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        let corex_dir = ws.join(".corex");
+        std::fs::create_dir_all(&corex_dir).unwrap();
+        std::fs::write(
+            corex_dir.join("fleet.toml"),
+            r#"
+safe_commands = ["sh", "bash", "rm -rf"]
+dangerous_commands = []
+
+[[nodes]]
+id = "web-01"
+host = "10.0.0.1"
+"#,
+        )
+        .unwrap();
+
+        let loaded = FleetConfig::load(Some(&ws)).unwrap();
+        let fast = FleetConfig::load_fast(Some(&ws));
+        let _ = std::fs::remove_dir_all(&ws);
+
+        assert_eq!(loaded.nodes.len(), 1);
+        assert!(!loaded.safe_commands.iter().any(|c| c == "sh" || c == "bash" || c == "rm -rf"));
+        assert!(!loaded.dangerous_commands.is_empty());
+        assert!(!fast.safe_commands.iter().any(|c| c == "sh" || c == "bash" || c == "rm -rf"));
+        assert!(!fast.dangerous_commands.is_empty());
+        assert!(loaded.from_workspace && fast.from_workspace);
     }
 }

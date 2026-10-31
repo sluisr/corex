@@ -1,5 +1,6 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 use ratatui::widgets::Clear;
 use ratatui::Frame;
 
@@ -37,13 +38,6 @@ pub fn dim_background(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// Paints one border cell (a junction such as `├`) on top of what was already rendered.
-pub fn set_junction(frame: &mut Frame, x: u16, y: u16, ch: char, color: Color) {
-    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
-        cell.set_char(ch).set_fg(color);
-    }
-}
-
 /// Common modal setup: dims the chat behind it, clears a `h_margin` x `v_margin` halo so chat
 /// text never touches the border, then clears the dialog area itself.
 pub fn begin_modal(frame: &mut Frame, area: Rect, dialog: Rect, h_margin: u16, v_margin: u16) {
@@ -59,4 +53,28 @@ pub fn begin_modal(frame: &mut Frame, area: Rect, dialog: Rect, h_margin: u16, v
     .intersection(area);
     frame.render_widget(Clear, halo);
     frame.render_widget(Clear, dialog);
+}
+
+/// Dialog shortcuts, the same everywhere: the key bright, its action dim, `·` between pairs.
+pub fn key_hints(pairs: &[(&'static str, &'static str)], theme: &crate::theme::Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (key, action)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(theme.dark_gray)));
+        }
+        spans.push(Span::styled(format!("{key} "), Style::default().fg(theme.text_strong)));
+        spans.push(Span::styled(*action, Style::default().fg(theme.dark_gray)));
+    }
+    spans
+}
+
+/// A thin rule above and below a panel: enough edge to read it as one surface over a
+/// transparent terminal, without boxing it in.
+pub fn panel_rules(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) {
+    if area.height < 2 {
+        return;
+    }
+    let rule = || ratatui::widgets::Paragraph::new(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.rule)));
+    frame.render_widget(rule(), Rect::new(area.x, area.y, area.width, 1));
+    frame.render_widget(rule(), Rect::new(area.x, area.bottom() - 1, area.width, 1));
 }

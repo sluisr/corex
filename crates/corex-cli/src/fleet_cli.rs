@@ -97,7 +97,7 @@ async fn show_status(workspace: &Path, check_online: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("\n{} ({} nodes registered):", "🌐 Corex Fleet Inventory".cyan().bold(), all_nodes.len());
+    println!("\n{} ({} nodes registered):", "Fleet inventory".cyan().bold(), all_nodes.len());
     println!("{}", "─────────────────────────────────────────────────────────────────────────────".dimmed());
     println!("{:<14} {:<24} {:<16} {:<12}", "NODE ID".bold(), "HOST / IP".bold(), "TAGS".bold(), "STATUS".bold());
     println!("{}", "─────────────────────────────────────────────────────────────────────────────".dimmed());
@@ -126,8 +126,8 @@ async fn show_status(workspace: &Path, check_online: bool) -> Result<()> {
 
         for (_, node, ping_res) in indexed {
             let status_badge = match ping_res {
-                Ok(latency) => format!("{} ({}ms)", "🟢 ONLINE".green().bold(), latency),
-                Err(_) => "🔴 OFFLINE".red().bold().to_string(),
+                Ok(latency) => format!("{} ({}ms)", "● ONLINE".green().bold(), latency),
+                Err(_) => "× OFFLINE".red().bold().to_string(),
             };
             let tags_str = if node.tags.is_empty() { "-".to_string() } else { node.tags.join(",") };
             println!(
@@ -168,7 +168,7 @@ async fn show_telemetry(workspace: &Path) -> Result<()> {
         return Ok(());
     }
 
-    println!("\n{} ({} nodes):", "📊 Live Fleet Telemetry & Health".cyan().bold(), all_nodes.len());
+    println!("\n{} ({} nodes):", "Fleet telemetry".cyan().bold(), all_nodes.len());
     println!("{}", "─────────────────────────────────────────────────────────────────────────────".dimmed());
 
     let semaphore = Arc::new(Semaphore::new(16));
@@ -299,7 +299,7 @@ async fn broadcast_cmd(workspace: &Path, targets: &str, command: &str, sudo: boo
         }
     }
 
-    println!("\n{} {} nodes concurrently...", "🚀 Broadcasting to".cyan().bold(), target_nodes.len());
+    println!("\n{} {} nodes concurrently...", "Broadcasting to".cyan().bold(), target_nodes.len());
     let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs).await;
 
     for (node_id, res) in results {

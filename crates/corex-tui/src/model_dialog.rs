@@ -4,10 +4,10 @@ use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, Padding, Paragraph};
 use ratatui::Frame;
 
-use crate::overlay::{begin_modal, set_junction};
+use crate::overlay::{begin_modal, key_hints, panel_rules};
 use crate::text::{fit_text, pad_right};
 use crate::theme::Theme;
 
@@ -41,9 +41,9 @@ pub fn get_reasoning_color(r: &str) -> Color {
 }
 
 /// Widest the dialog grows on a big terminal: the extra room goes to the setting descriptions.
-const MAX_DIALOG_WIDTH: u16 = 116;
+const MAX_DIALOG_WIDTH: u16 = 110;
 /// Width of the providers column, sized for the longest built-in names ("GitHub Models (Free)").
-const PROVIDERS_COL_WIDTH: u16 = 34;
+const PROVIDERS_COL_WIDTH: u16 = 28;
 
 /// Which of the three panes has keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +357,34 @@ impl ModelDialogState {
         self.row_idx = 0;
     }
 
+    /// Provider indices in the order the list shows them: the active one, then the ones ready to
+    /// use, then the ones still missing a key. Indices stay the real ones, so selection and
+    /// activation never depend on the display.
+    pub fn provider_order(&self) -> Vec<usize> {
+        let rank = |i: usize| {
+            if i == self.active_provider {
+                0
+            } else if self.ready.get(i).copied().unwrap_or(false) {
+                1
+            } else {
+                2
+            }
+        };
+        let mut order: Vec<usize> = (0..self.providers.len()).collect();
+        order.sort_by_key(|&i| rank(i));
+        order
+    }
+
+    /// Moves the provider selection one row up or down the displayed list.
+    fn step_provider(&mut self, down: bool) {
+        let order = self.provider_order();
+        let Some(pos) = order.iter().position(|&i| i == self.prov_idx) else { return };
+        let next = if down { order.get(pos + 1) } else { pos.checked_sub(1).and_then(|p| order.get(p)) };
+        if let Some(&idx) = next {
+            self.select_provider(idx);
+        }
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) -> DialogAction {
         match code {
             KeyCode::Esc => return DialogAction::Close,
@@ -372,11 +400,7 @@ impl ModelDialogState {
                 return DialogAction::SettingsChanged;
             }
             KeyCode::Up | KeyCode::Char('k') => match self.pane {
-                Pane::Providers => {
-                    if self.prov_idx > 0 {
-                        self.select_provider(self.prov_idx - 1);
-                    }
-                }
+                Pane::Providers => self.step_provider(false),
                 Pane::Models => {
                     self.model_idx = self.model_idx.saturating_sub(1);
                     self.row_idx = 0;
@@ -384,11 +408,7 @@ impl ModelDialogState {
                 Pane::Settings => self.row_idx = self.row_idx.saturating_sub(1),
             },
             KeyCode::Down | KeyCode::Char('j') => match self.pane {
-                Pane::Providers => {
-                    if self.prov_idx + 1 < self.providers.len() {
-                        self.select_provider(self.prov_idx + 1);
-                    }
-                }
+                Pane::Providers => self.step_provider(true),
                 Pane::Models => {
                     let n = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
                     if self.model_idx + 1 < n {
@@ -447,23 +467,15 @@ impl ModelDialogState {
     }
 }
 
-fn key_badge(key: &'static str, desc: &'static str, color: Color, theme: &Theme) -> Vec<Span<'static>> {
-    vec![
-        Span::styled("[", Style::default().fg(theme.border_dim)),
-        Span::styled(key, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled("] ", Style::default().fg(theme.border_dim)),
-        Span::styled(desc, Style::default().fg(theme.gray)),
-        Span::raw("  "),
-    ]
+/// A section label: quiet by default, brighter while its pane has the keyboard.
+fn pane_title(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
+    let fg = if focused { theme.text_strong } else { theme.dark_gray };
+    Line::from(vec![Span::styled(format!("   {}", label), Style::default().fg(fg).add_modifier(Modifier::BOLD))])
 }
 
-fn pane_title(label: &str, focused: bool, theme: &Theme) -> Line<'static> {
-    let style = if focused {
-        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)
-    };
-    Line::from(vec![Span::styled(format!(" {}", label), style)])
+/// The selection marker: the same rail that marks blocks elsewhere in Corex.
+fn marker(selected: bool, theme: &Theme) -> Span<'static> {
+    Span::styled(if selected { " ▎ " } else { "   " }, Style::default().fg(theme.accent_blue))
 }
 
 pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
@@ -478,29 +490,29 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     } else {
         MAX_DIALOG_WIDTH.min(area.width.saturating_sub(4)).max(60.min(area.width))
     };
-    let dialog_height = if is_mobile {
-        area.height.saturating_sub(2).min(28)
+    // As tall as what it shows, so the shortcuts sit right under the content.
+    let detail_rows = detail_row_count(state);
+    let body_rows = if is_mobile {
+        6 + 1 + detail_rows
     } else {
-        22.min(area.height.saturating_sub(2))
+        detail_rows.max(state.providers.len() + 2)
     };
+    let dialog_height = ((body_rows + 2 + 2) as u16).min(area.height.saturating_sub(2));
     let x = area.width.saturating_sub(dialog_width) / 2;
     let y = area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
 
     begin_modal(frame, area, dialog_area, 2, 1);
 
-    let block = Block::default()
-        .title("  Models  ")
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(theme.accent_blue));
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
+    // No fill, so a transparent terminal shows through; thin rules mark the top and bottom.
+    let panel = Block::default().padding(Padding::new(1, 1, 1, 1));
+    let inner = panel.inner(dialog_area);
+    frame.render_widget(panel, dialog_area);
+    panel_rules(frame, dialog_area, theme);
 
     let vertical = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
     let (body, footer_area) = (vertical[0], vertical[1]);
 
-    let mut divider_x = None;
     if is_mobile {
         let vert_body = Layout::vertical([
             Constraint::Length(6),
@@ -510,8 +522,6 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         .split(body);
 
         render_providers_pane(frame, vert_body[0], state, theme);
-        let sep = vec![Line::from(Span::styled("─".repeat(vert_body[1].width as usize), Style::default().fg(theme.rule)))];
-        frame.render_widget(Paragraph::new(sep), vert_body[1]);
         render_detail_pane(frame, vert_body[2], state, theme);
     } else {
         let horizontal = Layout::horizontal([
@@ -522,104 +532,86 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         .split(body);
 
         render_providers_pane(frame, horizontal[0], state, theme);
-        let sep: Vec<Line> = (0..horizontal[1].height)
-            .map(|_| Line::from(Span::styled("│", Style::default().fg(theme.rule))))
-            .collect();
-        frame.render_widget(Paragraph::new(sep), horizontal[1]);
         render_detail_pane(frame, horizontal[2], state, theme);
-        divider_x = Some(horizontal[1].x);
     }
 
-    let mut footer = vec![Span::raw(" ")];
-    if is_mobile {
-        match state.pane {
-            Pane::Providers => footer.extend(key_badge("Tab/→", "Models", theme.accent_cyan, theme)),
-            Pane::Models => footer.extend(key_badge("Enter", "Use", theme.accent_green, theme)),
-            Pane::Settings => footer.extend(key_badge("◄/►", "Adj", theme.accent_green, theme)),
-        }
-        footer.extend(key_badge("Esc", "Close", theme.gray, theme));
+    let next: (&'static str, &'static str) = match state.pane {
+        Pane::Providers => ("→", "models"),
+        Pane::Models => ("Enter", "use model"),
+        Pane::Settings => ("‹ ›", "adjust"),
+    };
+    let pairs: Vec<(&'static str, &'static str)> = if is_mobile {
+        vec![next, ("Esc", "close")]
     } else {
-        footer.extend(key_badge("↑/↓", "Select", theme.accent_blue, theme));
-        footer.extend(key_badge("Tab", "Pane", theme.accent_cyan, theme));
-        match state.pane {
-            Pane::Providers => footer.extend(key_badge("→", "Models", theme.accent_green, theme)),
-            Pane::Models => footer.extend(key_badge("Enter", "Use model", theme.accent_green, theme)),
-            Pane::Settings => footer.extend(key_badge("◄/►", "Adjust", theme.accent_green, theme)),
-        }
-        footer.extend(key_badge("E", "Key", theme.accent_yellow, theme));
-        footer.extend(key_badge("T", "Persist", theme.accent_yellow, theme));
-        footer.extend(key_badge("Esc", "Close", theme.gray, theme));
-    }
-    let footer_lines = vec![
-        Line::from(Span::styled("─".repeat(footer_area.width as usize), Style::default().fg(theme.rule))),
-        Line::from(footer),
-    ];
-    frame.render_widget(Paragraph::new(footer_lines), footer_area);
+        vec![("↑↓", "select"), ("Tab", "pane"), next, ("E", "key"), ("T", "persist"), ("Esc", "close")]
+    };
+    let mut footer = vec![Span::raw("  ")];
+    footer.extend(key_hints(&pairs, theme));
+    frame.render_widget(Paragraph::new(vec![Line::from(""), Line::from(footer)]), footer_area);
+}
 
-    // Join the rules to the frame so the lines read as one drawing. This runs last: the footer
-    // rule and the panes would otherwise paint over the junctions.
-    let (left_x, right_x) = (dialog_area.x, dialog_area.right().saturating_sub(1));
-    set_junction(frame, left_x, footer_area.y, '├', theme.accent_blue);
-    set_junction(frame, right_x, footer_area.y, '┤', theme.accent_blue);
-    if let Some(x) = divider_x {
-        set_junction(frame, x, dialog_area.y, '┬', theme.accent_blue);
-        set_junction(frame, x, footer_area.y, '┴', theme.rule);
-        set_junction(frame, x, body.y + 1, '├', theme.rule);
-        set_junction(frame, right_x, body.y + 1, '┤', theme.accent_blue);
+/// Most settings rows any model shows (temperature, reasoning, persist).
+const MAX_SETTINGS_ROWS: usize = 3;
+
+/// Rows the detail pane needs for the largest provider and model: header, models, settings and
+/// the key line, with their gaps. Sized for the worst case so the panel keeps its height (and
+/// stays put) while the selection moves.
+fn detail_row_count(state: &ModelDialogState) -> usize {
+    let models = state.providers.iter().map(|p| p.models.len()).max().unwrap_or(1).max(1);
+    2 + 1 + models + 1 + 1 + MAX_SETTINGS_ROWS + 1 + 1
+}
+
+/// The provider's name without a trailing aside such as "(Free / Ultra-Fast)", once it gets long.
+fn short_name(name: &str) -> &str {
+    match name.find(" (") {
+        Some(cut) if name.chars().count() > 16 => &name[..cut],
+        _ => name,
     }
 }
 
 fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
     let focused = state.pane == Pane::Providers;
     let w = area.width as usize;
-    let mut lines = vec![pane_title("PROVIDERS", focused, theme), Line::from("")];
+    let mut lines = vec![pane_title("Providers", focused, theme), Line::from("")];
 
-    for (i, p) in state.providers.iter().enumerate() {
+    for i in state.provider_order() {
+        let p = &state.providers[i];
         let selected = i == state.prov_idx;
         let is_active = i == state.active_provider;
         let ready = state.ready.get(i).copied().unwrap_or(false);
 
+        // Usable providers carry a dot; the ones still missing a key simply recede.
         let (dot, dot_col) = if is_active {
             ("●", theme.accent_green)
         } else if ready {
             ("○", theme.gray)
         } else {
-            ("!", theme.accent_yellow)
+            (" ", theme.dark_gray)
         };
-        let bg = if selected && focused { theme.selected_bg } else { Color::Reset };
-        let name_fg = if selected && focused { theme.text_on_selected } else { theme.foreground };
-        let count = format!("{}", p.models.len());
+        let name_fg = if selected && focused {
+            theme.text_on_selected
+        } else if ready {
+            theme.foreground
+        } else {
+            theme.dark_gray
+        };
+        let count = if ready { String::new() } else { "no key".to_string() };
         // Marker (3) + dot (2) + a gap before the count + the count + a trailing pad.
         let name_w = w.saturating_sub(5 + 1 + count.chars().count() + 1);
 
-        let mut name_style = Style::default().fg(name_fg).bg(bg);
+        let mut name_style = Style::default().fg(name_fg);
         if selected {
             name_style = name_style.add_modifier(Modifier::BOLD);
         }
         lines.push(Line::from(vec![
-            Span::styled(
-                if selected { " › " } else { "   " },
-                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{} ", dot), Style::default().fg(dot_col).bg(bg)),
-            Span::styled(pad_right(p.display_name(), name_w), name_style),
-            Span::styled(" ", Style::default().bg(bg)),
-            Span::styled(count, Style::default().fg(theme.dark_gray).bg(bg)),
-            Span::styled(" ", Style::default().bg(bg)),
+            marker(selected && focused, theme),
+            Span::styled(format!("{} ", dot), Style::default().fg(dot_col)),
+            Span::styled(pad_right(short_name(p.display_name()), name_w), name_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(count, Style::default().fg(theme.dark_gray)),
+            Span::styled(" ", Style::default()),
         ]));
     }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(" ● ", Style::default().fg(theme.accent_green)),
-        Span::styled("active ", Style::default().fg(theme.dark_gray)),
-        Span::styled("○ ", Style::default().fg(theme.gray)),
-        Span::styled("ready", Style::default().fg(theme.dark_gray)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" ! ", Style::default().fg(theme.accent_yellow)),
-        Span::styled("needs API key", Style::default().fg(theme.dark_gray)),
-    ]));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -637,52 +629,45 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     } else if ready {
         ("○ ready", theme.gray)
     } else {
-        ("! needs API key", theme.accent_yellow)
+        ("no key · E to add one", theme.dark_gray)
     };
     let endpoint = if provider.base_url.is_empty() { String::new() } else { provider.base_url.clone() };
     lines.push(Line::from(vec![
         Span::styled(
-            format!(" {}", provider.display_name()),
+            format!("   {}", provider.display_name()),
             Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(status, Style::default().fg(status_col).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", endpoint), Style::default().fg(theme.dark_gray)),
     ]));
-    lines.push(Line::from(Span::styled(
-        "─".repeat(w),
-        Style::default().fg(theme.rule),
-    )));
+    lines.push(Line::from(""));
 
     // Models
     let models_focused = state.pane == Pane::Models;
-    lines.push(pane_title("MODELS", models_focused, theme));
+    lines.push(pane_title("Models", models_focused, theme));
     for (i, m) in provider.models.iter().enumerate() {
         let selected = i == state.model_idx;
         let is_active = is_active_provider && i == state.active_model;
-        let bg = if selected && models_focused { theme.selected_bg } else { Color::Reset };
 
-        let radio = if is_active { "(●) " } else { "( ) " };
+        let radio = if is_active { "● " } else { "○ " };
         let radio_col = if is_active { theme.accent_green } else { theme.dark_gray };
         let tags = m.tags.join(" · ");
         let name_w = 26usize;
-        let tags_w = w.saturating_sub(3 + 4 + name_w + 1);
+        let tags_w = w.saturating_sub(3 + 2 + name_w + 1);
 
-        let mut name_style = Style::default().fg(if selected { theme.text_on_selected } else { theme.foreground }).bg(bg);
+        let mut name_style = Style::default().fg(if selected { theme.text_on_selected } else { theme.foreground });
         if selected {
             name_style = name_style.add_modifier(Modifier::BOLD);
         }
         lines.push(Line::from(vec![
-            Span::styled(
-                if selected { " › " } else { "   " },
-                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(radio, Style::default().fg(radio_col).bg(bg).add_modifier(Modifier::BOLD)),
+            marker(selected && models_focused, theme),
+            Span::styled(radio, Style::default().fg(radio_col)),
             Span::styled(pad_right(m.display_name(), name_w), name_style),
-            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(" ", Style::default()),
             Span::styled(
                 pad_right(&tags, tags_w),
-                Style::default().fg(theme.dark_gray).bg(bg),
+                Style::default().fg(theme.dark_gray),
             ),
         ]));
     }
@@ -696,50 +681,40 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     // Settings
     lines.push(Line::from(""));
     let settings_focused = state.pane == Pane::Settings;
-    let model_name = state.selected_model().map(|m| m.display_name().to_string()).unwrap_or_default();
     lines.push(Line::from(vec![
         Span::styled(
-            " SETTINGS",
-            if settings_focused {
-                Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)
-            },
+            "   Settings",
+            Style::default().fg(if settings_focused { theme.text_strong } else { theme.dark_gray }).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" · {}", model_name), Style::default().fg(theme.dark_gray)),
     ]));
 
     let family = state.selected_model().map(|m| m.family).unwrap_or_default();
     for (i, row) in state.settings_rows().iter().enumerate() {
         let selected = i == state.row_idx;
-        let bg = if selected && settings_focused { theme.selected_bg } else { Color::Reset };
         let (label, value, val_col, desc) = setting_display(*row, family, state);
 
         let arrow_col = if selected && settings_focused { theme.accent_cyan } else { theme.dark_gray };
         let label_style = if selected {
-            Style::default().fg(theme.text_on_selected).bg(bg).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme.text_on_selected).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.gray)
         };
-        // Every row but the on/off one is a value picker, so only those advertise ◄ ►.
-        let (left_arrow, right_arrow) = if *row == SettingRow::Persist { ("  ", "  ") } else { ("◄ ", " ►") };
-        let desc_w = w.saturating_sub(3 + 20 + 2 + 11 + 2 + 2);
+        // Every row but the on/off one is a value picker, so only those advertise ‹ ›.
+        let (left_arrow, right_arrow) = if *row == SettingRow::Persist { ("  ", "  ") } else { ("‹ ", " ›") };
+        let desc_w = w.saturating_sub(3 + 16 + 2 + 7 + 2 + 2);
         lines.push(Line::from(vec![
+            marker(selected && settings_focused, theme),
+            Span::styled(pad_right(label, 16), label_style),
+            Span::styled(left_arrow, Style::default().fg(arrow_col)),
             Span::styled(
-                if selected { " › " } else { "   " },
-                Style::default().fg(theme.accent_blue).bg(bg).add_modifier(Modifier::BOLD),
+                format!("{:^7}", value),
+                Style::default().fg(val_col).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(pad_right(label, 20), label_style),
-            Span::styled(left_arrow, Style::default().fg(arrow_col).bg(bg)),
-            Span::styled(
-                format!("{:^9}", value),
-                Style::default().fg(val_col).bg(bg).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(right_arrow, Style::default().fg(arrow_col).bg(bg)),
-            Span::styled("  ", Style::default().bg(bg)),
+            Span::styled(right_arrow, Style::default().fg(arrow_col)),
+            Span::styled("  ", Style::default()),
             Span::styled(
                 pad_right(&desc, desc_w),
-                Style::default().fg(if selected { theme.foreground } else { theme.dark_gray }).bg(bg),
+                Style::default().fg(if selected { theme.foreground } else { theme.dark_gray }),
             ),
         ]));
     }
@@ -748,8 +723,8 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
     lines.push(Line::from(""));
     let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
     lines.push(Line::from(Span::styled(
-        format!(" {}", fit_text(&hint, w.saturating_sub(2))),
-        Style::default().fg(if ready { theme.dark_gray } else { theme.accent_yellow }),
+        format!("   {}", fit_text(&hint, w.saturating_sub(4))),
+        Style::default().fg(theme.dark_gray),
     )));
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -810,30 +785,84 @@ mod tests {
     }
 
     #[test]
-    fn dialog_draws_joined_frame_without_clipped_names() {
+    fn dialog_is_a_transparent_panel_without_clipped_names() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
+        let theme = Theme::default();
         let mut s = open_default();
         s.is_open = true;
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
-        terminal
-            .draw(|f| render_model_dialog(f, f.area(), &s, &Theme::default()))
-            .unwrap();
+        terminal.draw(|f| render_model_dialog(f, f.area(), &s, &theme)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let rows: Vec<String> = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect();
         let screen = rows.join("\n");
 
-        assert!(screen.contains("┬"), "pane divider meets the top border");
-        assert!(screen.contains("┴"), "pane divider meets the footer rule");
-        assert!(screen.contains("├") && screen.contains("┤"), "rules meet the side borders");
+        assert!(!screen.contains(['┌', '┐', '└', '┘', '┬', '┴', '├', '┤', '│']), "no box, only rules:\n{screen}");
+        assert_eq!(rows.iter().filter(|r| r.contains("────")).count(), 2, "a thin rule above and below:\n{screen}");
+        assert!(screen.contains("Providers") && screen.contains("Models") && screen.contains("Settings"));
+        assert!(screen.contains("▎ ● DeepSeek"), "the active provider is selected with the rail:\n{screen}");
+        assert_eq!(screen.matches('▎').count(), 1, "only the focused pane shows the rail:\n{screen}");
+        let height = rows.iter().rposition(|r| r.contains("────")).unwrap() - rows.iter().position(|r| r.contains("────")).unwrap();
+        assert!(height < 22, "the panel is as tall as its content, not a fixed 22 rows: {height}");
+        assert!(screen.contains("Enter use model") || screen.contains("→ models"), "{screen}");
+        assert!(screen.contains("Esc close"));
         assert!(screen.contains("DeepSeek-V4.1-Flash"));
         assert!(!screen.contains("Flash-1017"), "Flash is listed once");
-        // Every provider name is either whole or ends in an ellipsis, never glued to its count.
+        // Long names drop their aside ("(Free)") and never run into the "no key" column.
         for line in screen.lines().filter(|l| l.contains("GitHub Models")) {
-            assert!(line.contains("GitHub Models (Free)") || line.contains("…"), "{line}");
+            assert!(line.contains("GitHub Models  ") && !line.contains("(Free)"), "{line}");
+        }
+
+        let y = rows.iter().position(|r| r.contains("Providers")).unwrap() as u16;
+        let x = rows[y as usize].find("Providers").unwrap() as u16;
+        assert_eq!(buf[(x, y)].bg, Color::Reset, "no fill: a transparent terminal shows through");
+    }
+
+    #[test]
+    fn arrows_follow_the_displayed_order_of_providers() {
+        let mut s = open_default();
+        s.pane = Pane::Providers;
+        // Only the last provider has a key besides the active one: it is listed right after it.
+        let last = s.providers.len() - 1;
+        s.ready = (0..s.providers.len()).map(|i| i == s.active_provider || i == last).collect();
+        let order = s.provider_order();
+        assert_eq!(order[0], s.active_provider);
+        assert_eq!(order[1], last);
+
+        s.prov_idx = s.active_provider;
+        s.handle_key(KeyCode::Down);
+        assert_eq!(s.prov_idx, last, "Down goes to the row shown below, not to the next index");
+        s.handle_key(KeyCode::Up);
+        assert_eq!(s.prov_idx, s.active_provider);
+    }
+
+    #[test]
+    fn the_panel_keeps_its_place_while_the_selection_moves() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = Theme::default();
+        let mut s = open_default();
+        s.is_open = true;
+        s.pane = Pane::Models;
+        let top_rule = |s: &ModelDialogState| {
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|f| render_model_dialog(f, f.area(), s, &theme)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            (0..buf.area.height).find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "─")).unwrap()
+        };
+        // Flash has three settings rows, Pro two: the panel must not shrink and recentre.
+        let flash = top_rule(&s);
+        s.handle_key(KeyCode::Down);
+        assert_eq!(s.settings_rows().len(), 2, "the second model has fewer settings");
+        assert_eq!(top_rule(&s), flash);
+        s.pane = Pane::Providers;
+        for _ in 0..s.providers.len() {
+            s.handle_key(KeyCode::Down);
+            assert_eq!(top_rule(&s), flash, "provider {}", s.prov_idx);
         }
     }
 

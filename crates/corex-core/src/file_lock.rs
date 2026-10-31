@@ -35,7 +35,17 @@ pub struct PathGuard {
 fn locks_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".corex").join("locks"))
-        .unwrap_or_else(|| std::env::temp_dir().join("corex-locks"))
+        .unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                let uid = unsafe { libc::getuid() };
+                std::env::temp_dir().join(format!("corex-locks-{}", uid))
+            }
+            #[cfg(not(unix))]
+            {
+                std::env::temp_dir().join("corex-locks")
+            }
+        })
 }
 
 /// FNV-1a, inlined so the path-to-lock-file mapping stays identical across releases. A collision
@@ -70,7 +80,7 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
     let lock_file = lock_file_for(path);
 
     if let Some(parent) = lock_file.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = crate::secure_fs::ensure_private_dir(parent) {
             tracing::warn!(
                 "[LOCK] cannot create {}: {} — falling back to in-process locking only",
                 parent.display(),
@@ -80,13 +90,15 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
         }
     }
 
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_file)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let file = match opts.open(&lock_file) {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(
@@ -97,6 +109,18 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
             return None;
         }
     };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = file.metadata() {
+            let mut perms = meta.permissions();
+            if perms.mode() & 0o077 != 0 {
+                perms.set_mode(0o600);
+                let _ = file.set_permissions(perms);
+            }
+        }
+    }
 
     // Blocks until no other process holds it. Safe to block here: the caller moved us onto a
     // blocking thread precisely so an async worker is never parked on this.
@@ -255,6 +279,23 @@ mod tests {
             .expect("the waiter must proceed once the guard is dropped")
             .unwrap();
         assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_dir_and_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = std::env::temp_dir().join(format!("corex_privlock_{}.txt", std::process::id()));
+        std::fs::write(&target, "x").unwrap();
+        let lock_file = lock_file_for(&target.canonicalize().unwrap());
+
+        let _guard = lock_path(&target).await;
+        let dir_mode = std::fs::metadata(locks_dir()).unwrap().permissions().mode() & 0o077;
+        let file_mode = std::fs::metadata(&lock_file).unwrap().permissions().mode() & 0o077;
+        assert_eq!(dir_mode, 0, "locks_dir must not grant group/other permissions");
+        assert_eq!(file_mode, 0, "lock file must not grant group/other permissions");
 
         let _ = std::fs::remove_file(&target);
     }

@@ -76,7 +76,22 @@ impl ApplyPatchTool {
         }
     }
 
-    fn extract_file_path(hunk_header: &str) -> Option<String> {
+    /// True when the post-image of the patch is `/dev/null`, i.e. the patch removes the file.
+    fn deletes_target(patch: &str) -> bool {
+        patch
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("@@"))
+            .any(|l| {
+                let t = l.trim();
+                (t.starts_with("+++ ") || t.starts_with("+++\t"))
+                    && t[3..].trim().split('\t').next() == Some("/dev/null")
+            })
+    }
+
+    pub(crate) fn extract_file_path(hunk_header: &str) -> Option<String> {
+        if let Some(path) = codex_target(hunk_header) {
+            return Some(path.1);
+        }
         let clean_path = |file: &str| -> Option<String> {
             let trimmed = file.trim().trim_matches('"').trim();
             let mut f = trimmed;
@@ -99,7 +114,7 @@ impl ApplyPatchTool {
             .take_while(|l| !l.trim_start().starts_with("@@"))
             .collect();
 
-        // Priority 1: +++ b/path (post-image target)
+        // The post-image path wins, then the pre-image one, then the `diff --git` header.
         for line in &header_section {
             let trimmed = line.trim();
             if (trimmed.starts_with("+++ ") || trimmed.starts_with("+++\t")) && !trimmed.starts_with("++++") {
@@ -110,7 +125,6 @@ impl ApplyPatchTool {
                 }
             }
         }
-        // Priority 2: --- a/path (pre-image fallback)
         for line in &header_section {
             let trimmed = line.trim();
             if (trimmed.starts_with("--- ") || trimmed.starts_with("---\t")) && !trimmed.starts_with("----") {
@@ -121,7 +135,6 @@ impl ApplyPatchTool {
                 }
             }
         }
-        // Priority 3: diff --git a/path b/path
         for line in &header_section {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("diff --git ") {
@@ -312,6 +325,118 @@ fn sanitize_and_repair_patch(raw: &str) -> Result<(String, Vec<ParsedHunk>), Str
     Ok((repaired_diff, hunks))
 }
 
+
+/// The operation and path of a `*** Begin Patch` envelope (the format Codex and many models
+/// write), from its first `*** Update/Add/Delete File:` line.
+fn codex_target(patch: &str) -> Option<(&'static str, String)> {
+    patch.lines().find_map(|l| {
+        let l = l.trim();
+        [("update", "*** Update File:"), ("add", "*** Add File:"), ("delete", "*** Delete File:")]
+            .iter()
+            .find_map(|(op, prefix)| l.strip_prefix(prefix).map(|p| (*op, p.trim().to_string())))
+    })
+}
+
+/// Rewrites a `*** Begin Patch` envelope as a unified diff for one file. Its hunks carry no line
+/// numbers, so each is located in `original` (the old side, or the new side when the patch was
+/// already applied) to give the rest of the pipeline real positions.
+fn codex_to_unified(patch: &str, original: Option<&str>) -> Result<String, String> {
+    let (op, path) = codex_target(patch).ok_or("no '*** Update File:' line")?;
+    let files = patch.lines().filter(|l| {
+        let l = l.trim_start();
+        l.starts_with("*** Update File:") || l.starts_with("*** Add File:") || l.starts_with("*** Delete File:")
+    });
+    if files.count() > 1 {
+        return Err("Multi-file patches are not supported in a single apply_patch call; please patch one file at a time.".into());
+    }
+    if patch.lines().any(|l| l.trim_start().starts_with("*** Move to:")) {
+        return Err("'*** Move to:' is not supported: move the file with a shell command, then patch it.".into());
+    }
+    let original = original.unwrap_or("").replace("\r\n", "\n");
+    let file: Vec<&str> = original.lines().collect();
+
+    if op == "delete" {
+        if file.is_empty() {
+            return Err(format!("Cannot delete {path}: it does not exist or is empty."));
+        }
+        let body: String = file.iter().map(|l| format!("-{l}\n")).collect();
+        return Ok(format!("--- a/{path}\n+++ /dev/null\n@@ -1,{} +0,0 @@\n{body}", file.len()));
+    }
+
+    let body = patch
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("*** Update File:") && !l.trim_start().starts_with("*** Add File:"))
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with("*** End Patch"))
+        .filter(|l| l.trim() != "*** End of File");
+    if op == "add" {
+        let lines: Vec<String> = body.map(|l| l.strip_prefix('+').unwrap_or(l).to_string()).collect();
+        let text: String = lines.iter().map(|l| format!("+{l}\n")).collect();
+        return Ok(format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n{text}", lines.len()));
+    }
+
+    let mut hunks: Vec<Vec<(char, String)>> = Vec::new();
+    for line in body {
+        if line.starts_with("@@") {
+            hunks.push(Vec::new());
+            continue;
+        }
+        if hunks.is_empty() {
+            hunks.push(Vec::new());
+        }
+        let (tag, text) = match line.chars().next() {
+            Some(c @ ('+' | '-' | ' ')) => (c, &line[1..]),
+            // Models often drop the leading space of a blank context line.
+            _ => (' ', line),
+        };
+        hunks.last_mut().unwrap().push((tag, text.to_string()));
+    }
+    hunks.retain(|h| h.iter().any(|(c, _)| *c != ' '));
+    if hunks.is_empty() {
+        return Err("the patch has no + or - lines".into());
+    }
+
+    let find = |needle: &[&str], from: usize| -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        (from..=file.len().saturating_sub(needle.len())).find(|&i| file[i..i + needle.len()] == *needle)
+    };
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
+    let (mut cursor, mut shift) = (0usize, 0isize);
+    for hunk in &hunks {
+        let old: Vec<&str> = hunk.iter().filter(|(c, _)| *c != '+').map(|(_, l)| l.as_str()).collect();
+        let new: Vec<&str> = hunk.iter().filter(|(c, _)| *c != '-').map(|(_, l)| l.as_str()).collect();
+        let (at, matched) = match find(&old, cursor) {
+            Some(i) => (i, old.len()),
+            None => find(&new, cursor).map_or((cursor, 0), |i| (i, new.len())),
+        };
+        cursor = at + matched;
+        let old_start = at + 1;
+        let new_start = (old_start as isize + shift).max(1);
+        shift += new.len() as isize - old.len() as isize;
+        out.push_str(&format!("@@ -{},{} +{},{} @@\n", old_start, old.len(), new_start, new.len()));
+        for (tag, text) in hunk {
+            out.push_str(&format!("{tag}{text}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// True when every hunk that adds lines finds its post-image already in place (within a few
+/// lines of where it would go): the patch was applied before, and applying it again would only
+/// duplicate the added lines.
+fn already_applied(original: &str, hunks: &[ParsedHunk]) -> bool {
+    let text = original.replace("\r\n", "\n");
+    let file: Vec<&str> = text.lines().collect();
+    let adding: Vec<&ParsedHunk> = hunks.iter().filter(|h| h.lines.iter().any(|(c, _)| *c == '+')).collect();
+    !adding.is_empty()
+        && adding.iter().all(|h| {
+            let post: Vec<&str> = h.lines.iter().filter(|(c, _)| *c != '-').map(|(_, l)| l.as_str()).collect();
+            let at = h.new_start.saturating_sub(1);
+            (at.saturating_sub(3)..=at + 3).any(|start| file.get(start..start + post.len()) == Some(&post[..]))
+        })
+}
 
 fn apply_fuzzy_hunks(original: &str, hunks: &[ParsedHunk]) -> Result<String, String> {
     if hunks.is_empty() {
@@ -568,6 +693,19 @@ impl Tool for ApplyPatchTool {
             Some(p) if !p.trim().is_empty() => p,
             _ => return Ok(ToolOutput::error("Error: 'patch' parameter cannot be empty.")),
         };
+        let converted;
+        let patch_str = if let Some((_, path)) = codex_target(patch_str) {
+            let original = fs::read_to_string(resolve_path(&context.workspace_dir, &path)).ok();
+            match codex_to_unified(patch_str, original.as_deref()) {
+                Ok(unified) => {
+                    converted = unified;
+                    converted.as_str()
+                }
+                Err(e) => return Ok(ToolOutput::error(format!("Error: {e}"))),
+            }
+        } else {
+            patch_str
+        };
 
         // Extract target file path before repair or from raw patch headers
         let target_file = match Self::extract_file_path(patch_str) {
@@ -613,7 +751,7 @@ impl Tool for ApplyPatchTool {
             String::new()
         };
 
-        // 1. Sanitize, unwrap markdown fences, normalize context lines, and repair hunk counts
+        // Models wrap patches in fences and miscount hunks: clean that up before parsing.
         let (repaired_patch, hunks) = match sanitize_and_repair_patch(patch_str) {
             Ok(res) => res,
             Err(err) => return Ok(ToolOutput::error(err)),
@@ -624,7 +762,13 @@ impl Tool for ApplyPatchTool {
             return Ok(ToolOutput::error(msg));
         }
 
-        // 2. Attempt primary application via diffy
+        if already_applied(&original_content, &hunks) {
+            return Ok(ToolOutput::error(format!(
+                "The patch is already applied to {}: its added lines are already in place. Read the file to confirm instead of applying it again.",
+                target_file
+            )));
+        }
+
         let mut patch_result = None;
         if let Ok(diffy_patch) = Patch::from_str(normalized_patch.as_ref()) {
             if let Ok(res) = Self::apply_tolerating_format_differences(&original_content, &diffy_patch) {
@@ -634,7 +778,7 @@ impl Tool for ApplyPatchTool {
             }
         }
 
-        // 3. Fallback: Fuzzy hunk matching if diffy failed or yielded no changes
+        // Strict application failed or changed nothing: retry matching each hunk by content.
         if patch_result.is_none() && !hunks.is_empty() {
             match apply_fuzzy_hunks(&original_content, &hunks) {
                 Ok(res) if res != original_content => {
@@ -668,6 +812,22 @@ impl Tool for ApplyPatchTool {
             }
         }
 
+        if Self::deletes_target(patch_str) {
+            if !patched_content.is_empty() {
+                return Ok(ToolOutput::error(format!(
+                    "The patch deletes {} (+++ /dev/null) but does not remove all of its lines. Read the file again and retry.",
+                    target_file
+                )));
+            }
+            if let Err(e) = fs::remove_file(&target_path) {
+                return Ok(ToolOutput::error(format!("Failed to delete {}: {}", target_path.display(), e)));
+            }
+            return Ok(ToolOutput::success_with_summary(
+                format!("Deleted {} successfully via apply_patch.", target_file),
+                format!("Deleted {}", target_file),
+            ));
+        }
+
         if let Err(e) = atomic_write(&target_path, &patched_content) {
             return Ok(ToolOutput::error(format!("Failed to write patched content to {}: {}", target_path.display(), e)));
         }
@@ -688,6 +848,110 @@ mod tests {
 
     /// A file whose last line has no terminator must be patchable without the author knowing the
     /// `\ No newline at end of file` marker — and must stay un-terminated afterwards.
+    #[tokio::test]
+    async fn codex_begin_patch_envelopes_apply() {
+        let ws = std::env::temp_dir().join(format!("corex_patch_codex_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let calc = ws.join("calc.py");
+        fs::write(&calc, "def add(a, b):\n    return a - b\n\n\ndef mean(values):\n    return sum(values) / len(values)\n").unwrap();
+        observe_file(&calc);
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let run = |patch: String| {
+            let context = &context;
+            async move { ApplyPatchTool.execute(json!({ "patch": patch }), context).await.unwrap() }
+        };
+        // What DeepSeek actually sent: absolute path, two hunks, a blank context line without its space.
+        let update = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@ def add(a, b):\n-    return a - b\n+    return a + b\n\n@@\n def mean(values):\n-    return sum(values) / len(values)\n+    if not values:\n+        return 0\n+    return sum(values) / len(values)\n*** End Patch\n",
+            calc.display()
+        );
+        let out = run(update.clone()).await;
+        assert!(!out.is_error, "{}", out.output);
+        let text = fs::read_to_string(&calc).unwrap();
+        assert!(text.contains("return a + b") && text.contains("if not values:"), "{text}");
+        assert!(run(update).await.output.contains("already applied"));
+
+        let add = "*** Begin Patch\n*** Add File: notes.txt\n+uno\n+dos\n*** End Patch\n".to_string();
+        assert!(!run(add).await.is_error);
+        assert_eq!(fs::read_to_string(ws.join("notes.txt")).unwrap(), "uno\ndos\n");
+
+        observe_file(&ws.join("notes.txt"));
+        let delete = "*** Begin Patch\n*** Delete File: notes.txt\n*** End Patch\n".to_string();
+        assert!(!run(delete).await.is_error);
+        assert!(!ws.join("notes.txt").exists());
+
+        let two = "*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** Update File: b.py\n@@\n-x\n+y\n*** End Patch\n".to_string();
+        assert!(run(two).await.output.contains("one file at a time"));
+        let moved = "*** Begin Patch\n*** Update File: calc.py\n*** Move to: other.py\n@@\n-x\n+y\n*** End Patch\n".to_string();
+        assert!(run(moved).await.is_error);
+        let _ = fs::remove_dir_all(&ws);
+        assert_eq!(ApplyPatchTool::extract_file_path("*** Begin Patch\n*** Update File: src/a.rs\n").as_deref(), Some("src/a.rs"));
+    }
+
+    #[tokio::test]
+    async fn applying_the_same_patch_twice_does_not_duplicate_lines() {
+        let ws = std::env::temp_dir().join(format!("corex_patch_twice_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let target = ws.join("lib.rs");
+        // The same block sits further down, away from where the patch goes: that must not count.
+        let far: String = (0..40).map(|i| format!("// filler {i}\n")).collect();
+        fs::write(&target, format!("fn a() {{\n}}\n{far}fn a() {{\n    x();\n}}\n")).unwrap();
+        observe_file(&target);
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let patch = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1,2 +1,3 @@\n fn a() {\n+    x();\n }\n";
+
+        let first = ApplyPatchTool.execute(json!({"patch": patch}), &context).await.unwrap();
+        assert!(!first.is_error, "{}", first.output);
+        let second = ApplyPatchTool.execute(json!({"patch": patch}), &context).await.unwrap();
+        let content = fs::read_to_string(&target).unwrap();
+        let _ = fs::remove_dir_all(&ws);
+        assert!(second.is_error && second.output.contains("already applied"), "{}", second.output);
+        assert_eq!(content.matches("    x();").count(), 2, "one from the patch, one that was already further down");
+        assert!(content.starts_with("fn a() {\n    x();\n}\n// filler 0"));
+    }
+
+    #[tokio::test]
+    async fn a_dev_null_target_deletes_the_file() {
+        let ws = std::env::temp_dir().join(format!("corex_patch_delete_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let target = ws.join("gone.txt");
+        fs::write(&target, "uno\ndos\n").unwrap();
+        observe_file(&target);
+        let context = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+
+        let partial = "--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,1 @@\n-uno\n dos\n";
+        let out = ApplyPatchTool.execute(json!({"patch": partial}), &context).await.unwrap();
+        assert!(out.is_error && target.exists(), "a deletion that leaves lines must not pass");
+
+        let delete = "--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-uno\n-dos\n";
+        let out = ApplyPatchTool.execute(json!({"patch": delete}), &context).await.unwrap();
+        let _ = fs::remove_dir_all(&ws);
+        assert!(!out.is_error, "{}", out.output);
+        assert!(out.output.starts_with("Deleted"));
+        assert!(!target.exists());
+    }
+
     #[test]
     fn test_patch_applies_to_file_without_final_newline() {
         let original = "uno\ndos\ntres";
@@ -791,6 +1055,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -861,6 +1126,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -954,6 +1220,7 @@ Hope this helps!
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -985,6 +1252,7 @@ Hope this helps!
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -1034,6 +1302,7 @@ Hope this helps!
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -1058,6 +1327,7 @@ Hope this helps!
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         let out = ApplyPatchTool
             .execute(json!({ "patch": patch, "file_path": "f.txt" }), &context)
@@ -1098,6 +1368,7 @@ Hope this helps!
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = ApplyPatchTool
@@ -1119,6 +1390,7 @@ Hope this helps!
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: vec!["edit".to_string()],
+            extra_dirs: Vec::new(),
         };
 
         // When "edit" is allowed, apply_patch must NOT require confirmation

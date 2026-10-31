@@ -14,7 +14,7 @@ FIM (Fill-in-the-Middle) is a specialized inference mode where the model complet
 
 ---
 
-## 🚀 Usage
+## Usage
 
 ### From the TUI
 ```
@@ -36,7 +36,7 @@ Corex will:
 
 ---
 
-## 🧠 How FIM Works
+## How FIM Works
 
 Unlike a normal chat request, FIM uses a special prompt format:
 
@@ -50,7 +50,7 @@ This means the model sees **both sides** of where you want the completion — gi
 
 ---
 
-## 🔧 Models for FIM
+## Models for FIM
 
 - **`deepseek-flash`** (DeepSeek-V4.1-Flash) — supports FIM natively, fast responses
 - **`deepseek-v4-pro`** — use for complex multi-line completions requiring deep reasoning
@@ -62,7 +62,7 @@ Switch model before running FIM:
 
 ---
 
-## 💡 Best Practices
+## Best Practices
 
 1. **Point to a specific file** — `/fim src/handler.rs` gives better context than pasting code
 2. **Be specific about the cursor position** — tell Corex which line or function to complete
@@ -71,7 +71,7 @@ Switch model before running FIM:
 
 ---
 
-## 📝 Examples
+## Examples
 
 ```
 /fim src/auth.rs
@@ -86,7 +86,7 @@ Switch model before running FIM:
 
 ---
 
-## ⚠️ Notes
+## Notes
 
 - FIM is different from asking the model to "write" code — it is designed for **insertion** at a specific point
 - For wholesale rewrites or new files, use a normal chat prompt instead

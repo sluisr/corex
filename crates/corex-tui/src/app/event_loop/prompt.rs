@@ -8,7 +8,7 @@ use corex_core::client::set_sudo_password;
 
 use super::{EventTx, Flow};
 use crate::app::formatting::{paste_tag_last_start, starts_with_paste_tag};
-use crate::app::mobile::{arrows_may_be_swipes, is_android_or_termux};
+use crate::app::mobile::arrows_may_be_swipes;
 use crate::app::state::App;
 
 pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Flow {
@@ -23,6 +23,8 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
     // captured by the completion menu (e.g. recalled `/resume`).
     let matching_cmds = app.matching_slash_commands();
     let is_slash_open = !matching_cmds.is_empty();
+    let matching_files = app.file_completions().unwrap_or_default();
+    let is_files_open = !matching_files.is_empty();
 
     match key.code {
         // History via readline shortcuts: Ctrl+P / Alt+Up (previous). Before the `Char` arms,
@@ -174,9 +176,17 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.last_esc_press = Some(Instant::now());
             }
         }
+        KeyCode::Tab | KeyCode::Enter if is_files_open && !alt => {
+            let selected = matching_files[app.slash_selected_idx % matching_files.len()].clone();
+            app.accept_file_completion(&selected);
+        }
+        KeyCode::Up if is_files_open && !(ctrl || shift) => select_prev_command(app, matching_files.len()),
+        KeyCode::Down if is_files_open && !(ctrl || shift) => {
+            app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_files.len();
+        }
         KeyCode::Tab => {
             if is_slash_open {
-                let selected = matching_cmds[app.slash_selected_idx % matching_cmds.len()];
+                let selected = &matching_cmds[app.slash_selected_idx % matching_cmds.len()];
                 app.input_buffer = format!("{} ", selected);
                 app.cursor_idx = app.input_buffer.len();
             }
@@ -199,10 +209,6 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_cmds.len();
             } else if arrow_is_swipe(app) {
                 app.scroll_chat(1);
-            } else if app.history_idx.is_none() && !app.auto_scroll && !is_android_or_termux() {
-                // Scrolled up reading the chat: Down scrolls towards the newest message.
-                // While browsing history, Down keeps walking it back to the draft.
-                app.scroll_chat(3);
             } else {
                 history_next(app);
             }
@@ -217,8 +223,10 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
             if text.is_empty() && send_now {
                 send_pending_now(app, event_tx);
             } else if !text.is_empty() {
-                let cmd_to_run = if is_slash_open && !text.contains(' ') {
-                    matching_cmds[app.slash_selected_idx % matching_cmds.len()].to_string()
+                // A trailing space means the typed command is complete: run it as is
+                // (`/yolo ` toggles) instead of picking the first subcommand.
+                let cmd_to_run = if is_slash_open && !app.input_buffer.ends_with(char::is_whitespace) {
+                    matching_cmds[app.slash_selected_idx % matching_cmds.len()].clone()
                 } else {
                     text
                 };
@@ -227,6 +235,7 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
         }
         _ => {}
     }
+    app.refresh_file_index();
     Flow::Handled
 }
 

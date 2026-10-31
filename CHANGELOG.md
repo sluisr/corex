@@ -11,6 +11,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-10-31
+
+### Added
+- **`@path` workspace autocompletion**: Typing `@` in the prompt opens an interactive, gitignore-aware popup that lists workspace files and directories in real time.
+- **Persistent Project & Global Memory (`/memory`)**: Added the `/memory` command and the `save_memory` tool. Custom rules and notes can be saved per project (`.corex/memory.json`) or globally (`~/.corex/memory.json`) and are injected dynamically into the system prompt. Global memory updates require explicit user confirmation.
+- **Interactive File Rewind (`/rewind`)**: Tool file edits are snapshotted turn-by-turn. Running `/rewind` opens an interactive dialog showing modified files and diff summaries, allowing you to selectively revert changes.
+- **Terminal-native mouse selection**:
+  - Releasing a drag copies the text to the clipboard while keeping the highlight visible until the next click or `Esc`.
+  - Completed selections survive window focus loss (compatible with focus-follows-mouse window managers).
+  - Highlighting uses a translucent accent background (`rgb(44, 66, 110)`) that preserves syntax colors.
+  - Dragging against the top or bottom viewport edge smoothly autoscrolls the conversation.
+- **Corex Lab (`scripts/corex-lab/`)**: An isolated testing harness running `cx` inside `bubblewrap` (`bwrap`) sandbox containers with automated `tmux` sessions, canary secret traps, and live trace inspection.
+
+### Security & Hardening
+- **Fleet workspace isolation & SSH injection protection**: `FleetConfig` strictly ignores `.corex/fleet.toml` located in untrusted repositories, reading only `~/.corex/fleet.toml`. Enforces `StrictHostKeyChecking=yes` and blocks CLI option injection in SSH host/user/key parameters.
+- **Hardened shell command safety**:
+  - Blocked execution-time environment injections (`LD_PRELOAD`, `BASH_ENV`, `GIT_PAGER`, `PYTHONPATH`, etc.).
+  - Removed `env` and `printenv` from auto-approved commands to prevent credential exfiltration.
+  - Strict inspection for `git`, `cargo`, `find`, `sed`, `sort`, compound commands (`;`, `&&`, `|`), multiline inputs (`\n`, `\r`), and attached redirects (`>.bashrc`).
+- **Protected workspace paths**: Writing or patching shell rc files, `.git/hooks`, `.corex/settings.json`, `.env`, and build files (`Makefile`, `build.rs`) always requires user confirmation, even in YOLO mode.
+- **Untrusted repository context boundaries**: `SYSTEM.md` is strictly loaded from `~/.corex/SYSTEM.md`. In-repo instructions (`COREX.md`, `AGENTS.md`, `.cursorrules`) are explicitly sandboxed within `<untrusted_project_context>` tags.
+- **Effective `/plan` mode enforcement**: Mutating tools are hidden from the model and blocked at execution time while `/plan` mode is active, even if `/yolo` or `allowed_commands` is configured.
+- **MCP environment scrubbing & task approval**: Stripped sensitive API keys, cloud tokens, and credentials from MCP child processes. Killing or sending input to background tasks requires confirmation.
+- **Secret & credential protections**:
+  - Sudo password buffers in RAM are zeroed with volatile writes (`set_sudo_password`).
+  - Temporary askpass scripts immediately shred and delete credential files.
+  - API key auth dialog (`auth_dialog`) masks 100% of the input with asterisks.
+  - Base URLs must use HTTPS for remote endpoints to prevent plaintext credential leaks.
+  - Forensic logs automatically redact API keys (`sk-*`, `ghp_*`, `$sudo:*`) and purge logs older than 7 days.
+- **Symlink traversal & SSRF hardening**: Blocked symlink escapes across `read_many_files`, `grep`, `glob`, and `ls`. Extended SSRF protections to IPv4 Class E, NAT64, SIIT, and documentation ranges.
+- **Update URL verification**: The self-updater validates release asset URLs against an explicit HTTPS domain whitelist.
+
+### Fixed
+- **Background task reporting (`TASK_DONE`)**: Tasks ending while the model is responding or while a modal dialog is open are now properly deferred and reported when Corex becomes idle.
+- **Anthropic protocol alignment**: Lenient parsing for streamed tool call arguments, thinking block tracking, single `Completed` stream events, and proper placement of task reports as user turns.
+- **Linux ARM64 glibc compatibility**: Release binaries are linked against `glibc 2.17`.
+- **Session turn rewind consistency**: Clean turn rollbacks without desynchronizing synthetic tool image notes or task reports.
+
+### Changed
+- **Modal Dialog Redesign**:
+  - `sudo_dialog`: Replaced heavy borders with a minimalist red rail (`▎`) and command chip.
+  - `auth_dialog`, `model_dialog`, `session_dialog`: Replaced ASCII box borders with clean `panel_rules` separators.
+- **Codebase Modularization**: Extracted slash commands from `app/mod.rs` into dedicated `commands.rs` (-1,125 lines in `mod.rs`).
+
+---
+
 ## [0.8.5] - 2026-10-30
 
 ### Fixed

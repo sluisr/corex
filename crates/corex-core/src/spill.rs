@@ -24,7 +24,15 @@ pub fn spill_dir() -> PathBuf {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "user".to_string());
     let safe: String = user.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
-    std::env::temp_dir().join(format!("corex-spill-{}", safe))
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        std::env::temp_dir().join(format!("corex-spill-{}-{}", safe, uid))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join(format!("corex-spill-{}", safe))
+    }
 }
 
 /// True when `path` lies inside the spill directory (symlinks resolved), so reading it needs no prompt.
@@ -39,6 +47,9 @@ fn prepared_dir() -> Option<PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
         let dir = spill_dir();
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return None;
+        }
         crate::ensure_private_dir(&dir).ok()?;
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -130,5 +141,20 @@ mod tests {
     fn small_output_is_untouched_and_foreign_paths_are_not_spill_paths() {
         assert_eq!(spill_large_output("x", "short".to_string()), "short");
         assert!(!is_spill_path(Path::new("/etc/hostname")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_dir_is_named_after_the_uid() {
+        let uid = unsafe { libc::getuid() }.to_string();
+        let dir_name = spill_dir()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            dir_name.contains(&uid),
+            "spill_dir ({dir_name}) must include numeric UID ({uid}) on Unix"
+        );
     }
 }

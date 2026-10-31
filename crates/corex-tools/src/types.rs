@@ -10,6 +10,8 @@ pub struct ToolContext {
     pub yolo_mode: bool,
     pub sudo_password: Option<String>,
     pub allowed_commands: Vec<String>,
+    /// Directories added with `/directory add`: read like the workspace, without confirmation.
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

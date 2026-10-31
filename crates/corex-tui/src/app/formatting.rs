@@ -390,9 +390,13 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
                 .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()))
                 .unwrap_or(raw_args)
                 .trim();
+            // Commands stand out from their output on a shaded chip, with the yellow prompt of
+            // the approval rail.
+            let chip = Style::default().bg(theme.code_bg);
             vec![
-                Span::styled("$ ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                Span::styled(corex_core::truncate_ellipsis(cmd, 70).to_string(), Style::default().fg(theme.gray)),
+                Span::styled(" $ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(corex_core::truncate_ellipsis(cmd, 70).to_string(), chip.fg(theme.text_strong)),
+                Span::styled(" ", chip),
             ]
         }
         "read_file" => {
@@ -596,14 +600,21 @@ pub fn format_input_spans<'a>(text: &'a str, theme: &'a Theme) -> Vec<Span<'a>> 
     spans
 }
 
+/// The composer's text with its caret. Without `caret` (a dialog has the keyboard) the text is
+/// drawn plain, so only the focused field shows a cursor.
 pub fn format_input_with_cursor<'a>(
     text: &'a str,
     cursor_idx: usize,
     theme: &'a Theme,
+    caret: bool,
 ) -> (Vec<Span<'a>>, usize) {
     let mut clamped = cursor_idx.min(text.len());
     while !text.is_char_boundary(clamped) {
         clamped = clamped.saturating_sub(1);
+    }
+    if !caret {
+        let col = format_input_spans(&text[..clamped], theme).iter().map(|s| s.width()).sum();
+        return (format_input_spans(text, theme), col);
     }
     let mut spans = Vec::new();
 

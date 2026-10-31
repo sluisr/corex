@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use corex_core::client::{get_sudo_password, StreamEvent};
 use corex_core::types::{Message, ToolCall};
+use corex_tools::policy::{self, Verdict};
 use corex_tools::types::ToolContext;
 use corex_tools::{command_requires_sudo, extract_first_sudo_command};
 
@@ -63,6 +64,7 @@ pub(super) fn tool_context(app: &App) -> ToolContext {
         yolo_mode: app.always_allow_tools,
         sudo_password: get_sudo_password(),
         allowed_commands: app.get_effective_allowed_commands(),
+        extra_dirs: app.extra_dirs.clone(),
     }
 }
 
@@ -78,15 +80,9 @@ pub(super) fn first_sudo_command(calls: &[ToolCall]) -> Option<String> {
     })
 }
 
-/// True when a call in `calls` must wait for the user (never with auto-approve on).
+/// True when a call in `calls` must wait for the user (see [`corex_tools::policy::verdict`]).
 pub(super) fn needs_approval(app: &App, calls: &[ToolCall], context: &ToolContext) -> bool {
-    !app.always_allow_tools
-        && calls.iter().any(|call| {
-            let args = corex_core::parse_lenient_json(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-            app.tool_registry
-                .get(&call.function.name)
-                .is_some_and(|t| t.needs_confirmation(&args, context))
-        })
+    calls.iter().any(|call| asks(app, call, context))
 }
 
 /// Splits a tool batch into the calls that wait for the user's approval and the ones that need
@@ -94,14 +90,13 @@ pub(super) fn needs_approval(app: &App, calls: &[ToolCall], context: &ToolContex
 pub(super) fn split_by_approval(app: &App, calls: Vec<ToolCall>, context: &ToolContext) -> (Vec<ToolCall>, Vec<ToolCall>) {
     calls.into_iter().partition(|call| {
         let args = corex_core::parse_lenient_json(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-        let needs_approval = app
-            .tool_registry
-            .get(&call.function.name)
-            .is_some_and(|t| t.needs_confirmation(&args, context));
-        let needs_sudo = call.function.name == "run_shell_command"
-            && args.get("command").and_then(|c| c.as_str()).is_some_and(command_requires_sudo);
-        needs_approval || needs_sudo
+        asks(app, call, context) || policy::needs_sudo(&call.function.name, &args)
     })
+}
+
+fn asks(app: &App, call: &ToolCall, context: &ToolContext) -> bool {
+    let args = corex_core::parse_lenient_json(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+    policy::verdict(&app.tool_registry, &call.function.name, &args, context, app.plan_mode) == Verdict::Ask
 }
 
 /// The approval dialog for `calls`, showing the first one.
@@ -305,6 +300,7 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         let search = ToolCall::new("search", "web_search", r#"{"query":"corex"}"#);
         let fetch = ToolCall::new("fetch", "web_fetch", r#"{"url":"https://example.com/page"}"#);
@@ -330,5 +326,64 @@ mod tests {
         let restart = ToolCall::new("s", "run_shell_command", r#"{"command":"sudo systemctl restart nginx"}"#);
         assert_eq!(first_sudo_command(&[read.clone(), ls.clone()]), None);
         assert!(first_sudo_command(&[read, ls, restart]).is_some_and(|c| c.contains("systemctl restart nginx")));
+    }
+
+    #[tokio::test]
+    async fn yolo_still_stops_at_credentials_hooks_and_global_memory() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), true);
+        app.always_allow_tools = true;
+        let context = ToolContext {
+            workspace_dir: PathBuf::from("/tmp"),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let wipe = ToolCall::new("wipe", "run_shell_command", r#"{"command":"rm -rf target"}"#);
+        let key = ToolCall::new("key", "run_shell_command", r#"{"command":"cat ~/.ssh/id_rsa"}"#);
+        let hook = ToolCall::new("hook", "run_shell_command", r#"{"command":"echo x >.git/hooks/pre-commit"}"#);
+        let global = ToolCall::new("global", "save_memory", r#"{"fact":"x"}"#);
+        let project = ToolCall::new("project", "save_memory", r#"{"fact":"x","scope":"project"}"#);
+
+        assert!(!needs_approval(&app, &[wipe.clone(), project.clone()], &context));
+        assert!(needs_approval(&app, &[wipe.clone(), key.clone()], &context));
+        let (gated, free) = split_by_approval(&app, vec![wipe, key, hook, global, project], &context);
+        assert_eq!(ids(&gated), ["key", "hook", "global"]);
+        assert_eq!(ids(&free), ["wipe", "project"]);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_gates_mutating_tools_even_with_yolo_or_allowed_commands() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), true);
+        app.plan_mode = true;
+        let context = ToolContext {
+            workspace_dir: PathBuf::from("/tmp"),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: vec!["write_file".to_string(), "edit".to_string()],
+            extra_dirs: Vec::new(),
+        };
+        let write = ToolCall::new("write", "write_file", r#"{"file_path":"notes.txt","content":"hi"}"#);
+        let read = ToolCall::new("read", "read_file", r#"{"file_path":"notes.txt"}"#);
+        assert!(needs_approval(&app, &[write.clone(), read.clone()], &context));
+        let (gated, free) = split_by_approval(&app, vec![write, read], &context);
+        assert_eq!(ids(&gated), ["write"]);
+        assert_eq!(ids(&free), ["read"]);
+        assert!(
+            !app.active_tool_definitions()
+                .iter()
+                .any(|d| d.function.name == "write_file" || d.function.name == "edit" || d.function.name == "apply_patch")
+        );
+
+        // The shell stays available to read the project, but anything that changes it waits.
+        let status = ToolCall::new("status", "run_shell_command", r#"{"command":"git status"}"#);
+        let wipe = ToolCall::new("wipe", "run_shell_command", r#"{"command":"rm -rf target"}"#);
+        let kill = ToolCall::new("kill", "kill_background_process", r#"{"pid":42}"#);
+        let send = ToolCall::new("send", "manage_task", r#"{"action":"send_input","pid":42,"input":"y"}"#);
+        let list = ToolCall::new("list", "manage_task", r#"{"action":"list"}"#);
+        let (gated, free) = split_by_approval(&app, vec![status, wipe, kill, send, list], &context);
+        assert_eq!(ids(&gated), ["wipe", "kill", "send"]);
+        assert_eq!(ids(&free), ["status", "list"]);
+        assert!(app.active_tool_definitions().iter().any(|d| d.function.name == "run_shell_command"));
     }
 }

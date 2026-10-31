@@ -2,6 +2,7 @@ pub mod apply_patch;
 pub mod background;
 pub mod fs_tools;
 pub mod grep;
+pub mod policy;
 pub mod registry;
 pub mod shell;
 pub mod types;
@@ -9,16 +10,19 @@ pub mod web;
 pub mod web_content;
 pub mod extra_tools;
 pub mod mcp;
+pub mod memory_tool;
 pub mod subagent;
 
 pub use apply_patch::ApplyPatchTool;
-pub use background::{get_task_manager, ManageTaskTool, TaskManager};
+pub use background::{get_task_manager, FinishedTask, ManageTaskTool, TaskManager};
 pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use mcp::{
     find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,
     McpServerStatus, McpTool,
 };
+pub use memory_tool::SaveMemoryTool;
+pub use policy::needs_approval_even_in_yolo;
 pub use registry::ToolRegistry;
 pub use shell::{command_requires_sudo, extract_first_sudo_command, ShellTool};
 pub use types::{Tool, ToolContext, ToolOutput};

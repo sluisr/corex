@@ -116,7 +116,9 @@ fn is_protected_write_path_raw(path: &Path) -> bool {
     p_str.ends_with("/.git/config")
         || p_str == ".git/config"
         || p_str.contains("/.git/info/attributes")
+        || p_str.starts_with(".git/info/attributes")
         || p_str.contains("/.git/hooks/")
+        || p_str.starts_with(".git/hooks/")
         || p_str.contains("/.corex/")
         || p_str.starts_with(".corex/")
         || p_str.ends_with("/.corex")
@@ -232,7 +234,10 @@ pub fn read_path_needs_confirmation(
         return false; // defaults to the workspace root
     };
     let path = resolve_path(&context.workspace_dir, raw);
-    if is_within_workspace(&path, &context.workspace_dir) && !is_sensitive_system_path(&path) {
+    let readable = std::iter::once(&context.workspace_dir)
+        .chain(&context.extra_dirs)
+        .any(|root| is_within_workspace(&path, root));
+    if readable && !is_sensitive_system_path(&path) {
         return false;
     }
     // Output the harness itself spilled to disk is meant to be read back without a prompt.
@@ -1074,6 +1079,12 @@ impl Tool for EditTool {
             Some(s) => s,
             None => return Ok(ToolOutput::error("Missing 'new_string' argument.")),
         };
+        if old_string == new_string {
+            return Ok(ToolOutput::error(
+                "'old_string' and 'new_string' are identical, so the edit would change nothing. \
+                 Provide the new text you want in place of the old one.",
+            ));
+        }
         let allow_multiple = args.get("allow_multiple").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let path = resolve_path(&context.workspace_dir, rel_path);
@@ -1352,6 +1363,13 @@ impl Tool for GlobTool {
             .map(|p| resolve_path(&context.workspace_dir, p))
             .unwrap_or_else(|| context.workspace_dir.clone());
 
+        if is_sensitive_system_path(&root_dir) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: searching sensitive credential directory '{}' is forbidden.",
+                root_dir.display()
+            )));
+        }
+
         let glob_pattern = match glob::Pattern::new(pattern_str) {
             Ok(g) => g,
             Err(e) => return Ok(ToolOutput::error(format!("Invalid glob pattern '{}': {}", pattern_str, e))),
@@ -1369,7 +1387,11 @@ impl Tool for GlobTool {
 
         for entry in walker.flatten() {
             let path = entry.path();
-            if path == root_dir || !path.is_file() {
+            if path == root_dir
+                || !path.is_file()
+                || !is_within_workspace(path, &root_dir)
+                || is_sensitive_system_path(path)
+            {
                 continue;
             }
             let rel_to_root = path.strip_prefix(&root_dir).unwrap_or(path);
@@ -1480,6 +1502,13 @@ impl Tool for LsTool {
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let rel_path = args.get("dir_path").and_then(|v| v.as_str()).unwrap_or(".");
         let path = resolve_path(&context.workspace_dir, rel_path);
+
+        if is_sensitive_system_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Access denied: listing sensitive credential directory '{}' is forbidden.",
+                rel_path
+            )));
+        }
 
         if !path.exists() {
             return Ok(ToolOutput::error(format!("Directory does not exist: {}", rel_path)));
@@ -1602,6 +1631,7 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         assert!(!read_path_needs_confirmation("read_file", Some("src/main.rs"), &ctx));
         assert!(!read_path_needs_confirmation("read_file", None, &ctx));
@@ -1615,7 +1645,52 @@ mod tests {
         let _ = fs::remove_dir_all(&ws);
     }
 
+    #[test]
+    fn added_directories_are_read_without_confirmation() {
+        let base = std::env::temp_dir().join(format!("corex-extra-dirs-{}", std::process::id()));
+        let (ws, data) = (base.join("ws"), base.join("data"));
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        let mut ctx = ToolContext {
+            workspace_dir: ws,
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let file = data.join("rows.csv").display().to_string();
+        assert!(read_path_needs_confirmation("read_file", Some(&file), &ctx));
+        ctx.extra_dirs.push(data.clone());
+        assert!(!read_path_needs_confirmation("read_file", Some(&file), &ctx));
+        assert!(!read_path_needs_confirmation("grep_search", Some("../data"), &ctx));
+        assert!(read_path_needs_confirmation("read_file", Some("/etc/hostname"), &ctx));
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_that_changes_nothing_is_an_error() {
+        let ws = std::env::temp_dir().join(format!("corex_edit_noop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let file = ws.join("a.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        observe_file(&file);
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            sudo_password: None,
+            allowed_commands: vec![],
+            extra_dirs: vec![],
+        };
+        let out = EditTool
+            .execute(serde_json::json!({"file_path": "a.rs", "old_string": "fn main()", "new_string": "fn main()"}), &ctx)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&ws);
+        assert!(out.is_error && out.output.contains("identical"), "{}", out.output);
+    }
+
     #[test]
     fn symlink_escape_is_rejected_by_is_within_workspace() {
         let base = std::env::temp_dir().join(format!("corex_symlink_escape_{}", std::process::id()));
@@ -1659,6 +1734,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let res = WriteFileTool
@@ -1683,6 +1759,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         // Write a test file
@@ -1753,6 +1830,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let writer = WriteFileTool;
@@ -1795,6 +1873,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let content = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n";
@@ -1855,6 +1934,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let reader = ReadFileTool;
@@ -1928,6 +2008,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let mut handles = Vec::new();
@@ -1974,6 +2055,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let res = EditTool
@@ -2039,6 +2121,7 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: vec!["apply_patch".to_string()],
+            extra_dirs: Vec::new(),
         };
 
         // When "apply_patch" is allowed, edit & write_file must NOT require confirmation
@@ -2062,6 +2145,7 @@ mod tests {
             yolo_mode: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
         (ws, ctx)
     }

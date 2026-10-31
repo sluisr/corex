@@ -214,16 +214,21 @@ fn user_blocks(content: Option<&MessageContent>) -> Vec<AnthropicBlock> {
 /// Key under a tool call's `extra_content` holding the turn's signed thinking blocks.
 pub const THINKING_EXTRA_KEY: &str = "anthropic_thinking";
 
+fn is_task_report(m: &Message) -> bool {
+    m.text_content()
+        .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+}
+
 /// Converts Corex messages and tool definitions into Anthropic's Messages API format.
 pub fn convert_messages_and_tools(
     messages: &[Message],
     tools: Option<&[ToolDefinition]>,
 ) -> (Option<String>, Vec<AnthropicMessage>, Option<Vec<AnthropicTool>>) {
-    // 1. Extract system prompt (Anthropic accepts top-level `system` string)
+    // Anthropic takes the system prompt as a top-level `system` string, not as a message.
     let mut system_parts = Vec::new();
     let mut non_system = Vec::new();
     for m in messages {
-        if m.role == "system" {
+        if m.role == "system" && !is_task_report(m) {
             if let Some(txt) = m.text_content() {
                 if !txt.trim().is_empty() {
                     system_parts.push(txt.trim());
@@ -239,11 +244,25 @@ pub fn convert_messages_and_tools(
         Some(system_parts.join("\n\n"))
     };
 
-    // 2. Convert conversation turns
     let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
 
     for m in non_system {
         match m.role.as_str() {
+            "system" => {
+                let block = AnthropicBlock::Text {
+                    text: format!("<system-notification>\n{}\n</system-notification>", m.text_content().unwrap_or("").trim_end()),
+                };
+                if let Some(last) = anthropic_messages.last_mut() {
+                    if last.role == "user" {
+                        last.content.push(block);
+                        continue;
+                    }
+                }
+                anthropic_messages.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: vec![block],
+                });
+            }
             "user" => {
                 let blocks = user_blocks(m.content.as_ref());
                 // Group consecutive user turns into a single user message
@@ -274,7 +293,12 @@ pub fn convert_messages_and_tools(
                 // Anthropic requires tool results in a `user` message. Group consecutive tool results together.
                 if let Some(last) = anthropic_messages.last_mut() {
                     if last.role == "user" {
-                        last.content.push(block);
+                        let pos = last
+                            .content
+                            .iter()
+                            .position(|b| !matches!(b, AnthropicBlock::ToolResult { .. }))
+                            .unwrap_or(last.content.len());
+                        last.content.insert(pos, block);
                         continue;
                     }
                 }
@@ -290,8 +314,13 @@ pub fn convert_messages_and_tools(
                 if let Some(saved) = m
                     .tool_calls
                     .as_ref()
-                    .and_then(|calls| calls.iter().find_map(|c| c.extra_content.as_ref()))
-                    .and_then(|ec| ec.get(THINKING_EXTRA_KEY))
+                    .and_then(|calls| {
+                        calls.iter().find_map(|c| {
+                            c.extra_content
+                                .as_ref()
+                                .and_then(|ec| ec.get(THINKING_EXTRA_KEY))
+                        })
+                    })
                     .and_then(|v| v.as_array())
                 {
                     blocks.extend(
@@ -308,7 +337,7 @@ pub fn convert_messages_and_tools(
                 }
                 if let Some(ref calls) = m.tool_calls {
                     for c in calls {
-                        let input_val: serde_json::Value = serde_json::from_str(&c.function.arguments)
+                        let input_val: serde_json::Value = crate::parse_lenient_json(&c.function.arguments)
                             .unwrap_or_else(|_| serde_json::json!({}));
                         blocks.push(AnthropicBlock::ToolUse {
                             id: c.id.clone(),
@@ -487,6 +516,7 @@ pub struct AnthropicStreamState {
     pub usage: Usage,
     open_thinking: std::collections::BTreeMap<usize, AnthropicBlock>,
     finished_thinking: Vec<serde_json::Value>,
+    completed: bool,
 }
 
 impl AnthropicStreamState {
@@ -622,11 +652,15 @@ pub fn parse_anthropic_sse_data(
                     "max_tokens" | "model_context_window_exceeded" => "length",
                     other => other,
                 };
+                state.completed = true;
                 events.push(StreamEvent::Completed { finish_reason: Some(normalized.to_string()) });
             }
         }
         AnthropicSseData::MessageStop => {
-            events.push(StreamEvent::Completed { finish_reason: None });
+            if !state.completed {
+                state.completed = true;
+                events.push(StreamEvent::Completed { finish_reason: None });
+            }
         }
         AnthropicSseData::Error { error } => {
             events.push(StreamEvent::Error(error.message));
@@ -717,6 +751,38 @@ mod tests {
         let t_list = anthropic_tools.unwrap();
         assert_eq!(t_list.len(), 1);
         assert_eq!(t_list[0].name, "run_shell_command");
+    }
+
+    #[test]
+    fn test_task_report_stays_in_place_as_a_user_turn() {
+        let messages = vec![
+            Message::system("You are a helpful assistant."),
+            Message::user("Build it."),
+            Message::assistant("Building in the background.".to_string(), None),
+            Message::system("TASK_DONE|42|0|31.2s\nFinished release"),
+        ];
+        let (system, msgs, _) = convert_messages_and_tools(&messages, None);
+        assert_eq!(system.as_deref(), Some("You are a helpful assistant."));
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, "user");
+        match &last.content[0] {
+            AnthropicBlock::Text { text } => assert!(text.contains("TASK_DONE|42|0|31.2s")),
+            other => panic!("expected a text block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_goes_before_a_task_report_added_while_it_ran() {
+        let messages = vec![
+            Message::user("Check."),
+            Message::assistant_with_tools(None, None, vec![ToolCall::new("c1", "run_shell_command", r#"{"command":"ls"}"#)]),
+            Message::system("TASK_DONE|42|1|3s\nerror"),
+            Message::tool_response("c1", "src"),
+        ];
+        let (_, msgs, _) = convert_messages_and_tools(&messages, None);
+        let last = msgs.last().unwrap();
+        assert!(matches!(last.content[0], AnthropicBlock::ToolResult { .. }));
+        assert!(matches!(last.content[1], AnthropicBlock::Text { .. }));
     }
 
     #[test]
@@ -877,5 +943,44 @@ mod tests {
         let haiku35 = model_profile("claude-3-5-haiku-20241022");
         assert_eq!(haiku35.thinking, ThinkingMode::Unsupported);
         assert_eq!(haiku35.max_output_tokens, 8192);
+    }
+
+    #[test]
+    fn tool_arguments_are_repaired_and_completed_is_sent_once() {
+        let mut call1 = ToolCall::new("c1", "read_file", r#"{"file_path": "a.rs",}"#);
+        call1.extra_content = Some(serde_json::json!({"other": true}));
+        let mut call2 = ToolCall::new("c2", "read_file", r#"{"file_path": "b.rs"}"#);
+        call2.extra_content = Some(serde_json::json!({
+            THINKING_EXTRA_KEY: [{"type": "thinking", "thinking": "step", "signature": "sig"}]
+        }));
+
+        let messages = vec![
+            Message::user("check files"),
+            Message::assistant_with_tools(None, None, vec![call1, call2]),
+            Message::tool_response("c1", "ok1"),
+            Message::tool_response("c2", "ok2"),
+        ];
+        let (_, converted, _) = convert_messages_and_tools(&messages, None);
+        assert!(matches!(converted[1].content[0], AnthropicBlock::Thinking { .. }));
+        match &converted[1].content[1] {
+            AnthropicBlock::ToolUse { input, .. } => {
+                assert_eq!(input.get("file_path").and_then(|v| v.as_str()), Some("a.rs"));
+            }
+            other => panic!("expected ToolUse, got {:?}", other),
+        }
+
+        let mut state = AnthropicStreamState::new();
+        let events = feed(
+            &mut state,
+            &[
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        let completed_count = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Completed { .. }))
+            .count();
+        assert_eq!(completed_count, 1, "must emit Completed only once per stream");
     }
 }

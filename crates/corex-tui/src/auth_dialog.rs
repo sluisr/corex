@@ -1,10 +1,10 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::overlay::begin_modal;
+use crate::overlay::{begin_modal, key_hints, panel_rules};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -113,34 +113,26 @@ pub fn render_auth_dialog(
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
-            format!("  Enter your {} API key / token:", state.provider_label),
-            Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD),
+            format!("  {} API key", state.provider_label),
+            Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("  Saved for ", Style::default().fg(theme.gray)),
+            Span::styled("  Saved for ", Style::default().fg(theme.dark_gray)),
             Span::styled(format!("${}", state.api_key_env), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" and ~/.corex/settings.json", Style::default().fg(theme.gray)),
+            Span::styled(" and ~/.corex/settings.json", Style::default().fg(theme.dark_gray)),
         ]),
         Line::from(""),
     ];
 
-    // Masked input box with stylish formatting
+    // Fully masked input box to prevent leaking any characters of the secret API key
     let (input_span, cursor) = if state.input_buffer.is_empty() {
         (
             Span::styled(format!("Paste or type key ({})", state.api_key_env), Style::default().fg(theme.dark_gray)),
             Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
         )
     } else {
-        let chars: Vec<char> = state.input_buffer.chars().collect();
-        let total_chars = chars.len();
-        let masked = if total_chars > 8 {
-            let prefix: String = chars[..4].iter().collect();
-            let suffix: String = chars[total_chars - 4..].iter().collect();
-            let stars = "*".repeat(total_chars - 8);
-            format!("{}{}{}", prefix, stars, suffix)
-        } else {
-            "*".repeat(total_chars)
-        };
+        let total_chars = state.input_buffer.chars().count();
+        let masked = "*".repeat(total_chars);
         (
             Span::styled(masked, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
             Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
@@ -148,7 +140,7 @@ pub fn render_auth_dialog(
     };
 
     lines.push(Line::from(vec![
-        Span::styled("  › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+        Span::styled("  ▎ ", Style::default().fg(theme.accent_blue)),
         input_span,
         cursor,
     ]));
@@ -156,12 +148,12 @@ pub fn render_auth_dialog(
 
     if let Some(ref err) = state.error_msg {
         lines.push(Line::from(Span::styled(
-            format!("  ✕ {}", err),
-            Style::default().fg(Color::LightRed),
+            format!("  {}", err),
+            Style::default().fg(theme.error),
         )));
     } else {
         lines.push(Line::from(vec![
-            Span::styled("  Get key/info at: ", Style::default().fg(theme.dark_gray)),
+            Span::styled("  Get one at ", Style::default().fg(theme.dark_gray)),
             Span::styled(
                 &state.portal_url,
                 Style::default().fg(theme.accent_blue).add_modifier(Modifier::UNDERLINED),
@@ -170,23 +162,13 @@ pub fn render_auth_dialog(
     }
     lines.push(Line::from(""));
 
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("[Enter]", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-        Span::styled(" Save & Activate    ", Style::default().fg(theme.gray)),
-        Span::styled("[Esc]", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(" Cancel", Style::default().fg(theme.gray)),
-    ]));
+    let mut hints = vec![Span::raw("  ")];
+    hints.extend(key_hints(&[("Enter", "save & activate"), ("Esc", "cancel")], theme));
+    lines.push(Line::from(hints));
 
-    let title_str = format!(" {} API Key ", state.provider_label);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(ratatui::symbols::border::PLAIN)
-        .border_style(Style::default().fg(theme.accent_blue))
-        .title(title_str)
-        .title_alignment(ratatui::layout::Alignment::Left);
-
-    frame.render_widget(Paragraph::new(lines).block(block), dialog_area);
+    // Transparent like the other dialogs, with a thin rule above and below.
+    frame.render_widget(Paragraph::new(lines), Rect::new(dialog_area.x, dialog_area.y + 1, dialog_area.width, dialog_area.height.saturating_sub(2)));
+    panel_rules(frame, dialog_area, theme);
 }
 
 #[cfg(test)]
@@ -197,6 +179,28 @@ mod tests {
     fn env_override_note_only_for_deepseek_with_a_different_env_key() {
         // Only the DeepSeek key is overridden by the environment at load time.
         assert_eq!(env_override_note("openai", "sk-new"), None);
+    }
+
+    #[test]
+    fn auth_dialog_masks_api_key_completely() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = Theme::default();
+        let mut auth = AuthDialogState::new();
+        auth.open();
+        auth.input_buffer = "sk-ant-api03-secret123456789".to_string();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_auth_dialog(f, f.area(), &auth, &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+
+        // Must not contain any plaintext fragments of the key
+        assert!(!text.contains("sk-ant"));
+        assert!(!text.contains("6789"));
+        // Must contain fully masked stars
+        assert!(text.contains(&"*".repeat(auth.input_buffer.len())));
     }
 
     #[test]

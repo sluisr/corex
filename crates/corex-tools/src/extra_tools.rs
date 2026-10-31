@@ -148,6 +148,14 @@ impl Tool for ReadManyFilesTool {
             let rel = file.strip_prefix(&context.workspace_dir).unwrap_or(file);
             concatenated.push_str(&format!("=== FILE: {} ===\n", rel.display()));
 
+            let readable = std::iter::once(&context.workspace_dir)
+                .chain(&context.extra_dirs)
+                .any(|root| crate::fs_tools::is_within_workspace(file, root));
+            if !readable {
+                concatenated.push_str("(Skipped symlink escaping workspace)\n\n");
+                continue;
+            }
+
             if crate::fs_tools::is_sensitive_system_path(file) {
                 concatenated.push_str("(Skipped sensitive system/credential file)\n\n");
                 continue;
@@ -284,12 +292,26 @@ impl Tool for WriteTodosTool {
             Some(t) => t,
             None => return Ok(ToolOutput::error("Missing 'todos' argument.")),
         };
+        let Some(items) = todos_val.as_array() else {
+            return Ok(ToolOutput::error("'todos' must be a list of {description, status} items."));
+        };
+        for (i, item) in items.iter().enumerate() {
+            let description = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if description.trim().is_empty() {
+                return Ok(ToolOutput::error(format!("Todo {} has no description.", i + 1)));
+            }
+            if !matches!(status, "pending" | "in_progress" | "completed") {
+                return Ok(ToolOutput::error(format!(
+                    "Todo {} has status '{}': use pending, in_progress or completed.",
+                    i + 1,
+                    status
+                )));
+            }
+        }
 
-        let dir = context.workspace_dir.join(".corex");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("todos.json");
-        
-        if let Err(e) = fs::write(&path, serde_json::to_string_pretty(todos_val)?) {
+        let content = serde_json::to_string_pretty(todos_val)?;
+        if let Err(e) = write_workspace_corex_json(&context.workspace_dir, "todos.json", &content) {
             return Ok(ToolOutput::error(format!("Failed to write todos: {}", e)));
         }
 
@@ -338,19 +360,38 @@ impl Tool for ActivateSkillTool {
         }
 
         // Search precedence: 1. Workspace .agents/skills 2. Workspace .corex/skills 3. Global ~/.agents/skills 4. Global ~/.corex/skills
+        let home_dir = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
         let candidates = [
-            context.workspace_dir.join(".agents").join("skills").join(name).join("SKILL.md"),
-            context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
-            directories::BaseDirs::new()
-                .map(|b| b.home_dir().join(".agents").join("skills").join(name).join("SKILL.md"))
-                .unwrap_or_else(|| Path::new("").to_path_buf()),
-            directories::BaseDirs::new()
-                .map(|b| b.home_dir().join(".corex").join("skills").join(name).join("SKILL.md"))
-                .unwrap_or_else(|| Path::new("").to_path_buf()),
+            (
+                context.workspace_dir.join(".agents").join("skills"),
+                context.workspace_dir.join(".agents").join("skills").join(name).join("SKILL.md"),
+            ),
+            (
+                context.workspace_dir.join(".corex").join("skills"),
+                context.workspace_dir.join(".corex").join("skills").join(name).join("SKILL.md"),
+            ),
+            (
+                home_dir.as_ref().map(|h| h.join(".agents").join("skills")).unwrap_or_default(),
+                home_dir
+                    .as_ref()
+                    .map(|h| h.join(".agents").join("skills").join(name).join("SKILL.md"))
+                    .unwrap_or_default(),
+            ),
+            (
+                home_dir.as_ref().map(|h| h.join(".corex").join("skills")).unwrap_or_default(),
+                home_dir
+                    .as_ref()
+                    .map(|h| h.join(".corex").join("skills").join(name).join("SKILL.md"))
+                    .unwrap_or_default(),
+            ),
         ];
 
-        for path in &candidates {
-            if path.exists() && !crate::fs_tools::is_sensitive_system_path(path) {
+        for (base_root, path) in &candidates {
+            if !path.as_os_str().is_empty()
+                && path.exists()
+                && crate::fs_tools::is_within_workspace(path, base_root)
+                && !crate::fs_tools::is_sensitive_system_path(path)
+            {
                 match fs::read_to_string(path) {
                     Ok(content) => return Ok(ToolOutput::success(content)),
                     Err(e) => return Ok(ToolOutput::error(format!("Failed to read skill {}: {}", name, e))),
@@ -431,8 +472,41 @@ struct Task {
     dependencies: Vec<String>,
 }
 
+fn write_workspace_corex_json(workspace_dir: &Path, filename: &str, content: &str) -> std::io::Result<()> {
+    let dir = workspace_dir.join(".corex");
+    if let Ok(meta) = fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Refusing to write through a symlinked .corex directory",
+            ));
+        }
+    }
+    let path = dir.join(filename);
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("Refusing to write to symlinked {}", filename),
+            ));
+        }
+    }
+    if !crate::fs_tools::is_within_workspace(&path, workspace_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Target {} resolves outside the workspace", filename),
+        ));
+    }
+    corex_core::write_private_atomic(&path, content)
+}
+
 fn load_tasks(workspace_dir: &Path) -> Vec<Task> {
     let path = workspace_dir.join(".corex").join("tasks.json");
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink())
+        || !crate::fs_tools::is_within_workspace(&path, workspace_dir)
+    {
+        return Vec::new();
+    }
     if path.exists() {
         if let Ok(content) = fs::read_to_string(path) {
             if let Ok(tasks) = serde_json::from_str(&content) {
@@ -444,10 +518,7 @@ fn load_tasks(workspace_dir: &Path) -> Vec<Task> {
 }
 
 fn save_tasks(workspace_dir: &Path, tasks: &[Task]) -> Result<()> {
-    let dir = workspace_dir.join(".corex");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("tasks.json");
-    fs::write(path, serde_json::to_string_pretty(tasks)?)?;
+    write_workspace_corex_json(workspace_dir, "tasks.json", &serde_json::to_string_pretty(tasks)?)?;
     Ok(())
 }
 
@@ -869,17 +940,17 @@ impl Tool for UpdateTopicTool {
         let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
         let intent = args.get("strategic_intent").and_then(|v| v.as_str()).unwrap_or("");
 
-        let dir = context.workspace_dir.join(".corex");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("topic.json");
-
         let topic_json = json!({
             "title": title,
             "summary": summary,
             "strategic_intent": intent
         });
 
-        fs::write(path, serde_json::to_string_pretty(&topic_json)?)?;
+        write_workspace_corex_json(
+            &context.workspace_dir,
+            "topic.json",
+            &serde_json::to_string_pretty(&topic_json)?,
+        )?;
         Ok(ToolOutput::success(format!("Topic updated: {}", title)))
     }
 }
@@ -897,11 +968,148 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: vec![],
+            extra_dirs: Vec::new(),
         };
 
         let result = tool.execute(json!({"name": "corex-about"}), &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.output.contains("sluisr"));
         assert!(result.output.contains("Corex"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_tools_refuse_symlinked_targets() {
+        let ws = std::env::temp_dir().join(format!("corex_f07_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let corex_dir = ws.join(".corex");
+        fs::create_dir_all(&corex_dir).unwrap();
+
+        let outside_victim = std::env::temp_dir().join(format!("corex_f07_victim_{}", std::process::id()));
+        fs::write(&outside_victim, "ORIGINAL_SECRET").unwrap();
+
+        std::os::unix::fs::symlink(&outside_victim, corex_dir.join("todos.json")).unwrap();
+        std::os::unix::fs::symlink(&outside_victim, corex_dir.join("tasks.json")).unwrap();
+        std::os::unix::fs::symlink(&outside_victim, corex_dir.join("topic.json")).unwrap();
+
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec![],
+            extra_dirs: Vec::new(),
+        };
+
+        let _ = WriteTodosTool
+            .execute(json!({"todos": [{"description": "pwn", "status": "pending"}]}), &ctx)
+            .await;
+        let _ = TrackerCreateTaskTool
+            .execute(json!({"title": "pwn", "description": "pwn"}), &ctx)
+            .await;
+        let _ = UpdateTopicTool
+            .execute(json!({"title": "pwn", "summary": "pwn"}), &ctx)
+            .await;
+
+        let victim_after = fs::read_to_string(&outside_victim).unwrap();
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_file(&outside_victim);
+        assert_eq!(victim_after, "ORIGINAL_SECRET", "symlinked metadata files must never overwrite target");
+    }
+
+    #[tokio::test]
+    async fn write_todos_rejects_malformed_items() {
+        let ws = std::env::temp_dir().join(format!("corex_todos_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec![],
+            extra_dirs: vec![],
+        };
+        let run = |todos: serde_json::Value| {
+            let ctx = &ctx;
+            async move { WriteTodosTool.execute(json!({ "todos": todos }), ctx).await.unwrap() }
+        };
+        assert!(run(json!([{"description": "x", "status": "weird"}])).await.is_error);
+        assert!(run(json!([{"description": "  ", "status": "pending"}])).await.is_error);
+        assert!(run(json!("not a list")).await.is_error);
+        assert!(!run(json!([{"description": "probar", "status": "in_progress"}])).await.is_error);
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_many_files_follows_links_into_added_directories() {
+        let ws = std::env::temp_dir().join(format!("corex_rmf_ws_{}", std::process::id()));
+        let data = std::env::temp_dir().join(format!("corex_rmf_data_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&data);
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("notes.txt"), "SHARED_DATA").unwrap();
+        std::os::unix::fs::symlink(data.join("notes.txt"), ws.join("notes.txt")).unwrap();
+
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec![],
+            extra_dirs: vec![data.clone()],
+        };
+        let out = ReadManyFilesTool.execute(json!({"include": ["*.txt"]}), &ctx).await.unwrap();
+
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&data);
+        assert!(out.output.contains("SHARED_DATA"), "{}", out.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escapes_and_credential_listings_are_blocked() {
+        let ws = std::env::temp_dir().join(format!("corex_f12_ws_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        let skill_dir = ws.join(".agents").join("skills").join("escape");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        let outside_file = std::env::temp_dir().join(format!("corex_f12_outside_{}.txt", std::process::id()));
+        fs::write(&outside_file, "TOP_SECRET_OUTSIDE_WORKSPACE").unwrap();
+
+        std::os::unix::fs::symlink(&outside_file, ws.join("linked.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside_file, skill_dir.join("SKILL.md")).unwrap();
+
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: vec![],
+            extra_dirs: Vec::new(),
+        };
+
+        let many = ReadManyFilesTool
+            .execute(json!({"include": ["*.txt"]}), &ctx)
+            .await
+            .unwrap();
+        let skill = ActivateSkillTool
+            .execute(json!({"name": "escape"}), &ctx)
+            .await
+            .unwrap();
+        let grep = crate::grep::GrepTool
+            .execute(json!({"pattern": "TOP_SECRET"}), &ctx)
+            .await
+            .unwrap();
+        let ls_ssh = crate::fs_tools::LsTool
+            .execute(json!({"dir_path": "~/.ssh"}), &ctx)
+            .await
+            .unwrap();
+
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_file(&outside_file);
+
+        assert!(!many.output.contains("TOP_SECRET_OUTSIDE_WORKSPACE"));
+        assert!(!skill.output.contains("TOP_SECRET_OUTSIDE_WORKSPACE"));
+        assert!(!grep.output.contains("TOP_SECRET_OUTSIDE_WORKSPACE"));
+        assert!(ls_ssh.is_error, "LsTool must refuse sensitive credential directories");
     }
 }

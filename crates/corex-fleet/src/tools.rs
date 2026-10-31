@@ -12,6 +12,84 @@ use crate::config::{FleetConfig, NodeConfig};
 use crate::ssh::{assess_command_risk, CommandRiskLevel, SshExecutor};
 use crate::telemetry::TelemetryCollector;
 
+/// The node `fleet_run_command` would reach: the one named, else the default or only one.
+fn run_target_node<'a>(config: &'a FleetConfig, args: &serde_json::Value) -> Option<&'a NodeConfig> {
+    args.get("node_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|id| config.find_node(id))
+        .or_else(|| config.default_or_single_node())
+}
+
+/// Servers listed by the repository's own `fleet.toml` are not trusted until the user approves
+/// reaching them, for the session or for good.
+fn untrusted_inventory(config: &FleetConfig, tool: &str, context: &ToolContext) -> bool {
+    config.from_workspace && !context.allowed_commands.iter().any(|c| c == tool)
+}
+
+/// Whether running `command` needs approval, given how risky it is and where its servers come from.
+fn command_needs_confirmation(config: &FleetConfig, command: &str, tool: &str, context: &ToolContext) -> bool {
+    let risk = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands);
+    if risk == CommandRiskLevel::Dangerous {
+        return true;
+    }
+    let approved = context.allowed_commands.iter().any(|c| c == tool || c == command);
+    !approved && (risk != CommandRiskLevel::Safe || config.from_workspace)
+}
+
+fn run_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, tool: &str, context: &ToolContext) -> bool {
+    if context.yolo_mode {
+        return false;
+    }
+    if args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return true;
+    }
+    let sudo_node = match run_target_node(config, args) {
+        Some(node) => node.sudo,
+        None => config.all_nodes().iter().any(|n| n.sudo),
+    };
+    if sudo_node {
+        return true;
+    }
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+    command_needs_confirmation(config, command, tool, context)
+}
+
+fn broadcast_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, tool: &str, context: &ToolContext) -> bool {
+    if context.yolo_mode {
+        return false;
+    }
+    if args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return true;
+    }
+    let targets = args.get("targets").and_then(|v| v.as_str()).unwrap_or("all");
+    if resolve_target_nodes(config, targets).iter().any(|n| n.sudo) {
+        return true;
+    }
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
+    command_needs_confirmation(config, command, tool, context)
+}
+
+/// Extra lines for the confirmation dialog when the servers come from the repository, so the
+/// user sees where the command really goes before approving it.
+fn workspace_origin(config: &FleetConfig, nodes: Vec<&NodeConfig>) -> String {
+    if !config.from_workspace {
+        return String::new();
+    }
+    let mut out = String::from("\nServers from this repository's .corex/fleet.toml:");
+    for node in nodes {
+        out.push_str(&format!("\n  {}: {}@{}:{}", node.id, node.user, node.host, node.port));
+        if let Some(jump) = &node.proxy_jump {
+            out.push_str(&format!(" via ProxyJump {}", jump));
+        }
+        if let Some(key) = &node.key_path {
+            out.push_str(&format!(", key {}", key.display()));
+        }
+    }
+    out
+}
+
 fn resolve_target_nodes<'a>(config: &'a FleetConfig, targets_str: &str) -> Vec<&'a NodeConfig> {
     let targets_str = targets_str.trim();
     if targets_str.eq_ignore_ascii_case("all") {
@@ -57,6 +135,14 @@ impl Tool for FleetListNodesTool {
         })
     }
 
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        if context.yolo_mode {
+            return false;
+        }
+        let check_status = args.get("check_status").and_then(|v| v.as_bool()).unwrap_or(false);
+        check_status && untrusted_inventory(&FleetConfig::load_fast(Some(&context.workspace_dir)), self.name(), context)
+    }
+
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let config = FleetConfig::load(Some(&context.workspace_dir))?;
         let all_nodes = config.all_nodes();
@@ -70,7 +156,7 @@ impl Tool for FleetListNodesTool {
         let check_status = args.get("check_status").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let mut output = String::new();
-        output.push_str(&format!("📦 Corex Fleet Inventory ({} nodes found):\n\n", all_nodes.len()));
+        output.push_str(&format!("Fleet inventory ({} nodes):\n\n", all_nodes.len()));
 
         if check_status {
             let semaphore = Arc::new(Semaphore::new(16));
@@ -184,48 +270,19 @@ impl Tool for FleetRunCommandTool {
             return true;
         }
 
-        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let config = FleetConfig::load_fast(Some(&context.workspace_dir));
-
-        let resolved_node = args
-            .get("node_id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|id| config.find_node(id))
-            .or_else(|| config.default_or_single_node());
-
-        if let Some(node) = resolved_node {
-            if node.sudo {
-                return true;
-            }
-        } else if config.nodes.iter().chain(config.clusters.values().flat_map(|c| &c.nodes)).any(|n| n.sudo) {
-            return true;
-        }
-
-        let risk = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands);
-
-        if context
-            .allowed_commands
-            .iter()
-            .any(|c| c == self.name() || c == command)
-            && risk != CommandRiskLevel::Dangerous
-        {
-            return false;
-        }
-
-        risk != CommandRiskLevel::Safe
+        run_needs_confirmation(&FleetConfig::load_fast(Some(&context.workspace_dir)), args, self.name(), context)
     }
 
-    fn format_diff(&self, args: &serde_json::Value, _workspace: &Path) -> Option<String> {
+    fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
         let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("active-server");
         let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         let sudo = args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        let config = FleetConfig::load_fast(Some(workspace));
+        let origin = workspace_origin(&config, run_target_node(&config, args).into_iter().collect());
         let sudo_str = if sudo { " [sudo]" } else { "" };
-        Some(format!("Target Node: {}{}\n$ {}", node_id, sudo_str, command))
+        Some(format!("Target Node: {}{}{}\n$ {}", node_id, sudo_str, origin, command))
     }
-
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(cmd) if !cmd.trim().is_empty() => cmd.trim(),
@@ -350,36 +407,18 @@ impl Tool for FleetBroadcastTool {
             return true;
         }
 
-        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let targets_str = args.get("targets").and_then(|v| v.as_str()).unwrap_or("all");
-        let config = FleetConfig::load_fast(Some(&context.workspace_dir));
-
-        let target_nodes = resolve_target_nodes(&config, targets_str);
-        if target_nodes.iter().any(|n| n.sudo) {
-            return true;
-        }
-
-        let risk = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands);
-
-        if context
-            .allowed_commands
-            .iter()
-            .any(|c| c == self.name() || c == command)
-            && risk != CommandRiskLevel::Dangerous
-        {
-            return false;
-        }
-
-        risk != CommandRiskLevel::Safe
+        broadcast_needs_confirmation(&FleetConfig::load_fast(Some(&context.workspace_dir)), args, self.name(), context)
     }
 
-    fn format_diff(&self, args: &serde_json::Value, _workspace: &Path) -> Option<String> {
+    fn format_diff(&self, args: &serde_json::Value, workspace: &Path) -> Option<String> {
         let targets = args.get("targets").and_then(|v| v.as_str()).unwrap_or("all");
         let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         let sudo = args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        let config = FleetConfig::load_fast(Some(workspace));
+        let origin = workspace_origin(&config, resolve_target_nodes(&config, targets));
         let sudo_str = if sudo { " [sudo]" } else { "" };
-        Some(format!("BROADCAST to [{}]{}\n$ {}", targets, sudo_str, command))
+        Some(format!("BROADCAST to [{}]{}{}\n$ {}", targets, sudo_str, origin, command))
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -474,6 +513,10 @@ impl Tool for FleetTelemetryTool {
         })
     }
 
+    fn needs_confirmation(&self, _args: &serde_json::Value, context: &ToolContext) -> bool {
+        !context.yolo_mode && untrusted_inventory(&FleetConfig::load_fast(Some(&context.workspace_dir)), self.name(), context)
+    }
+
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let config = FleetConfig::load(Some(&context.workspace_dir))?;
 
@@ -511,7 +554,7 @@ impl Tool for FleetTelemetryTool {
         indexed.sort_by_key(|(idx, _)| *idx);
 
         let mut output = String::new();
-        output.push_str("📊 Fleet Health & Telemetry Report:\n\n");
+        output.push_str("Fleet telemetry:\n\n");
 
         for (_, telemetry) in indexed {
             if telemetry.is_online {
@@ -527,7 +570,7 @@ impl Tool for FleetTelemetryTool {
                     .unwrap_or_default();
 
                 output.push_str(&format!(
-                    "🟢 [{}] {} | Latency: {}\n   OS: {} | Uptime: {}{}\n   RAM: {} | Root Disk: {} | Load: {}\n\n",
+                    "● [{}] {} | Latency: {}\n   OS: {} | Uptime: {}{}\n   RAM: {} | Root Disk: {} | Load: {}\n\n",
                     telemetry.node_id,
                     telemetry.hostname.as_deref().unwrap_or(""),
                     latency_str,
@@ -540,7 +583,7 @@ impl Tool for FleetTelemetryTool {
                 ));
             } else {
                 output.push_str(&format!(
-                    "🔴 [{}] OFFLINE / UNREACHABLE: {}\n\n",
+                    "× [{}] UNREACHABLE: {}\n\n",
                     telemetry.node_id,
                     telemetry.error_message.as_deref().unwrap_or("Unknown error")
                 ));
@@ -567,72 +610,90 @@ mod tests {
 
     #[test]
     fn test_run_and_broadcast_needs_confirmation_sudo_and_allowed() {
+        // The user's own fleet.toml: safe commands on trusted servers run unasked.
         let mut cfg = FleetConfig::default();
-        let mut normal_node = NodeConfig::new("web-1", "10.0.0.1");
-        normal_node.sudo = false;
+        cfg.nodes.push(NodeConfig::new("web-1", "10.0.0.1"));
         let mut sudo_node = NodeConfig::new("root-1", "10.0.0.2");
         sudo_node.sudo = true;
-        cfg.nodes.push(normal_node);
         cfg.nodes.push(sudo_node);
 
-        let ws = make_temp_workspace("confirm", &cfg);
-        let run_tool = FleetRunCommandTool;
-        let bcast_tool = FleetBroadcastTool;
-
-        let base_ctx = ToolContext {
-            workspace_dir: ws.clone(),
-            yolo_mode: false,
-            sudo_password: None,
-            allowed_commands: Vec::new(),
+        let run = |args: serde_json::Value, ctx: &ToolContext| run_needs_confirmation(&cfg, &args, "fleet_run_command", ctx);
+        let bcast = |args: serde_json::Value, ctx: &ToolContext| {
+            broadcast_needs_confirmation(&cfg, &args, "fleet_broadcast_command", ctx)
         };
+        let ctx = test_context(Vec::new());
 
-        // Safe command on non-sudo node -> no confirmation
-        assert!(!run_tool.needs_confirmation(
-            &json!({"node_id": "web-1", "command": "uptime"}),
-            &base_ctx
-        ));
+        assert!(!run(json!({"node_id": "web-1", "command": "uptime"}), &ctx));
+        assert!(run(json!({"node_id": "web-1", "command": "uptime", "sudo": true}), &ctx));
+        assert!(run(json!({"node_id": "root-1", "command": "uptime"}), &ctx));
+        assert!(bcast(json!({"targets": "all", "command": "uptime"}), &ctx));
+        assert!(!bcast(json!({"targets": "web-1", "command": "uptime"}), &ctx));
 
-        // Safe command with sudo=true arg -> requires confirmation
-        assert!(run_tool.needs_confirmation(
-            &json!({"node_id": "web-1", "command": "uptime", "sudo": true}),
-            &base_ctx
-        ));
+        // An approved command skips confirmation when mutating, never when dangerous.
+        let allowed = test_context(vec!["systemctl restart nginx".to_string()]);
+        assert!(!run(json!({"node_id": "web-1", "command": "systemctl restart nginx"}), &allowed));
+        assert!(run(json!({"node_id": "web-1", "command": "rm -rf /var/www"}), &allowed));
+    }
 
-        // Safe command on node with node.sudo=true -> requires confirmation
-        assert!(run_tool.needs_confirmation(
-            &json!({"node_id": "root-1", "command": "uptime"}),
-            &base_ctx
-        ));
+    #[test]
+    fn test_workspace_servers_need_approval_even_for_safe_commands() {
+        let mut cfg = FleetConfig::default();
+        cfg.nodes.push(NodeConfig::new("web-1", "10.0.0.1"));
+        cfg.from_workspace = true;
+        let ctx = test_context(Vec::new());
 
-        // Broadcast to all includes root-1 (node.sudo=true) -> requires confirmation
-        assert!(bcast_tool.needs_confirmation(
-            &json!({"targets": "all", "command": "uptime"}),
-            &base_ctx
-        ));
-
-        // Broadcast only to web-1 with safe command -> no confirmation
-        assert!(!bcast_tool.needs_confirmation(
+        assert!(run_needs_confirmation(&cfg, &json!({"node_id": "web-1", "command": "uptime"}), "fleet_run_command", &ctx));
+        assert!(broadcast_needs_confirmation(
+            &cfg,
             &json!({"targets": "web-1", "command": "uptime"}),
-            &base_ctx
+            "fleet_broadcast_command",
+            &ctx
         ));
+        assert!(untrusted_inventory(&cfg, "fleet_telemetry", &ctx));
 
-        // Allowed command bypasses confirmation for Mutating, but NOT Dangerous
-        let allowed_ctx = ToolContext {
-            workspace_dir: ws.clone(),
+        // Approving for the session ([s]) or for good ([p]) stores the same rules as elsewhere.
+        let approved = test_context(vec!["uptime".to_string(), "fleet_telemetry".to_string()]);
+        assert!(!run_needs_confirmation(&cfg, &json!({"node_id": "web-1", "command": "uptime"}), "fleet_run_command", &approved));
+        assert!(!untrusted_inventory(&cfg, "fleet_telemetry", &approved));
+        assert!(run_needs_confirmation(&cfg, &json!({"node_id": "web-1", "command": "rm -rf /"}), "fleet_run_command", &approved));
+
+        let yolo = ToolContext { yolo_mode: true, ..test_context(Vec::new()) };
+        assert!(!run_needs_confirmation(&cfg, &json!({"node_id": "web-1", "command": "uptime"}), "fleet_run_command", &yolo));
+    }
+
+    #[test]
+    fn test_global_servers_are_probed_without_asking() {
+        let mut cfg = FleetConfig::default();
+        cfg.nodes.push(NodeConfig::new("web-1", "10.0.0.1"));
+        let ctx = test_context(Vec::new());
+        assert!(!untrusted_inventory(&cfg, "fleet_telemetry", &ctx));
+        assert!(!untrusted_inventory(&cfg, "fleet_list_nodes", &ctx));
+    }
+
+    #[test]
+    fn test_confirmation_shows_where_workspace_servers_lead() {
+        let mut node = NodeConfig::new("web-1", "203.0.113.7");
+        node.proxy_jump = Some("bastion.example.com".to_string());
+        node.key_path = Some(PathBuf::from("~/.ssh/id_ed25519"));
+        let mut cfg = FleetConfig::default();
+        cfg.nodes.push(node);
+
+        assert!(workspace_origin(&cfg, cfg.all_nodes()).is_empty());
+        cfg.from_workspace = true;
+        let origin = workspace_origin(&cfg, cfg.all_nodes());
+        assert!(origin.contains("203.0.113.7"));
+        assert!(origin.contains("ProxyJump bastion.example.com"));
+        assert!(origin.contains("id_ed25519"));
+    }
+
+    fn test_context(allowed_commands: Vec<String>) -> ToolContext {
+        ToolContext {
+            workspace_dir: std::env::temp_dir(),
             yolo_mode: false,
             sudo_password: None,
-            allowed_commands: vec!["systemctl restart nginx".to_string()],
-        };
-        assert!(!run_tool.needs_confirmation(
-            &json!({"node_id": "web-1", "command": "systemctl restart nginx"}),
-            &allowed_ctx
-        ));
-        assert!(run_tool.needs_confirmation(
-            &json!({"node_id": "web-1", "command": "rm -rf /var/www"}),
-            &allowed_ctx
-        ));
-
-        let _ = std::fs::remove_dir_all(&ws);
+            allowed_commands,
+            extra_dirs: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -650,6 +711,7 @@ mod tests {
             yolo_mode: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
         };
 
         let out = FleetListNodesTool
@@ -657,6 +719,43 @@ mod tests {
             .await
             .unwrap();
         assert!(out.output.contains("cluster:production (Prod Cluster) -> Members: [prod-web-1, prod-db-1]"));
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn test_workspace_fleet_toml_cannot_bypass_confirmation_and_ssh_probes_need_confirmation() {
+        let mut cfg = FleetConfig::default();
+        cfg.safe_commands = vec!["sh".to_string(), "rm -rf".to_string()];
+        cfg.dangerous_commands.clear();
+        cfg.nodes.push(NodeConfig::new("web-1", "10.0.0.1"));
+
+        let ws = make_temp_workspace("f01_bypass", &cfg);
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+
+        assert!(FleetRunCommandTool.needs_confirmation(
+            &json!({"node_id": "web-1", "command": "sh"}),
+            &ctx
+        ));
+        assert!(FleetBroadcastTool.needs_confirmation(
+            &json!({"targets": "all", "command": "rm -rf /var/www"}),
+            &ctx
+        ));
+        assert!(!FleetListNodesTool.needs_confirmation(
+            &json!({"check_status": false}),
+            &ctx
+        ));
+        assert!(FleetListNodesTool.needs_confirmation(
+            &json!({"check_status": true}),
+            &ctx
+        ));
+        assert!(FleetTelemetryTool.needs_confirmation(&json!({}), &ctx));
 
         let _ = std::fs::remove_dir_all(&ws);
     }

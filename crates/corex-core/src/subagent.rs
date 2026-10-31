@@ -35,10 +35,10 @@ impl SubagentRole {
 
     pub fn icon(&self) -> &'static str {
         match self {
-            SubagentRole::Scout => "🔭",
-            SubagentRole::Tester => "🧪",
-            SubagentRole::Researcher => "📚",
-            SubagentRole::Worker => "⚙️",
+            SubagentRole::Scout => "◎",
+            SubagentRole::Tester => "✓",
+            SubagentRole::Researcher => "◇",
+            SubagentRole::Worker => "▸",
         }
     }
 }

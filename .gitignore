@@ -19,3 +19,7 @@ npm/bin/corex.exe
 node_modules/
 tools/
 *.py
+*.pyc
+__pycache__/
+*audit*.md
+

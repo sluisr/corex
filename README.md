@@ -20,7 +20,7 @@
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.4 ms (`cx --version`) and draws its first frame in about 3 ms, ships as one native binary per platform, and idles at about 11.7 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
-> **Release Status:** Active Development / Beta (`v0.8.5`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development / Beta (`v0.9.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 
@@ -35,7 +35,7 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
 - **File Locks & Protected Paths:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
 - **Session Audit Log:** A plain-text log of every tool call, shell command and LLM exchange, with millisecond timestamps, in `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`, kept for 7 days. It is not signed or encrypted.
-- **Global & Workspace Personality (`SYSTEM.md`):** Discovers and applies persistent behavioral rules from `~/.corex/SYSTEM.md` and workspace `COREX.md`.
+- **Global & Workspace Personality (`SYSTEM.md`):** Loads every instruction file it finds (`~/.corex/SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`, global first, then the workspace); `/memory list` shows which ones are in use.
 - **Clipboard Integration:** Copies text through `wl-copy`, `xclip`/`xsel` or OSC 52, and pastes images with `Ctrl+V` (as `[Image #N]`) for models that can see them.
 - **KV Cache Preservation:** Context management and tool compression keep the prompt prefix stable so provider prompt caching applies. The hit rate depends on the provider and the conversation; `/stats` and the summary printed on exit report it.
 - **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands, plus contextual non-intrusive provider auth.
@@ -64,7 +64,7 @@ Corex is built with Link-Time Optimization (`lto = "fat"`), a single codegen uni
 | Platform | Download | Binary | Notes |
 | :--- | ---: | ---: | :--- |
 | Linux x86_64 | 7.23 MB | 8.09 MB | glibc 2.17 or newer |
-| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.39 or newer in `v0.8.5`; 2.17 or newer from the next release |
+| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.17 or newer since `v0.9.0` (2.39 in `v0.8.5`) |
 | macOS Apple Silicon | 6.39 MB | 6.31 MB | |
 | macOS Intel | 6.88 MB | 7.02 MB | |
 | Windows x86_64 | 6.77 MB | 6.91 MB | |
@@ -317,8 +317,10 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/prefix <text>` | Enforce specific response prefixes for strict formatting. |
 | `/chat` / `/resume` | List, save, or resume conversation sessions. |
 | `/save <tag>` | Save a checkpoint of the current session. |
-| `/rewind` | Revert conversation history by one turn. |
+| `/rewind` | Go back to any earlier message: rewind the conversation, revert the agent's file edits since then, or both. |
 | `/compact` / `/compress` | Compress session context to conserve token limits. |
+| `/memory [list\|show\|add\|reload]` | List the instruction files in the prompt, show the memory block, save a note (`~/.corex/COREX.md`, or private to the project with `--project`), or reload them after editing. The model can save notes too with `save_memory`, after your approval. |
+| `/directory [add\|show]` | Let the agent read directories outside the workspace without confirmation, for this session (alias `/dir`). |
 | `/mcp` | Interactive Model Context Protocol server catalog (`/mcp catalog`, `/mcp add`, `/mcp reload`). |
 | `/tasks` | Manage background tasks (`status`, `kill`, `send_input`). |
 | `/stats` (alias `/context`) | View session metrics, KV Cache hit rates, financial cost, and the context in use against the compaction limit. |
@@ -341,7 +343,7 @@ Corex exposes native tools directly to the reasoning engine:
 - **`web_search` & `web_fetch`:** Live search engine integration and clean HTML-to-markdown extraction.
 - **`delegate_subagent` & `manage_subagents`:** Parallel delegation to specialized autonomous subagents (`scout`, `tester`, `researcher`, `worker`) with context isolation and reactive completion notifications.
 - **`write_todos`:** Multi-step autonomous task tracking and verification.
-- **Persistent Memory:** Context retention across runs via `./COREX.md` (project) and `~/.corex/COREX.md` (global).
+- **Persistent Memory:** Context retention across runs via `~/.corex/COREX.md` (global), `./COREX.md` / `./AGENTS.md` (project) and private per-project notes in `~/.corex/projects/`.
 
 ---
 
@@ -352,9 +354,9 @@ Configuration and logs are stored globally in `~/.corex/` and can be overridden 
 | Path | Description |
 | :--- | :--- |
 | `~/.corex/fleet.toml` | Global Fleet configuration: VPS nodes, clusters, SSH keys, jump hosts, and command whitelist. |
-| `.corex/fleet.toml` | Workspace-level Fleet overrides for project-specific infrastructure nodes. |
+| `.corex/fleet.toml` | Workspace-level Fleet nodes and clusters for project-specific infrastructure. It replaces the global file while present, but its `safe_commands`/`dangerous_commands` are ignored (the global lists apply) and every command or status probe on its servers asks for confirmation, since the file arrives with the repository. |
 | `~/.corex/SYSTEM.md` | Global AI personality, operational rules, and behavioral guidelines injected into all sessions. |
-| `.corex/SYSTEM.md` | Workspace-level AI instructions and coding constraints (`COREX.md` and `AGENTS.md` at the project root work too). |
+| `.corex/SYSTEM.md` | Workspace-level AI instructions and coding constraints (`COREX.md`, `AGENTS.md` and `DEEPSEEK.md` at the project root are loaded too, in that order). |
 | `~/.corex/settings.json` | Global provider credentials, base URLs, default model, and allowed commands. |
 | `.corex/settings.json` | Project-level workspace settings overrides (secrets automatically stripped before git). |
 | `~/.corex/flash_settings.json` | CoT reasoning depth configuration for Flash. |

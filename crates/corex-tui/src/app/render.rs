@@ -17,6 +17,7 @@ use crate::fleet_dialog::render_fleet_dialog;
 use crate::markdown::render_markdown;
 use crate::model_dialog::render_model_dialog;
 use crate::session_dialog::render_session_dialog;
+use crate::file_completion::render_file_popup;
 use crate::slash_commands::render_command_popup;
 use crate::sudo_dialog::render_sudo_dialog;
 use crate::theme::Theme;
@@ -852,8 +853,11 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
-    if app.input_buffer.starts_with('/') {
+    if let Some(query) = app.file_query() {
+        app.last_file_query = Some(query);
+    } else if app.input_buffer.starts_with('/') {
         app.last_slash_filter = app.input_buffer.clone();
+        app.last_file_query = None;
     }
 
     app.advance_slash_popup();
@@ -906,7 +910,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 .clamp(1, MAX_COMPOSER_LINES)
         }
     };
-    let composer_height = if app.user_dialog.is_open {
+    let composer_height = if app.rewind_dialog.is_open {
+        app.rewind_dialog.height(size.height)
+    } else if app.user_dialog.is_open {
         crate::user_dialog::calculate_dialog_height(&app.user_dialog, size.width, size.height)
     } else {
         composer_content_lines as u16 + 2
@@ -944,7 +950,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     let content_max_width = (chat_chunk.width as usize).saturating_sub(4).max(20);
 
-    // 1. Header Banner (First item in scrollable feed!)
+    // The banner scrolls away with the feed instead of staying pinned.
     // Config is snapshotted once per frame and reused by the status footer below.
     let cfg = app.llm_client.get_config();
     let is_auth = !cfg.api_key.trim().is_empty();
@@ -969,7 +975,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         )
     };
 
-    // 2. Cached Messages & Tool Executions List
     if app.cached_render_width != content_max_width
         || app.cached_session_id != app.session.id
         || app.cached_logs_expanded != app.logs_expanded
@@ -1043,7 +1048,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.selection_lines.cached.extend(new_plain);
     }
 
-    // 3. Live tail (uncached pending message, confirmation dialog, streaming output, queue)
+    // Live tail, never cached: pending message, approval dialog, streaming output, queue.
     let mut tail_lines: Vec<Line<'static>> = Vec::new();
 
     if target_cache_count < app.session.display_messages().len() {
@@ -1302,7 +1307,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
     }
 
-    // 3. Input Prompt Composer
     let show_esc_hint = app.last_esc_press
         .map(|i| i.elapsed() <= Duration::from_millis(500))
         .unwrap_or(false);
@@ -1313,13 +1317,19 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         (
             vec![Line::from(vec![
                 prompt_prefix.clone(),
-                Span::styled("(Press 1-3 or Enter to select, Esc to decline)", Style::default().fg(app.theme.dark_gray)),
+                Span::styled("(Press 1-5, the letter shown, or Enter to select; Esc to decline)", Style::default().fg(app.theme.dark_gray)),
             ])],
             0usize,
         )
     } else if app.input_buffer.is_empty() && !show_esc_hint {
         let is_mobile = is_mobile_portrait(size.width, size.height);
-        let placeholder = if is_mobile {
+        let copy_notice = app
+            .copy_notice
+            .filter(|(at, notice)| at.elapsed() < Duration::from_millis(if notice.len() > 30 { 6000 } else { 1500 }))
+            .map(|(_, notice)| notice);
+        let placeholder = if let Some(notice) = copy_notice {
+            notice
+        } else if is_mobile {
             "Type message or /help"
         } else if app.is_streaming {
             "Type to queue a message · Alt+Enter sends it now"
@@ -1329,7 +1339,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         (
             vec![Line::from(vec![
                 prompt_prefix.clone(),
-                Span::styled(format!("{} ", crate::cursor::block()), Style::default().fg(app.theme.accent_blue)),
+                Span::styled(
+                    format!("{} ", if app.dialog_has_focus() { " " } else { crate::cursor::block() }),
+                    Style::default().fg(app.theme.accent_blue),
+                ),
                 Span::styled(placeholder, Style::default().fg(app.theme.dark_gray)),
             ])],
             0usize,
@@ -1344,7 +1357,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray))
         });
 
-        let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme);
+        let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme, !app.dialog_has_focus());
 
         let mut clamped = app.cursor_idx.min(app.input_buffer.len());
         while !app.input_buffer.is_char_boundary(clamped) {
@@ -1386,7 +1399,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         );
     }
 
-    if app.user_dialog.is_open {
+    if app.rewind_dialog.is_open {
+        crate::rewind_dialog::render_rewind_dialog(frame, composer_chunk, &app.rewind_dialog, &app.theme);
+    } else if app.user_dialog.is_open {
         render_user_dialog(frame, composer_chunk, &app.user_dialog, &app.theme);
     } else {
         frame.render_widget(
@@ -1397,8 +1412,12 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         );
     }
 
-    // Render slash command popup if active
-    if let Some(p_chunk) = popup_chunk {
+    // Render the `@path` or slash command popup if active
+    if let (Some(p_chunk), Some(query)) = (popup_chunk, app.last_file_query.as_deref()) {
+        let matches = app.file_index.as_ref().map(|i| i.matches(query)).unwrap_or_default();
+        let index_empty = app.file_index.as_ref().is_none_or(|i| i.is_empty());
+        render_file_popup(frame, query, &matches, index_empty, app.slash_selected_idx, p_chunk, &app.theme);
+    } else if let Some(p_chunk) = popup_chunk {
         let filter_text = if app.input_buffer.starts_with('/') {
             &app.input_buffer
         } else {
@@ -1407,7 +1426,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         render_command_popup(frame, filter_text, app.slash_selected_idx, p_chunk, &app.theme);
     }
 
-    // 4. Status Footer Bar (Left: Workspace Path | Right: Model Info)
 
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
@@ -1700,22 +1718,18 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         frame.render_widget(Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right), footer_cols[2]);
     }
 
-    // 5. Sudo Authentication Dialog Modal if open
     if app.sudo_dialog.is_open {
         render_sudo_dialog(frame, size, &app.sudo_dialog, &app.theme);
     }
 
-    // 6. Model Dialog Modal if open
     if app.model_dialog.is_open {
         render_model_dialog(frame, size, &app.model_dialog, &app.theme);
     }
 
-    // 7. Auth Dialog Modal if open
     if app.auth_dialog.is_open {
         render_auth_dialog(frame, size, &app.auth_dialog, &app.theme);
     }
 
-    // 8. Session Dialog Modal if open
     if app.session_dialog.is_open {
         render_session_dialog(frame, size, &mut app.session_dialog, &app.theme);
     }
