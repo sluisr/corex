@@ -332,9 +332,18 @@ fn model_key(app: &mut App, key: KeyEvent) -> Flow {
 fn early_key(app: &mut App, key: KeyEvent) -> Flow {
     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // Like Ctrl+C, a second press within two seconds confirms, so a reflexive "undo" never
+    // leaves the session.
     if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
-        #[cfg(unix)]
-        crate::app::terminal::suspend();
+        let is_recent = app.last_ctrl_z_press.is_some_and(|i| i.elapsed() <= Duration::from_secs(2));
+        app.last_ctrl_c_press = None;
+        if is_recent {
+            app.last_ctrl_z_press = None;
+            #[cfg(unix)]
+            crate::app::terminal::suspend();
+        } else {
+            app.last_ctrl_z_press = Some(Instant::now());
+        }
         return Flow::Handled;
     }
 
@@ -417,6 +426,7 @@ fn global_hotkey(app: &mut App, key: KeyEvent, terminal: &mut Tui) -> Result<Flo
                 return Ok(Flow::Quit);
             }
             app.last_ctrl_c_press = Some(Instant::now());
+            app.last_ctrl_z_press = None;
         }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('\x14') => {
             app.thinking_state.is_expanded = !app.thinking_state.is_expanded;

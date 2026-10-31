@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.9.1] - 2026-11-01
 
 ### Changed
-- **Ctrl+Z suspends instead of quitting**: Like any terminal program, Ctrl+Z hands the terminal back to the shell and `fg` resumes the session where it was. It used to close Corex at once, which a reflexive "undo" after a paste turned into a lost session.
+- **Ctrl+Z suspends instead of quitting**: Pressing Ctrl+Z twice within two seconds, like Ctrl+C, hands the terminal back to the shell and `fg` resumes the session where it was; the first press only warns. It used to close Corex at once, which a reflexive "undo" after a paste turned into a lost session.
 - **Mouse selection no longer overwrites the clipboard**: Releasing a drag fills the primary selection (middle-click paste) on Linux and keeps the highlight; `Ctrl+C` with text highlighted copies it to the clipboard, and the next `Ctrl+C` cancels or exits as before. Inside tmux, release still copies, as tmux itself does.
 
 ### Fixed

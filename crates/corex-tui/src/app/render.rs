@@ -1630,15 +1630,21 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     }
 
     // Left spans: Workspace directory, git branch, plan mode, and exit warning
-    let show_exit_warning = app.last_ctrl_c_press
-        .map(|i| i.elapsed() <= std::time::Duration::from_secs(2))
-        .unwrap_or(false);
+    let recent = |press: Option<std::time::Instant>| press.is_some_and(|i| i.elapsed() <= std::time::Duration::from_secs(2));
+    let exit_warning = if recent(app.last_ctrl_z_press) {
+        Some("Press Ctrl+Z again to suspend.")
+    } else if recent(app.last_ctrl_c_press) {
+        Some("Press Ctrl+C again to exit.")
+    } else {
+        None
+    };
 
     let right_width = right_spans.iter().map(|s| s.width()).sum::<usize>();
     let center_width = center_spans.iter().map(|s| s.width()).sum::<usize>();
 
     let mut left_spans = Vec::new();
-    if show_exit_warning {
+    if let Some(warning) = exit_warning {
+        let warning_width = warning.len() + 1;
         // Available width for the left side of the status bar (accounting for right & center widgets)
         let avail = (status_chunk.width as usize).saturating_sub(right_width + center_width + 1);
         let path_str = format!(" {} ", app.shorten_path());
@@ -1649,7 +1655,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         };
         let full_needed = unicode_width::UnicodeWidthStr::width(path_str.as_str())
             + unicode_width::UnicodeWidthStr::width(branch_str.as_str())
-            + 28;
+            + warning_width;
 
         if avail >= full_needed {
             // Full space available: render path + branch + plan mode + warning
@@ -1658,14 +1664,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 left_spans.push(Span::styled(branch_str, Style::default().fg(app.theme.accent_cyan)));
             }
             left_spans.extend(mode_badges(app));
-            left_spans.push(Span::styled("Press Ctrl+C again to exit. ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
-        } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + 28 && !branch_str.is_empty() {
+            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + warning_width && !branch_str.is_empty() {
             // Medium space: prioritize branch and the exit warning so it is never truncated
             left_spans.push(Span::styled(format!(" {} ", branch_str.trim()), Style::default().fg(app.theme.accent_cyan)));
-            left_spans.push(Span::styled("Press Ctrl+C again to exit. ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
         } else {
             // Narrow space (e.g. /fleet split mode on narrower terminals): show complete exit warning
-            left_spans.push(Span::styled(" Press Ctrl+C again to exit.", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+            left_spans.push(Span::styled(format!(" {warning}"), Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
         }
     } else {
         left_spans.push(Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)));

@@ -125,6 +125,7 @@ impl App {
             last_turn_start: None,
             last_esc_press: None,
             last_ctrl_c_press: None,
+            last_ctrl_z_press: None,
             slash_popup_height_current: 0.0,
             slash_popup_clock: None,
             last_slash_filter: String::new(),

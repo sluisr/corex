@@ -201,7 +201,7 @@ cx --yolo
 |`Alt+Enter` | While the agent works: deliver the message at the next safe point |
 |`Esc` | Cancel the generation / close popup / snap scroll to bottom; twice within 0.5 s clears the prompt |
 |`Ctrl+C` | Cancel the generation; twice within 2 s quits |
-|`Ctrl+Z` | Suspend to the shell (`fg` resumes) |
+|`Ctrl+Z` (twice) | Suspend to the shell (`fg` resumes) |
 |`Ctrl+T` | Expand / collapse Chain-of-Thought reasoning blocks |
 |`Ctrl+O` | Expand / collapse full tool output & diff previews |
 |`Ctrl+L` | Repaint the screen |

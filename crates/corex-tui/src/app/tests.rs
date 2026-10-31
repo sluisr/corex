@@ -1243,6 +1243,12 @@ use corex_core::types::ToolCall;
             "Footer in fleet mode truncated the exit warning! Found: '{}'",
             footer_line
         );
+
+        app.last_ctrl_z_press = Some(std::time::Instant::now());
+        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer_line: String = (0..70).map(|x| buffer[(x, 29)].symbol()).collect();
+        assert!(footer_line.contains("Press Ctrl+Z again to suspend"), "Found: '{}'", footer_line);
     }
 
     fn plain(lines: &[Line<'_>]) -> Vec<String> {
