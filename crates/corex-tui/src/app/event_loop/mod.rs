@@ -221,6 +221,28 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 }
 
 async fn handle_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, terminal: &mut Tui) -> Result<Flow> {
+    let edits_prompt = match &ev {
+        Event::Paste(_) => true,
+        Event::Key(key) => key.kind == KeyEventKind::Press && !is_ctrl_z(key),
+        _ => false,
+    };
+    if !edits_prompt {
+        return dispatch_terminal_event(app, ev, event_tx, terminal).await;
+    }
+    let before = (app.input_buffer.clone(), app.cursor_idx);
+    let flow = dispatch_terminal_event(app, ev, event_tx, terminal).await;
+    if app.input_buffer != before.0 {
+        app.record_prompt_edit(before);
+    }
+    flow
+}
+
+fn is_ctrl_z(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a'))
+}
+
+async fn dispatch_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, terminal: &mut Tui) -> Result<Flow> {
     match ev {
         Event::Paste(pasted) => handle_paste(app, pasted),
         // A resize or regaining focus can leave ghost cells the diff renderer believes
@@ -332,11 +354,16 @@ fn model_key(app: &mut App, key: KeyEvent) -> Flow {
 fn early_key(app: &mut App, key: KeyEvent) -> Flow {
     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-    // Like Ctrl+C, a second press within two seconds confirms, so a reflexive "undo" never
-    // leaves the session.
-    if is_ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a')) {
-        let is_recent = app.last_ctrl_z_press.is_some_and(|i| i.elapsed() <= Duration::from_secs(2));
+    // With text in the prompt Ctrl+Z undoes, a letter or an edit at a time. On an empty prompt it
+    // suspends, and like Ctrl+C only on a second press within two seconds.
+    if is_ctrl_z(&key) {
         app.last_ctrl_c_press = None;
+        if !app.input_buffer.is_empty() {
+            app.last_ctrl_z_press = None;
+            app.undo_prompt_edit();
+            return Flow::Handled;
+        }
+        let is_recent = app.last_ctrl_z_press.is_some_and(|i| i.elapsed() <= Duration::from_secs(2));
         if is_recent {
             app.last_ctrl_z_press = None;
             #[cfg(unix)]

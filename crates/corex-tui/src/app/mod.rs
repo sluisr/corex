@@ -43,6 +43,7 @@ pub mod render;
 pub use render::*;
 pub mod event_loop;
 mod commands;
+mod undo;
 pub use event_loop::*;
 
 const YOLO_ON_MESSAGE: &str = "YOLO on: tools run without asking, except shell commands that touch credentials, git hooks or shell startup files, and notes for the global memory.";
@@ -126,6 +127,7 @@ impl App {
             last_esc_press: None,
             last_ctrl_c_press: None,
             last_ctrl_z_press: None,
+            undo: undo::ComposerUndo::default(),
             slash_popup_height_current: 0.0,
             slash_popup_clock: None,
             last_slash_filter: String::new(),
@@ -889,16 +891,33 @@ impl App {
         Message::user_parts(parts)
     }
 
-    /// Forgets what a paste tag stood for once the tag is deleted from the prompt.
-    pub fn forget_paste_tag(&mut self, tag: &str) {
-        if let Some(rest) = tag.strip_prefix("[Pasted text #") {
-            if let Some(id) = rest.split(' ').next().and_then(|n| n.parse().ok()) {
-                self.pastes.remove(&id);
-            }
-        } else if let Some(rest) = tag.strip_prefix("[Image #") {
-            if let Ok(id) = rest.trim_end_matches(']').parse() {
-                self.images.remove(&id);
-            }
+    /// Notes a prompt edit for Ctrl+Z. Paste contents are kept while their tag may still come
+    /// back through undo, and released once the prompt is empty and no tag can.
+    pub fn record_prompt_edit(&mut self, before: (String, usize)) {
+        self.undo.record(before, &self.input_buffer);
+        if self.input_buffer.is_empty() {
+            self.pastes.clear();
+            self.images.clear();
+        }
+    }
+
+    /// Ctrl+Z with text in the prompt: back to the state before the last letter or edit. Text
+    /// that arrived without a recorded step (a queued message) goes a letter at a time.
+    pub fn undo_prompt_edit(&mut self) {
+        if let Some((text, cursor)) = self.undo.undo() {
+            self.input_buffer = text;
+            self.cursor_idx = cursor.min(self.input_buffer.len());
+        } else {
+            self.clamp_cursor();
+            let start = self.input_buffer[..self.cursor_idx].char_indices().last().map_or(0, |(i, _)| i);
+            self.input_buffer.drain(start..self.cursor_idx);
+            self.cursor_idx = start;
+        }
+        self.slash_selected_idx = 0;
+        if self.input_buffer.is_empty() {
+            self.undo.clear();
+            self.pastes.clear();
+            self.images.clear();
         }
     }
 

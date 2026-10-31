@@ -89,14 +89,7 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
             if app.cursor_idx < app.input_buffer.len() {
                 let after = &app.input_buffer[app.cursor_idx..];
                 let tag_end = starts_with_paste_tag(after).then(|| after.find(']')).flatten();
-                let len = match tag_end {
-                    Some(end_bracket) => {
-                        let tag = after[..=end_bracket].to_string();
-                        app.forget_paste_tag(&tag);
-                        end_bracket + 1
-                    }
-                    None => next_char_len(after),
-                };
+                let len = tag_end.map_or_else(|| next_char_len(after), |end_bracket| end_bracket + 1);
                 app.input_buffer.drain(app.cursor_idx..app.cursor_idx + len);
                 app.clamp_cursor();
             }
@@ -141,14 +134,7 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                     .then(|| paste_tag_last_start(before))
                     .flatten()
                     .filter(|&open_idx| before[open_idx..].ends_with(']'));
-                let start = match tag_start {
-                    Some(open_idx) => {
-                        let tag = before[open_idx..].to_string();
-                        app.forget_paste_tag(&tag);
-                        open_idx
-                    }
-                    None => prev_char_start(before),
-                };
+                let start = tag_start.unwrap_or_else(|| prev_char_start(before));
                 app.input_buffer.drain(start..app.cursor_idx);
                 app.cursor_idx = start;
             }

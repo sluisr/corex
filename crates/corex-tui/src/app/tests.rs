@@ -1558,14 +1558,40 @@ use corex_core::types::ToolCall;
     }
 
     #[tokio::test]
-    async fn test_deleting_an_image_tag_forgets_its_image() {
+    async fn test_an_emptied_prompt_releases_its_pastes() {
         let mut app = idle_app().await;
         let image = clipboard::ClipboardImage { media_type: "image/png", data: vec![9] };
         app.images.insert(4, image);
         app.pastes.insert(7, "some pasted text".to_string());
-        app.forget_paste_tag("[Image #4]");
-        app.forget_paste_tag("[Pasted text #7 +3 lines]");
+        app.input_buffer = "[Image #4] [Pasted text #7 +3 lines]".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        let before = (app.input_buffer.clone(), app.cursor_idx);
+        app.input_buffer.clear();
+        app.cursor_idx = 0;
+        app.record_prompt_edit(before);
         assert!(app.images.is_empty() && app.pastes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_z_brings_back_a_deleted_paste_with_its_content() {
+        let mut app = idle_app().await;
+        app.handle_paste(format!("mira {}", "x".repeat(200)));
+        let tagged = app.input_buffer.clone();
+        assert!(tagged.contains("[Pasted text #"), "a long paste becomes a tag: {tagged}");
+        let before = (app.input_buffer.clone(), app.cursor_idx);
+        app.input_buffer.insert_str(0, "a ");
+        app.cursor_idx += 2;
+        app.record_prompt_edit(before);
+        let before = (app.input_buffer.clone(), app.cursor_idx);
+        app.input_buffer = "a ".to_string();
+        app.cursor_idx = 2;
+        app.record_prompt_edit(before);
+
+        app.undo_prompt_edit();
+        assert_eq!(app.input_buffer, format!("a {tagged}"));
+        assert_eq!(app.pastes.len(), 1, "the tag must still expand once restored");
+        app.undo_prompt_edit();
+        assert_eq!(app.input_buffer, tagged);
     }
 
     #[test]

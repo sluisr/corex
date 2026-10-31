@@ -314,6 +314,7 @@ pub struct App {
     pub last_ctrl_c_press: Option<Instant>,
     /// First Ctrl+Z of the pair that suspends to the shell.
     pub last_ctrl_z_press: Option<Instant>,
+    pub undo: super::undo::ComposerUndo,
     pub slash_popup_height_current: f32,
     /// Time of the last easing step; `None` while the popup is at rest.
     pub slash_popup_clock: Option<Instant>,
