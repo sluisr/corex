@@ -133,6 +133,76 @@ pub fn at_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
     (starts_word && !query.contains(char::is_whitespace)).then_some((start, query))
 }
 
+/// The folder being typed after `/directory add` (or `/dir add`) at `cursor`: the byte offset where
+/// it starts and its text. With several comma-separated folders, the last one.
+pub fn dir_arg_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
+    let before = input.get(..cursor)?;
+    let args = ["/directory add ", "/dir add "].iter().find_map(|p| before.strip_prefix(p))?;
+    let last = args.rsplit(',').next().unwrap_or(args).trim_start();
+    Some((cursor - last.len(), last))
+}
+
+/// `~` and `~name` are read as `~/` and `~/name`, so a missing slash still finds the folder.
+fn normalize_folder_query(query: &str) -> String {
+    match query.strip_prefix('~') {
+        Some(rest) if !rest.starts_with('/') => format!("~/{rest}"),
+        _ if query.is_empty() => "~/".to_string(),
+        _ => query.to_string(),
+    }
+}
+
+/// True when `query` already names an existing folder (`~/Escritorio` or `~/Escritorio/`), so
+/// Enter can run `/directory add` instead of completing it.
+pub fn is_existing_folder(query: &str, workspace: &Path) -> bool {
+    let query = normalize_folder_query(query);
+    query != "~/" && corex_tools::fs_tools::resolve_path(workspace, query.trim_end_matches('/')).is_dir()
+}
+
+/// Folders whose name starts with what is typed after the last `/` of `query`, read from disk:
+/// `~/…`, absolute, or relative to the workspace. Hidden folders only when the name starts with
+/// `.`, and never ones that hold credentials, which `/directory add` refuses anyway. An empty
+/// query lists the home directory.
+pub fn folder_matches(query: &str, workspace: &Path) -> Vec<String> {
+    static CACHE: std::sync::Mutex<Option<(String, PathBuf, Instant, Vec<String>)>> = std::sync::Mutex::new(None);
+    let query = normalize_folder_query(query);
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((q, ws, at, hits)) = cache.as_ref() {
+            if *q == query && ws == workspace && at.elapsed() < Duration::from_secs(2) {
+                return hits.clone();
+            }
+        }
+    }
+    let (dir, prefix) = match query.rfind('/') {
+        Some(i) => (&query[..=i], &query[i + 1..]),
+        None => ("", query.as_str()),
+    };
+    let base = if dir.is_empty() { workspace.to_path_buf() } else { corex_tools::fs_tools::resolve_path(workspace, dir) };
+    let needle = prefix.to_lowercase();
+    let mut hits: Vec<String> = std::fs::read_dir(&base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_str()?.to_string();
+                    let path = entry.path();
+                    let visible = !name.starts_with('.') || prefix.starts_with('.');
+                    (visible
+                        && name.to_lowercase().starts_with(&needle)
+                        && path.is_dir()
+                        && !corex_tools::fs_tools::is_sensitive_system_path(&path))
+                    .then(|| format!("{dir}{name}/"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    hits.sort_by_key(|h| h.to_lowercase());
+    hits.truncate(MAX_MATCHES);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((query, workspace.to_path_buf(), Instant::now(), hits.clone()));
+    }
+    hits
+}
+
 /// True when `query` is a `~/…` or absolute path that exists but lies outside every root, so the
 /// popup can say to add its folder instead of only that nothing matched.
 pub fn is_outside_roots(query: &str, roots: &[PathBuf]) -> bool {
@@ -152,6 +222,8 @@ pub enum IndexState {
     Empty,
     Ready,
     OutsideRoots,
+    /// Folders for `/directory add`, read from disk.
+    Folders,
 }
 
 pub fn render_file_popup(
@@ -163,6 +235,7 @@ pub fn render_file_popup(
     area: Rect,
     theme: &Theme,
 ) {
+    let folders = matches!(index, IndexState::Folders);
     if area.height < 3 {
         return;
     }
@@ -176,6 +249,7 @@ pub fn render_file_popup(
             IndexState::Empty => "No files found in the workspace".to_string(),
             IndexState::Ready => format!("No files match '{}' in the workspace or added folders", query),
             IndexState::OutsideRoots => "Outside the workspace: /directory add <folder> to search it".to_string(),
+            IndexState::Folders => format!("No folders match '{}'", query),
         };
         vec![Line::from(Span::styled(format!("  {}", note), Style::default().fg(theme.gray)))]
     } else {
@@ -186,7 +260,7 @@ pub fn render_file_popup(
             .map(|(i, path)| {
                 let style = if i == selected {
                     Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-                } else if path.ends_with('/') {
+                } else if path.ends_with('/') && !folders {
                     Style::default().fg(theme.gray)
                 } else {
                     Style::default().fg(theme.foreground)
@@ -203,12 +277,24 @@ pub fn render_file_popup(
     let selected_line = if matches.is_empty() { 0 } else { selected_idx % matches.len() };
     let scroll = (selected_line + 1).saturating_sub(visible);
     // Like the command menu: no fill, the title on top, then the matches.
+    let title = if folders { "  Folders" } else { "  Files" };
     frame.render_widget(
-        Paragraph::new(Span::styled("  Files", Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(title, Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))),
         Rect::new(popup_area.x, popup_area.y, popup_area.width, 1),
     );
     let body = Rect::new(popup_area.x + 1, popup_area.y + 1, popup_area.width.saturating_sub(2), popup_area.height.saturating_sub(2));
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+
+    // The free last row says where the selection is and whether more lies below, as the
+    // command menu does.
+    if !matches.is_empty() {
+        let more_below = scroll + visible < matches.len();
+        let counter = format!("  {}({}/{})", if more_below { "▼ " } else { "" }, selected_line + 1, matches.len());
+        frame.render_widget(
+            Paragraph::new(Span::styled(counter, Style::default().fg(theme.dark_gray))),
+            Rect::new(popup_area.x, popup_area.y + popup_area.height - 1, popup_area.width, 1),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +350,41 @@ mod tests {
         assert!(!is_outside_roots(&outside, &[ws.clone(), extra]), "an added folder is in reach");
         assert!(!is_outside_roots("Escritorio", &[ws]), "a bare name is a search, not a path");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_folder_after_directory_add_is_the_token() {
+        let input = "/directory add ~/Es";
+        assert_eq!(dir_arg_token(input, input.len()), Some((15, "~/Es")));
+        let input = "/dir add ~/a, ~/Do";
+        assert_eq!(dir_arg_token(input, input.len()), Some((14, "~/Do")), "the last of several folders");
+        assert_eq!(dir_arg_token("/directory add ", 15), Some((15, "")));
+        assert_eq!(dir_arg_token("/directory show", 15), None);
+        assert_eq!(dir_arg_token("tell me about /directory add", 28), None);
+        assert_eq!(normalize_folder_query("~Es"), "~/Es");
+        assert_eq!(normalize_folder_query("~"), "~/");
+        assert_eq!(normalize_folder_query(""), "~/");
+        assert_eq!(normalize_folder_query("/srv/"), "/srv/");
+    }
+
+    #[test]
+    fn folder_matches_list_folders_only() {
+        let base = std::env::temp_dir().join(format!("corex-folders-{}", std::process::id()));
+        for d in ["Escritorio", "escuela", "Documents", ".oculta"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("Es-un-archivo.txt"), "").unwrap();
+        let root = format!("{}/", base.display());
+        let ws = Path::new("/");
+
+        let es = folder_matches(&format!("{root}es"), ws);
+        let hidden = folder_matches(&format!("{root}."), ws);
+        let all = folder_matches(&root, ws);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(es, [format!("{root}Escritorio/"), format!("{root}escuela/")], "folders only, any case");
+        assert_eq!(hidden, [format!("{root}.oculta/")], "hidden folders when the name starts with a dot");
+        assert!(!all.iter().any(|f| f.contains(".oculta")) && all.len() == 3, "{all:?}");
     }
 
     #[test]

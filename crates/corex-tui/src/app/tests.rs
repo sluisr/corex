@@ -854,8 +854,8 @@ use corex_core::types::ToolCall;
         assert_eq!(app.pastes.len(), 1);
     }
 
-    #[test]
-    fn test_user_message_box_rendering() {
+    #[tokio::test]
+    async fn test_user_message_box_rendering() {
         let theme = Theme::default();
         let msg = Message::user("hola mundo".to_string());
         let lines = render_single_message_with_pending(0, &msg, None, &theme, 80, None, false);
@@ -870,9 +870,31 @@ use corex_core::types::ToolCall;
             assert!(!line.contains('❯'), "User message should not contain ❯: {}", line);
         }
 
-        // 2. Clean typography: starts with "[You]" and the user message
-        assert!(rendered_text[0].contains("[You]"));
-        assert!(rendered_text[0].contains("hola mundo"));
+        let cfg = corex_core::config::Config { user_color: Some("#82d7a0".into()), ..Default::default() };
+        let tinted = App::new(LlmClient::new(cfg), PathBuf::from("/tmp"), false);
+        assert_eq!(tinted.theme.user_text, ratatui::style::Color::Rgb(0x82, 0xd7, 0xa0), "user_color from settings.json");
+        let cfg = corex_core::config::Config { user_color: Some("verde".into()), ..Default::default() };
+        let wrong = App::new(LlmClient::new(cfg), PathBuf::from("/tmp"), false);
+        assert_eq!(wrong.theme.user_text, theme.user_text, "an invalid colour keeps the default");
+        assert!(wrong.session.messages.iter().any(|m| m.text_content().is_some_and(|t| t.contains("not a #rrggbb"))));
+        assert_eq!(crate::app::render::clean_label("Luis Soza\u{7}"), Some("LuisSoza".to_string()));
+        assert_eq!(crate::app::render::clean_label(" \t"), None);
+
+        // 2. Clean typography: the login of whoever runs Corex in brackets, then the message
+        let label = format!("[{}] ", crate::app::render::user_label());
+        assert!(rendered_text[0].starts_with(&format!("  {label}hola mundo")), "{:?}", rendered_text[0]);
+        let body = lines[0].spans.iter().find(|s| s.content.contains("hola")).unwrap();
+        assert_eq!(body.style.fg, Some(theme.user_text), "the user's words stand apart from the agent's");
+
+        let long = Message::user(format!("first line\n{}", "palabra ".repeat(20)));
+        let rows: Vec<String> = render_single_message_with_pending(0, &long, None, &theme, 60, None, false)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let hang = 2 + label.len();
+        for row in rows.iter().skip(1).filter(|r| !r.trim().is_empty()) {
+            assert_eq!(row.len() - row.trim_start().len(), hang, "continuation rows line up under the text: {row:?}");
+        }
     }
 
     #[tokio::test]
@@ -1270,12 +1292,35 @@ use corex_core::types::ToolCall;
         let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal.draw(|f| render_ui(f, &mut app)).unwrap();
         let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
-        assert!(footer.contains(&format!("{} context files", global + 2)), "{footer}");
+        assert!(footer.contains(&format!("{} ctx", global + 2)), "{footer}");
 
         app.context_files = 0;
         terminal.draw(|f| render_ui(f, &mut app)).unwrap();
         let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
-        assert!(!footer.contains("context file"), "hidden when none are loaded: {footer}");
+        assert!(!footer.contains(" ctx"), "hidden when none are loaded: {footer}");
+    }
+
+    #[tokio::test]
+    async fn context_usage_shows_only_from_half_the_window() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        let window = app.llm_client.get_config().context_window() as u64;
+        let footer = |app: &mut App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+            terminal.draw(|f| render_ui(f, app)).unwrap();
+            (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect()
+        };
+
+        app.session.add_message(Message::user("hi".to_string()));
+        app.session.update_usage(&corex_core::types::Usage { prompt_tokens: window / 10, ..Default::default() });
+        assert!(!footer(&mut app).contains('%'), "10% says nothing worth the room: {}", footer(&mut app));
+
+        app.session.update_usage(&corex_core::types::Usage { prompt_tokens: window * 6 / 10, ..Default::default() });
+        assert!(footer(&mut app).contains("~60%"), "{}", footer(&mut app));
     }
 
     #[tokio::test]

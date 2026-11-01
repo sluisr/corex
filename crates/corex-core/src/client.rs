@@ -1155,7 +1155,7 @@ impl LlmClient {
         if api_key.is_empty() {
             crate::forensic::ForensicLogger::log_error("stream_chat", "Missing API key in Config");
             if is_deepseek {
-                bail!("API key is missing. Please set COREX_API_KEY / DEEPSEEK_API_KEY or configure ~/.corex/settings.json");
+                bail!("API key is missing. Please set COREX_API_KEY / DEEPSEEK_API_KEY or save one with /key");
             } else {
                 bail!(
                     "API key for provider '{}' is missing. Export its API key environment variable (see /model) or switch provider.",

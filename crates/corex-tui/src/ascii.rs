@@ -138,6 +138,8 @@ pub fn render_gradient_logo_adaptive(
             .add_modifier(Modifier::BOLD),
     ));
     line1.push(Span::styled(format!(" v{}", version), Style::default().fg(muted_gray)));
+    line1.push(Span::styled(" · ", Style::default().fg(sep_gray)));
+    line1.push(Span::styled("sluisr", Style::default().fg(muted_gray)));
     lines.push(Line::from(line1));
 
     // Line 2: Chevron bottom (solid gray) + Model + Quick Commands

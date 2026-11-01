@@ -1047,6 +1047,7 @@ pub(crate) fn shortcuts_help() -> String {
         "  /command         run a command (/help lists them)",
         "  !command         run a shell command yourself; the agent sees its output next turn",
         "  Enter            send (queues while the agent works) · Alt+Enter: send now",
+        "  Shift+Tab        cycle modes: normal · accept edits · plan (/yolo approves everything)",
         "  Esc              take back a queued message, then cancel the reply",
         "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
         "  Ctrl+V           paste an image from the clipboard, or its text",

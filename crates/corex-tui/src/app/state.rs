@@ -322,6 +322,8 @@ pub struct App {
     /// Workspace paths offered while an `@path` is typed; rebuilt when stale.
     pub file_index: Option<crate::file_completion::FileIndex>,
     pub file_index_rx: Option<std::sync::mpsc::Receiver<crate::file_completion::FileIndex>>,
+    /// Shift+Tab's middle mode: file edits inside the workspace run without asking.
+    pub accept_edits: bool,
     /// The report of a `!command` the user is running, delivered when it finishes.
     pub user_shell_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// Esc was pressed while the `!command` ran, so its report says it was stopped.
@@ -331,6 +333,8 @@ pub struct App {
     pub context_files_checked: Option<std::time::Instant>,
     /// The `@path` query the popup last showed, kept so it can close smoothly.
     pub last_file_query: Option<String>,
+    /// That query was a `/directory add` folder, not an `@path`.
+    pub last_query_is_folder: bool,
     pub local_llm_online: Arc<AtomicBool>,
     pub last_local_check: Option<Instant>,
     pub cached_message_lines: Vec<Line<'static>>,

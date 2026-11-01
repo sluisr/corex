@@ -36,6 +36,8 @@ pub struct Theme {
     pub text_on_selected: Color,
     /// Emphasised text that must stand out from the plain foreground (titles, values).
     pub text_strong: Color,
+    /// The user's own messages in the conversation, apart from the agent's plain foreground.
+    pub user_text: Color,
     /// Background of the highlighted row in dialogs and lists.
     pub selected_bg: Color,
     /// Hairline rules between dialog sections.
@@ -52,6 +54,16 @@ impl Default for Theme {
     fn default() -> Self {
         Self::dark()
     }
+}
+
+/// A `#rrggbb` (or `rrggbb`) colour from settings.json.
+pub fn parse_hex_color(raw: &str) -> Option<Color> {
+    let hex = raw.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
 }
 
 impl Theme {
@@ -85,6 +97,7 @@ impl Theme {
             link: Color::Rgb(105, 185, 235),
             text_on_selected: Color::White,
             text_strong: Color::Rgb(225, 230, 240),
+            user_text: Color::Rgb(175, 192, 215),
             selected_bg: Color::Rgb(26, 38, 58),
             rule: Color::Rgb(50, 60, 75),
             code_bg: Color::Rgb(30, 35, 45),
@@ -121,6 +134,7 @@ impl Theme {
             link: Color::Rgb(0, 95, 170),
             text_on_selected: Color::Black,
             text_strong: Color::Rgb(25, 30, 40),
+            user_text: Color::Rgb(55, 75, 105),
             selected_bg: Color::Rgb(215, 226, 245),
             rule: Color::Rgb(205, 210, 220),
             code_bg: Color::Rgb(236, 238, 243),
@@ -178,7 +192,7 @@ mod tests {
     #[test]
     fn dark_text_colours_are_readable_on_black() {
         let t = Theme::dark();
-        for (name, c) in [("dark_gray", t.dark_gray), ("muted", t.muted), ("gray", t.gray)] {
+        for (name, c) in [("dark_gray", t.dark_gray), ("muted", t.muted), ("gray", t.gray), ("user_text", t.user_text)] {
             assert!(contrast(c, Color::Rgb(0, 0, 0)) >= 4.5, "{name}");
         }
     }
@@ -191,6 +205,7 @@ mod tests {
             ("gray", t.gray),
             ("dark_gray", t.dark_gray),
             ("muted", t.muted),
+            ("user_text", t.user_text),
             ("accent_blue", t.accent_blue),
             ("accent_purple", t.accent_purple),
             ("accent_cyan", t.accent_cyan),
@@ -205,6 +220,15 @@ mod tests {
             ("effort_max", t.effort_max),
         ] {
             assert!(contrast(c, white) >= 4.5, "{name} = {:.1}", contrast(c, white));
+        }
+    }
+
+    #[test]
+    fn user_colors_are_read_as_hex() {
+        assert_eq!(parse_hex_color("#82D7A0"), Some(Color::Rgb(0x82, 0xd7, 0xa0)));
+        assert_eq!(parse_hex_color(" afc0d7 "), Some(Color::Rgb(0xaf, 0xc0, 0xd7)));
+        for bad in ["green", "#fff", "#12345g", "", "#1234567"] {
+            assert_eq!(parse_hex_color(bad), None, "{bad}");
         }
     }
 

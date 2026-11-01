@@ -37,6 +37,27 @@ pub fn pad_right(s: &str, w: usize) -> String {
     format!("{}{}", fitted, " ".repeat(w.saturating_sub(used)))
 }
 
+/// `text` broken into lines of at most `width` columns at spaces; a word longer than a line is cut
+/// with `…` by [`fit_text`].
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let needed = UnicodeWidthStr::width(current.as_str()) + usize::from(!current.is_empty()) + UnicodeWidthStr::width(word);
+        if !current.is_empty() && needed > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines.into_iter().map(|l| fit_text(&l, width)).collect()
+}
+
 /// `950` -> `950`, `120_000` -> `120k`, `1_000_000` -> `1M`, `1_250_000` -> `1.2M`.
 pub fn short_tokens(n: usize) -> String {
     if n < 1_000 {

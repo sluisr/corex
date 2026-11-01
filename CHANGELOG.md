@@ -7,16 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.10.0] - 2026-11-01
 
 ### Added
+- **Shift+Tab cycles permission modes**: Normal → `[ACCEPT EDITS]` → `[PLAN MODE]` → normal. Accept edits lets file edits and new files inside the workspace through without asking; shell commands, reads outside the project, and protected or sensitive files (`.env`, `.git/hooks`, shell rc files, build files) still ask, and `/rewind` still undoes the edits. `/yolo` stays a command of its own, so a stray key press never lets every shell command run.
+- **Your name and colour on your messages**: Your messages are labelled with the machine's login instead of `You` and drawn in a soft blue-grey, apart from the agent's text. `user_name` and `user_color` (`#rrggbb`) in `~/.corex/settings.json` change them; the corex-config skill documents both, so the agent can set them when asked.
 - **Shell mode (`!command`)**: A prompt that starts with `!` runs the command yourself, without the approval dialog, through the same shell tool and forensic log the agent uses. The command, its exit code, time and output appear in the conversation (collapsible with Ctrl+O), and the agent reads them on your next message; running one does not start a reply. Esc stops it. It waits while a reply or another command is running.
 - **Window title follows the agent**: The terminal window and tab title reads `Working`, `Action required!` (an approval, the sudo password or a question waits for you) or `Ready`, followed by `cx` and the project name, so a Corex tab in the background shows when it needs you. The previous title is saved on xterm's title stack and restored on exit and on Ctrl+Z; `COREX_TITLE=0` turns it off. Inside tmux it shows when `set-titles` is on.
 - **`?` for shortcuts**: On an empty prompt, `?` lists the keyboard shortcuts and prompt prefixes (`@path`, `/command`, `!command`). `/help` shows the same list, and the prompt placeholder points to it.
-- **Context files in the status bar**: The bar shows how many instruction files the system prompt loads (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`), as `/memory list` counts them. It is hidden when there are none and on phone screens.
+- **Context files in the status bar**: The bar shows how many instruction files the system prompt loads (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`), as `/memory list` counts them, in a short `2 ctx`. It is hidden when there are none and on phone screens.
 - **`@path` references stand out**: An `@path` that starts a word is drawn in the accent purple in the prompt and in the conversation, so a file reference reads as one piece. E-mail addresses stay plain.
 
+- **Folder completion for `/directory add`**: Typing the folder opens a "Folders" popup read from disk: `~` lists the home directory, and each letter narrows it (`~Es` is read as `~/Es`). Tab completes and keeps the path open to go deeper; Enter completes a partial name or, once the folder exists, adds it. Hidden folders appear only after a dot, and folders that hold credentials never. With several comma-separated folders it completes the last one.
+
+### Security
+- **API keys move to the system keyring**: Keys are stored in GNOME Keyring or KWallet (through Secret Service), macOS Keychain or Windows Credential Manager, as one `corex` / `credentials` entry, instead of in plain text in `settings.json`. Where no keyring answers (SSH, servers, Termux, containers), or with `COREX_KEYRING=0`, they go to `~/.corex/credentials.json` with mode 600. Keys in an existing `settings.json` keep working and move on the next save, after which `settings.json` holds no key.
+
 ### Changed
+- **`settings.json` only holds what you changed**: It is written with the values that differ from the defaults, grouped (model, behaviour, you, allowed commands, local model, providers, MCP servers) instead of every field in code order. The flash/pro settings, which have files of their own, `target_dir`, which nothing read, and the old `compact_threshold_tokens: 95000` are no longer written.
+- **Context use shows when it matters**: The `~N%` of the model's window in use appears from half the window (or once past the auto-compact limit, in yellow) instead of from the first message, where `~0%` only took room.
+- **Mode badges come first in the status bar**: `[AUTO-APPROVE]`, `[ACCEPT EDITS]` and `[PLAN MODE]` sit before the path, so a long path is cut instead of the mode.
+- **Completion popups show where you are**: The `@path` and folder popups end with the position of the selection and the total (`▼ (1/13)`, the arrow while more lies below).
 - **Ctrl+O shows whole commands**: Full logs used to expand only the output; the command itself stayed cut at 70 columns. With Ctrl+O the command is shown complete, one row per line and wrapped under itself. Collapsed, a multi-line command shows its first line and an ellipsis instead of a raw newline.
 
 ### Fixed

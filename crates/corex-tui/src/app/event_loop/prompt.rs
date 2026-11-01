@@ -170,7 +170,9 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.last_esc_press = Some(Instant::now());
             }
         }
-        KeyCode::Tab | KeyCode::Enter if is_files_open && !alt => {
+        KeyCode::Tab | KeyCode::Enter
+            if is_files_open && !alt && !(key.code == KeyCode::Enter && app.folder_query_is_complete()) =>
+        {
             let selected = matching_files[app.slash_selected_idx % matching_files.len()].clone();
             app.accept_file_completion(&selected);
         }
@@ -178,6 +180,7 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
         KeyCode::Down if is_files_open && !(ctrl || shift) => {
             app.slash_selected_idx = (app.slash_selected_idx + 1) % matching_files.len();
         }
+        KeyCode::BackTab => app.cycle_permission_mode(),
         KeyCode::Tab => {
             if is_slash_open {
                 let selected = &matching_cmds[app.slash_selected_idx % matching_cmds.len()];
@@ -301,8 +304,9 @@ async fn submit(app: &mut App, cmd_to_run: String, send_now: bool, event_tx: &Ev
         return Flow::Handled;
     }
 
-    if app.is_streaming {
-        if send_now {
+    // A message sent while a `!command` runs waits for its report, so the agent reads both.
+    if app.is_streaming || app.user_shell_rx.is_some() {
+        if send_now && app.is_streaming {
             app.steer_messages.push(user_prompt_clean);
         } else {
             app.message_queue.push_back(user_prompt_clean);
@@ -524,6 +528,19 @@ mod tests {
             type_text(&mut app, "?", &tx).await;
             assert!(app.input_buffer.is_empty(), "? on an empty prompt is not typed");
             assert!(last_text(&app).starts_with("Shortcuts:") && last_text(&app).contains("!command"), "{}", last_text(&app));
+            assert!(last_text(&app).contains("Shift+Tab"), "the shortcuts list the mode cycle");
+            for expected in ["[ACCEPT EDITS]", "[PLAN MODE]", ""] {
+                prompt_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &tx).await;
+                let (_, rows) = screen(&mut app);
+                let all = rows.join("\n");
+                if expected.is_empty() {
+                    assert!(!all.contains("[ACCEPT EDITS]") && !all.contains("[PLAN MODE]"), "back to normal:\n{all}");
+                } else {
+                    let bar = rows.iter().find(|r| r.contains(expected)).unwrap_or_else(|| panic!("Shift+Tab shows {expected}:\n{all}"));
+                    let path = ws.file_name().unwrap().to_str().unwrap();
+                    assert!(bar.find(expected) < bar.find(path), "the mode comes before the path, so a long path cannot hide it: {bar}");
+                }
+            }
             type_text(&mut app, "why?", &tx).await;
             assert_eq!(app.input_buffer, "why?", "inside a message ? is a plain character");
             app.input_buffer.clear();
@@ -568,6 +585,14 @@ mod tests {
                 assert!(started.elapsed() < Duration::from_secs(10), "sleep never started");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            type_text(&mut app, "what did it print?", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert!(!app.is_streaming, "a message sent during a !command does not start a turn");
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("what did it print? (after the command)"), "{all}");
+            assert!(all.contains("Esc: stop the command") && !all.contains("Esc: undo"), "{all}");
+            assert_eq!(app.message_queue.pop_front().as_deref(), Some("what did it print?"), "it waits for the report");
             prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
             wait_for_shell(&mut app).await;
             assert!(started.elapsed() < Duration::from_secs(15), "Esc stopped the command early");
@@ -589,6 +614,47 @@ mod tests {
             assert!(last_text(&app).starts_with("Wait for the current reply"), "{}", last_text(&app));
             assert!(app.user_shell_rx.is_none());
             app.is_streaming = false;
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
+        async fn directory_add_completes_folders() {
+            crate::test_support::isolate_home();
+            let home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap();
+            std::fs::create_dir_all(home.join("Escritorio")).unwrap();
+            std::fs::create_dir_all(home.join("Escuela")).unwrap();
+            std::fs::create_dir_all(home.join(".ssh")).unwrap();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-folders-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+
+            type_text(&mut app, "/directory add ~", &tx).await;
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("Folders") && all.contains("~/Escritorio/") && all.contains("~/Escuela/"), "{all}");
+            assert!(!all.contains(".ssh"), "{all}");
+            assert!(all.contains("(1/"), "the counter shows where the selection is:\n{all}");
+
+            type_text(&mut app, "Es", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert_eq!(app.input_buffer, "/directory add ~/Escritorio/", "Enter on a partial name completes it");
+            for _ in 0.."~/Escritorio/".len() {
+                prompt_key(&mut app, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &tx).await;
+            }
+            type_text(&mut app, "~Escr", &tx).await;
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("~/Escritorio/") && !all.contains("~/Escuela/") && all.contains("(1/1)"), "{all}");
+
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx).await;
+            assert_eq!(app.input_buffer, "/directory add ~/Escritorio/", "a missing slash after ~ is filled in");
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert!(app.input_buffer.is_empty(), "Enter on a complete folder runs the command");
+            assert!(last_text(&app).contains("Added") && last_text(&app).contains("Escritorio"), "{}", last_text(&app));
 
             let _ = std::fs::remove_dir_all(&ws);
         }
@@ -631,7 +697,7 @@ mod tests {
             app.context_files_checked = None;
             app.refresh_context_files();
             let (_, rows) = screen(&mut app);
-            assert!(rows.iter().any(|r| r.contains("1 context file")), "{}", rows.join("\n"));
+            assert!(rows.iter().any(|r| r.contains("1 ctx")), "{}", rows.join("\n"));
 
             app.input_buffer.clear();
             app.cursor_idx = 0;

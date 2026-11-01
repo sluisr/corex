@@ -129,7 +129,7 @@ fn user_line_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
         .into_iter()
         .map(|span| {
             let style = if span.style == Style::default() {
-                Style::default().fg(theme.foreground)
+                Style::default().fg(theme.user_text)
             } else {
                 span.style
             };
@@ -137,9 +137,37 @@ fn user_line_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
         })
         .collect();
     if spans.is_empty() {
-        spans.push(Span::styled(String::new(), Style::default().fg(theme.foreground)));
+        spans.push(Span::styled(String::new(), Style::default().fg(theme.user_text)));
     }
     spans
+}
+
+static USER_LABEL_OVERRIDE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// A name usable as a label: no spaces or control characters, up to 16 characters.
+pub(crate) fn clean_label(name: &str) -> Option<String> {
+    let clean: String = name.chars().filter(|c| !c.is_control() && !c.is_whitespace()).take(16).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
+/// Sets the name from `user_name` in settings.json; `None` goes back to the machine's login.
+pub(crate) fn set_user_label(name: Option<&str>) {
+    if let Ok(mut label) = USER_LABEL_OVERRIDE.write() {
+        *label = name.and_then(clean_label);
+    }
+}
+
+/// The name on the user's messages: `user_name` from settings.json, else the login of whoever
+/// runs Corex (`$USER`, then `$LOGNAME`), or `You` when none is set.
+pub(crate) fn user_label() -> String {
+    if let Some(name) = USER_LABEL_OVERRIDE.read().ok().and_then(|l| l.clone()) {
+        return name;
+    }
+    ["USER", "LOGNAME"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find_map(|name| clean_label(&name))
+        .unwrap_or_else(|| "You".to_string())
 }
 
 /// Rows of a command/subagent log that stay visible while logs are collapsed.
@@ -557,12 +585,15 @@ pub fn render_single_message_with_pending_and_thinking(
             }
             let text = msg.display_text();
             let content = text.as_deref().unwrap_or("");
+            let name = user_label();
+            // Continuation rows line up under the text, after "  [name] ".
+            let hang = " ".repeat(2 + unicode_width::UnicodeWidthStr::width(name.as_str()) + 3);
             for (idx, line) in content.split('\n').enumerate() {
                 let (spans, first_indent) = if idx == 0 {
                     (
                         vec![
                             Span::styled("[", Style::default().fg(theme.border_dim)),
-                            Span::styled("You", Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
+                            Span::styled(name.clone(), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)),
                             Span::styled("] ", Style::default().fg(theme.border_dim)),
                         ]
                         .into_iter()
@@ -571,9 +602,9 @@ pub fn render_single_message_with_pending_and_thinking(
                         "  ",
                     )
                 } else {
-                    (user_line_spans(line, theme), "        ")
+                    (user_line_spans(line, theme), hang.as_str())
                 };
-                let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, "        ");
+                let wrapped = crate::markdown::wrap_spans_with_indent(spans, content_max_width, first_indent, &hang);
                 lines.extend(wrapped);
             }
             lines.push(Line::from(""));
@@ -893,8 +924,12 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
-    if let Some(query) = app.file_query() {
+    if let Some(query) = app.folder_query() {
         app.last_file_query = Some(query);
+        app.last_query_is_folder = true;
+    } else if let Some(query) = app.file_query() {
+        app.last_file_query = Some(query);
+        app.last_query_is_folder = false;
     } else if app.input_buffer.starts_with('/') {
         app.last_slash_filter = app.input_buffer.clone();
         app.last_file_query = None;
@@ -1210,7 +1245,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 Span::styled("  ", Style::default()),
                 Span::styled(label, Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(queued_msg.clone(), Style::default().fg(app.theme.foreground)),
-                Span::styled(" (after the answer)", Style::default().fg(app.theme.dark_gray)),
+                Span::styled(
+                    if app.user_shell_rx.is_some() { " (after the command)" } else { " (after the answer)" },
+                    Style::default().fg(app.theme.dark_gray),
+                ),
             ];
             tail_lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "              "));
         }
@@ -1314,7 +1352,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         // Key hints, longest first: the status text on the left varies in length, and a hint that
         // does not fit must give way to a shorter one instead of vanishing.
         let is_mobile = is_mobile_portrait(size.width, size.height);
-        let right_options: &[&str] = if steer_count > 0 {
+        // A `!command` takes Esc for itself, and Enter waits for its report.
+        let right_options: &[&str] = if app.user_shell_rx.is_some() {
+            &["(Enter: queue · Esc: stop the command) ", "(Esc: stop the command) "]
+        } else if steer_count > 0 {
             &["(Alt+Enter: interrupt now · Esc: undo) ", "(Alt+Enter: interrupt) ", "(Esc: undo) "]
         } else if queue_count > 0 {
             &["(Alt+Enter: send now · Esc: undo) ", "(Alt+Enter: send now) ", "(Esc: undo) "]
@@ -1453,7 +1494,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     }
 
     // Render the `@path` or slash command popup if active
-    if let (Some(p_chunk), Some(query)) = (popup_chunk, app.last_file_query.as_deref()) {
+    if let (Some(p_chunk), Some(query), true) = (popup_chunk, app.last_file_query.as_deref(), app.last_query_is_folder) {
+        let matches = crate::file_completion::folder_matches(query, &app.workspace_dir);
+        render_file_popup(frame, query, &matches, IndexState::Folders, app.slash_selected_idx, p_chunk, &app.theme);
+    } else if let (Some(p_chunk), Some(query)) = (popup_chunk, app.last_file_query.as_deref()) {
         let matches = app.file_index.as_ref().map(|i| i.matches(query)).unwrap_or_default();
         let index = match &app.file_index {
             _ if matches.is_empty() && crate::file_completion::is_outside_roots(query, &app.file_index_roots()) => {
@@ -1581,22 +1625,17 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     // Share of the model's window in use, so a compaction is never a surprise. The count comes from
     // the API's last reported prompt size; the window is a per-provider default unless
-    // `context_window_tokens` is set, hence the "~". Yellow once the prompt is past the auto-compact limit.
+    // `context_window_tokens` is set, hence the "~". Hidden below half the window, where it says
+    // nothing worth the room; yellow once the prompt is past the auto-compact limit.
     if !is_mobile_portrait(size.width, size.height) && !app.session.messages.is_empty() {
         let used = app.session.context_tokens();
         let window = if cfg.model.starts_with("local") { 24_000 } else { cfg.context_window() };
-        let color = if cfg.auto_compact && used >= cfg.effective_compact_threshold() {
-            app.theme.accent_yellow
-        } else {
-            app.theme.muted
-        };
-        right_spans.insert(
-            0,
-            Span::styled(
-                format!("~{}% · ", (used * 100 / window.max(1)).min(100)),
-                Style::default().fg(color),
-            ),
-        );
+        let percent = (used * 100 / window.max(1)).min(100);
+        let past_compact = cfg.auto_compact && used >= cfg.effective_compact_threshold();
+        if percent >= 50 || past_compact {
+            let color = if past_compact { app.theme.accent_yellow } else { app.theme.muted };
+            right_spans.insert(0, Span::styled(format!("~{percent}% · "), Style::default().fg(color)));
+        }
     }
 
     // Center spans: Local LLM status indicator and Active Background Tasks badge
@@ -1676,11 +1715,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         if !center_spans.is_empty() {
             center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
         }
-        let label = match app.context_files {
-            1 => "1 context file".to_string(),
-            n => format!("{n} context files"),
-        };
-        center_spans.push(Span::styled(label, Style::default().fg(app.theme.dark_gray)));
+        center_spans.push(Span::styled(format!("{} ctx", app.context_files), Style::default().fg(app.theme.dark_gray)));
     }
 
     // Left spans: Workspace directory, git branch, plan mode, and exit warning
@@ -1712,12 +1747,12 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             + warning_width;
 
         if avail >= full_needed {
-            // Full space available: render path + branch + plan mode + warning
+            // Full space available: render mode badges + path + branch + warning
+            left_spans.extend(mode_badges(app));
             left_spans.push(Span::styled(path_str, Style::default().fg(app.theme.foreground)));
             if !branch_str.is_empty() {
                 left_spans.push(Span::styled(branch_str, Style::default().fg(app.theme.accent_cyan)));
             }
-            left_spans.extend(mode_badges(app));
             left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.gray)));
         } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + warning_width && !branch_str.is_empty() {
             // Medium space: prioritize branch and the exit warning so it is never truncated
@@ -1728,11 +1763,12 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             left_spans.push(Span::styled(format!(" {warning}"), Style::default().fg(app.theme.gray)));
         }
     } else {
+        // The mode comes first: when the bar is short, the path is cut instead of the mode.
+        left_spans.extend(mode_badges(app));
         left_spans.push(Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)));
         if !app.git_branch.is_empty() {
             left_spans.push(Span::styled(format!("({}) ", app.git_branch), Style::default().fg(app.theme.accent_cyan)));
         }
-        left_spans.extend(mode_badges(app));
     }
 
     if is_mobile {
@@ -1806,10 +1842,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 fn mode_badges(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if app.always_allow_tools {
-        spans.push(Span::styled("[AUTO-APPROVE] ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" [AUTO-APPROVE]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+    }
+    if app.accept_edits {
+        spans.push(Span::styled(" [ACCEPT EDITS]", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
     }
     if app.plan_mode {
-        spans.push(Span::styled("[PLAN MODE] ", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" [PLAN MODE]", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD)));
     }
     spans
 }

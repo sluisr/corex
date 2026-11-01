@@ -420,6 +420,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shift_tab_cycles_modes_and_accept_edits_lets_only_edits_through() {
+        let ws = std::env::temp_dir().join(format!("corex-accept-edits-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), ws.clone(), false);
+        let edit = ToolCall::new("edit", "write_file", r#"{"file_path":"src/new.rs","content":"fn x() {}"}"#);
+        let env = ToolCall::new("env", "write_file", r#"{"file_path":".env","content":"KEY=1"}"#);
+        let outside = ToolCall::new("outside", "write_file", r#"{"file_path":"/etc/corex-test","content":"x"}"#);
+        let shell = ToolCall::new("shell", "run_shell_command", r#"{"command":"rm -rf target"}"#);
+
+        assert!(needs_approval(&app, std::slice::from_ref(&edit), &tool_context(&app)), "normal asks for edits");
+
+        app.cycle_permission_mode();
+        assert!(app.accept_edits && !app.plan_mode);
+        let (gated, free) = split_by_approval(&app, vec![edit.clone(), env, outside, shell], &tool_context(&app));
+        assert_eq!(ids(&free), ["edit"], "only the workspace edit runs on its own");
+        assert_eq!(ids(&gated), ["env", "outside", "shell"], "protected files, outside paths and shell still ask");
+
+        app.cycle_permission_mode();
+        assert!(!app.accept_edits && app.plan_mode, "then plan mode");
+        app.cycle_permission_mode();
+        assert!(!app.accept_edits && !app.plan_mode, "then back to normal");
+        assert!(!app.always_allow_tools, "YOLO is never part of the cycle");
+        assert!(needs_approval(&app, &[edit], &tool_context(&app)));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn plan_mode_gates_mutating_tools_even_with_yolo_or_allowed_commands() {
         let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), true);
         app.plan_mode = true;

@@ -119,7 +119,7 @@ pub fn render_auth_dialog(
         Line::from(vec![
             Span::styled("  Saved for ", Style::default().fg(theme.dark_gray)),
             Span::styled(format!("${}", state.api_key_env), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" and ~/.corex/settings.json", Style::default().fg(theme.dark_gray)),
+            Span::styled(" and the system keyring", Style::default().fg(theme.dark_gray)),
         ]),
         Line::from(""),
     ];

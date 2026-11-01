@@ -65,6 +65,7 @@ fn is_idle(app: &App) -> bool {
         && !app.sudo_dialog.is_open
         && app.fleet_dialog.pending_approval.is_none()
         && !app.is_checking_balance
+        && app.user_shell_rx.is_none()
 }
 
 fn finished_task_reports() -> Vec<String> {

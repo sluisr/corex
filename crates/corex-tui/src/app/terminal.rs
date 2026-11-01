@@ -14,8 +14,24 @@ pub const MOUSE_REPORTING_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// Saves and restores the window title on xterm's title stack, so the shell gets its own title
 /// back after the agent's states. Terminals without the stack ignore both.
-pub const TITLE_PUSH: &str = "\x1b[22;0t";
-pub const TITLE_POP: &str = "\x1b[23;0t";
+const TITLE_PUSH: &str = "\x1b[22;0t";
+const TITLE_POP: &str = "\x1b[23;0t";
+
+/// Whether a title is on the stack: teardown runs more than once (panic hook, then the guard),
+/// and a second pop would restore a title older than the shell's.
+static TITLE_SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn save_title(out: &mut impl Write) {
+    if window_title_enabled() && !TITLE_SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let _ = out.write_all(TITLE_PUSH.as_bytes());
+    }
+}
+
+fn restore_title(out: &mut impl Write) {
+    if TITLE_SAVED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = out.write_all(TITLE_POP.as_bytes());
+    }
+}
 
 /// The window title follows the agent's state unless `COREX_TITLE` is `0`, `false` or `off`.
 pub fn window_title_enabled() -> bool {
@@ -37,9 +53,7 @@ pub fn title_sequence(title: &str) -> String {
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = stdout();
-    if window_title_enabled() {
-        let _ = stdout.write_all(TITLE_POP.as_bytes());
-    }
+    restore_title(&mut stdout);
     // Explicitly switch every mouse mode off (also the ones enabled by hand in the TUI loop)
     // and reset attributes so a dead session never leaves escape junk in the shell.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());

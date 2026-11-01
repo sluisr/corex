@@ -72,6 +72,49 @@ struct LocalOverrides {
     local_llm_enabled: Option<bool>,
 }
 
+/// Order of the keys in `settings.json`: the model, how Corex behaves, you, the commands it may
+/// run, the local model, then providers and MCP servers. Other keys follow alphabetically.
+const SETTINGS_ORDER: &[&str] = &[
+    "active_provider",
+    "model",
+    "base_url",
+    "temperature",
+    "reasoning_effort",
+    "yolo_mode",
+    "auto_compact",
+    "compact_threshold_tokens",
+    "history_token_limit",
+    "context_window_tokens",
+    "user_name",
+    "user_color",
+    "allowed_commands",
+    "local_llm_enabled",
+    "local_llm_url",
+    "local_llm_model",
+    "local_prompt_lite",
+    "providers",
+    "mcp_servers",
+];
+
+/// Keys `settings.json` no longer carries; they are still read from files that have them.
+const NOT_IN_SETTINGS: &[&str] = &["api_key", "provider_api_keys", "flash_settings", "pro_settings", "target_dir"];
+
+/// The fixed auto-compact threshold of earlier versions, which counts as unset.
+const LEGACY_COMPACT_THRESHOLD: u64 = 95_000;
+
+/// The system keyring entry that holds every key, as one JSON document.
+const KEYRING_SERVICE: &str = "corex";
+const KEYRING_USER: &str = "credentials";
+
+/// The keys, from the system keyring or `~/.corex/credentials.json`.
+#[derive(Debug, Default, Deserialize)]
+struct Credentials {
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    provider_api_keys: HashMap<String, String>,
+}
+
 /// Where `Config::context_window` got its number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowSource {
@@ -159,6 +202,12 @@ pub struct Config {
     /// Persisted API keys for external providers (e.g. google, openai, anthropic).
     #[serde(default)]
     pub provider_api_keys: HashMap<String, String>,
+    /// Name on the user's messages in the conversation. Unset: the login of the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// Colour of the user's messages, as `#rrggbb`. Unset: the theme's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_color: Option<String>,
 }
 
 fn default_auto_compact() -> bool {
@@ -314,6 +363,8 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider: None,
             provider_api_keys: HashMap::new(),
+            user_name: None,
+            user_color: None,
         }
     }
 }
@@ -575,6 +626,118 @@ impl Config {
         Ok(())
     }
 
+    /// `credentials.json` for `cfg`: the API keys, apart from the settings so that `settings.json`
+    /// can be read, shared or synced without them. `None` when there is no key to keep.
+    fn credentials_document(cfg: &Config) -> Option<String> {
+        let mut doc = serde_json::Map::new();
+        if !cfg.api_key.trim().is_empty() {
+            doc.insert("api_key".into(), cfg.api_key.clone().into());
+        }
+        let mut providers: Vec<(&String, &String)> = cfg.provider_api_keys.iter().filter(|(_, k)| !k.trim().is_empty()).collect();
+        providers.sort();
+        if !providers.is_empty() {
+            let map = providers.into_iter().map(|(p, k)| (p.clone(), serde_json::Value::from(k.clone()))).collect();
+            doc.insert("provider_api_keys".into(), serde_json::Value::Object(map));
+        }
+        (!doc.is_empty()).then(|| serde_json::to_string_pretty(&serde_json::Value::Object(doc)).ok()).flatten()
+    }
+
+    /// `settings.json` for `cfg`: only what differs from the defaults, grouped by [`SETTINGS_ORDER`],
+    /// so the file shows what was changed. Credentials, the flash/pro settings (files of their own)
+    /// and `target_dir` (read by nothing) are left out, and so is `compact_threshold_tokens: 95000`,
+    /// the old default that earlier versions wrote.
+    fn settings_document(cfg: &Config) -> anyhow::Result<String> {
+        let value = serde_json::to_value(cfg)?;
+        let mut defaults = Config::default();
+        defaults.base_url = default_base_url_static().to_string();
+        defaults.model = "deepseek-flash".to_string();
+        let defaults = serde_json::to_value(defaults)?;
+        let Some(fields) = value.as_object() else { anyhow::bail!("settings are not an object") };
+        let kept = |key: &str, v: &serde_json::Value| {
+            !NOT_IN_SETTINGS.contains(&key)
+                && !v.is_null()
+                && !(key == "compact_threshold_tokens" && v.as_u64() == Some(LEGACY_COMPACT_THRESHOLD))
+                && (key == "model" || defaults.get(key) != Some(v))
+        };
+        let mut keys: Vec<&str> = SETTINGS_ORDER.iter().copied().filter(|k| fields.get(*k).is_some_and(|v| kept(k, v))).collect();
+        let mut rest: Vec<&str> = fields
+            .iter()
+            .filter(|(k, v)| !SETTINGS_ORDER.contains(&k.as_str()) && kept(k, v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        rest.sort_unstable();
+        keys.extend(rest);
+
+        let mut out = String::from("{\n");
+        for (i, key) in keys.iter().enumerate() {
+            let pretty = serde_json::to_string_pretty(&fields[*key])?.replace('\n', "\n  ");
+            let comma = if i + 1 < keys.len() { "," } else { "" };
+            out.push_str(&format!("  {}: {}{}\n", serde_json::to_string(key)?, pretty, comma));
+        }
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    fn credentials_path() -> Option<PathBuf> {
+        BaseDirs::new().map(|d| d.home_dir().join(".corex").join("credentials.json"))
+    }
+
+    /// The system keyring entry holding the keys (Secret Service, Keychain or Credential
+    /// Manager). `None` when there is none to reach (SSH, a server, Termux, a container), when
+    /// `COREX_KEYRING` is `0`, `false` or `off`, and always in tests, which must never touch the
+    /// keyring of whoever runs them.
+    fn keyring_entry() -> Option<keyring::Entry> {
+        if cfg!(test)
+            || std::env::var("COREX_KEYRING").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        {
+            return None;
+        }
+        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
+    }
+
+    /// The keys from the system keyring, else from `credentials.json`.
+    fn load_credentials() -> Option<Credentials> {
+        if let Some(stored) = Self::keyring_entry().and_then(|e| e.get_password().ok()) {
+            if let Ok(credentials) = serde_json::from_str(&stored) {
+                return Some(credentials);
+            }
+        }
+        let content = fs::read_to_string(Self::credentials_path()?).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    /// Stores the keys in the system keyring and removes `credentials.json`; where no keyring
+    /// answers, writes that file (mode 600) instead. Never a workspace copy, which lives in a
+    /// repository.
+    fn save_credentials(content: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
+        if workspace.is_some_and(|w| w.starts_with(std::env::temp_dir())) {
+            return Ok(());
+        }
+        let path = Self::credentials_path();
+        if Self::keyring_entry().is_some_and(|e| e.set_password(content).is_ok()) {
+            if let Some(path) = path.filter(|p| p.exists()) {
+                fs::remove_file(path)?;
+            }
+            return Ok(());
+        }
+        if let Some(path) = path {
+            if let Some(dir) = path.parent() {
+                crate::secure_fs::ensure_private_dir(dir)?;
+            }
+            crate::secure_fs::write_private_atomic(&path, content)?;
+        }
+        Ok(())
+    }
+
+    /// Where the keys are kept, for messages to the user.
+    pub fn credentials_location() -> &'static str {
+        if Self::keyring_entry().is_some_and(|e| e.get_password().is_ok()) {
+            "the system keyring"
+        } else {
+            "~/.corex/credentials.json"
+        }
+    }
+
     /// Removes credentials and secret-bearing maps from a serialized workspace settings document.
     /// Fails closed: content that cannot be parsed is never returned as-is.
     fn strip_secrets(content: &str) -> Option<String> {
@@ -661,6 +824,15 @@ impl Config {
                     }
                 }
             }
+        }
+
+        // Keys live in `credentials.json`; a `settings.json` from before keeps working until the
+        // next save moves them.
+        if let Some(credentials) = Self::load_credentials() {
+            if !credentials.api_key.trim().is_empty() {
+                config.api_key = credentials.api_key;
+            }
+            config.provider_api_keys.extend(credentials.provider_api_keys);
         }
 
         // Workspace overrides (`.corex/settings.json`) are restricted to non-privileged fields.
@@ -794,10 +966,14 @@ impl Config {
         config
     }
 
-    /// The key literally stored in the global `settings.json` (never the environment).
+    /// The key literally stored on disk (never the environment): `credentials.json`, else the
+    /// `settings.json` of versions that kept it there.
     fn load_existing_api_key(workspace: Option<&Path>) -> Option<String> {
         // Credentials are only ever read from the user's global config, never from a workspace.
         let _ = workspace;
+        if let Some(key) = Self::load_credentials().map(|c| c.api_key).filter(|k| !k.trim().is_empty()) {
+            return Some(key);
+        }
         let path = Self::resolve_settings_path(None, "settings.json")?;
         let content = fs::read_to_string(path).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -836,7 +1012,14 @@ impl Config {
             to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
         }
 
-        let content = serde_json::to_string_pretty(&to_save)?;
+        // Keys first: if they cannot be written, settings.json keeps the ones it may still hold.
+        match Self::credentials_document(&to_save) {
+            Some(credentials) => Self::save_credentials(&credentials, workspace)?,
+            // Every key was removed: empty the store instead of leaving the old ones in it.
+            None if Self::load_credentials().is_some() => Self::save_credentials("{}\n", workspace)?,
+            None => {}
+        }
+        let content = Self::settings_document(&to_save)?;
         Self::save_to_destinations(&content, "settings.json", workspace)
     }
 
@@ -967,6 +1150,57 @@ mod tests {
         claude.model = "claude-opus-5-5".to_string();
         claude.provider_api_keys.insert(crate::providers::ANTHROPIC_ID.to_string(), "k".to_string());
         assert!(claude.can_see_images());
+    }
+
+    #[test]
+    #[ignore = "uses the real system keyring; run with --ignored on a desktop session"]
+    fn system_keyring_round_trip_with_a_throwaway_entry() {
+        let entry = keyring::Entry::new("corex-selftest", "round-trip").expect("a keyring answers");
+        entry.set_password(r#"{"api_key":"sk-selftest"}"#).expect("stored");
+        let back = entry.get_password().expect("read back");
+        entry.delete_credential().expect("deleted");
+        assert_eq!(back, r#"{"api_key":"sk-selftest"}"#);
+        assert!(entry.get_password().is_err(), "gone after delete");
+    }
+
+    #[test]
+    fn settings_keep_only_what_changed_and_no_keys() {
+        let mut cfg = Config {
+            api_key: "sk-main".into(),
+            model: "deepseek-flash".into(),
+            active_provider: Some("deepseek".into()),
+            reasoning_effort: "high".into(),
+            compact_threshold_tokens: Some(95_000),
+            allowed_commands: vec!["cargo test".into()],
+            target_dir: PathBuf::from("/home/someone"),
+            local_llm_url: "http://10.0.0.2:8080/v1".into(),
+            user_name: Some("Luis".into()),
+            ..Config::default()
+        };
+        cfg.provider_api_keys.insert("openai".into(), "sk-openai".into());
+        let doc = Config::settings_document(&cfg).unwrap();
+
+        for gone in ["sk-", "api_key", "provider_api_keys", "flash_settings", "pro_settings", "target_dir", "95000", "local_llm_model", "yolo_mode"] {
+            assert!(!doc.contains(gone), "{gone} must not be written:\n{doc}");
+        }
+        let at = |k: &str| doc.find(&format!("\"{k}\"")).unwrap_or_else(|| panic!("{k} missing:\n{doc}"));
+        assert!(at("active_provider") < at("model") && at("model") < at("user_name"), "{doc}");
+        assert!(at("user_name") < at("allowed_commands") && at("allowed_commands") < at("local_llm_url"), "{doc}");
+
+        let back: Config = serde_json::from_str(&doc).expect("the file reads back");
+        assert_eq!(back.model, "deepseek-flash");
+        assert_eq!(back.active_provider.as_deref(), Some("deepseek"));
+        assert_eq!(back.allowed_commands, ["cargo test"]);
+        assert_eq!(back.local_llm_url, "http://10.0.0.2:8080/v1", "a changed value survives");
+        assert_eq!(back.user_name.as_deref(), Some("Luis"));
+        assert_eq!(back.compact_threshold_tokens, None, "the old default goes back to unset");
+
+        let creds: serde_json::Value = serde_json::from_str(&Config::credentials_document(&cfg).unwrap()).unwrap();
+        assert_eq!(creds["api_key"], "sk-main");
+        assert_eq!(creds["provider_api_keys"]["openai"], "sk-openai");
+        assert!(Config::credentials_document(&Config { api_key: String::new(), ..Config::default() }).is_none()
+            || std::env::var("COREX_API_KEY").is_ok()
+            || std::env::var("DEEPSEEK_API_KEY").is_ok());
     }
 
     #[test]

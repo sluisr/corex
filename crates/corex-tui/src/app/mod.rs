@@ -133,11 +133,13 @@ impl App {
             last_slash_filter: String::new(),
             file_index: None,
             file_index_rx: None,
+            accept_edits: false,
             user_shell_rx: None,
             user_shell_stopped: false,
             context_files: 0,
             context_files_checked: None,
             last_file_query: None,
+            last_query_is_folder: false,
             local_llm_online: is_online,
             last_local_check: None,
             cached_message_lines: Vec::new(),
@@ -167,6 +169,15 @@ impl App {
             last_interaction: Instant::now(),
         };
         corex_fleet::register_fleet_tools(&mut app.tool_registry);
+        crate::app::render::set_user_label(cfg.user_name.as_deref());
+        if let Some(raw) = cfg.user_color.as_deref() {
+            match crate::theme::parse_hex_color(raw) {
+                Some(color) => app.theme.user_text = color,
+                None => app.session.add_message(Message::system(format!(
+                    "user_color \"{raw}\" in settings.json is not a #rrggbb colour; your messages keep the default."
+                ))),
+            }
+        }
         app.trigger_local_health_check();
         app.trigger_update_check();
         if cfg.api_key.trim().is_empty() && cfg.endpoint().1.trim().is_empty() && !cfg.local_llm_enabled {
@@ -515,7 +526,11 @@ impl App {
     /// exact command name, which would otherwise hijack the arrows for autocomplete
     /// navigation and trap the user on a single-item list.
     pub fn matching_slash_commands(&self) -> Vec<String> {
-        if self.history_idx.is_some() || !self.input_buffer.starts_with('/') || self.file_query().is_some() {
+        if self.history_idx.is_some()
+            || !self.input_buffer.starts_with('/')
+            || self.file_query().is_some()
+            || self.folder_query().is_some()
+        {
             return Vec::new();
         }
         // `/home/me/x` is a path, not a command: no command name holds a second slash.
@@ -537,8 +552,26 @@ impl App {
         crate::file_completion::at_token(&self.input_buffer, self.cursor_idx).map(|(_, q)| q.to_string())
     }
 
-    /// Paths matching the `@path` being typed; `None` outside of one.
+    /// The folder being typed after `/directory add`, unless the user is browsing history.
+    pub fn folder_query(&self) -> Option<String> {
+        if self.history_idx.is_some() {
+            return None;
+        }
+        crate::file_completion::dir_arg_token(&self.input_buffer, self.cursor_idx).map(|(_, q)| q.to_string())
+    }
+
+    /// A folder typed in full (`~/Escritorio`, with or without the slash): Enter runs
+    /// `/directory add` instead of completing it or descending into its first subfolder.
+    pub fn folder_query_is_complete(&self) -> bool {
+        self.folder_query().is_some_and(|q| crate::file_completion::is_existing_folder(&q, &self.workspace_dir))
+    }
+
+    /// What the completion popup offers: folders after `/directory add`, otherwise the paths
+    /// matching the `@path` being typed; `None` outside of both.
     pub fn file_completions(&self) -> Option<Vec<String>> {
+        if let Some(query) = self.folder_query() {
+            return Some(crate::file_completion::folder_matches(&query, &self.workspace_dir));
+        }
         let query = self.file_query()?;
         Some(self.file_index.as_ref().map(|index| index.matches(&query)).unwrap_or_default())
     }
@@ -661,13 +694,16 @@ impl App {
         }
     }
 
-    /// Replaces the `@path` being typed with `path`. A file ends the token with a space; a
-    /// directory keeps it open so its contents are listed next.
+    /// Replaces the `@path` or `/directory add` folder being typed with `path`. A file ends the
+    /// token with a space; a directory keeps it open so its contents are listed next.
     pub fn accept_file_completion(&mut self, path: &str) {
-        let Some((start, _)) = crate::file_completion::at_token(&self.input_buffer, self.cursor_idx) else {
+        let (start, replacement) = if let Some((start, _)) = crate::file_completion::dir_arg_token(&self.input_buffer, self.cursor_idx) {
+            (start, path.to_string())
+        } else if let Some((start, _)) = crate::file_completion::at_token(&self.input_buffer, self.cursor_idx) {
+            (start, if path.ends_with('/') { format!("@{}", path) } else { format!("@{} ", path) })
+        } else {
             return;
         };
-        let replacement = if path.ends_with('/') { format!("@{}", path) } else { format!("@{} ", path) };
         self.input_buffer.replace_range(start..self.cursor_idx, &replacement);
         self.cursor_idx = start + replacement.len();
         self.slash_selected_idx = 0;
@@ -864,12 +900,25 @@ impl App {
 
     pub fn get_effective_allowed_commands(&self) -> Vec<String> {
         let mut all = self.llm_client.get_config().allowed_commands.clone();
-        for cmd in &self.session_allowed_commands {
+        let accepted_edits = ["edit", "write_file", "apply_patch"].map(String::from);
+        let extra = if self.accept_edits { &accepted_edits[..] } else { &[] };
+        for cmd in self.session_allowed_commands.iter().chain(extra) {
             if !all.contains(cmd) {
                 all.push(cmd.clone());
             }
         }
         all
+    }
+
+    /// Shift+Tab: normal → accept edits → plan → normal. Accept edits lets file edits inside the
+    /// workspace through (protected and outside paths still ask); YOLO stays a command of its own,
+    /// so a stray key press never lets every shell command run.
+    pub fn cycle_permission_mode(&mut self) {
+        (self.accept_edits, self.plan_mode) = match (self.accept_edits, self.plan_mode) {
+            (false, false) => (true, false),
+            (true, _) => (false, true),
+            (false, true) => (false, false),
+        };
     }
 
     /// A dialog has the keyboard, so the composer behind it shows no caret of its own.

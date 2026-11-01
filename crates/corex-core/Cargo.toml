@@ -30,3 +30,4 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 libc = "0.2"
+keyring = "4.2"

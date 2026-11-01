@@ -68,9 +68,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     // Clear any stale mouse mode left by a previously killed session before starting.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
     let title_enabled = crate::app::terminal::window_title_enabled();
-    if title_enabled {
-        let _ = stdout.write_all(crate::app::terminal::TITLE_PUSH.as_bytes());
-    }
+    crate::app::terminal::save_title(&mut stdout);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
     let _guard = TerminalGuard;
 
@@ -98,10 +96,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         if crate::app::terminal::RESUMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             let _ = terminal.clear();
             mouse_capture_applied = false;
-            if title_enabled {
-                let _ = terminal.backend_mut().write_all(crate::app::terminal::TITLE_PUSH.as_bytes());
-                title_applied = None;
-            }
+            crate::app::terminal::save_title(terminal.backend_mut());
+            title_applied = None;
             needs_redraw = true;
         }
 

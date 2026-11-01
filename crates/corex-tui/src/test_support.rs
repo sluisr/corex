@@ -17,6 +17,8 @@ pub(crate) fn isolate_home() {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("HOME", &dir);
+        // API keys go to the system keyring, which a changed $HOME does not isolate.
+        std::env::set_var("COREX_KEYRING", "0");
         dir
     });
 }

@@ -20,7 +20,7 @@
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.4 ms (`cx --version`) and draws its first frame in about 3 ms, ships as one native binary per platform, and idles at about 11.7 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
-> **Release Status:** Active Development / Beta (`v0.9.1`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development / Beta (`v0.10.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 
@@ -357,7 +357,9 @@ Configuration and logs are stored globally in `~/.corex/` and can be overridden 
 | `.corex/fleet.toml` | Workspace-level Fleet nodes and clusters for project-specific infrastructure. It replaces the global file while present, but its `safe_commands`/`dangerous_commands` are ignored (the global lists apply) and every command or status probe on its servers asks for confirmation, since the file arrives with the repository. |
 | `~/.corex/SYSTEM.md` | Global AI personality, operational rules, and behavioral guidelines injected into all sessions. |
 | `.corex/SYSTEM.md` | Workspace-level AI instructions and coding constraints (`COREX.md`, `AGENTS.md` and `DEEPSEEK.md` at the project root are loaded too, in that order). |
-| `~/.corex/settings.json` | Global provider credentials, base URLs, default model, and allowed commands. |
+| `~/.corex/settings.json` | Global settings: provider, base URLs, default model, allowed commands. Only values that differ from the defaults are written. |
+| System keyring | API keys, in the `corex` / `credentials` entry (GNOME Keyring or KWallet through Secret Service, macOS Keychain, Windows Credential Manager). |
+| `~/.corex/credentials.json` | API keys where no keyring answers (SSH, servers, Termux, containers) or with `COREX_KEYRING=0`. Mode 600. |
 | `.corex/settings.json` | Project-level workspace settings overrides (secrets automatically stripped before git). |
 | `~/.corex/flash_settings.json` | CoT reasoning depth configuration for Flash. |
 | `~/.corex/pro_settings.json` | Deep reasoning configuration for Pro. |

@@ -122,6 +122,10 @@ pub struct ModelDialogState {
     pub generic_reasoning: String,
 
     pub local_prompt_lite: bool,
+
+    /// Drawn as one column (phone, narrow terminal): the keys then walk it as a single list.
+    /// Set by the renderer, which is the one that knows the width.
+    pub compact: std::cell::Cell<bool>,
 }
 
 impl Default for ModelDialogState {
@@ -198,6 +202,7 @@ impl ModelDialogState {
             generic_reasoning: String::new(),
 
             local_prompt_lite: false,
+            compact: std::cell::Cell::new(false),
         }
     }
 
@@ -385,7 +390,34 @@ impl ModelDialogState {
         }
     }
 
+    /// Keys of the one-column layout: ↑↓ walk provider, models and settings as one list; ←→ change
+    /// the provider on its row and adjust a setting on its row. `None` leaves the key to
+    /// [`Self::handle_key`]'s common handling.
+    fn handle_compact_key(&mut self, code: KeyCode) -> Option<DialogAction> {
+        let models = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
+        match (code, self.pane) {
+            (KeyCode::Up | KeyCode::Char('k'), Pane::Providers) => {}
+            (KeyCode::Up | KeyCode::Char('k'), Pane::Models) if self.model_idx == 0 => self.pane = Pane::Providers,
+            (KeyCode::Up | KeyCode::Char('k'), Pane::Settings) if self.row_idx == 0 => self.pane = Pane::Models,
+            (KeyCode::Down | KeyCode::Char('j'), Pane::Providers) => self.pane = Pane::Models,
+            (KeyCode::Down | KeyCode::Char('j'), Pane::Models) if self.model_idx + 1 >= models => {
+                self.pane = Pane::Settings;
+                self.row_idx = 0;
+            }
+            (KeyCode::Left | KeyCode::Char('h'), Pane::Providers) => self.step_provider(false),
+            (KeyCode::Right | KeyCode::Char('l'), Pane::Providers) => self.step_provider(true),
+            (KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l'), Pane::Models) => {}
+            _ => return None,
+        }
+        Some(DialogAction::None)
+    }
+
     pub fn handle_key(&mut self, code: KeyCode) -> DialogAction {
+        if self.compact.get() {
+            if let Some(action) = self.handle_compact_key(code) {
+                return action;
+            }
+        }
         match code {
             KeyCode::Esc => return DialogAction::Close,
             KeyCode::Tab => self.pane = self.pane.next(),
@@ -483,19 +515,20 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         return;
     }
 
-    let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
+    let compact = crate::app::is_mobile_portrait(area.width, area.height) || area.width < COMPACT_BELOW;
+    state.compact.set(compact);
 
-    let dialog_width = if is_mobile {
+    let dialog_width = if compact {
         area.width.saturating_sub(2).max(20)
     } else {
         MAX_DIALOG_WIDTH.min(area.width.saturating_sub(4)).max(60.min(area.width))
     };
     // As tall as what it shows, so the shortcuts sit right under the content.
-    let detail_rows = detail_row_count(state);
-    let body_rows = if is_mobile {
-        6 + 1 + detail_rows
+    let body_rows = if compact {
+        compact_row_count(state)
     } else {
-        detail_rows.max(state.providers.len() + 2)
+        // +3: the title, its gap and the "without a key" line.
+        detail_row_count(state).max(state.providers.len() + 3)
     };
     let dialog_height = ((body_rows + 2 + 2) as u16).min(area.height.saturating_sub(2));
     let x = area.width.saturating_sub(dialog_width) / 2;
@@ -513,16 +546,8 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     let vertical = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
     let (body, footer_area) = (vertical[0], vertical[1]);
 
-    if is_mobile {
-        let vert_body = Layout::vertical([
-            Constraint::Length(6),
-            Constraint::Length(1),
-            Constraint::Min(4),
-        ])
-        .split(body);
-
-        render_providers_pane(frame, vert_body[0], state, theme);
-        render_detail_pane(frame, vert_body[2], state, theme);
+    if compact {
+        render_compact_body(frame, body, state, theme);
     } else {
         let horizontal = Layout::horizontal([
             Constraint::Length(PROVIDERS_COL_WIDTH),
@@ -535,19 +560,119 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         render_detail_pane(frame, horizontal[2], state, theme);
     }
 
-    let next: (&'static str, &'static str) = match state.pane {
-        Pane::Providers => ("→", "models"),
-        Pane::Models => ("Enter", "use model"),
-        Pane::Settings => ("‹ ›", "adjust"),
-    };
-    let pairs: Vec<(&'static str, &'static str)> = if is_mobile {
-        vec![next, ("Esc", "close")]
+    let pairs: Vec<(&'static str, &'static str)> = if compact {
+        let next = match state.pane {
+            Pane::Providers => ("←→", "provider"),
+            Pane::Models => ("Enter", "use"),
+            Pane::Settings => ("←→", "adjust"),
+        };
+        vec![("↑↓", "select"), next, ("Esc", "close")]
     } else {
+        let next = match state.pane {
+            Pane::Providers => ("→", "models"),
+            Pane::Models => ("Enter", "use model"),
+            Pane::Settings => ("‹ ›", "adjust"),
+        };
         vec![("↑↓", "select"), ("Tab", "pane"), next, ("E", "key"), ("T", "persist"), ("Esc", "close")]
     };
     let mut footer = vec![Span::raw("  ")];
     footer.extend(key_hints(&pairs, theme));
     frame.render_widget(Paragraph::new(vec![Line::from(""), Line::from(footer)]), footer_area);
+}
+
+/// Below this width the two columns no longer fit and the dialog is drawn as one column.
+const COMPACT_BELOW: u16 = 80;
+
+/// Rows of the one-column layout: provider, gap, models, gap, settings (with title), gap, hint.
+/// Sized for the largest provider so the panel does not jump while the provider changes.
+fn compact_row_count(state: &ModelDialogState) -> usize {
+    let models = state.providers.iter().map(|p| p.models.len()).max().unwrap_or(1).max(1);
+    1 + 1 + 1 + models + 1 + 1 + MAX_SETTINGS_ROWS + 1 + 1
+}
+
+/// One column: the provider on a single row (←→ changes it), then its models and settings.
+fn render_compact_body(frame: &mut Frame, area: Rect, state: &ModelDialogState, theme: &Theme) {
+    let Some(provider) = state.selected_provider() else { return };
+    let w = area.width as usize;
+    let ready = state.ready.get(state.prov_idx).copied().unwrap_or(false);
+    let is_active_provider = state.prov_idx == state.active_provider;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Provider row
+    let focused = state.pane == Pane::Providers;
+    let (status, status_col) = if is_active_provider {
+        ("● active", theme.accent_green)
+    } else if ready {
+        ("○ ready", theme.gray)
+    } else {
+        ("no key · E", theme.dark_gray)
+    };
+    let arrow_col = if focused { theme.accent_cyan } else { theme.dark_gray };
+    let name_fg = if focused { theme.text_on_selected } else { theme.foreground };
+    lines.push(Line::from(vec![
+        marker(focused, theme),
+        Span::styled("‹ ", Style::default().fg(arrow_col)),
+        Span::styled(
+            fit_text(short_name(provider.display_name()), w.saturating_sub(3 + 2 + 2 + 1 + status.chars().count())),
+            Style::default().fg(name_fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ›", Style::default().fg(arrow_col)),
+        Span::styled(" ", Style::default()),
+        Span::styled(status, Style::default().fg(status_col).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(""));
+
+    // Models
+    let models_focused = state.pane == Pane::Models;
+    lines.push(pane_title("Models", models_focused, theme));
+    for (i, m) in provider.models.iter().enumerate() {
+        let selected = i == state.model_idx;
+        let is_active = is_active_provider && i == state.active_model;
+        let radio = if is_active { "● " } else { "○ " };
+        let radio_col = if is_active { theme.accent_green } else { theme.dark_gray };
+        let mut style = Style::default().fg(if selected && models_focused { theme.text_on_selected } else { theme.foreground });
+        if selected {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        lines.push(Line::from(vec![
+            marker(selected && models_focused, theme),
+            Span::styled(radio, Style::default().fg(radio_col)),
+            Span::styled(fit_text(m.display_name(), w.saturating_sub(5)), style),
+        ]));
+    }
+    if provider.models.is_empty() {
+        lines.push(Line::from(Span::styled("   (no models defined)", Style::default().fg(theme.dark_gray))));
+    }
+
+    // Settings
+    lines.push(Line::from(""));
+    let settings_focused = state.pane == Pane::Settings;
+    lines.push(pane_title("Settings", settings_focused, theme));
+    let family = state.selected_model().map(|m| m.family).unwrap_or_default();
+    for (i, row) in state.settings_rows().iter().enumerate() {
+        let selected = i == state.row_idx && settings_focused;
+        let (label, value, val_col, _) = setting_display(*row, family, state);
+        let label_style = if selected {
+            Style::default().fg(theme.text_on_selected).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.gray)
+        };
+        lines.push(Line::from(vec![
+            marker(selected, theme),
+            Span::styled(pad_right(label, 17), label_style),
+            Span::styled(value, Style::default().fg(val_col).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+
+    // Credentials / endpoint hint
+    lines.push(Line::from(""));
+    let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
+    lines.push(Line::from(Span::styled(
+        format!("   {}", fit_text(&hint, w.saturating_sub(4))),
+        Style::default().fg(theme.dark_gray),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Most settings rows any model shows (temperature, reasoning, persist).
