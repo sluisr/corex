@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Shell mode (`!command`)**: A prompt that starts with `!` runs the command yourself, without the approval dialog, through the same shell tool and forensic log the agent uses. The command, its exit code, time and output appear in the conversation (collapsible with Ctrl+O), and the agent reads them on your next message; running one does not start a reply. It waits while a reply or another command is running.
+- **Shell mode (`!command`)**: A prompt that starts with `!` runs the command yourself, without the approval dialog, through the same shell tool and forensic log the agent uses. The command, its exit code, time and output appear in the conversation (collapsible with Ctrl+O), and the agent reads them on your next message; running one does not start a reply. Esc stops it. It waits while a reply or another command is running.
+- **Window title follows the agent**: The terminal window and tab title reads `Working`, `Action required!` (an approval, the sudo password or a question waits for you) or `Ready`, followed by `cx` and the project name, so a Corex tab in the background shows when it needs you. The previous title is saved on xterm's title stack and restored on exit and on Ctrl+Z; `COREX_TITLE=0` turns it off. Inside tmux it shows when `set-titles` is on.
 - **`?` for shortcuts**: On an empty prompt, `?` lists the keyboard shortcuts and prompt prefixes (`@path`, `/command`, `!command`). `/help` shows the same list, and the prompt placeholder points to it.
 - **Context files in the status bar**: The bar shows how many instruction files the system prompt loads (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`), as `/memory list` counts them. It is hidden when there are none and on phone screens.
 - **`@path` references stand out**: An `@path` that starts a word is drawn in the accent purple in the prompt and in the conversation, so a file reference reads as one piece. E-mail addresses stay plain.
@@ -22,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/directory add` and `@path` completion**: Adding a directory granted read access but `@` never searched it, so `@Escritorio` answered "No files match". Added directories are now indexed: folders in your home directory are listed and inserted as `~/Escritorio/...`, others by absolute path. A `~/` or absolute path outside the workspace and the added folders points to `/directory add`, and "No files match" says where it searched.
 
 ### Thanks
-- Thanks to **Francisco Vera ([kbdd23](https://github.com/kbdd23))** for the UX report behind these changes: the context file indicator, shell mode, `@path` highlighting and the `/directory add` search.
+- Thanks to **Francisco Vera ([kbdd23](https://github.com/kbdd23))** for the UX report behind these changes: the context file indicator, shell mode, `@path` highlighting, the `/directory add` search and the window title.
 
 ---
 
