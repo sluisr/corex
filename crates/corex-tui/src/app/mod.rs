@@ -133,6 +133,8 @@ impl App {
             last_slash_filter: String::new(),
             file_index: None,
             file_index_rx: None,
+            context_files: 0,
+            context_files_checked: None,
             last_file_query: None,
             local_llm_online: is_online,
             last_local_check: None,
@@ -561,6 +563,18 @@ impl App {
             let _ = tx.send(crate::file_completion::FileIndex::build(&roots));
         });
         self.file_index_rx = Some(rx);
+    }
+
+    /// Counts the instruction files (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, …) the system prompt
+    /// loads, at most every few seconds; true when the number changed and the bar must redraw.
+    pub fn refresh_context_files(&mut self) -> bool {
+        if self.context_files_checked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+            return false;
+        }
+        self.context_files_checked = Some(std::time::Instant::now());
+        let memory = corex_core::memory::Memory::new(&self.workspace_dir);
+        let count = memory.candidates().iter().filter(|(_, path)| path.is_file()).count();
+        std::mem::replace(&mut self.context_files, count) != count
     }
 
     /// Takes a finished background index build; true when one arrived and the popup must redraw.

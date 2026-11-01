@@ -1246,6 +1246,39 @@ use corex_core::types::ToolCall;
     }
 
     #[tokio::test]
+    async fn the_status_bar_counts_context_files() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        let ws = std::env::temp_dir().join(format!("corex-context-files-{}", std::process::id()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut app = App::new(corex_core::client::LlmClient::new(corex_core::config::Config::default()), ws.clone(), false);
+        app.auth_dialog.close();
+
+        app.refresh_context_files();
+        let global = app.context_files;
+        assert!(!app.refresh_context_files(), "counted at most every few seconds");
+
+        std::fs::write(ws.join("AGENTS.md"), "rules").unwrap();
+        std::fs::write(ws.join("COREX.md"), "notes").unwrap();
+        app.context_files_checked = None;
+        assert!(app.refresh_context_files());
+        let _ = std::fs::remove_dir_all(&ws);
+        assert_eq!(app.context_files, global + 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+        let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
+        assert!(footer.contains(&format!("{} context files", global + 2)), "{footer}");
+
+        app.context_files = 0;
+        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+        let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
+        assert!(!footer.contains("context file"), "hidden when none are loaded: {footer}");
+    }
+
+    #[tokio::test]
     async fn test_fleet_mode_exit_warning_not_truncated() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;

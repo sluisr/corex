@@ -1630,6 +1630,17 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         }
     }
 
+    if app.context_files > 0 && !is_mobile {
+        if !center_spans.is_empty() {
+            center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
+        }
+        let label = match app.context_files {
+            1 => "1 context file".to_string(),
+            n => format!("{n} context files"),
+        };
+        center_spans.push(Span::styled(label, Style::default().fg(app.theme.dark_gray)));
+    }
+
     // Left spans: Workspace directory, git branch, plan mode, and exit warning
     let recent = |press: Option<std::time::Instant>| press.is_some_and(|i| i.elapsed() <= std::time::Duration::from_secs(2));
     let exit_warning = if recent(app.last_ctrl_z_press) {

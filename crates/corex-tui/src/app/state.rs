@@ -322,6 +322,9 @@ pub struct App {
     /// Workspace paths offered while an `@path` is typed; rebuilt when stale.
     pub file_index: Option<crate::file_completion::FileIndex>,
     pub file_index_rx: Option<std::sync::mpsc::Receiver<crate::file_completion::FileIndex>>,
+    /// Instruction files in the system prompt, for the status bar, and when they were counted.
+    pub context_files: usize,
+    pub context_files_checked: Option<std::time::Instant>,
     /// The `@path` query the popup last showed, kept so it can close smoothly.
     pub last_file_query: Option<String>,
     pub local_llm_online: Arc<AtomicBool>,
