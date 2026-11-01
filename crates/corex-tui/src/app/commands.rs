@@ -996,9 +996,8 @@ impl App {
                     help.push_str(&format!("  {:<30} {}{}\n", usage, c.description, alias));
                 }
                 help.push_str("  /sudo <pwd>  Store sudo password in RAM for silent privilege escalation\n");
-                help.push_str("\nKeyboard Shortcuts:\n  Enter: Submit | Ctrl+T: Toggle Thought Box | Ctrl+C: Cancel/Exit | Up/Down: History / Command Nav");
-                help.push_str("\n  Scroll chat: Mouse wheel | PageUp / PageDown | Shift+Up / Shift+Down");
-                help.push_str("\n  Copy text: drag to select, then Ctrl+C (inside tmux, release copies)");
+                help.push('\n');
+                help.push_str(&shortcuts_help());
                 self.session.add_message(Message::system(help));
                 true
             }
@@ -1040,6 +1039,25 @@ impl App {
 }
 
 /// Loaded instruction files in prompt order, followed by the full search order.
+/// What `?` on an empty prompt shows, and the keyboard part of `/help`.
+pub(crate) fn shortcuts_help() -> String {
+    [
+        "Shortcuts:",
+        "  @path            reference a file (Tab completes)",
+        "  /command         run a command (/help lists them)",
+        "  !command         run a shell command yourself; the agent sees its output next turn",
+        "  Enter            send (queues while the agent works) · Alt+Enter: send now",
+        "  Esc              take back a queued message, then cancel the reply",
+        "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
+        "  Ctrl+V           paste an image from the clipboard, or its text",
+        "  Ctrl+Z           undo in the prompt · twice on an empty prompt: suspend",
+        "  Ctrl+O           full logs and commands · Ctrl+T: thinking",
+        "  Ctrl+C           copy the selection, cancel, or twice to exit",
+        "  Wheel / PageUp   scroll the chat · F2: mouse reporting on or off",
+    ]
+    .join("\n")
+}
+
 fn memory_file_list(memory: &Memory) -> String {
     let files = memory.files();
     let mut msg = if files.is_empty() {

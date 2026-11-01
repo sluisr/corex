@@ -97,7 +97,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         app.poll_local_health_check();
-        if app.poll_file_index() | app.refresh_context_files() {
+        if app.poll_file_index() | app.refresh_context_files() | app.poll_user_shell() {
             needs_redraw = true;
         }
 

@@ -216,7 +216,7 @@ pub const THINKING_EXTRA_KEY: &str = "anthropic_thinking";
 
 fn is_task_report(m: &Message) -> bool {
     m.text_content()
-        .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+        .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|") || t.starts_with("USER_SHELL|"))
 }
 
 /// Converts Corex messages and tool definitions into Anthropic's Messages API format.
@@ -767,6 +767,24 @@ mod tests {
         assert_eq!(last.role, "user");
         match &last.content[0] {
             AnthropicBlock::Text { text } => assert!(text.contains("TASK_DONE|42|0|31.2s")),
+            other => panic!("expected a text block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_user_shell_report_stays_in_place_as_a_user_turn() {
+        let messages = vec![
+            Message::system("You are a helpful assistant."),
+            Message::user("Hi."),
+            Message::assistant("Hello.".to_string(), None),
+            Message::system("USER_SHELL|0|0.1s\n$ ls\nREADME.md"),
+        ];
+        let (system, msgs, _) = convert_messages_and_tools(&messages, None);
+        assert_eq!(system.as_deref(), Some("You are a helpful assistant."), "not folded into the system prompt");
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, "user");
+        match &last.content[0] {
+            AnthropicBlock::Text { text } => assert!(text.contains("$ ls\nREADME.md")),
             other => panic!("expected a text block, got {:?}", other),
         }
     }

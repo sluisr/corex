@@ -559,7 +559,7 @@ impl LlmClient {
                 true
             } else if msg.role == "system" {
                 msg.text_content()
-                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+                    .map(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|") || t.starts_with("USER_SHELL|"))
                     .unwrap_or(false)
             } else {
                 false

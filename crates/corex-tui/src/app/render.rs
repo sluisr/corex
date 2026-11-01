@@ -221,6 +221,7 @@ enum SystemNotice {
     InfoCard,
     TaskDone,
     SubagentDone,
+    UserShell,
     ModelChange,
     Error,
     Checkpoint,
@@ -237,6 +238,8 @@ impl SystemNotice {
             Self::TaskDone
         } else if first.starts_with("SUBAGENT_DONE|") || first.starts_with("SUBAGENTDONE|") {
             Self::SubagentDone
+        } else if first.starts_with("USER_SHELL|") {
+            Self::UserShell
         } else if first.starts_with("Activated ") || first.starts_with("Switched ") {
             Self::ModelChange
         } else if first.starts_with("Error") || first.starts_with("Failed") {
@@ -332,6 +335,40 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
 
         push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
 
+        return lines;
+    }
+
+    if notice == SystemNotice::UserShell {
+        let parts: Vec<&str> = first_line.split('|').collect();
+        let code = parts.get(1).copied().unwrap_or("0");
+        let duration = parts.get(2).copied().unwrap_or("");
+        let command_rows = raw_lines[1..].iter().take_while(|l| l.starts_with("$ ")).count();
+        let command: Vec<&str> = raw_lines[1..1 + command_rows].iter().map(|l| &l[2..]).collect();
+        let output_lines: Vec<&str> = raw_lines[1 + command_rows..].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+
+        let args = serde_json::json!({ "command": command.join("\n") }).to_string();
+        let spans = format_tool_call_spans("run_shell_command", &args, theme, logs_expanded);
+        let hang = " ".repeat(4 + spans.first().map_or(0, |s| s.width()));
+        for (i, group) in split_spans_at_newlines(spans).into_iter().enumerate() {
+            let lead = if i == 0 { "  ! " } else { "    " };
+            let mut wrapped = crate::markdown::wrap_spans_with_indent(group, content_max_width, "", &hang);
+            if let Some(first) = wrapped.first_mut() {
+                first.spans.insert(0, Span::styled(lead, Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)));
+            }
+            lines.extend(wrapped);
+        }
+
+        let (icon, color, status) = match code {
+            "0" => ("  ✓ ", theme.success, "you ran it (exit 0)".to_string()),
+            "error" => ("  ✕ ", theme.error, "could not run".to_string()),
+            other => ("  ✕ ", theme.error, format!("you ran it (exit {other})")),
+        };
+        let mut status_spans = vec![Span::styled(icon, Style::default().fg(color)), Span::styled(status, Style::default().fg(color))];
+        if !duration.is_empty() {
+            status_spans.push(Span::styled(format!(" ({duration})"), Style::default().fg(muted_dim)));
+        }
+        lines.push(Line::from(status_spans));
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
         return lines;
     }
 
@@ -1336,7 +1373,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         } else if app.is_streaming {
             "Type to queue a message · Alt+Enter sends it now"
         } else {
-            "Type your message or @path/to/file"
+            "Type your message, @path/to/file or !command · ? for shortcuts"
         };
         (
             vec![Line::from(vec![

@@ -199,6 +199,73 @@ async fn run_one_tool(registry: &corex_tools::ToolRegistry, call: ToolCall, ctx:
     let _ = tx.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
 }
 
+/// Output kept from a `!command`, from its end, as for finished background tasks.
+const USER_SHELL_TAIL_BYTES: usize = 12_000;
+
+/// Runs a `!command` the user typed. It is their own command, so no approval is asked; it goes
+/// through the same shell tool and forensic log as the agent's. The report lands in the session
+/// when it finishes ([`App::poll_user_shell`]) and the agent reads it on the next turn.
+pub(super) fn run_user_shell(app: &mut App, command: String) {
+    if app.is_streaming || app.in_flight_tool_calls > 0 || app.user_shell_rx.is_some() {
+        app.session.add_message(Message::system(
+            "Wait for the current reply or command to finish (Esc cancels the reply) before running a shell command.",
+        ));
+        app.invalidate_message_cache();
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let registry = app.tool_registry.clone();
+    let context = tool_context(app);
+    app.set_status(&format!("Running !{}", corex_core::truncate_ellipsis(&command, 50)));
+    app.user_shell_rx = Some(rx);
+    tokio::spawn(async move {
+        let args = serde_json::json!({ "command": command });
+        let start = Instant::now();
+        let output = match registry.execute("run_shell_command", args.clone(), &context).await {
+            Ok(o) => o,
+            Err(e) => corex_tools::types::ToolOutput::error(format!("Error: {e}")),
+        };
+        let elapsed = start.elapsed();
+        corex_core::ForensicLogger::log_tool_call(
+            "user_shell",
+            "user",
+            &args.to_string(),
+            &output.output,
+            elapsed.as_millis(),
+            !output.is_error,
+        );
+        let _ = tx.send(user_shell_report(&command, &output.output, output.is_error, elapsed.as_secs_f32()));
+    });
+}
+
+/// `USER_SHELL|<exit>|<seconds>`, the command with a `$ ` before each line, then the output's tail.
+fn user_shell_report(command: &str, output: &str, is_error: bool, secs: f32) -> String {
+    let (code, body) = match output.strip_prefix("Command exited with status code ") {
+        Some(rest) => {
+            let (code, body) = rest.split_once(":\n").unwrap_or((rest, ""));
+            (code.trim().to_string(), body)
+        }
+        None if is_error => ("error".to_string(), output),
+        None => ("0".to_string(), output),
+    };
+    let mut report = format!("USER_SHELL|{code}|{secs:.1}s\n");
+    for line in command.lines() {
+        report.push_str(&format!("$ {line}\n"));
+    }
+    let body = body.trim_end();
+    if body.len() > USER_SHELL_TAIL_BYTES {
+        let mut cut = body.len() - USER_SHELL_TAIL_BYTES;
+        while !body.is_char_boundary(cut) {
+            cut += 1;
+        }
+        report.push_str(&format!("[... {cut} earlier bytes omitted ...]\n"));
+        report.push_str(&body[cut..]);
+    } else {
+        report.push_str(body);
+    }
+    report
+}
+
 /// Finishes the interactive ask_user dialog: executes the pending tool batch
 /// (feeding the user's answers to the `ask_user` call), then triggers the next
 /// agent turn via `AllToolsDone`.

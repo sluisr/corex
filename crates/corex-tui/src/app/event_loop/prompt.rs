@@ -119,6 +119,12 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.scroll_to_bottom();
                 return Flow::Handled;
             }
+            if c == '?' && app.input_buffer.is_empty() && app.history_idx.is_none() {
+                app.session.add_message(corex_core::types::Message::system(crate::app::commands::shortcuts_help()));
+                app.invalidate_message_cache();
+                app.scroll_to_bottom();
+                return Flow::Handled;
+            }
             app.clamp_cursor();
             app.input_buffer.insert(app.cursor_idx, c);
             app.cursor_idx += c.len_utf8();
@@ -285,6 +291,13 @@ async fn submit(app: &mut App, cmd_to_run: String, send_now: bool, event_tx: &Ev
 
     expand_paste_tags(app, &mut user_prompt_clean);
     app.pastes.clear();
+
+    if let Some(command) = user_prompt_clean.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+        app.images.clear();
+        super::tools::run_user_shell(app, command.to_string());
+        app.scroll_to_bottom();
+        return Flow::Handled;
+    }
 
     if app.is_streaming {
         if send_now {
@@ -479,6 +492,71 @@ mod tests {
             let buf = terminal.backend().buffer().clone();
             let rows = (0..H).map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect()).collect();
             (terminal, rows)
+        }
+
+        async fn wait_for_shell(app: &mut App) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !app.poll_user_shell() {
+                assert!(Instant::now() < deadline, "the !command never reported");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn last_text(app: &App) -> String {
+            app.session.messages.last().and_then(|m| m.text_content()).unwrap_or_default().to_string()
+        }
+
+        #[tokio::test]
+        async fn question_mark_and_bang_commands() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-bang-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("\n").contains("? for shortcuts"), "the placeholder points to ?");
+
+            type_text(&mut app, "?", &tx).await;
+            assert!(app.input_buffer.is_empty(), "? on an empty prompt is not typed");
+            assert!(last_text(&app).starts_with("Shortcuts:") && last_text(&app).contains("!command"), "{}", last_text(&app));
+            type_text(&mut app, "why?", &tx).await;
+            assert_eq!(app.input_buffer, "why?", "inside a message ? is a plain character");
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+
+            type_text(&mut app, "!echo hola-corex", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert!(app.input_buffer.is_empty());
+            wait_for_shell(&mut app).await;
+            let report = last_text(&app);
+            assert!(report.starts_with("USER_SHELL|0|"), "{report}");
+            assert!(report.contains("$ echo hola-corex\nhola-corex"), "{report}");
+            assert!(!app.is_streaming, "a !command does not start a turn");
+            assert_eq!(app.input_history.last().map(String::as_str), Some("!echo hola-corex"));
+
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("! ") && all.contains("$ echo hola-corex"), "{all}");
+            assert!(all.contains("you ran it (exit 0)") && all.contains("│ hola-corex"), "{all}");
+
+            type_text(&mut app, "!echo boom; exit 3", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            wait_for_shell(&mut app).await;
+            assert!(last_text(&app).starts_with("USER_SHELL|3|") && last_text(&app).contains("boom"), "{}", last_text(&app));
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("\n").contains("you ran it (exit 3)"), "{}", rows.join("\n"));
+
+            app.is_streaming = true;
+            type_text(&mut app, "!ls", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert!(last_text(&app).starts_with("Wait for the current reply"), "{}", last_text(&app));
+            assert!(app.user_shell_rx.is_none());
+            app.is_streaming = false;
+
+            let _ = std::fs::remove_dir_all(&ws);
         }
 
         #[tokio::test]

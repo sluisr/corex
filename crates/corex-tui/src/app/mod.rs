@@ -133,6 +133,7 @@ impl App {
             last_slash_filter: String::new(),
             file_index: None,
             file_index_rx: None,
+            user_shell_rx: None,
             context_files: 0,
             context_files_checked: None,
             last_file_query: None,
@@ -563,6 +564,22 @@ impl App {
             let _ = tx.send(crate::file_completion::FileIndex::build(&roots));
         });
         self.file_index_rx = Some(rx);
+    }
+
+    /// Puts the report of a finished `!command` in the conversation; true when one arrived.
+    pub fn poll_user_shell(&mut self) -> bool {
+        let Some(rx) = &self.user_shell_rx else { return false };
+        let report = match rx.try_recv() {
+            Ok(report) => report,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => "USER_SHELL|error|0.0s\nThe command stopped without a result.".to_string(),
+        };
+        self.user_shell_rx = None;
+        self.clear_status();
+        self.session.add_message(Message::system(report));
+        self.invalidate_message_cache();
+        self.scroll_to_bottom();
+        true
     }
 
     /// Counts the instruction files (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, …) the system prompt
