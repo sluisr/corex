@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Ctrl+Z undoes in the prompt and no longer quits**: With text in the prompt, Ctrl+Z takes back the last letter typed, paste or run of deletions, the way an editor does. On an empty prompt, pressing it twice within two seconds (like Ctrl+C) suspends to the shell and `fg` resumes the session where it was. It used to close Corex at once, which a reflexive "undo" after a paste turned into a lost session.
 - **Mouse selection no longer overwrites the clipboard**: Releasing a drag fills the primary selection (middle-click paste) on Linux and keeps the highlight; `Ctrl+C` with text highlighted copies it to the clipboard, and the next `Ctrl+C` cancels or exits as before. Inside tmux, release still copies, as tmux itself does.
-- **Tool approval dialog**: Options are grouped (allow once, for this session, always, then deny and deny with instructions) under a thin rule, with a highlighted `▸` row instead of bullets and numbers, and plain shortcut hints. "Always allow" is marked as the one that saves to config. For a single call, `3` now picks "always allow" and `4` "deny"; the letter shortcuts are unchanged.
-- **Exit warning**: "Press Ctrl+C again to exit." and its Ctrl+Z twin are shown in the muted grey instead of bold red.
+- **Quieter command approval and exit prompt**: The interface gets out of the way when Corex asks something of you.
+  - The approval dialog for commands and edits no longer shows bullets, numbers and bracketed keys on every row. The allow options sit together above a thin rule with the deny options below it, the selected row is a single highlighted `▸` line, and the shortcut keys are muted. "Always allow" is marked as the option that saves to config, so the one with lasting effect is the only one that stands out.
+  - For a single call, `3` now picks "always allow" and `4` "deny"; the letter shortcuts (`y`, `s`, `p`, `n`, `w`) are unchanged.
+  - "Press Ctrl+C again to exit." and its Ctrl+Z twin are shown in muted grey instead of bold red, so a warning you can ignore no longer reads like an error.
 
 ### Fixed
 - **YOLO mode stopping on the home directory**: A command that merely names `~` or `$HOME` (`cd "$HOME"; curl ...`) no longer waits for approval in YOLO mode. Credential paths below it still do, and `rm` aimed at the home directory itself now does too.
