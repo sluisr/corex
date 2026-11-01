@@ -12,11 +12,34 @@ use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 pub const MOUSE_REPORTING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub const MOUSE_REPORTING_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+/// Saves and restores the window title on xterm's title stack, so the shell gets its own title
+/// back after the agent's states. Terminals without the stack ignore both.
+pub const TITLE_PUSH: &str = "\x1b[22;0t";
+pub const TITLE_POP: &str = "\x1b[23;0t";
+
+/// The window title follows the agent's state unless `COREX_TITLE` is `0`, `false` or `off`.
+pub fn window_title_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("COREX_TITLE").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+    })
+}
+
+/// The OSC 0 sequence that sets the window and tab title, without control characters that
+/// would end it early.
+pub fn title_sequence(title: &str) -> String {
+    let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]0;{clean}\x07")
+}
+
 /// Restores the terminal to its standard state by disabling raw mode,
 /// leaving alternate screen, disabling mouse capture/bracketed paste, and showing the cursor.
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = stdout();
+    if window_title_enabled() {
+        let _ = stdout.write_all(TITLE_POP.as_bytes());
+    }
     // Explicitly switch every mouse mode off (also the ones enabled by hand in the TUI loop)
     // and reset attributes so a dead session never leaves escape junk in the shell.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());

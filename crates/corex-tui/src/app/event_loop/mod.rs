@@ -67,6 +67,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let mut stdout = stdout();
     // Clear any stale mouse mode left by a previously killed session before starting.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let title_enabled = crate::app::terminal::window_title_enabled();
+    if title_enabled {
+        let _ = stdout.write_all(crate::app::terminal::TITLE_PUSH.as_bytes());
+    }
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
     let _guard = TerminalGuard;
 
@@ -82,6 +86,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     // Mouse reporting is applied by the loop below (reconcile step) so that startup
     // and F2 share a single code path.
     let mut mouse_capture_applied = false;
+    let mut title_applied: Option<String> = None;
 
     let (event_tx, mut event_rx) = mpsc::channel::<(u64, StreamEvent)>(100);
 
@@ -93,6 +98,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         if crate::app::terminal::RESUMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
             let _ = terminal.clear();
             mouse_capture_applied = false;
+            if title_enabled {
+                let _ = terminal.backend_mut().write_all(crate::app::terminal::TITLE_PUSH.as_bytes());
+                title_applied = None;
+            }
             needs_redraw = true;
         }
 
@@ -115,6 +124,16 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             let _ = out.flush();
             mouse_capture_applied = app.mouse_capture;
             needs_redraw = true;
+        }
+
+        if title_enabled {
+            let title = app.window_title();
+            if title_applied.as_deref() != Some(title.as_str()) {
+                let out = terminal.backend_mut();
+                let _ = out.write_all(crate::app::terminal::title_sequence(&title).as_bytes());
+                let _ = out.flush();
+                title_applied = Some(title);
+            }
         }
 
         if background::poll_background_work(&mut app, &event_tx) {

@@ -149,7 +149,9 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
             app.last_esc_press = None;
         }
         KeyCode::Esc => {
-            if is_slash_open {
+            if app.user_shell_rx.is_some() {
+                app.stop_user_shell();
+            } else if is_slash_open {
                 clear_prompt(app);
             } else if app.fleet_dialog.is_open && !app.fleet_dialog.command_mode {
                 app.exit_fleet_mode();
@@ -549,7 +551,36 @@ mod tests {
             let (_, rows) = screen(&mut app);
             assert!(rows.join("\n").contains("you ran it (exit 3)"), "{}", rows.join("\n"));
 
+            let project = ws.file_name().unwrap().to_str().unwrap().to_string();
+            assert_eq!(app.window_title(), format!("Ready · cx · {project}"));
+            type_text(&mut app, "!sleep 30", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            assert!(app.window_title().starts_with("Working · cx"), "{}", app.window_title());
+            let started = Instant::now();
+            loop {
+                let running = corex_tools::background::get_task_manager()
+                    .lock()
+                    .map(|m| m.all_processes().values().any(|p| p.is_active() && !p.is_backgrounded()))
+                    .unwrap_or(false);
+                if running {
+                    break;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "sleep never started");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
+            wait_for_shell(&mut app).await;
+            assert!(started.elapsed() < Duration::from_secs(15), "Esc stopped the command early");
+            assert!(!last_text(&app).starts_with("USER_SHELL|0|"), "{}", last_text(&app));
+            assert!(app.window_title().starts_with("Ready"));
+
             app.is_streaming = true;
+            assert!(app.window_title().starts_with("Working"));
+            app.sudo_dialog.is_open = true;
+            assert!(app.window_title().starts_with("Action required!"), "waiting beats working");
+            app.sudo_dialog.is_open = false;
+            assert_eq!(crate::app::terminal::title_sequence("a\x07b\x1bc"), "\x1b]0;abc\x07");
+
             type_text(&mut app, "!ls", &tx).await;
             prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
             assert!(last_text(&app).starts_with("Wait for the current reply"), "{}", last_text(&app));

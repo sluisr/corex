@@ -566,6 +566,45 @@ impl App {
         self.file_index_rx = Some(rx);
     }
 
+    /// The window and tab title: the agent's state first, so it survives a narrow tab, then the
+    /// project, so several Corex tabs can be told apart.
+    pub fn window_title(&self) -> String {
+        let waiting = self.pending_confirmation.is_some()
+            || self.sudo_dialog.is_open
+            || self.user_dialog.is_open
+            || self.fleet_dialog.pending_approval.is_some();
+        let working = self.is_streaming || self.in_flight_tool_calls > 0 || self.user_shell_rx.is_some();
+        let state = if waiting {
+            "Action required!"
+        } else if working {
+            "Working"
+        } else {
+            "Ready"
+        };
+        match self.workspace_dir.file_name().and_then(|n| n.to_str()) {
+            Some(project) => format!("{state} · cx · {project}"),
+            None => format!("{state} · cx"),
+        }
+    }
+
+    /// Esc while a `!command` runs: ends its foreground processes. The agent runs nothing in the
+    /// meantime, so every foreground process is the command's; background tasks are left alone.
+    pub fn stop_user_shell(&mut self) {
+        let manager = corex_tools::background::get_task_manager();
+        if let Ok(mut mgr) = manager.lock() {
+            let pids: Vec<u32> = mgr
+                .all_processes()
+                .iter()
+                .filter(|(_, p)| p.is_active() && !p.is_backgrounded())
+                .map(|(pid, _)| *pid)
+                .collect();
+            for pid in pids {
+                mgr.kill(pid);
+            }
+        }
+        self.set_status("Stopping the command…");
+    }
+
     /// Puts the report of a finished `!command` in the conversation; true when one arrived.
     pub fn poll_user_shell(&mut self) -> bool {
         let Some(rx) = &self.user_shell_rx else { return false };
