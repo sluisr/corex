@@ -597,34 +597,74 @@ pub fn image_tag_ids(text: &str) -> Vec<usize> {
     ids
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum InputKind {
+    Plain,
+    PasteTag,
+    AtPath,
+}
+
+/// Byte ranges of `text` by how they are drawn: paste tags such as `[Image #1]`, `@path` tokens
+/// that start a word (as for the completion menu, so e-mail addresses stay plain), and the rest.
+fn input_ranges(text: &str) -> Vec<(usize, usize, InputKind)> {
+    let mut ranges = Vec::new();
+    let push_plain = |ranges: &mut Vec<(usize, usize, InputKind)>, from: usize, to: usize| {
+        let mut pos = from;
+        while let Some(rel) = text[pos..to].find('@') {
+            let at = pos + rel;
+            let starts_word = text[..at].chars().next_back().is_none_or(char::is_whitespace);
+            let end = text[at..to].find(char::is_whitespace).map_or(to, |e| at + e);
+            if starts_word && end > at + 1 {
+                if at > pos {
+                    ranges.push((pos, at, InputKind::Plain));
+                }
+                ranges.push((at, end, InputKind::AtPath));
+                pos = end;
+            } else {
+                ranges.push((pos, at + 1, InputKind::Plain));
+                pos = at + 1;
+            }
+        }
+        if pos < to {
+            ranges.push((pos, to, InputKind::Plain));
+        }
+    };
+    let mut pos = 0;
+    while let Some(rel) = paste_tag_start(&text[pos..]) {
+        let start = pos + rel;
+        let Some(close) = text[start..].find(']') else { break };
+        push_plain(&mut ranges, pos, start);
+        ranges.push((start, start + close + 1, InputKind::PasteTag));
+        pos = start + close + 1;
+    }
+    push_plain(&mut ranges, pos, text.len());
+    ranges
+}
+
+/// The spans for `text[from..to]`, styled by where each piece falls in the whole `text`, so a
+/// token cut by the caret keeps its colour on both sides.
+fn format_input_range<'a>(text: &'a str, from: usize, to: usize, theme: &Theme) -> Vec<Span<'a>> {
+    input_ranges(text)
+        .into_iter()
+        .filter_map(|(start, end, kind)| {
+            let (start, end) = (start.max(from), end.min(to));
+            (start < end).then(|| {
+                let style = match kind {
+                    InputKind::Plain => Style::default(),
+                    InputKind::PasteTag => Style::default()
+                        .fg(theme.accent_cyan)
+                        .bg(Color::Rgb(25, 45, 65))
+                        .add_modifier(Modifier::BOLD),
+                    InputKind::AtPath => Style::default().fg(theme.accent_purple),
+                };
+                Span::styled(&text[start..end], style)
+            })
+        })
+        .collect()
+}
+
 pub fn format_input_spans<'a>(text: &'a str, theme: &'a Theme) -> Vec<Span<'a>> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    while let Some(start_idx) = paste_tag_start(rest) {
-        if start_idx > 0 {
-            spans.push(Span::raw(&rest[..start_idx]));
-        }
-        let after_start = &rest[start_idx..];
-        if let Some(end_bracket) = after_start.find(']') {
-            let tag = &after_start[..=end_bracket];
-            spans.push(Span::styled(
-                tag,
-                Style::default()
-                    .fg(theme.accent_cyan)
-                    .bg(Color::Rgb(25, 45, 65))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            rest = &after_start[end_bracket + 1..];
-        } else {
-            spans.push(Span::raw(after_start));
-            rest = "";
-            break;
-        }
-    }
-    if !rest.is_empty() {
-        spans.push(Span::raw(rest));
-    }
-    spans
+    format_input_range(text, 0, text.len(), theme)
 }
 
 /// The composer's text with its caret. Without `caret` (a dialog has the keyboard) the text is
@@ -640,7 +680,7 @@ pub fn format_input_with_cursor<'a>(
         clamped = clamped.saturating_sub(1);
     }
     if !caret {
-        let col = format_input_spans(&text[..clamped], theme).iter().map(|s| s.width()).sum();
+        let col = format_input_range(text, 0, clamped, theme).iter().map(|s| s.width()).sum();
         return (format_input_spans(text, theme), col);
     }
     let mut spans = Vec::new();
@@ -657,14 +697,12 @@ pub fn format_input_with_cursor<'a>(
         return (spans, cursor_col);
     }
 
-    let before = &text[..clamped];
-    let mut before_spans = format_input_spans(before, theme);
+    let mut before_spans = format_input_range(text, 0, clamped, theme);
     let cursor_col: usize = before_spans.iter().map(|s| s.width()).sum();
 
     if starts_with_paste_tag(&text[clamped..]) {
         if let Some(end_bracket) = text[clamped..].find(']') {
             let tag = &text[clamped..=clamped + end_bracket];
-            let after = &text[clamped + end_bracket + 1..];
             spans.append(&mut before_spans);
             spans.push(Span::styled(
                 tag,
@@ -673,7 +711,7 @@ pub fn format_input_with_cursor<'a>(
                     .bg(theme.accent_blue)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.extend(format_input_spans(after, theme));
+            spans.extend(format_input_range(text, clamped + end_bracket + 1, text.len(), theme));
             return (spans, cursor_col);
         }
     }
@@ -681,7 +719,6 @@ pub fn format_input_with_cursor<'a>(
     let c = text[clamped..].chars().next().unwrap_or(' ');
     let c_len = c.len_utf8();
     let char_str = &text[clamped..clamped + c_len];
-    let after = &text[clamped + c_len..];
 
     spans.append(&mut before_spans);
     spans.push(Span::styled(
@@ -691,7 +728,7 @@ pub fn format_input_with_cursor<'a>(
             .bg(theme.accent_blue)
             .add_modifier(Modifier::BOLD),
     ));
-    spans.extend(format_input_spans(after, theme));
+    spans.extend(format_input_range(text, clamped + c_len, text.len(), theme));
 
     (spans, cursor_col)
 }

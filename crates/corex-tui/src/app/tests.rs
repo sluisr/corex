@@ -986,6 +986,23 @@ use corex_core::types::ToolCall;
     }
 
     #[test]
+    fn at_paths_stand_out_in_the_prompt() {
+        let theme = Theme::default();
+        let purple = |spans: &[ratatui::text::Span<'_>]| -> Vec<String> {
+            spans.iter().filter(|s| s.style.fg == Some(theme.accent_purple)).map(|s| s.content.to_string()).collect()
+        };
+        let text = "look at @src/main.rs and mail me at a@b.com, @ alone";
+        assert_eq!(purple(&format_input_spans(text, &theme)), ["@src/main.rs"], "e-mails and a bare @ stay plain");
+
+        let (spans, _) = format_input_with_cursor(text, 15, &theme, true);
+        assert_eq!(purple(&spans), ["@src/ma", "n.rs"], "both sides of the caret keep the colour");
+
+        let tagged = format_input_spans("[Image #1] @a.png", &theme);
+        assert_eq!(purple(&tagged), ["@a.png"]);
+        assert!(tagged.iter().any(|s| s.content == "[Image #1]" && s.style.fg == Some(theme.accent_cyan)));
+    }
+
+    #[test]
     fn full_logs_show_the_whole_command() {
         let theme = Theme::default();
         let text = |spans: Vec<ratatui::text::Span<'static>>| spans.iter().map(|s| s.content.to_string()).collect::<String>();
