@@ -268,9 +268,10 @@ mod tests {
 
     #[test]
     fn folders_in_the_home_directory_show_their_name() {
-        let home = Path::new("/home/kbdd");
-        assert_eq!(root_prefix(Path::new("/home/kbdd/Escritorio"), Some(home)), "~/Escritorio/");
-        assert_eq!(root_prefix(Path::new("/srv/data"), Some(home)), "/srv/data/");
-        assert_eq!(root_prefix(home, Some(home)), "/home/kbdd/");
+        let home = std::env::temp_dir().join("corex-fake-home");
+        assert_eq!(root_prefix(&home.join("Escritorio"), Some(&home)), "~/Escritorio/");
+        let elsewhere = std::env::temp_dir().join("corex-elsewhere");
+        assert_eq!(root_prefix(&elsewhere, Some(&home)), format!("{}/", elsewhere.display()));
+        assert_eq!(root_prefix(&home, Some(&home)), format!("{}/", home.display()));
     }
 }

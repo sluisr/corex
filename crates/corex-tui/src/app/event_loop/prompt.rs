@@ -447,6 +447,108 @@ fn next_char_len(after: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Drives the real key handler and draws the whole UI, the way a user sees it.
+    mod end_to_end {
+        use super::*;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        const W: u16 = 140;
+        const H: u16 = 35;
+
+        async fn type_text(app: &mut App, text: &str, tx: &EventTx) {
+            for c in text.chars() {
+                prompt_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), tx).await;
+            }
+        }
+
+        fn wait_for_index(app: &mut App) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.poll_file_index() {
+                assert!(Instant::now() < deadline, "the @path index never arrived");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn screen(app: &mut App) -> (Terminal<TestBackend>, Vec<String>) {
+            let mut terminal = Terminal::new(TestBackend::new(W, H)).unwrap();
+            for _ in 0..30 {
+                app.advance_slash_popup();
+                terminal.draw(|f| crate::app::render::render_ui(f, app)).unwrap();
+            }
+            let buf = terminal.backend().buffer().clone();
+            let rows = (0..H).map(|y| (0..W).map(|x| buf[(x, y)].symbol()).collect()).collect();
+            (terminal, rows)
+        }
+
+        #[tokio::test]
+        async fn directory_add_at_paths_context_files_and_full_commands() {
+            crate::test_support::isolate_home();
+            let home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap();
+            let escritorio = home.join("Escritorio");
+            std::fs::create_dir_all(escritorio.join("notas")).unwrap();
+            std::fs::write(escritorio.join("notas/tarea.md"), "x").unwrap();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-ws-{}", std::process::id()));
+            std::fs::create_dir_all(ws.join("src")).unwrap();
+            std::fs::write(ws.join("src/main.rs"), "fn main() {}").unwrap();
+            std::fs::write(ws.join("AGENTS.md"), "rules").unwrap();
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+
+            type_text(&mut app, "/directory add ~/Escritorio", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            let added = app.session.messages.iter().rev().find_map(|m| m.text_content()).unwrap_or_default().to_string();
+            assert!(added.contains("Added"), "{added}");
+
+            type_text(&mut app, "@Escritorio", &tx).await;
+            wait_for_index(&mut app);
+            let (terminal, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("~/Escritorio/"), "the added folder is offered by name:\n{all}");
+            assert!(all.contains("~/Escritorio/notas/tarea.md") || all.contains("~/Escritorio/notas/"), "{all}");
+            assert!(!all.contains("No files match"), "{all}");
+
+            let prompt_row = rows.iter().position(|r| r.contains("> @Escritorio")).expect("prompt row");
+            let at_col = rows[prompt_row].find('@').unwrap() as u16;
+            let cell = &terminal.backend().buffer()[(at_col, prompt_row as u16)];
+            assert_eq!(cell.fg, app.theme.accent_purple, "the @path is drawn in purple");
+
+            app.context_files_checked = None;
+            app.refresh_context_files();
+            let (_, rows) = screen(&mut app);
+            assert!(rows.iter().any(|r| r.contains("1 context file")), "{}", rows.join("\n"));
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            type_text(&mut app, "@/usr/", &tx).await;
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("\n").contains("/directory add <folder>"), "{}", rows.join("\n"));
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            let long = format!("cargo test --workspace -- {}--end", "--flag ".repeat(20));
+            let call = corex_core::types::ToolCall::new("c1", "run_shell_command", serde_json::json!({ "command": long }).to_string());
+            app.session.add_message(corex_core::types::Message::assistant_with_tools(None, None, vec![call]));
+            app.session.add_message(corex_core::types::Message::tool_response("c1", "ok"));
+            app.invalidate_message_cache();
+            let (_, rows) = screen(&mut app);
+            assert!(!rows.join("").contains("--end"), "collapsed, the command is cut");
+            app.logs_expanded = true;
+            app.invalidate_message_cache();
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("").contains("--end"), "with Ctrl+O the whole command shows:\n{}", rows.join("\n"));
+            let first = rows.iter().position(|r| r.contains(" $ cargo test")).unwrap();
+            let command_col = rows[first].find("cargo").unwrap();
+            let wrapped = &rows[first + 1];
+            assert_eq!(wrapped.len() - wrapped.trim_start().len(), command_col, "a wrapped command lines up under itself:\n{}", rows.join("\n"));
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+    }
+
     #[test]
     fn prompt_prefixes_are_removed() {
         assert_eq!(strip_prompt_prefixes("$auto fix the build".to_string()), "fix the build");

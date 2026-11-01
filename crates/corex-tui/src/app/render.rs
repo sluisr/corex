@@ -582,8 +582,9 @@ pub fn render_single_message_with_pending_and_thinking(
                     }
 
                     let spans = format_tool_call_spans(&call.function.name, &call.function.arguments, theme, logs_expanded);
+                    let hang = " ".repeat(2 + spans.first().map_or(0, |s| s.width()));
                     for group in split_spans_at_newlines(spans) {
-                        lines.extend(crate::markdown::wrap_spans(group, content_max_width, "  "));
+                        lines.extend(crate::markdown::wrap_spans_with_indent(group, content_max_width, "  ", &hang));
                     }
                 }
             }
