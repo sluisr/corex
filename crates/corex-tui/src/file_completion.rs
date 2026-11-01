@@ -1,8 +1,9 @@
-//! `@path` completion in the prompt: a gitignore-aware index of the workspace and the popup that
-//! lists its matches while a path is typed.
+//! `@path` completion in the prompt: a gitignore-aware index of the workspace and of the
+//! directories added with `/directory add`, and the popup that lists its matches while a path is
+//! typed.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -20,9 +21,10 @@ const MAX_DEPTH: usize = 12;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 pub const MAX_MATCHES: usize = 50;
 
-/// Workspace files and directories (with a trailing `/`), relative, shallowest first.
+/// Files and directories (with a trailing `/`), shallowest first: relative to the workspace, the
+/// first root, and absolute for the added directories, so the inserted path reads the same file.
 pub struct FileIndex {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     built: Instant,
     paths: Vec<String>,
     /// `paths` lowercased once, so matching on every keystroke allocates nothing per entry.
@@ -33,31 +35,40 @@ pub struct FileIndex {
 }
 
 impl FileIndex {
-    pub fn build(root: &Path) -> Self {
-        let mut paths: Vec<String> = ignore::WalkBuilder::new(root)
-            .max_depth(Some(MAX_DEPTH))
-            .build()
-            .flatten()
-            .filter_map(|entry| {
-                let rel = entry.path().strip_prefix(root).ok()?.to_str()?.to_string();
-                if rel.is_empty() {
-                    return None;
-                }
-                Some(if entry.file_type()?.is_dir() { format!("{}/", rel) } else { rel })
-            })
-            .take(MAX_ENTRIES)
-            .collect();
+    pub fn build(roots: &[PathBuf]) -> Self {
+        let mut paths: Vec<String> = Vec::new();
+        for (i, root) in roots.iter().enumerate() {
+            let prefix = if i == 0 { String::new() } else { format!("{}/", root.display()) };
+            if i > 0 {
+                paths.push(prefix.clone());
+            }
+            paths.extend(
+                ignore::WalkBuilder::new(root)
+                    .max_depth(Some(MAX_DEPTH))
+                    .build()
+                    .flatten()
+                    .filter_map(|entry| {
+                        let rel = entry.path().strip_prefix(root).ok()?.to_str()?;
+                        if rel.is_empty() {
+                            return None;
+                        }
+                        let slash = if entry.file_type()?.is_dir() { "/" } else { "" };
+                        Some(format!("{prefix}{rel}{slash}"))
+                    })
+                    .take(MAX_ENTRIES),
+            );
+        }
         paths.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
         let lower = paths.iter().map(|p| p.to_lowercase()).collect();
-        Self { root: root.to_path_buf(), built: Instant::now(), paths, lower, last: RefCell::new(None) }
+        Self { roots: roots.to_vec(), built: Instant::now(), paths, lower, last: RefCell::new(None) }
     }
 
-    pub fn is_fresh_for(&self, root: &Path) -> bool {
-        self.root == root && self.built.elapsed() < STALE_AFTER
+    pub fn is_fresh_for(&self, roots: &[PathBuf]) -> bool {
+        self.is_for(roots) && self.built.elapsed() < STALE_AFTER
     }
 
-    pub fn is_for(&self, root: &Path) -> bool {
-        self.root == root
+    pub fn is_for(&self, roots: &[PathBuf]) -> bool {
+        self.roots == roots
     }
 
     pub fn is_empty(&self) -> bool {
@@ -195,7 +206,7 @@ mod tests {
         for f in ["src/main.rs", "src/app/mainline.rs", "README.md", "domain.txt"] {
             std::fs::write(root.join(f), "").unwrap();
         }
-        let index = FileIndex::build(&root);
+        let index = FileIndex::build(std::slice::from_ref(&root));
         let _ = std::fs::remove_dir_all(&root);
 
         assert_eq!(index.matches("src/m"), ["src/main.rs"]);
@@ -203,5 +214,23 @@ mod tests {
         assert_eq!(index.matches("")[..3], ["README.md", "domain.txt", "src/"]);
         assert!(index.matches("zzz").is_empty());
         assert_eq!(index.matches("MAIN"), index.matches("main"), "a cached query must not leak into another");
+    }
+
+    #[test]
+    fn added_directories_are_searchable_by_absolute_path() {
+        let base = std::env::temp_dir().join(format!("corex-file-index-extra-{}", std::process::id()));
+        let (ws, extra) = (base.join("ws"), base.join("Escritorio"));
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(extra.join("notas")).unwrap();
+        std::fs::write(ws.join("src/main.rs"), "").unwrap();
+        std::fs::write(extra.join("notas/tarea.md"), "").unwrap();
+        let index = FileIndex::build(&[ws.clone(), extra.clone()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let extra_root = format!("{}/", extra.display());
+        assert_eq!(index.matches("escritorio").first(), Some(&extra_root));
+        assert!(index.matches("tarea").contains(&format!("{extra_root}notas/tarea.md")));
+        assert_eq!(index.matches("main"), ["src/main.rs"], "workspace paths stay relative");
+        assert!(index.is_for(&[ws.clone(), extra]) && !index.is_for(&[ws]), "adding a directory rebuilds the index");
     }
 }

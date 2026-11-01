@@ -539,21 +539,26 @@ impl App {
         Some(self.file_index.as_ref().map(|index| index.matches(&query)).unwrap_or_default())
     }
 
-    /// Builds the workspace index the first time an `@path` is typed, and again once stale. The
+    /// The roots `@path` completion searches: the workspace, then the `/directory add` ones.
+    fn file_index_roots(&self) -> Vec<std::path::PathBuf> {
+        std::iter::once(self.workspace_dir.clone()).chain(self.extra_dirs.iter().cloned()).collect()
+    }
+
+    /// Builds the file index the first time an `@path` is typed, and again once stale. The
     /// walk runs on its own thread (a large tree takes long enough to freeze typing); the stale
     /// index keeps answering until the new one lands in [`App::poll_file_index`].
     pub fn refresh_file_index(&mut self) {
-        let fresh = self.file_index.as_ref().is_some_and(|i| i.is_fresh_for(&self.workspace_dir));
+        let roots = self.file_index_roots();
+        let fresh = self.file_index.as_ref().is_some_and(|i| i.is_fresh_for(&roots));
         if fresh || self.file_index_rx.is_some() || self.file_query().is_none() {
             return;
         }
-        if self.file_index.as_ref().is_some_and(|i| !i.is_for(&self.workspace_dir)) {
+        if self.file_index.as_ref().is_some_and(|i| !i.is_for(&roots)) {
             self.file_index = None;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = self.workspace_dir.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::file_completion::FileIndex::build(&root));
+            let _ = tx.send(crate::file_completion::FileIndex::build(&roots));
         });
         self.file_index_rx = Some(rx);
     }
@@ -564,7 +569,7 @@ impl App {
         match rx.try_recv() {
             Ok(index) => {
                 self.file_index_rx = None;
-                if index.is_for(&self.workspace_dir) {
+                if index.is_for(&self.file_index_roots()) {
                     self.file_index = Some(index);
                 }
                 true
