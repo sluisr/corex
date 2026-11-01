@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.1] - 2026-11-01
+
+### Changed
+- **`/directory add` accepts a folder that is already readable**: A folder inside the workspace used to be refused with "it is already readable", although that only meant the agent could read it, not that `@path` could find it. It is now added as a root of its own, so `@` indexes it by name, and the answer says so (`already readable, now indexed for @path`). Folders that do not exist, are not directories, or hold credentials or system files are still refused, and adding the same folder twice answers `it is already added`.
+- **`/model` panel**: The credentials line (`key: ••••7bf3`, or the `export …` hint) sits under the provider's name instead of alone at the bottom. Providers without a key are grouped under one `Without a key` label instead of repeating `no key` on every row. `HIGH` reasoning is amber instead of red, since it is a setting and not a warning, and the gap between the two columns is wider so the focus rail no longer looks like it points at the provider list.
+
+### Fixed
+- **`@path` lost the folders of a large tree**: The workspace index walked depth-first and stopped silently at 20,000 entries, so with `~` as the workspace one dense folder filled it before the next was reached, and `@Escritorio` answered "No files match" for a folder that exists. The index is now built one level at a time and keeps every level that fits, so the folders near the top are always there however large the tree below them is. `node_modules`, `target`, `dist`, `venv` and `__pycache__` are skipped even where no `.gitignore` names them.
+- **A truncated index says so, and typing the folder reaches what it left out**: When a root has more than 20,000 entries, the popup title reads `partial index (20000 entries): type a folder to go deeper`, and "No files match" gives the same reason. The folder being typed (`@Escritorio/Proyectos/`) is then listed from disk, so each step of a path finds its next entry. Searching by file name alone, without a folder, still only covers what the index holds.
+- **"Press Esc again to rewind."**: The notice came from the time Esc Esc opened the rewind dialog. Since then the second Esc only clears the prompt, so with an empty prompt it promised an action that did not exist. The notice now shows only when there is text to clear (`Press Esc again to clear prompt.`); `/rewind` remains the way to undo edits.
+
+### Thanks
+- Thanks to **Francisco Vera ([kbdd23](https://github.com/kbdd23))** for the UX report behind these changes: the Esc notice that outlived the rewind redesign, `@path` going blind in dense trees, and `/directory add` refusing a folder that was readable but not indexed.
+
+---
+
 ## [0.10.0] - 2026-11-01
 
 ### Added

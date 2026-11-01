@@ -1388,9 +1388,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
     }
 
-    let show_esc_hint = app.last_esc_press
-        .map(|i| i.elapsed() <= Duration::from_millis(500))
-        .unwrap_or(false);
+    let show_esc_hint = !app.input_buffer.is_empty()
+        && app.last_esc_press.is_some_and(|i| i.elapsed() <= Duration::from_millis(500));
 
     // `cursor_row` is the wrapped row the caret sits on; it drives the vertical scroll so the
     // caret stays visible once the message occupies more rows than the composer can show.
@@ -1429,14 +1428,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             0usize,
         )
     } else {
-        let hint = show_esc_hint.then(|| {
-            let msg = if app.input_buffer.is_empty() {
-                "Press Esc again to rewind."
-            } else {
-                "Press Esc again to clear prompt."
-            };
-            Span::styled(format!(" ({})", msg), Style::default().fg(app.theme.gray))
-        });
+        let hint = show_esc_hint
+            .then(|| Span::styled(" (Press Esc again to clear prompt.)", Style::default().fg(app.theme.gray)));
 
         let (input_spans, _) = format_input_with_cursor(&app.input_buffer, app.cursor_idx, &app.theme, !app.dialog_has_focus());
 
@@ -1504,6 +1497,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 IndexState::OutsideRoots
             }
             None if app.file_index_rx.is_some() => IndexState::Building,
+            Some(i) if i.is_truncated() => IndexState::Truncated,
             Some(i) if !i.is_empty() => IndexState::Ready,
             _ => IndexState::Empty,
         };

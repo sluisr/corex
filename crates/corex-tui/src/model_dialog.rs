@@ -34,7 +34,7 @@ pub fn get_reasoning_color(r: &str) -> Color {
         "dynamic" => Color::Rgb(105, 240, 174),
         "low" => Color::Rgb(79, 195, 247),
         "medium" => Color::Rgb(255, 213, 79),
-        "high" => Color::Rgb(255, 110, 110),
+        "high" => Color::Rgb(255, 183, 77),
         "max" => Color::Rgb(224, 64, 251),
         _ => Color::Rgb(135, 175, 255),
     }
@@ -527,7 +527,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     let body_rows = if compact {
         compact_row_count(state)
     } else {
-        // +3: the title, its gap and the "without a key" line.
+        // +3: the title, its gap and the "Without a key" label.
         detail_row_count(state).max(state.providers.len() + 3)
     };
     let dialog_height = ((body_rows + 2 + 2) as u16).min(area.height.saturating_sub(2));
@@ -551,7 +551,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     } else {
         let horizontal = Layout::horizontal([
             Constraint::Length(PROVIDERS_COL_WIDTH),
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(20),
         ])
         .split(body);
@@ -683,7 +683,7 @@ const MAX_SETTINGS_ROWS: usize = 3;
 /// stays put) while the selection moves.
 fn detail_row_count(state: &ModelDialogState) -> usize {
     let models = state.providers.iter().map(|p| p.models.len()).max().unwrap_or(1).max(1);
-    2 + 1 + models + 1 + 1 + MAX_SETTINGS_ROWS + 1 + 1
+    3 + 1 + models + 1 + 1 + MAX_SETTINGS_ROWS
 }
 
 /// The provider's name without a trailing aside such as "(Free / Ultra-Fast)", once it gets long.
@@ -698,12 +698,18 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
     let focused = state.pane == Pane::Providers;
     let w = area.width as usize;
     let mut lines = vec![pane_title("Providers", focused, theme), Line::from("")];
+    let mut keyless_labeled = false;
 
     for i in state.provider_order() {
         let p = &state.providers[i];
         let selected = i == state.prov_idx;
         let is_active = i == state.active_provider;
         let ready = state.ready.get(i).copied().unwrap_or(false);
+
+        if !ready && !is_active && !keyless_labeled {
+            keyless_labeled = true;
+            lines.push(Line::from(Span::styled("   Without a key", Style::default().fg(theme.dark_gray))));
+        }
 
         // Usable providers carry a dot; the ones still missing a key simply recede.
         let (dot, dot_col) = if is_active {
@@ -720,9 +726,8 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
         } else {
             theme.dark_gray
         };
-        let count = if ready { String::new() } else { "no key".to_string() };
-        // Marker (3) + dot (2) + a gap before the count + the count + a trailing pad.
-        let name_w = w.saturating_sub(5 + 1 + count.chars().count() + 1);
+        // Marker (3) + dot (2) + a trailing pad.
+        let name_w = w.saturating_sub(5 + 1);
 
         let mut name_style = Style::default().fg(name_fg);
         if selected {
@@ -732,8 +737,6 @@ fn render_providers_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState
             marker(selected && focused, theme),
             Span::styled(format!("{} ", dot), Style::default().fg(dot_col)),
             Span::styled(pad_right(short_name(p.display_name()), name_w), name_style),
-            Span::styled(" ", Style::default()),
-            Span::styled(count, Style::default().fg(theme.dark_gray)),
             Span::styled(" ", Style::default()),
         ]));
     }
@@ -766,6 +769,11 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
         Span::styled(status, Style::default().fg(status_col).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  {}", endpoint), Style::default().fg(theme.dark_gray)),
     ]));
+    let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
+    lines.push(Line::from(Span::styled(
+        format!("   {}", fit_text(&hint, w.saturating_sub(4))),
+        Style::default().fg(theme.dark_gray),
+    )));
     lines.push(Line::from(""));
 
     // Models
@@ -843,14 +851,6 @@ fn render_detail_pane(frame: &mut Frame, area: Rect, state: &ModelDialogState, t
             ),
         ]));
     }
-
-    // Credentials / endpoint hint
-    lines.push(Line::from(""));
-    let hint = state.hints.get(state.prov_idx).cloned().unwrap_or_default();
-    lines.push(Line::from(Span::styled(
-        format!("   {}", fit_text(&hint, w.saturating_sub(4))),
-        Style::default().fg(theme.dark_gray),
-    )));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -944,6 +944,31 @@ mod tests {
         let y = rows.iter().position(|r| r.contains("Providers")).unwrap() as u16;
         let x = rows[y as usize].find("Providers").unwrap() as u16;
         assert_eq!(buf[(x, y)].bg, Color::Reset, "no fill: a transparent terminal shows through");
+    }
+
+    #[test]
+    fn the_credentials_hint_sits_under_the_header_and_keyless_providers_are_grouped() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let theme = Theme::default();
+        let mut s = open_default();
+        s.is_open = true;
+        s.ready = (0..s.providers.len()).map(|i| i == s.active_provider).collect();
+        s.hints[s.prov_idx] = "credentials-hint".to_string();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|f| render_model_dialog(f, f.area(), &s, &theme)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+
+        let header = screen.iter().position(|r| r.contains("● active")).expect("header");
+        assert!(screen[header + 1].contains("credentials-hint"), "{}", screen.join("\n"));
+        assert!(screen[header + 3].contains("Models"), "a gap, then the models:\n{}", screen.join("\n"));
+        assert_eq!(screen.iter().filter(|r| r.contains("Without a key")).count(), 1, "{}", screen.join("\n"));
+        assert!(!screen.iter().any(|r| r.contains("no key")), "the label replaces the per-row tag");
+        assert_ne!(get_reasoning_color("high"), Color::Rgb(255, 110, 110), "high reasoning is not an alarm");
     }
 
     #[test]

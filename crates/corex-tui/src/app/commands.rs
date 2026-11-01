@@ -35,7 +35,10 @@ impl App {
                         .map(str::trim)
                         .filter(|p| !p.is_empty())
                         .map(|p| match self.add_directory(p) {
-                            Ok(dir) => format!("Added {}: the agent can read it without confirmation.", dir.display()),
+                            Ok((dir, true)) => format!("Added {}: already readable, now indexed for @path.", dir.display()),
+                            Ok((dir, false)) => {
+                                format!("Added {}: the agent can read it without confirmation.", dir.display())
+                            }
                             Err(e) => format!("Could not add {}: {}", p, e),
                         })
                         .collect::<Vec<_>>()
@@ -1005,9 +1008,10 @@ impl App {
         }
     }
 
-    /// Adds a read-only root for this session, after checking it is a real, non-sensitive
-    /// directory the agent cannot already read.
-    pub(super) fn add_directory(&mut self, raw: &str) -> Result<PathBuf, String> {
+    /// Adds a root for this session after checking it is a real, non-sensitive directory. A
+    /// directory the agent can already read is still added, so `@path` indexes it by name even
+    /// when the workspace is too large to be indexed whole; the flag says it was already readable.
+    pub(super) fn add_directory(&mut self, raw: &str) -> Result<(PathBuf, bool), String> {
         use corex_tools::fs_tools::{is_sensitive_system_path, is_within_workspace, resolve_path};
 
         let dir = resolve_path(&self.workspace_dir, raw).canonicalize().map_err(|e| e.to_string())?;
@@ -1017,11 +1021,13 @@ impl App {
         if is_sensitive_system_path(&dir) {
             return Err("it holds credentials or system files".to_string());
         }
-        if std::iter::once(&self.workspace_dir).chain(&self.extra_dirs).any(|root| is_within_workspace(&dir, root)) {
-            return Err("it is already readable".to_string());
+        let roots = || std::iter::once(&self.workspace_dir).chain(&self.extra_dirs);
+        if roots().any(|root| *root == dir) {
+            return Err("it is already added".to_string());
         }
+        let readable = roots().any(|root| is_within_workspace(&dir, root));
         self.extra_dirs.push(dir.clone());
-        Ok(dir)
+        Ok((dir, readable))
     }
 
     pub(super) fn directory_report(&self) -> String {

@@ -1816,12 +1816,12 @@ async fn test_directory_add_validates_and_lists_roots() {
     let report = app.directory_report();
     let _ = std::fs::remove_dir_all(&base);
 
-    assert_eq!(added, Ok(data.canonicalize().unwrap_or(data.clone())));
+    assert_eq!(added, Ok((data.canonicalize().unwrap_or(data.clone()), false)));
     assert!(file.is_err());
-    assert_eq!(inside, Err("it is already readable".to_string()));
-    assert_eq!(again, Err("it is already readable".to_string()));
+    assert_eq!(inside, Ok((ws.join("src").canonicalize().unwrap_or(ws.join("src")), true)), "readable, but still indexed");
+    assert_eq!(again, Err("it is already added".to_string()));
     assert!(missing.is_err());
-    assert_eq!(app.extra_dirs.len(), 1);
+    assert_eq!(app.extra_dirs.len(), 2);
     assert!(report.contains("Additional directories"));
 }
 

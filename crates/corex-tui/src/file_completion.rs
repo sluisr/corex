@@ -15,9 +15,12 @@ use ratatui::Frame;
 use crate::text::{fit_text, pad_right};
 use crate::theme::Theme;
 
-/// Enough for real repositories while keeping a walk of `$HOME` short.
+/// Enough for real repositories while keeping a walk of `$HOME` short. Per root.
 const MAX_ENTRIES: usize = 20_000;
 const MAX_DEPTH: usize = 12;
+/// Generated directories that outweigh everything else and are never worth completing into, even
+/// where no `.gitignore` names them.
+const SKIPPED_DIRS: [&str; 5] = ["node_modules", "target", "dist", "venv", "__pycache__"];
 const STALE_AFTER: Duration = Duration::from_secs(30);
 pub const MAX_MATCHES: usize = 50;
 
@@ -28,6 +31,9 @@ pub struct FileIndex {
     roots: Vec<PathBuf>,
     built: Instant,
     paths: Vec<String>,
+    /// A root had more than [`MAX_ENTRIES`] entries: the levels that did not fit are missing, and
+    /// [`FileIndex::matches`] lists the folder being typed from disk to reach them.
+    truncated: bool,
     /// `paths` lowercased once, so matching on every keystroke allocates nothing per entry.
     lower: Vec<String>,
     /// The last query and its matches: the prompt, the popup height and the render all ask for
@@ -39,30 +45,23 @@ impl FileIndex {
     pub fn build(roots: &[PathBuf]) -> Self {
         let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
         let mut paths: Vec<String> = Vec::new();
+        let mut truncated = false;
         for (i, root) in roots.iter().enumerate() {
             let prefix = if i == 0 { String::new() } else { root_prefix(root, home.as_deref()) };
             if i > 0 {
                 paths.push(prefix.clone());
             }
-            paths.extend(
-                ignore::WalkBuilder::new(root)
-                    .max_depth(Some(MAX_DEPTH))
-                    .build()
-                    .flatten()
-                    .filter_map(|entry| {
-                        let rel = entry.path().strip_prefix(root).ok()?.to_str()?;
-                        if rel.is_empty() {
-                            return None;
-                        }
-                        let slash = if entry.file_type()?.is_dir() { "/" } else { "" };
-                        Some(format!("{prefix}{rel}{slash}"))
-                    })
-                    .take(MAX_ENTRIES),
-            );
+            let (found, cut) = walk_by_level(root, &prefix, MAX_ENTRIES);
+            truncated |= cut;
+            paths.extend(found);
         }
         paths.sort_by(|a, b| a.matches('/').count().cmp(&b.matches('/').count()).then_with(|| a.cmp(b)));
         let lower = paths.iter().map(|p| p.to_lowercase()).collect();
-        Self { roots: roots.to_vec(), built: Instant::now(), paths, lower, last: RefCell::new(None) }
+        Self { roots: roots.to_vec(), built: Instant::now(), paths, truncated, lower, last: RefCell::new(None) }
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub fn is_fresh_for(&self, roots: &[PathBuf]) -> bool {
@@ -108,10 +107,87 @@ impl FileIndex {
             ranked.truncate(MAX_MATCHES);
         }
         ranked.sort_unstable();
-        let hits: Vec<String> = ranked.into_iter().map(|(_, i)| self.paths[i].clone()).collect();
+        let mut hits: Vec<String> = ranked.into_iter().map(|(_, i)| self.paths[i].clone()).collect();
+        if self.truncated {
+            let mut listed = self.list_typed_dir(query);
+            hits.retain(|h| !listed.contains(h));
+            listed.append(&mut hits);
+            listed.truncate(MAX_MATCHES);
+            hits = listed;
+        }
         *self.last.borrow_mut() = Some((query.to_string(), hits.clone()));
         hits
     }
+
+    /// The entries of the folder named in `query` (`Escritorio/Pro`, `~/Docs/`) read from disk,
+    /// for the levels a truncated index does not hold: typing down a path always finds its next
+    /// step. Only inside a root, and never what `/directory add` refuses.
+    fn list_typed_dir(&self, query: &str) -> Vec<String> {
+        use corex_tools::fs_tools::{is_sensitive_system_path, is_within_workspace, resolve_path};
+
+        let Some(base) = self.roots.first() else { return Vec::new() };
+        let Some(split) = query.rfind('/') else { return Vec::new() };
+        let (dir, prefix) = (&query[..=split], query[split + 1..].to_lowercase());
+        let folder = resolve_path(base, dir.trim_end_matches('/'));
+        if !folder.is_dir() || is_sensitive_system_path(&folder) || !self.roots.iter().any(|r| is_within_workspace(&folder, r)) {
+            return Vec::new();
+        }
+        let mut names: Vec<(String, bool)> = std::fs::read_dir(&folder)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name().to_str()?.to_string();
+                        let shown = !name.starts_with('.') || prefix.starts_with('.');
+                        (shown && name.to_lowercase().starts_with(&prefix)).then(|| (name, entry.path().is_dir()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort_by_key(|(name, _)| name.to_lowercase());
+        names.truncate(MAX_MATCHES);
+        names.into_iter().map(|(name, is_dir)| format!("{dir}{name}{}", if is_dir { "/" } else { "" })).collect()
+    }
+}
+
+/// The entries of `root` down to the deepest level that fits in [`MAX_ENTRIES`], and whether a
+/// deeper level was left out. Walking one level at a time keeps every shallow folder in the index
+/// however large the tree below it is, which one depth-first walk cut at the limit does not.
+fn walk_by_level(root: &Path, prefix: &str, limit: usize) -> (Vec<String>, bool) {
+    let mut kept: Vec<String> = Vec::new();
+    for depth in 1..=MAX_DEPTH {
+        let mut level: Vec<String> = ignore::WalkBuilder::new(root)
+            .max_depth(Some(depth))
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || !(entry.file_type().is_some_and(|t| t.is_dir())
+                        && entry.file_name().to_str().is_some_and(|name| SKIPPED_DIRS.contains(&name)))
+            })
+            .build()
+            .flatten()
+            .filter_map(|entry| {
+                let rel = entry.path().strip_prefix(root).ok()?.to_str()?;
+                if rel.is_empty() {
+                    return None;
+                }
+                let slash = if entry.file_type()?.is_dir() { "/" } else { "" };
+                Some(format!("{prefix}{rel}{slash}"))
+            })
+            .take(limit + 1)
+            .collect();
+        if level.len() > limit {
+            if depth == 1 {
+                level.truncate(limit);
+                kept = level;
+            }
+            return (kept, true);
+        }
+        if level.len() == kept.len() {
+            break;
+        }
+        kept = level;
+    }
+    (kept, false)
 }
 
 /// How an added directory starts its paths: `~/Escritorio/` inside the home directory, which
@@ -221,6 +297,8 @@ pub enum IndexState {
     Building,
     Empty,
     Ready,
+    /// The index stopped at [`MAX_ENTRIES`]: deeper files appear once their folder is typed.
+    Truncated,
     OutsideRoots,
     /// Folders for `/directory add`, read from disk.
     Folders,
@@ -248,6 +326,9 @@ pub fn render_file_popup(
             IndexState::Building => "Indexing the workspace…".to_string(),
             IndexState::Empty => "No files found in the workspace".to_string(),
             IndexState::Ready => format!("No files match '{}' in the workspace or added folders", query),
+            IndexState::Truncated => {
+                format!("No files match '{}': the index stops at {MAX_ENTRIES} entries, type the folder (@folder/) to go deeper", query)
+            }
             IndexState::OutsideRoots => "Outside the workspace: /directory add <folder> to search it".to_string(),
             IndexState::Folders => format!("No folders match '{}'", query),
         };
@@ -277,7 +358,13 @@ pub fn render_file_popup(
     let selected_line = if matches.is_empty() { 0 } else { selected_idx % matches.len() };
     let scroll = (selected_line + 1).saturating_sub(visible);
     // Like the command menu: no fill, the title on top, then the matches.
-    let title = if folders { "  Folders" } else { "  Files" };
+    let title = if folders {
+        "  Folders".to_string()
+    } else if matches!(index, IndexState::Truncated) {
+        format!("  Files · partial index ({MAX_ENTRIES} entries): type a folder to go deeper")
+    } else {
+        "  Files".to_string()
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(title, Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))),
         Rect::new(popup_area.x, popup_area.y, popup_area.width, 1),
@@ -325,6 +412,37 @@ mod tests {
         assert_eq!(index.matches("")[..3], ["README.md", "domain.txt", "src/"]);
         assert!(index.matches("zzz").is_empty());
         assert_eq!(index.matches("MAIN"), index.matches("main"), "a cached query must not leak into another");
+    }
+
+    #[test]
+    fn a_dense_subtree_cannot_hide_the_folders_above_it() {
+        let root = std::env::temp_dir().join(format!("corex-file-index-dense-{}", std::process::id()));
+        let dense = Path::new("big").join("inner").join("leaf");
+        let top = format!("{}/", dense.components().next().unwrap().as_os_str().to_str().unwrap());
+        let wanted = format!("{}/needle.md", dense.display());
+        let generated = Path::new(SKIPPED_DIRS[0]).join("pkg");
+        std::fs::create_dir_all(root.join(&dense)).unwrap();
+        std::fs::create_dir_all(root.join(&generated)).unwrap();
+        std::fs::write(root.join(&wanted), "").unwrap();
+        std::fs::write(root.join(&generated).join("index.js"), "").unwrap();
+        for i in 0..30 {
+            std::fs::write(root.join(&dense).join(format!("filler{i}.txt")), "").unwrap();
+        }
+
+        let (shallow, cut) = walk_by_level(&root, "", 10);
+        let (all, whole) = walk_by_level(&root, "", 1000);
+        let mut index = FileIndex::build(std::slice::from_ref(&root));
+        index.truncated = true;
+        index.lower = shallow.iter().map(|p| p.to_lowercase()).collect();
+        index.paths = shallow.clone();
+        let listed = index.matches(&wanted[..wanted.len() - 4]);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(cut && shallow.contains(&top), "{shallow:?}");
+        assert!(!shallow.iter().any(|p| p.contains("filler")), "the level that overflowed is left out whole: {shallow:?}");
+        assert!(!whole && all.contains(&wanted));
+        assert!(!all.iter().any(|p| p.starts_with(SKIPPED_DIRS[0])), "generated folders are skipped: {all:?}");
+        assert_eq!(listed, [wanted], "typing the folder reaches the file");
     }
 
     #[test]
