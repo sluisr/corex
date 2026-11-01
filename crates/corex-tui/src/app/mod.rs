@@ -134,6 +134,7 @@ impl App {
             file_index: None,
             file_index_rx: None,
             user_shell_rx: None,
+            user_shell_stopped: false,
             context_files: 0,
             context_files_checked: None,
             last_file_query: None,
@@ -602,6 +603,7 @@ impl App {
                 mgr.kill(pid);
             }
         }
+        self.user_shell_stopped = true;
         self.set_status("Stopping the command…");
     }
 
@@ -615,6 +617,13 @@ impl App {
         };
         self.user_shell_rx = None;
         self.clear_status();
+        let report = match (std::mem::take(&mut self.user_shell_stopped), report.split_once('\n')) {
+            (true, Some((header, rest))) => {
+                let secs = header.rsplit('|').next().unwrap_or("");
+                format!("USER_SHELL|stopped|{secs}\n{rest}")
+            }
+            _ => report,
+        };
         self.session.add_message(Message::system(report));
         self.invalidate_message_cache();
         self.scroll_to_bottom();

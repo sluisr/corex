@@ -571,7 +571,10 @@ mod tests {
             prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
             wait_for_shell(&mut app).await;
             assert!(started.elapsed() < Duration::from_secs(15), "Esc stopped the command early");
-            assert!(!last_text(&app).starts_with("USER_SHELL|0|"), "{}", last_text(&app));
+            assert!(last_text(&app).starts_with("USER_SHELL|stopped|") && last_text(&app).contains("$ sleep 30"), "{}", last_text(&app));
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("\n").contains("you stopped it (Esc)"), "{}", rows.join("\n"));
+            assert!(!app.user_shell_stopped, "the next command starts clean");
             assert!(app.window_title().starts_with("Ready"));
 
             app.is_streaming = true;

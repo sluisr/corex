@@ -360,6 +360,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
 
         let (icon, color, status) = match code {
             "0" => ("  ✓ ", theme.success, "you ran it (exit 0)".to_string()),
+            "stopped" => ("  ■ ", theme.warning, "you stopped it (Esc)".to_string()),
             "error" => ("  ✕ ", theme.error, "could not run".to_string()),
             other => ("  ✕ ", theme.error, format!("you ran it (exit {other})")),
         };

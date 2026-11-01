@@ -324,6 +324,8 @@ pub struct App {
     pub file_index_rx: Option<std::sync::mpsc::Receiver<crate::file_completion::FileIndex>>,
     /// The report of a `!command` the user is running, delivered when it finishes.
     pub user_shell_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// Esc was pressed while the `!command` ran, so its report says it was stopped.
+    pub user_shell_stopped: bool,
     /// Instruction files in the system prompt, for the status bar, and when they were counted.
     pub context_files: usize,
     pub context_files_checked: Option<std::time::Instant>,
