@@ -986,37 +986,57 @@ use corex_core::types::ToolCall;
     }
 
     #[test]
+    fn full_logs_show_the_whole_command() {
+        let theme = Theme::default();
+        let text = |spans: Vec<ratatui::text::Span<'static>>| spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let long = format!("cargo test --workspace -- {}", "--some-flag ".repeat(10));
+        let args = serde_json::json!({ "command": long }).to_string();
+
+        let collapsed = text(format_tool_call_spans("run_shell_command", &args, &theme, false));
+        assert!(collapsed.contains("...") && collapsed.len() < long.len(), "{collapsed}");
+        let full = text(format_tool_call_spans("run_shell_command", &args, &theme, true));
+        assert!(full.contains(long.trim()), "Ctrl+O must not cut the command: {full}");
+
+        let script = serde_json::json!({ "command": "cd web\nnpm run build" }).to_string();
+        let collapsed = text(format_tool_call_spans("run_shell_command", &script, &theme, false));
+        assert!(!collapsed.contains('\n') && collapsed.contains("cd web …"), "{collapsed:?}");
+        let groups = split_spans_at_newlines(format_tool_call_spans("run_shell_command", &script, &theme, true));
+        let rows: Vec<String> = groups.into_iter().map(text).collect();
+        assert_eq!(rows, [" $ cd web", "   npm run build "], "each line on its own row, aligned under the command");
+    }
+
+    #[test]
     fn test_format_tool_call_spans_no_emojis() {
         let theme = Theme::default();
-        let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme);
+        let spans = format_tool_call_spans("run_shell_command", r#"{"command":"cargo build"}"#, &theme, false);
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
         assert!(!joined.contains('›'), "Must not contain chevron: {}", joined);
         assert_eq!(joined, " $ cargo build ");
         assert!(spans.iter().all(|s| s.style.bg == Some(theme.code_bg)), "the command sits on a shaded chip");
 
-        let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme);
+        let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme, false);
         let search_joined: String = search_spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(search_joined, "web \"sluisr sluisr.com Linux\"");
 
-        let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme);
+        let skill_spans = format_tool_call_spans("activate_skill", r#"{"name":"corex-about"}"#, &theme, false);
         let skill_joined: String = skill_spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!skill_joined.contains('⚙'), "Must not contain gear emoji: {}", skill_joined);
         assert_eq!(skill_joined, "skill corex-about");
 
-        let read_spans = format_tool_call_spans("read_file", r#"{"file_path":"src/main.rs"}"#, &theme);
+        let read_spans = format_tool_call_spans("read_file", r#"{"file_path":"src/main.rs"}"#, &theme, false);
         let read_joined: String = read_spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(read_joined, "read src/main.rs");
 
-        let list_spans = format_tool_call_spans("list_directory", r#"{"path":"crates"}"#, &theme);
+        let list_spans = format_tool_call_spans("list_directory", r#"{"path":"crates"}"#, &theme, false);
         let list_joined: String = list_spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(list_joined, "ls crates/");
 
-        let agent_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"scout","prompt":"inspect codebase"}"#, &theme);
+        let agent_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"scout","prompt":"inspect codebase"}"#, &theme, false);
         let agent_joined: String = agent_spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(agent_joined, "agent scout inspect codebase");
 
-        let agent_task_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"tester","task":"run all tests"}"#, &theme);
+        let agent_task_spans = format_tool_call_spans("delegate_subagent", r#"{"role":"tester","task":"run all tests"}"#, &theme, false);
         let agent_task_joined: String = agent_task_spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(agent_task_joined, "agent tester run all tests");
     }
@@ -1078,13 +1098,13 @@ use corex_core::types::ToolCall;
         let theme = Theme::default();
         
         // 1. Tool call using "pattern" argument (the schema canonical parameter)
-        let spans = format_tool_call_spans("grep_search", r#"{"pattern":"my_struct","dir_path":"src"}"#, &theme);
+        let spans = format_tool_call_spans("grep_search", r#"{"pattern":"my_struct","dir_path":"src"}"#, &theme, false);
         let joined: String = spans.into_iter().map(|s| s.content.to_string()).collect();
         assert!(joined.contains("\"my_struct\""), "Expected pattern to be extracted, got: {}", joined);
         assert!(!joined.contains("\"\""), "Must never render empty quotes, got: {}", joined);
 
         // 2. Tool call using "query" fallback
-        let spans_q = format_tool_call_spans("grep", r#"{"query":"test_fn","path":"crates"}"#, &theme);
+        let spans_q = format_tool_call_spans("grep", r#"{"query":"test_fn","path":"crates"}"#, &theme, false);
         let joined_q: String = spans_q.into_iter().map(|s| s.content.to_string()).collect();
         assert!(joined_q.contains("\"test_fn\""), "Expected query to be extracted, got: {}", joined_q);
         assert!(!joined_q.contains("\"\""), "Must never render empty quotes, got: {}", joined_q);

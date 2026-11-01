@@ -382,7 +382,10 @@ pub fn format_relative_path(path_str: &str) -> String {
     clean.to_string()
 }
 
-pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<Span<'static>> {
+/// The command or arguments of a tool call as the conversation shows them. Collapsed, a shell
+/// command is its first line cut to 70 columns; `full` (Ctrl+O) keeps all of it, newlines included,
+/// for [`split_spans_at_newlines`].
+pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme, full: bool) -> Vec<Span<'static>> {
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
     match name {
         "run_shell_command" | "shell" | "run_command" => {
@@ -393,9 +396,16 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
             // Commands stand out from their output on a shaded chip, with the yellow prompt of
             // the approval rail.
             let chip = Style::default().bg(theme.code_bg);
+            let shown = if full {
+                cmd.to_string()
+            } else {
+                let first = cmd.lines().next().unwrap_or("");
+                let cut = corex_core::truncate_ellipsis(first, 70);
+                if first.len() < cmd.len() && !cut.ends_with("...") { format!("{cut} …") } else { cut }
+            };
             vec![
                 Span::styled(" $ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(corex_core::truncate_ellipsis(cmd, 70).to_string(), chip.fg(theme.text_strong)),
+                Span::styled(shown, chip.fg(theme.text_strong)),
                 Span::styled(" ", chip),
             ]
         }
@@ -539,6 +549,23 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme) -> Vec<
 const PASTE_TAG_PREFIXES: [&str; 2] = ["[Pasted text #", "[Image #"];
 
 /// Start of the first paste tag in `text`.
+/// Splits spans into one group per line of their text. A continuation starts with blanks as wide
+/// as the first span, in its style, so the lines of a command stay on its chip.
+pub fn split_spans_at_newlines(spans: Vec<Span<'static>>) -> Vec<Vec<Span<'static>>> {
+    let lead = spans.first().map(|s| Span::styled(" ".repeat(s.content.chars().count()), s.style));
+    let mut groups = vec![Vec::new()];
+    for span in spans {
+        let mut parts = span.content.split('\n');
+        if let Some(first) = parts.next() {
+            groups.last_mut().unwrap().push(Span::styled(first.to_string(), span.style));
+        }
+        for part in parts {
+            groups.push(lead.iter().cloned().chain([Span::styled(part.to_string(), span.style)]).collect());
+        }
+    }
+    groups
+}
+
 pub fn paste_tag_start(text: &str) -> Option<usize> {
     PASTE_TAG_PREFIXES.iter().filter_map(|p| text.find(p)).min()
 }
