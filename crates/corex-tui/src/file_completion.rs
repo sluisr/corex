@@ -3,7 +3,7 @@
 //! typed.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -22,7 +22,8 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 pub const MAX_MATCHES: usize = 50;
 
 /// Files and directories (with a trailing `/`), shallowest first: relative to the workspace, the
-/// first root, and absolute for the added directories, so the inserted path reads the same file.
+/// first root, and `~/…` or absolute for the added directories, so the folder's name shows and the
+/// inserted path still reads the same file.
 pub struct FileIndex {
     roots: Vec<PathBuf>,
     built: Instant,
@@ -36,9 +37,10 @@ pub struct FileIndex {
 
 impl FileIndex {
     pub fn build(roots: &[PathBuf]) -> Self {
+        let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
         let mut paths: Vec<String> = Vec::new();
         for (i, root) in roots.iter().enumerate() {
-            let prefix = if i == 0 { String::new() } else { format!("{}/", root.display()) };
+            let prefix = if i == 0 { String::new() } else { root_prefix(root, home.as_deref()) };
             if i > 0 {
                 paths.push(prefix.clone());
             }
@@ -112,6 +114,15 @@ impl FileIndex {
     }
 }
 
+/// How an added directory starts its paths: `~/Escritorio/` inside the home directory, which
+/// `read_file` resolves, and the absolute path elsewhere.
+fn root_prefix(root: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| root.strip_prefix(h).ok()) {
+        Some(rel) if !rel.as_os_str().is_empty() => format!("~/{}/", rel.display()),
+        _ => format!("{}/", root.display()),
+    }
+}
+
 /// The `@path` being typed at `cursor`: the byte offset of its `@` and the text after it.
 /// The `@` must start a word, so e-mail addresses never open the menu.
 pub fn at_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
@@ -122,12 +133,25 @@ pub fn at_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
     (starts_word && !query.contains(char::is_whitespace)).then_some((start, query))
 }
 
+/// True when `query` is a `~/…` or absolute path that exists but lies outside every root, so the
+/// popup can say to add its folder instead of only that nothing matched.
+pub fn is_outside_roots(query: &str, roots: &[PathBuf]) -> bool {
+    use corex_tools::fs_tools::{is_within_workspace, resolve_path};
+    if !(query.starts_with("~/") || query.starts_with('/')) {
+        return false;
+    }
+    let Some(base) = roots.first() else { return false };
+    let path = resolve_path(base, query.trim_end_matches('/'));
+    path.exists() && !roots.iter().any(|root| is_within_workspace(&path, root))
+}
+
 /// What the popup says when nothing matches.
 #[derive(Clone, Copy)]
 pub enum IndexState {
     Building,
     Empty,
     Ready,
+    OutsideRoots,
 }
 
 pub fn render_file_popup(
@@ -150,7 +174,8 @@ pub fn render_file_popup(
         let note = match index {
             IndexState::Building => "Indexing the workspace…".to_string(),
             IndexState::Empty => "No files found in the workspace".to_string(),
-            IndexState::Ready => format!("No files match '{}'", query),
+            IndexState::Ready => format!("No files match '{}' in the workspace or added folders", query),
+            IndexState::OutsideRoots => "Outside the workspace: /directory add <folder> to search it".to_string(),
         };
         vec![Line::from(Span::styled(format!("  {}", note), Style::default().fg(theme.gray)))]
     } else {
@@ -231,6 +256,21 @@ mod tests {
         assert_eq!(index.matches("escritorio").first(), Some(&extra_root));
         assert!(index.matches("tarea").contains(&format!("{extra_root}notas/tarea.md")));
         assert_eq!(index.matches("main"), ["src/main.rs"], "workspace paths stay relative");
-        assert!(index.is_for(&[ws.clone(), extra]) && !index.is_for(&[ws]), "adding a directory rebuilds the index");
+        assert!(index.is_for(&[ws.clone(), extra.clone()]) && !index.is_for(&[ws.clone()]), "adding a directory rebuilds the index");
+
+        std::fs::create_dir_all(&extra).unwrap();
+        let outside = format!("{}", extra.display());
+        assert!(is_outside_roots(&outside, std::slice::from_ref(&ws)), "an existing folder that was not added");
+        assert!(!is_outside_roots(&outside, &[ws.clone(), extra]), "an added folder is in reach");
+        assert!(!is_outside_roots("Escritorio", &[ws]), "a bare name is a search, not a path");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn folders_in_the_home_directory_show_their_name() {
+        let home = Path::new("/home/kbdd");
+        assert_eq!(root_prefix(Path::new("/home/kbdd/Escritorio"), Some(home)), "~/Escritorio/");
+        assert_eq!(root_prefix(Path::new("/srv/data"), Some(home)), "/srv/data/");
+        assert_eq!(root_prefix(home, Some(home)), "/home/kbdd/");
     }
 }

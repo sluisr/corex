@@ -1417,6 +1417,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     if let (Some(p_chunk), Some(query)) = (popup_chunk, app.last_file_query.as_deref()) {
         let matches = app.file_index.as_ref().map(|i| i.matches(query)).unwrap_or_default();
         let index = match &app.file_index {
+            _ if matches.is_empty() && crate::file_completion::is_outside_roots(query, &app.file_index_roots()) => {
+                IndexState::OutsideRoots
+            }
             None if app.file_index_rx.is_some() => IndexState::Building,
             Some(i) if !i.is_empty() => IndexState::Ready,
             _ => IndexState::Empty,

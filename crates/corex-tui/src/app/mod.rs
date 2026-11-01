@@ -542,7 +542,7 @@ impl App {
     }
 
     /// The roots `@path` completion searches: the workspace, then the `/directory add` ones.
-    fn file_index_roots(&self) -> Vec<std::path::PathBuf> {
+    pub(crate) fn file_index_roots(&self) -> Vec<std::path::PathBuf> {
         std::iter::once(self.workspace_dir.clone()).chain(self.extra_dirs.iter().cloned()).collect()
     }
 
