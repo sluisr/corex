@@ -10,6 +10,22 @@
 
 ---
 
+## Contents
+
+- [Overview](#overview)
+- [Key Highlights](#key-highlights)
+- [Performance & Resource Footprint](#performance--resource-footprint)
+- [Operating Modes](#operating-modes)
+- [Installation](#installation)
+- [Authentication & Configuration](#authentication--configuration)
+- [Usage](#usage)
+- [Slash Commands](#slash-commands)
+- [Core Developer Tools](#core-developer-tools)
+- [Configuration Files](#configuration-files)
+- [License & Commercial Licensing](#license--commercial-licensing)
+
+---
+
 ## Overview
 
 **Corex** (invoked as `cx`, `corex`, or `cxs`) is a native terminal agent architected for software engineers and systems administrators who require low latency, deterministic execution, and air-gapped privacy:
