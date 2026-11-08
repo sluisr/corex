@@ -131,6 +131,26 @@ Corex supports three unified execution paradigms:
 
 ## Installation
 
+### Requirements
+
+Corex ships as a single native binary, so there is no runtime to install and no Node.js or Python toolchain to manage. What it needs:
+
+| Item | Requirement |
+| :--- | :--- |
+| **Linux** | x86_64 or ARM64, glibc 2.17 or newer (2.39 for ARM64 builds older than `v0.9.0`) |
+| **macOS** | Apple Silicon or Intel |
+| **Windows** | x86_64 (`x86_64-pc-windows-msvc`) |
+| **Android** | aarch64 via Termux |
+| **Terminal** | Unicode and 256-color support; mouse reporting and bracketed paste are used when the terminal offers them |
+| **Disk** | The binary is 6.3 – 8.1 MB and the release archive around 7 MB, plus `~/.corex` for configuration and logs |
+
+Everything below is optional and only needed for the feature you want to use:
+
+- **A model provider.** Either an API key for one of the cloud providers (see [Authentication & Configuration](#authentication--configuration)), or a local `llama-server` / `Ollama` endpoint on `http://127.0.0.1:8080/v1` to run fully offline at $0.00.
+- **Fleet mode (`cxs`).** The OpenSSH client (`ssh`) must be installed and on `PATH`, and the target nodes must accept key-based authentication.
+- **Clipboard integration.** `wl-copy` on Wayland, `xclip` or `xsel` on X11, or a terminal that supports OSC 52. Without any of these, copy and paste fall back to the terminal's own shortcuts.
+- **Building from source.** A Rust toolchain (2021 edition) — see [Method 6](#method-6-build-from-source).
+
 ### Method 1: Pre-compiled Binary (Recommended for Linux, macOS & Android)
 
 Install via the official installation script:
