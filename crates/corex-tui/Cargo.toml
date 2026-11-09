@@ -30,6 +30,7 @@ base64 = { workspace = true }
 vt100 = "0.15.2"
 portable-pty = "0.9.0"
 parking_lot = "0.12"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

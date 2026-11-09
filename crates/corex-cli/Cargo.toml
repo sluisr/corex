@@ -15,6 +15,7 @@ corex-tools = { workspace = true }
 corex-prompt = { workspace = true }
 corex-tui = { workspace = true }
 corex-fleet = { workspace = true }
+corex-browser = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::text::{fit_text, pad_right};
+use unicode_width::UnicodeWidthStr;
+
+use crate::text::{fit_path, pad_right, wrap_path};
 use crate::theme::Theme;
 
 /// Enough for real repositories while keeping a walk of `$HOME` short. Per root.
@@ -199,14 +201,88 @@ fn root_prefix(root: &Path, home: Option<&Path>) -> String {
     }
 }
 
+pub fn escape_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if c.is_control() {
+            out.push_str(&format!("\\x{:02x}", c as u32));
+        } else if c.is_whitespace() {
+            out.push('\\');
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn escaped_char(after: &str) -> Option<(char, usize)> {
+    let hex = after.strip_prefix('x').and_then(|h| h.get(..2)).filter(|h| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    if let Some(control) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()).map(char::from).filter(|c| c.is_control()) {
+        return Some((control, 3));
+    }
+    let next = after.chars().next()?;
+    (next == '\\' || next.is_whitespace()).then_some((next, next.len_utf8()))
+}
+
+/// A `\` before any other character stays as typed, so `C:\temp\new` is not turned into tabs.
+pub fn unescape_path(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        if let Some((unescaped, used)) = escaped_char(rest).filter(|_| c == '\\') {
+            out.push(unescaped);
+            rest = &rest[used..];
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn printable(path: &str) -> String {
+    path.chars().map(|c| if c.is_control() { format!("\\x{:02x}", c as u32) } else { c.to_string() }).collect()
+}
+
+pub fn token_query(token: &str) -> String {
+    let trailing = token.chars().rev().take_while(|&c| c == '\\').count();
+    unescape_path(if trailing % 2 == 1 { &token[..token.len() - 1] } else { token })
+}
+
+pub fn token_end(text: &str) -> usize {
+    let mut escaped = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() && !escaped {
+            return i;
+        }
+        escaped = c == '\\' && !escaped;
+    }
+    text.len()
+}
+
 /// The `@path` being typed at `cursor`: the byte offset of its `@` and the text after it.
 /// The `@` must start a word, so e-mail addresses never open the menu.
 pub fn at_token(input: &str, cursor: usize) -> Option<(usize, &str)> {
     let before = input.get(..cursor)?;
-    let start = before.rfind('@')?;
-    let query = &before[start + 1..];
-    let starts_word = before[..start].chars().next_back().is_none_or(char::is_whitespace);
-    (starts_word && !query.contains(char::is_whitespace)).then_some((start, query))
+    before.rmatch_indices('@').find_map(|(start, _)| {
+        let query = &before[start + 1..];
+        (starts_token(before, start) && token_end(query) == query.len()).then_some((start, query))
+    })
+}
+
+pub fn starts_token(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    match before.chars().next_back() {
+        None => true,
+        Some(c) if c.is_whitespace() => {
+            let backslashes = before[..before.len() - c.len_utf8()].chars().rev().take_while(|&b| b == '\\').count();
+            backslashes % 2 == 0
+        }
+        Some(_) => false,
+    }
 }
 
 /// The folder being typed after `/directory add` (or `/dir add`) at `cursor`: the byte offset where
@@ -304,6 +380,23 @@ pub enum IndexState {
     Folders,
 }
 
+const POPUP_MAX_WIDTH: u16 = 110;
+const DETAIL_ROWS: usize = 2;
+
+fn popup_inner_width(area_width: u16) -> usize {
+    POPUP_MAX_WIDTH.min(area_width).saturating_sub(4) as usize
+}
+
+/// Depends on the whole list, not the selection, so the popup keeps its height while it moves.
+pub fn detail_rows(matches: &[String], area_width: u16) -> usize {
+    let inner = popup_inner_width(area_width);
+    if matches.iter().any(|m| UnicodeWidthStr::width(printable(m).as_str()) > inner) {
+        DETAIL_ROWS
+    } else {
+        0
+    }
+}
+
 pub fn render_file_popup(
     frame: &mut Frame,
     query: &str,
@@ -318,8 +411,10 @@ pub fn render_file_popup(
         return;
     }
     frame.render_widget(Clear, area);
-    let popup_area = Rect::new(area.x, area.y, 75.min(area.width), area.height);
-    let inner_w = popup_area.width.saturating_sub(4) as usize;
+    let popup_area = Rect::new(area.x, area.y, POPUP_MAX_WIDTH.min(area.width), area.height);
+    let inner_w = popup_inner_width(area.width);
+    let wanted = detail_rows(matches, area.width);
+    let detail = if area.height as usize >= 3 + wanted { wanted } else { 0 };
 
     let lines: Vec<Line> = if matches.is_empty() {
         let note = match index {
@@ -348,13 +443,13 @@ pub fn render_file_popup(
                 };
                 Line::from(vec![
                     Span::styled(if i == selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue)),
-                    Span::styled(pad_right(&fit_text(path, inner_w), inner_w + 1), style),
+                    Span::styled(pad_right(&fit_path(&printable(path), inner_w), inner_w + 1), style),
                 ])
             })
             .collect()
     };
 
-    let visible = area.height.saturating_sub(2) as usize;
+    let visible = (area.height as usize).saturating_sub(2 + detail);
     let selected_line = if matches.is_empty() { 0 } else { selected_idx % matches.len() };
     let scroll = (selected_line + 1).saturating_sub(visible);
     // Like the command menu: no fill, the title on top, then the matches.
@@ -369,8 +464,19 @@ pub fn render_file_popup(
         Paragraph::new(Span::styled(title, Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))),
         Rect::new(popup_area.x, popup_area.y, popup_area.width, 1),
     );
-    let body = Rect::new(popup_area.x + 1, popup_area.y + 1, popup_area.width.saturating_sub(2), popup_area.height.saturating_sub(2));
+    let body = Rect::new(popup_area.x + 1, popup_area.y + 1, popup_area.width.saturating_sub(2), visible as u16);
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
+
+    if detail > 0 {
+        let wrapped = wrap_path(&printable(&matches[selected_line]), inner_w, detail);
+        let top = popup_area.y + popup_area.height - 1 - detail as u16;
+        for (i, text) in wrapped.into_iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!("  {text}"), Style::default().fg(theme.foreground))),
+                Rect::new(popup_area.x + 1, top + i as u16, popup_area.width.saturating_sub(2), 1),
+            );
+        }
+    }
 
     // The free last row says where the selection is and whether more lies below, as the
     // command menu does.
@@ -395,6 +501,87 @@ mod tests {
         assert_eq!(at_token("mail me at a@b.com", 18), None);
         assert_eq!(at_token("@src/main.rs please", 19), None);
         assert_eq!(at_token("no token", 8), None);
+    }
+
+    #[test]
+    fn escaped_spaces_keep_a_name_in_one_token() {
+        assert_eq!(escape_path("Project Files/"), "Project\\ Files/");
+        for name in [
+            "a b  c.md", "back\\slash", "ends\\ ", "a\\ b", "two\\\\ x", " lead", "trail ", "日本 語", "q\"uo'te s", "me@host notes.md",
+            "tab\there", "line\nbreak", "cr\rlf", "\\t is not a tab", "\\n", "\\x09 is not either", "\u{1b}[0m", "nb\u{a0}space", "ideo\u{3000}space", "all \t\n\r\\ in one",
+        ] {
+            let token = escape_path(name);
+            assert_eq!(token_end(&token), token.len(), "{name:?} is one token: {token:?}");
+            assert_eq!(unescape_path(&token), name, "{name:?} survives the round trip");
+        }
+        assert_eq!(unescape_path("plain\\x"), "plain\\x", "a backslash before anything else stays");
+        assert_eq!(unescape_path("end\\"), "end\\");
+        assert_eq!(escape_path("tab\there\nnew"), "tab\\x09here\\x0anew", "no raw control character reaches the prompt");
+        assert_eq!(printable("a\tb\nc é"), "a\\x09b\\x0ac é");
+        assert_eq!(unescape_path("a\\x09b\\x0Ac\\x41d\\x9"), "a\tb\\x0Ac\\x41d\\x9", "only a lowercase hex pair that is a control character");
+        for typed in ["C:\\temp\\new\\notes\\readme", "dir\\tmp", "~/new\\tab", "back\\slash", "\\xyz", "\\x4", "\\é"] {
+            assert_eq!(unescape_path(typed), typed, "a backslash typed before an ordinary character is kept: {typed}");
+            assert_eq!(token_query(typed), typed, "and so is the search for it: {typed}");
+        }
+        assert_eq!(token_query("Project\\ Files/Sprint\\"), "Project Files/Sprint", "an unfinished escape is not searched");
+        assert_eq!(token_query("odd\\\\\\"), "odd\\", "three backslashes: one escaped pair, one unfinished");
+        assert_eq!(token_query("even\\\\"), "even\\", "an escaped backslash is a real one");
+        assert_eq!(token_query(""), "");
+
+        let input = "look at @Project\\ Files/";
+        assert_eq!(at_token(input, input.len()), Some((8, "Project\\ Files/")));
+        let input = "look at @Project Files";
+        assert_eq!(at_token(input, input.len()), None, "an unescaped space ends the token");
+        let input = "@a\\ b.md next";
+        assert_eq!(token_end(input), "@a\\ b.md".len());
+        assert_eq!(token_end("a\\\\ b"), 3, "an escaped backslash does not escape the space after it");
+        assert_eq!(token_end("tab\there"), 3);
+        assert_eq!(token_end("whole"), 5);
+    }
+
+    #[test]
+    fn an_at_sign_inside_a_name_does_not_hide_the_token() {
+        let token = escape_path("me@host notes.md");
+        let input = format!("see @{token}");
+        assert_eq!(at_token(&input, input.len()), Some((4, token.as_str())));
+        let input = "see @@types/node";
+        assert_eq!(at_token(input, input.len()), Some((4, "@types/node")));
+        assert_eq!(at_token("write to a@b.com", 16), None, "an address still opens nothing");
+    }
+
+    #[test]
+    fn any_name_survives_being_written_and_read_back() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let pieces = ["a", "t", "n", "x", "0", "9", " ", " ", "\\", "\\", "@", "é", "日", "/", ".", "-", "'", "\"", "\t", "\n", "\r", "\u{1b}", "\u{7f}", "\u{85}", "\u{a0}", "\u{3000}"];
+        for _ in 0..5000 {
+            let name: String = (0..1 + next(12)).map(|_| pieces[next(pieces.len())]).collect();
+            let token = escape_path(&name);
+            let input = format!("look at @{token}");
+            assert_eq!(unescape_path(&token), name, "{name:?}");
+            assert_eq!(at_token(&input, input.len()), Some((8, token.as_str())), "{name:?} -> {token:?}");
+            assert_eq!(token_end(&input[8..]), token.len() + 1, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_folder_with_spaces_can_be_entered_and_searched() {
+        let root = std::env::temp_dir().join(format!("corex-file-index-spaces-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Project Files/Sprint 1")).unwrap();
+        std::fs::write(root.join("Project Files/Sprint 1/final notes.md"), "").unwrap();
+        let index = FileIndex::build(std::slice::from_ref(&root));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let typed = "@Project\\ Files/Sp";
+        let (_, raw) = at_token(typed, typed.len()).unwrap();
+        let hits = index.matches(&unescape_path(raw));
+        assert_eq!(hits, ["Project Files/Sprint 1/", "Project Files/Sprint 1/final notes.md"]);
+        assert_eq!(escape_path(&hits[1]), "Project\\ Files/Sprint\\ 1/final\\ notes.md");
     }
 
     #[test]

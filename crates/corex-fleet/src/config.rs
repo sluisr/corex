@@ -21,6 +21,23 @@ impl Default for AuthMethod {
     }
 }
 
+/// Where a server entry came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeSource {
+    #[default]
+    Fleet,
+    SshConfig,
+}
+
+impl NodeSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeSource::Fleet => "corex",
+            NodeSource::SshConfig => "ssh",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub id: String,
@@ -41,6 +58,8 @@ pub struct NodeConfig {
     pub sudo: bool,
     #[serde(default)]
     pub proxy_jump: Option<String>,
+    #[serde(skip)]
+    pub source: NodeSource,
 }
 
 fn default_port() -> u16 {
@@ -65,6 +84,14 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn bracketed_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
 impl NodeConfig {
     pub fn new(id: impl Into<String>, host: impl Into<String>) -> Self {
         Self {
@@ -78,7 +105,12 @@ impl NodeConfig {
             tags: Vec::new(),
             sudo: false,
             proxy_jump: None,
+            source: NodeSource::Fleet,
         }
+    }
+
+    pub fn is_user_owned(&self) -> bool {
+        self.source == NodeSource::SshConfig
     }
 
     pub fn display_name(&self) -> &str {
@@ -86,7 +118,7 @@ impl NodeConfig {
     }
 
     pub fn target_string(&self) -> String {
-        format!("{}@{}:{}", self.user, self.host, self.port)
+        format!("{}@{}:{}", self.user, bracketed_host(&self.host), self.port)
     }
 
     pub fn resolved_key_path(&self) -> Option<PathBuf> {
@@ -315,31 +347,53 @@ impl FleetConfig {
     }
 
     pub fn load(workspace: Option<&Path>) -> Result<Self> {
-        if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
-            return Self::read_candidate(&path, workspace);
-        }
+        let mut cfg = match Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
+            Some(path) => Self::read_candidate(&path, workspace)?,
+            None => FleetConfig::default(),
+        };
+        cfg.merge_discovered(Self::discover_ssh_config().unwrap_or_default());
+        cfg.normalize();
 
-        let mut default_cfg = FleetConfig::default();
-        if let Ok(discovered) = Self::discover_ssh_config() {
-            if !discovered.is_empty() {
-                default_cfg.nodes = discovered;
-            }
-        }
-        default_cfg.normalize();
-
-        Ok(default_cfg)
+        Ok(cfg)
     }
 
-    /// Fast config loader for safety checks that only reads fleet.toml if present,
-    /// avoiding ~/.ssh/config auto-discovery overhead.
+    /// Loader for safety checks: never fails, still discovers `~/.ssh/config`.
     pub fn load_fast(workspace: Option<&Path>) -> Self {
-        if let Some(path) = Self::candidate_paths(workspace).into_iter().find(|p| p.exists()) {
-            if let Ok(cfg) = Self::read_candidate(&path, workspace) {
-                return cfg;
+        let mut cfg = Self::candidate_paths(workspace)
+            .into_iter()
+            .find(|p| p.exists())
+            .and_then(|path| Self::read_candidate(&path, workspace).ok())
+            .unwrap_or_default();
+        cfg.merge_discovered(Self::discover_ssh_config().unwrap_or_default());
+        cfg.normalize();
+
+        cfg
+    }
+
+    pub fn merge_discovered(&mut self, discovered: Vec<NodeConfig>) {
+        for node in discovered {
+            let claimed = self.nodes.iter().any(|n| n.id == node.id)
+                || self
+                    .clusters
+                    .values()
+                    .any(|c| c.nodes.iter().any(|n| n.id == node.id));
+            if !claimed {
+                self.nodes.push(node);
             }
         }
+    }
 
-        FleetConfig::default()
+    pub fn node_is_untrusted(&self, node: &NodeConfig) -> bool {
+        self.from_workspace && !node.is_user_owned()
+    }
+
+    pub fn has_untrusted_nodes(&self) -> bool {
+        self.from_workspace
+            && (self.nodes.iter().any(|n| !n.is_user_owned())
+                || self
+                    .clusters
+                    .values()
+                    .any(|c| c.nodes.iter().any(|n| !n.is_user_owned())))
     }
 
     /// Saves configuration to workspace `.corex/fleet.toml` or global `~/.config/corex/fleet.toml`.
@@ -358,7 +412,13 @@ impl FleetConfig {
             PathBuf::from("fleet.toml")
         };
 
-        let serialized = toml::to_string_pretty(self)
+        let mut persistable = self.clone();
+        persistable.nodes.retain(|n| n.source == NodeSource::Fleet);
+        for cluster in persistable.clusters.values_mut() {
+            cluster.nodes.retain(|n| n.source == NodeSource::Fleet);
+        }
+
+        let serialized = toml::to_string_pretty(&persistable)
             .context("Failed to serialize fleet configuration to TOML")?;
         corex_core::write_private_atomic(&target_path, serialized)
             .with_context(|| format!("Failed to write to {}", target_path.display()))?;
@@ -481,6 +541,7 @@ impl FleetConfig {
                     node.port = resolved_port;
                     node.key_path = k.clone();
                     node.proxy_jump = j.clone();
+                    node.source = NodeSource::SshConfig;
                     node.tags.push("ssh_config".to_string());
                     discovered.push(node);
                 }
@@ -748,11 +809,91 @@ host = "10.0.0.1"
         let fast = FleetConfig::load_fast(Some(&ws));
         let _ = std::fs::remove_dir_all(&ws);
 
-        assert_eq!(loaded.nodes.len(), 1);
+        assert_eq!(
+            loaded.nodes.iter().filter(|n| n.source == NodeSource::Fleet).count(),
+            1,
+            "the repository file still contributes exactly its own server"
+        );
+        assert!(loaded.find_node("web-01").is_some());
         assert!(!loaded.safe_commands.iter().any(|c| c == "sh" || c == "bash" || c == "rm -rf"));
         assert!(!loaded.dangerous_commands.is_empty());
         assert!(!fast.safe_commands.iter().any(|c| c == "sh" || c == "bash" || c == "rm -rf"));
         assert!(!fast.dangerous_commands.is_empty());
         assert!(loaded.from_workspace && fast.from_workspace);
+    }
+
+    #[test]
+    fn merge_keeps_the_explicit_inventory_and_adds_discovered_hosts() {
+        let mut cfg =
+            FleetConfig::parse("[[nodes]]\nid = \"node-a\"\nhost = \"192.0.2.10\"\n").unwrap();
+        let mut clash = NodeConfig::new("node-a", "198.51.100.99");
+        clash.source = NodeSource::SshConfig;
+        let mut ssh_host = NodeConfig::new("host-b", "198.51.100.20");
+        ssh_host.source = NodeSource::SshConfig;
+
+        cfg.merge_discovered(vec![clash, ssh_host]);
+
+        assert_eq!(cfg.nodes.len(), 2, "a clashing host is not listed twice");
+        let explicit = cfg.find_node("node-a").unwrap();
+        assert_eq!(explicit.host, "192.0.2.10", "fleet.toml wins on id clashes");
+        assert_eq!(explicit.source, NodeSource::Fleet);
+        assert_eq!(cfg.find_node("host-b").unwrap().source, NodeSource::SshConfig);
+    }
+
+    #[test]
+    fn repository_servers_need_approval_but_discovered_ones_do_not() {
+        let mut cfg =
+            FleetConfig::parse("[[nodes]]\nid = \"repo-node\"\nhost = \"192.0.2.20\"\n").unwrap();
+        cfg.from_workspace = true;
+
+        let repo_node = cfg.find_node("repo-node").unwrap().clone();
+        assert!(cfg.node_is_untrusted(&repo_node));
+
+        let mut ssh_node = NodeConfig::new("host-b", "198.51.100.20");
+        ssh_node.source = NodeSource::SshConfig;
+        cfg.merge_discovered(vec![ssh_node]);
+
+        let ssh_node = cfg.find_node("host-b").unwrap();
+        assert!(ssh_node.is_user_owned());
+        assert!(!cfg.node_is_untrusted(ssh_node));
+        assert!(cfg.has_untrusted_nodes());
+    }
+
+    #[test]
+    fn target_string_brackets_ipv6_literals() {
+        let mut v4 = NodeConfig::new("a", "192.0.2.10");
+        v4.user = "deploy".to_string();
+        assert_eq!(v4.target_string(), "deploy@192.0.2.10:22");
+
+        let mut v6 = NodeConfig::new("b", "2001:db8::1");
+        v6.user = "deploy".to_string();
+        assert_eq!(v6.target_string(), "deploy@[2001:db8::1]:22");
+
+        let mut already = NodeConfig::new("c", "[2001:db8::2]");
+        already.user = "deploy".to_string();
+        assert_eq!(already.target_string(), "deploy@[2001:db8::2]:22");
+    }
+
+    #[test]
+    fn saving_never_persists_discovered_hosts() {
+        let dir = std::env::temp_dir().join(format!("corex_fleet_save_src_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut cfg =
+            FleetConfig::parse("[[nodes]]\nid = \"node-a\"\nhost = \"192.0.2.10\"\n").unwrap();
+        let mut ssh_node = NodeConfig::new("host-b", "198.51.100.20");
+        ssh_node.source = NodeSource::SshConfig;
+        cfg.merge_discovered(vec![ssh_node]);
+
+        let path = cfg.save(Some(&dir)).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(written.contains("node-a"));
+        assert!(
+            !written.contains("host-b"),
+            "hosts discovered in ~/.ssh/config stay there: {written}"
+        );
     }
 }

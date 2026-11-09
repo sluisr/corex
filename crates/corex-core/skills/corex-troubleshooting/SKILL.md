@@ -7,7 +7,9 @@ description: >-
   Trigger phrases: 'not working', 'error', 'API error', 'connection refused',
   'slow', 'key not found', 'unauthorized', '401', '429', 'rate limit',
   'blank output', 'hangs', 'crashes', 'local llm not connecting',
-  'ignores my SYSTEM.md', 'no toma mis instrucciones'.
+  'ignores my SYSTEM.md', 'no toma mis instrucciones', 'browser extension',
+  'extension is not running', 'extension no funciona', 'Corex Browser Bridge',
+  'no abre el navegador'.
 ---
 
 # Corex Troubleshooting Guide
@@ -157,6 +159,23 @@ To manually compact before hitting the limit:
 2. If you just edited the file, run `/memory reload`; otherwise the change applies within 15 seconds.
 3. If the list says `truncated`, the file is over 20,000 bytes and its end is cut. Shorten it or split it across `SYSTEM.md` and the project files.
 4. Run `/memory show` to read exactly what the model receives.
+
+---
+
+## Browser Extension Not Running
+
+The `browser` tool reports *"the Corex Browser Bridge extension is not running"* when it cannot reach the extension. Check, in this order:
+
+1. **Installed and enabled:** the [Corex Browser Bridge](https://chromewebstore.google.com/detail/pgbencaoenigjeekljfindfeaolenaip) extension must be installed from the Chrome Web Store and switched on in `chrome://extensions` (or `brave://extensions`, `edge://extensions`). The browser must be open.
+2. **`cx` started since the browser was installed:** on every start `cx` writes the native messaging manifest `com.corex.bridge.json` into the `NativeMessagingHosts` folder of each browser it finds (`~/.config/google-chrome`, `chromium`, `BraveSoftware/Brave-Browser`, `microsoft-edge`, `vivaldi`; under `~/Library/Application Support/` on macOS). Check it is there:
+   ```bash
+   ls ~/.config/*/NativeMessagingHosts/com.corex.bridge.json ~/.config/BraveSoftware/*/NativeMessagingHosts/com.corex.bridge.json 2>/dev/null
+   ```
+   If it is missing, restart `cx` and then reload the extension.
+3. **Snap or Flatpak browsers:** they keep their configuration inside their sandbox (`~/snap/…`, `~/.var/app/…`), where Corex does not look yet. Use the browser's native package (`.deb`, `.rpm`, AUR) instead.
+4. **Windows:** not supported yet.
+
+While Corex works, the banner *"Corex Browser Bridge started debugging this browser"* is expected: it is how Chromium browsers show the `debugger` permission the extension uses. Corex only acts in the tabs it opened, in the Corex tab group; **Release tabs** in the extension gives them back.
 
 ---
 

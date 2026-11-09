@@ -4,8 +4,13 @@
 //! acted on them. Cutting each to its head and tail costs no model call and often frees enough
 //! room that no summary is needed at all.
 
+use std::collections::HashSet;
+
 use crate::spill::{trim_with_spill, TRIM_MARKER};
 use crate::types::{Message, MessageContent};
+
+const STALE_SNAPSHOT_NOTE: &str = "[page snapshot omitted: a newer browser result follows, and refs from this one are stale]";
+const STALE_SNAPSHOT_MIN_LINES: usize = 20;
 
 /// Tool results with more characters than this are trimmed.
 pub const PRUNE_THRESHOLD_CHARS: usize = 8192;
@@ -49,6 +54,35 @@ pub fn prune_tool_results(messages: &mut [Message]) -> PruneStats {
         message.content = Some(MessageContent::Text(trimmed));
     }
     stats
+}
+
+pub fn collapse_stale_browser_snapshots(messages: &mut [Message]) {
+    let browser_calls: HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .filter(|call| call.function.name == "browser")
+        .map(|call| call.id.clone())
+        .collect();
+    let results: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool" && m.tool_call_id.as_ref().is_some_and(|id| browser_calls.contains(id)))
+        .map(|(index, _)| index)
+        .collect();
+    let Some((_, older)) = results.split_last() else { return };
+    for &index in older {
+        let Some(MessageContent::Text(text)) = &messages[index].content else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(tree_start) = lines.iter().position(|line| line.trim_start().starts_with("- ")) else { continue };
+        if lines.len() - tree_start < STALE_SNAPSHOT_MIN_LINES {
+            continue;
+        }
+        let mut collapsed = lines[..tree_start].join("\n");
+        collapsed.push('\n');
+        collapsed.push_str(STALE_SNAPSHOT_NOTE);
+        messages[index].content = Some(MessageContent::Text(collapsed));
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +135,25 @@ mod tests {
         assert_eq!(stats.pruned, 1);
         assert_eq!(msgs[2].text_content().unwrap(), "ok");
         assert!(msgs[3].text_content().unwrap().starts_with("ññ"));
+    }
+
+    #[test]
+    fn keeps_only_the_newest_browser_snapshot() {
+        let tree = |label: &str| format!("{label}\nPage: Inbox (https://mail.test/)\n{}", "- button \"x\" [ref=e1]\n".repeat(30));
+        let mut msgs = vec![
+            Message::assistant_with_tools(None, None, vec![ToolCall::new("b1", "browser", "{}")]),
+            Message::tool_response("b1", tree("Clicked e4")),
+            Message::assistant_with_tools(None, None, vec![ToolCall::new("g1", "grep_search", "{}")]),
+            Message::tool_response("g1", "- grep line\n".repeat(30)),
+            Message::assistant_with_tools(None, None, vec![ToolCall::new("b2", "browser", "{}")]),
+            Message::tool_response("b2", tree("Typed into e9")),
+        ];
+        collapse_stale_browser_snapshots(&mut msgs);
+        let first = msgs[1].text_content().unwrap();
+        assert!(first.starts_with("Clicked e4\nPage: Inbox"));
+        assert!(first.ends_with(STALE_SNAPSHOT_NOTE));
+        assert!(!first.contains("[ref="));
+        assert!(msgs[3].text_content().unwrap().contains("grep line"));
+        assert!(msgs[5].text_content().unwrap().contains("[ref=e1]"));
     }
 }

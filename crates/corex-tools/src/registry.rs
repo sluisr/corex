@@ -9,6 +9,7 @@ use crate::background::{
     WriteBackgroundInputTool,
 };
 use crate::fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
+use crate::browser_tool::BrowserTool;
 use crate::grep::GrepTool;
 use crate::memory_tool::SaveMemoryTool;
 use crate::shell::ShellTool;
@@ -84,6 +85,7 @@ impl ToolRegistry {
         registry.register_primary(write_background_input.clone());
         registry.register_primary(web_search.clone());
         registry.register_primary(web_fetch.clone());
+        registry.register_primary(Arc::new(BrowserTool));
 
         registry.register_primary(read_many_files);
         registry.register_primary(ask_user);

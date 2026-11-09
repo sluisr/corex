@@ -97,10 +97,26 @@ async fn show_status(workspace: &Path, check_online: bool) -> Result<()> {
         return Ok(());
     }
 
+    let host_width = all_nodes
+        .iter()
+        .map(|n| n.target_string().len())
+        .max()
+        .unwrap_or(24)
+        .max(24);
+    let rule = "─".repeat(host_width + 55);
+
     println!("\n{} ({} nodes registered):", "Fleet inventory".cyan().bold(), all_nodes.len());
-    println!("{}", "─────────────────────────────────────────────────────────────────────────────".dimmed());
-    println!("{:<14} {:<24} {:<16} {:<12}", "NODE ID".bold(), "HOST / IP".bold(), "TAGS".bold(), "STATUS".bold());
-    println!("{}", "─────────────────────────────────────────────────────────────────────────────".dimmed());
+    println!("{}", rule.dimmed());
+    println!(
+        "{:<14} {:<host_width$} {:<16} {:<8} {}",
+        "NODE ID".bold(),
+        "HOST / IP".bold(),
+        "TAGS".bold(),
+        "SOURCE".bold(),
+        "STATUS".bold(),
+        host_width = host_width
+    );
+    println!("{}", rule.dimmed());
 
     if check_online {
         let semaphore = Arc::new(Semaphore::new(16));
@@ -127,31 +143,35 @@ async fn show_status(workspace: &Path, check_online: bool) -> Result<()> {
         for (_, node, ping_res) in indexed {
             let status_badge = match ping_res {
                 Ok(latency) => format!("{} ({}ms)", "● ONLINE".green().bold(), latency),
-                Err(_) => "× OFFLINE".red().bold().to_string(),
+                Err(_) => "✕ OFFLINE".red().bold().to_string(),
             };
             let tags_str = if node.tags.is_empty() { "-".to_string() } else { node.tags.join(",") };
             println!(
-                "{:<14} {:<24} {:<16} {}",
+                "{:<14} {:<host_width$} {:<16} {:<8} {}",
                 node.id.cyan(),
                 node.target_string(),
                 tags_str.dimmed(),
-                status_badge
+                node.source.label().dimmed(),
+                status_badge,
+                host_width = host_width
             );
         }
     } else {
         for node in all_nodes {
             let tags_str = if node.tags.is_empty() { "-".to_string() } else { node.tags.join(",") };
             println!(
-                "{:<14} {:<24} {:<16} {}",
+                "{:<14} {:<host_width$} {:<16} {:<8} {}",
                 node.id.cyan(),
                 node.target_string(),
                 tags_str.dimmed(),
-                "⚪ UNCHECKED".dimmed()
+                node.source.label().dimmed(),
+                "○ UNCHECKED".dimmed(),
+                host_width = host_width
             );
         }
     }
 
-    println!("{}\n", "─────────────────────────────────────────────────────────────────────────────".dimmed());
+    println!("{}\n", rule.dimmed());
     Ok(())
 }
 
@@ -248,7 +268,7 @@ async fn run_on_node(workspace: &Path, node_id: &str, command: &str, sudo: bool)
     }
 
     println!("\n{} [{}] $ {}", "› Executing on".cyan(), node.id, corex_core::sanitize_for_terminal(command));
-    let out = SshExecutor::execute(node, command, sudo, config.timeout_secs).await?;
+    let out = SshExecutor::execute_retrying(node, command, sudo, config.timeout_secs, risk == CommandRiskLevel::Safe).await?;
 
     if !out.stdout.is_empty() {
         print!("{}", corex_core::sanitize_for_terminal(&out.stdout));
@@ -300,7 +320,7 @@ async fn broadcast_cmd(workspace: &Path, targets: &str, command: &str, sudo: boo
     }
 
     println!("\n{} {} nodes concurrently...", "Broadcasting to".cyan().bold(), target_nodes.len());
-    let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs).await;
+    let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs, risk == CommandRiskLevel::Safe).await;
 
     for (node_id, res) in results {
         println!("\n{} [{}]", "─── Result for".bold(), node_id.cyan());

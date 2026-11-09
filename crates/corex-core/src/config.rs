@@ -87,6 +87,7 @@ const SETTINGS_ORDER: &[&str] = &[
     "context_window_tokens",
     "user_name",
     "user_color",
+    "exports_dir",
     "allowed_commands",
     "local_llm_enabled",
     "local_llm_url",
@@ -208,6 +209,9 @@ pub struct Config {
     /// Colour of the user's messages, as `#rrggbb`. Unset: the theme's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_color: Option<String>,
+    /// Where `/export` saves chats, one folder per project inside. Unset: `~/.corex/exports`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exports_dir: Option<String>,
 }
 
 fn default_auto_compact() -> bool {
@@ -365,6 +369,7 @@ impl Default for Config {
             provider_api_keys: HashMap::new(),
             user_name: None,
             user_color: None,
+            exports_dir: None,
         }
     }
 }
@@ -584,10 +589,6 @@ impl Config {
             let corex_global = dirs.home_dir().join(".corex").join(filename);
             if corex_global.exists() {
                 return Some(corex_global);
-            }
-            let legacy = dirs.home_dir().join(".deepseek").join(filename);
-            if legacy.exists() {
-                return Some(legacy);
             }
         }
         None

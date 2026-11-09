@@ -6,7 +6,8 @@ description: >-
   to tag or label a session, how to delete a session, or how conversation
   history works. Trigger phrases: 'resume session', 'save chat', 'continue
   conversation', 'session history', 'chat list', 'how to resume', 'load
-  previous chat', 'save checkpoint', 'tag session', 'delete session'.
+  previous chat', 'save checkpoint', 'tag session', 'delete session',
+  'export chat', 'exportar chat', 'guardar como pdf', 'chat a markdown', '/export'.
 ---
 
 # Corex Session Management
@@ -71,6 +72,25 @@ cx -r auth-fix
 ```
 
 Corex will restore the full conversation history, model, temperature, and reasoning settings from that session.
+
+---
+
+## Exporting a Chat
+
+Sessions are JSON for Corex to resume. To keep a conversation as a document, export it:
+
+```
+/export                 ← Markdown (default)
+/export txt             ← plain text
+/export html            ← a page; open it in a browser and print it (Ctrl+P) to get a PDF
+/export html full       ← also include the full output of every tool step
+/export md ~/Desktop    ← this one export to another folder (or a file path)
+```
+
+* Exports go to `~/.corex/exports/<project>/`, named by date and chat title (`2026-11-09_22-50_check-the-disk.html`). An export never overwrites an earlier one.
+* The folder can be moved with `exports_dir` in `~/.corex/settings.json`; the `corex-config` skill explains how, and Corex can change it for the user.
+* Without `full`, each tool step is summed up in one line (`run_shell_command \`df -h /\` → Filesystem Size Used (3 lines)`), so a long session stays readable.
+* Code blocks are kept as they are; raw HTML from the chat is shown as text in the `html` export, never run.
 
 ---
 

@@ -42,16 +42,6 @@ impl ReasoningCache {
                     }
                 }
             }
-        } else if let Some(dirs) = BaseDirs::new() {
-            let legacy_file = dirs.home_dir().join(".deepseek").join("reasoning_cache.json");
-            if legacy_file.exists() {
-                if let Ok(data) = fs::read_to_string(&legacy_file) {
-                    if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&data) {
-                        raw_map = parsed;
-                        debug!("[CACHE] Migrated {} entries from legacy DeepSeek cache", raw_map.len());
-                    }
-                }
-            }
         }
 
         let mut map = HashMap::with_capacity(raw_map.len().min(MAX_CACHE_ENTRIES));

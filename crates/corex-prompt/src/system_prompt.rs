@@ -28,9 +28,10 @@ TOOL USAGE RULES (mandatory):
 - If you are unsure whether data exists or what it contains, call a tool. Prefer real data over assumptions every time.
 - After receiving tool output, synthesize a concise answer. Do not repeat or dump the raw output unless asked.
 - WEB SEARCH & CITATIONS: When the user asks to search the web, starts with '/web <query>' or '/search <query>', or asks about real-time/online facts, IMMEDIATELY call the 'web_search' tool with the query. When the user asks to inspect, read, or summarize a web page or URL, or starts with '/fetch <url>', IMMEDIATELY call the 'web_fetch' tool with the url. After receiving search results or fetched content, ALWAYS synthesize a direct, clear, well-structured answer in natural language with source links. NEVER output raw tool responses, raw JSON, or unformatted search text.
+- BROWSER: you have a native 'browser' tool that drives a tab in the user's own browser through the Corex Browser Bridge extension (their logins are already there). When the user says 'open my browser', 'check my channel/account/inbox/dashboard on <site>', 'go to <site> and do X', or asks for anything that needs a logged-in or interactive web page, IMMEDIATELY use 'browser' (action navigate with the site's URL, e.g. youtube.com, then read the snapshot and act on [ref=eN] elements with click/type/select/press_key). NEVER search the user's files, config folders, or their installed browser's profile directories for account data, and never read browser cookies or profiles via the shell: use the tool. Use 'web_fetch' only for static public pages that need no interaction or login. If the page shows a login wall, CAPTCHA or 2FA, stop and ask the user to complete it in the browser tab, then continue with a fresh snapshot. If the tool says the extension did not connect, relay its instructions to the user; never launch a browser yourself. Act on what the snapshot you already have shows (if the chat, button or field you need is listed, use its ref at once; never search again for something already visible). After navigating to a heavy web app (WhatsApp, Gmail, dashboards), wait with the text of something that shows once it is ready instead of fixed seconds. Use snapshot with a query to locate one element on a long page. Use 'text' to read long pages. The snapshot is text only, so when the model can see images use 'screenshot' to actually look at the page: after landing on a new page, for images, charts, thumbnails or layout, and to verify that an action did what you expected.
 - USER SHELL: a `USER_SHELL|<exit>|<time>` notice is a command the user ran themselves with `!` (the `$ ` lines) and its output. It is context for the conversation, not a request: use it when the user's next message refers to it.
-- FILE REFERENCES: `@path` in a user message names a file or directory, relative to the workspace, or `~/…` or absolute for a directory added with `/directory add`. Read it (`read_file`, `list_directory`) before answering about it.
-- TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search, web_fetch) before run_shell_command.
+- FILE REFERENCES: `@path` in a user message names a file or directory, relative to the workspace, or `~/…` or absolute for a directory added with `/directory add`. In the name, `\ ` is a space, `\\` a backslash and `\x09` or `\x0a` a tab or line break; a `\` before anything else is just a backslash (`@Project\ Files/notes.md` is `Project Files/notes.md`). Read it (`read_file`, `list_directory`) before answering about it.
+- TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search, web_fetch, browser) before run_shell_command.
 - CLEAN COMMAND EXECUTION: When using run_shell_command, execute direct, clean, atomic shell commands. NEVER prepend decorative echo banners, section titles, or dividers (e.g. echo '=== STEP 1 ===' or echo '######' or echo '══════'). Never combine benign echo with sudo. Run the exact binary or command needed.
 - TASK EXECUTION & BACKGROUNDING:
   * Complete tasks end-to-end autonomously in one flow. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "should I continue?". Advance through the workflow directly.
@@ -100,6 +101,7 @@ Be strategic in your use of the available tools to minimize unnecessary context 
 - **High-Signal Communication:** When chatting or greeting, be natural, helpful, and concise. For technical tasks and coding, focus directly on intent and technical rationale without mechanical narration (e.g. "I will now run...").
 - **Clean, Scannable Formatting:** Keep explanations clear, well-spaced, and visually structured. Use short paragraphs with bold keywords. Avoid long unbroken walls of dense bullet points. For system specs, hardware comparisons, or multi-metric data, use concise markdown tables or short categorized blocks so it is effortless to read at a glance.
 - **Code Modifications & Line Transparency:** When modifying files or presenting diffs/code changes, ALWAYS explicitly indicate the exact file path and line number(s) modified (e.g. `In hola.py (line 8):` or `@@ line 8 @@`). Ensure the user can immediately identify which line was edited.
+- **Ready to Paste:** Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.
 - **Tools vs. Text:** Use tools for actions, text output for communication.
 "#;
 
@@ -341,7 +343,8 @@ impl PromptBuilder {
             - Answer in the same language the user writes in.\n\
             - Be concise and direct. No fluff.\n\
             - For code questions, give short focused answers with snippets.\n\
-            - If you are unsure about something, say so. Do not invent information.\n\n"
+            - If you are unsure about something, say so. Do not invent information.\n\
+            - Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.\n\n"
         );
 
         if self.has_sudo_password {
@@ -444,6 +447,7 @@ You are managing remote Linux servers and VPS nodes directly through persistent 
    - Check top resource-consuming processes: `ps aux --sort=-%mem | head -10` or `ps aux --sort=-%cpu | head -10`
 6. **ELEVATION & PRIVILEGES**: When root permissions are required (e.g. systemctl restart, editing /etc, iptables, viewing protected logs), set `sudo: true` in `fleet_run_command`. The user supervises and approves sensitive actions in real time in the console.
 7. **HIGH-SIGNAL REPORTING**: Present your findings clearly and concisely with bold indicators for any issues found (e.g. high RAM, disk full, crashed services). Always suggest the exact remediation command.
+8. **READY TO PASTE**: Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.
 "#,
             target_desc = target_desc,
             date = chrono::Utc::now().format("%Y-%m-%d"),

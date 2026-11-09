@@ -47,6 +47,10 @@ impl FleetPtySession {
         cmd.arg("ConnectTimeout=10");
         cmd.arg("-o");
         cmd.arg("StrictHostKeyChecking=accept-new");
+        for option in corex_fleet::ssh::KEEPALIVE_OPTIONS {
+            cmd.arg("-o");
+            cmd.arg(option);
+        }
 
         // SSH Multiplexing for near-zero latency reusing ControlPath
         if let Some(base) = directories::BaseDirs::new() {
@@ -216,6 +220,18 @@ impl FleetPtySession {
             Ok(None) => true,
             Err(_) => false,
         }
+    }
+
+    pub fn exit_code(&self) -> Option<u32> {
+        match self.child.lock().try_wait() {
+            Ok(Some(status)) => Some(status.exit_code()),
+            Ok(None) => None,
+            Err(_) => Some(1),
+        }
+    }
+
+    pub fn has_output(&self) -> bool {
+        !self.parser.lock().screen().contents().trim().is_empty()
     }
 
     /// Renders the current virtual terminal screen into the specified ratatui buffer area.

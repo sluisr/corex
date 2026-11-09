@@ -217,6 +217,7 @@ jobs:
         run: |
           echo "Publishing workspace crates to Crates.io in topological order..."
           cargo publish -p corex-core --locked || true
+          cargo publish -p corex-browser --locked || true
           sleep 15
           cargo publish -p corex-tools --locked || true
           cargo publish -p corex-prompt --locked || true

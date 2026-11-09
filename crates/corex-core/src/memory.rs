@@ -64,12 +64,8 @@ impl Memory {
         if let Some(dirs) = BaseDirs::new() {
             let home = dirs.home_dir();
             candidates.extend(
-                [
-                    home.join(".corex").join("SYSTEM.md"),
-                    home.join(".corex").join("COREX.md"),
-                    home.join(".deepseek").join("DEEPSEEK.md"),
-                ]
-                .map(|p| (MemoryScope::Global, p)),
+                [home.join(".corex").join("SYSTEM.md"), home.join(".corex").join("COREX.md")]
+                    .map(|p| (MemoryScope::Global, p)),
             );
         }
         candidates.extend(

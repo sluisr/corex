@@ -14,6 +14,56 @@ use crate::theme::Theme;
 /// - Blockquotes: `> ` -> `  ▎ `
 /// - Horizontal Rules: `---`
 pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
+    render_markdown_with_copy(text, theme, max_width, false)
+}
+
+pub const CODE_RAIL: &str = "  ▎ ";
+pub const CODE_RAIL_WRAPPED: &str = "  ▏ ";
+pub const COPY_LABEL: &str = "⧉ copy";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeBlock {
+    pub lang: String,
+    pub text: String,
+}
+
+fn is_fence(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
+pub fn code_blocks(text: &str) -> Vec<CodeBlock> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(String, Vec<&str>)> = None;
+    for line in text.lines() {
+        if is_fence(line) {
+            match open.take() {
+                Some((lang, body)) if !body.is_empty() => blocks.push(CodeBlock { lang, text: body.join("\n") }),
+                Some(_) => {}
+                None => open = Some((line.trim().trim_start_matches(['`', '~']).trim().to_string(), Vec::new())),
+            }
+        } else if let Some((_, body)) = open.as_mut() {
+            body.push(line);
+        }
+    }
+    if let Some((lang, body)) = open {
+        if !body.is_empty() {
+            blocks.push(CodeBlock { lang, text: body.join("\n") });
+        }
+    }
+    blocks
+}
+
+pub fn is_copy_header(line: &str) -> bool {
+    line.starts_with(CODE_RAIL) && line.trim_end().ends_with(COPY_LABEL)
+}
+
+pub fn render_markdown_with_copy(
+    text: &str,
+    theme: &Theme,
+    max_width: usize,
+    copy_buttons: bool,
+) -> Vec<Line<'static>> {
     let mut result_lines = Vec::new();
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
@@ -31,7 +81,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
     for line in text.lines() {
         let trimmed = line.trim();
 
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        if is_fence(line) {
             flush_table(&mut table_buffer, &mut result_lines, theme, effective_width);
             if in_code_block {
                 in_code_block = false;
@@ -40,6 +90,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
                     &code_block_lang,
                     theme,
                     effective_width,
+                    copy_buttons,
                     &mut result_lines,
                 );
             } else {
@@ -172,6 +223,7 @@ pub fn render_markdown(text: &str, theme: &Theme, max_width: usize) -> Vec<Line<
             &code_block_lang,
             theme,
             effective_width,
+            copy_buttons,
             &mut result_lines,
         );
     }
@@ -187,26 +239,33 @@ fn flush_code_block(
     lang: &str,
     theme: &Theme,
     max_width: usize,
+    copy_button: bool,
     result: &mut Vec<Line<'static>>,
 ) {
     if buf.is_empty() {
         return;
     }
-    let rail = || Span::styled("  ▎ ", Style::default().fg(theme.dark_gray));
-    if !lang.is_empty() {
-        result.push(Line::from(vec![
-            rail(),
-            Span::styled(lang.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC)),
-        ]));
+    let rail = |glyph: &'static str| Span::styled(glyph, Style::default().fg(theme.dark_gray));
+    let lang_span = || Span::styled(lang.to_string(), Style::default().fg(theme.gray).add_modifier(Modifier::ITALIC));
+    if copy_button {
+        let mut header = vec![rail(CODE_RAIL)];
+        if !lang.is_empty() {
+            header.push(lang_span());
+            header.push(Span::raw("  "));
+        }
+        header.push(Span::styled(COPY_LABEL, Style::default().fg(theme.dark_gray)));
+        result.push(Line::from(header));
+    } else if !lang.is_empty() {
+        result.push(Line::from(vec![rail(CODE_RAIL), lang_span()]));
     }
     let inner = max_width.saturating_sub(4).max(1);
     for line in buf {
         let rows = wrap_code_spans(colorize_code_line(line, lang, theme), inner);
         if rows.is_empty() {
-            result.push(Line::from(rail()));
+            result.push(Line::from(rail(CODE_RAIL)));
         }
-        for row in rows {
-            let mut spans = vec![rail()];
+        for (idx, row) in rows.into_iter().enumerate() {
+            let mut spans = vec![rail(if idx == 0 { CODE_RAIL } else { CODE_RAIL_WRAPPED })];
             spans.extend(row);
             result.push(Line::from(spans));
         }
@@ -1075,6 +1134,33 @@ mod tests {
     }
 
     #[test]
+    fn copyable_blocks_get_a_header_and_match_the_extracted_text() {
+        let text = "Run this:\n```bash\nsudo apt update\nsudo apt upgrade -y\n```\nThen:\n```\n```\n~~~\nreboot\n~~~\n";
+        let lines: Vec<String> = render_markdown_with_copy(text, &Theme::default(), 80, true).iter().map(plain).collect();
+        let headers: Vec<&String> = lines.iter().filter(|l| is_copy_header(l)).collect();
+        assert_eq!(headers, vec!["  ▎ bash  ⧉ copy", "  ▎ ⧉ copy"], "{lines:#?}");
+        assert_eq!(
+            code_blocks(text),
+            vec![
+                CodeBlock { lang: "bash".into(), text: "sudo apt update\nsudo apt upgrade -y".into() },
+                CodeBlock { lang: String::new(), text: "reboot".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_block_is_still_a_block() {
+        assert_eq!(code_blocks("```sh\nls -la\n"), vec![CodeBlock { lang: "sh".into(), text: "ls -la".into() }]);
+    }
+
+    #[test]
+    fn wrapped_code_rows_use_a_rail_of_their_own() {
+        let text = format!("```\n{}\n```\n", "x".repeat(70));
+        let lines: Vec<String> = render_markdown(&text, &Theme::default(), 40).iter().map(plain).collect();
+        assert!(lines[0].starts_with(CODE_RAIL) && lines[1].starts_with(CODE_RAIL_WRAPPED), "{lines:#?}");
+    }
+
+    #[test]
     fn a_block_without_language_has_no_label_row() {
         let lines = render_markdown("```\n~/.cargo/bin/cx\n```\n", &Theme::default(), 120);
         assert_eq!(lines.len(), 1);
@@ -1208,7 +1294,7 @@ mod code_block_tests {
     fn long_code_lines_wrap_without_losing_characters() {
         let line = format!("    x = \"{}\"", "a".repeat(60));
         let out = rows(&format!("```\n{line}\n```"), 40);
-        let body: String = out.iter().filter_map(|r| r.strip_prefix("  ▎ ")).collect();
+        let body: String = out.iter().filter_map(|r| r.strip_prefix(CODE_RAIL).or_else(|| r.strip_prefix(CODE_RAIL_WRAPPED))).collect();
         assert_eq!(body.trim_end(), line, "{out:#?}");
     }
 }

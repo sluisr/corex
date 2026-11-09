@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Admin panel</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f7;color:#1c1e21}
+header{background:#1f2937;color:#fff;padding:14px 24px;font-weight:600}
+main{max-width:860px;margin:24px auto;background:#fff;border-radius:10px;padding:24px;box-shadow:0 1px 3px #0002}
+[hidden]{display:none!important}
+[role=tablist]{display:flex;gap:4px;border-bottom:1px solid #ddd;margin-bottom:20px}
+[role=tab]{padding:10px 16px;border:0;background:none;cursor:pointer;font-size:15px}
+[role=tab][aria-selected=true]{border-bottom:3px solid #2563eb;font-weight:600}
+.row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eee}
+.dd{position:relative}.dd button{min-width:220px;text-align:left;padding:8px 12px;cursor:pointer}
+.dd ul{position:absolute;right:0;top:40px;list-style:none;margin:0;padding:4px;background:#fff;border:1px solid #ccc;border-radius:6px;min-width:220px;z-index:5}
+.dd li{padding:8px 10px;cursor:pointer}.dd li:hover{background:#eef}
+.sw{width:44px;height:24px;border-radius:12px;background:#bbb;position:relative;cursor:pointer}
+.sw[aria-checked=true]{background:#2563eb}.sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.2s}
+.sw[aria-checked=true]::after{left:23px}
+.chip{display:inline-block;background:#e0e7ff;border-radius:12px;padding:3px 10px;margin:2px}
+.cards{display:flex;gap:10px}.card{border:2px solid #ccc;border-radius:8px;padding:12px 18px;cursor:pointer}
+.card[aria-checked=true]{border-color:#2563eb;background:#eff6ff}
+.cal{position:absolute;right:0;top:40px;background:#fff;border:1px solid #ccc;border-radius:8px;padding:10px;z-index:6;width:280px}
+.cal .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}.cal .grid button{padding:6px 0}
+details{padding:12px 0;border-bottom:1px solid #eee}summary{cursor:pointer;font-weight:600}
+#bar{position:sticky;bottom:0;background:#fff;padding:14px 0;text-align:right;border-top:1px solid #ddd;margin-top:20px}
+#bar button{background:#2563eb;color:#fff;border:0;padding:10px 22px;border-radius:6px;font-size:15px;cursor:pointer}
+#toast{color:#15803d;font-weight:600;margin-right:14px}
+.modal{position:fixed;inset:0;background:#0006;display:flex;align-items:center;justify-content:center}
+.modal>div{background:#fff;padding:24px;border-radius:10px;min-width:320px}
+</style></head><body>
+<header>Admin panel · Acme Cloud</header>
+<main>
+<div role="tablist" aria-label="Sections">
+  <button role="tab" aria-selected="true" data-p="general">General</button>
+  <button role="tab" aria-selected="false" data-p="notif">Notifications</button>
+  <button role="tab" aria-selected="false" data-p="billing">Billing</button>
+  <button role="tab" aria-selected="false" data-p="security">Security</button>
+</div>
+
+<section class="panel" id="general">
+  <div class="row"><label>Interface language</label>
+    <div class="dd"><button id="lang" role="combobox" aria-haspopup="listbox" aria-expanded="false">English (US)</button>
+      <ul role="listbox" hidden>
+        <li role="option">English (US)</li><li role="option">Spanish (Mexico)</li>
+        <li role="option">Spanish (Spain)</li><li role="option">Portuguese (Brazil)</li>
+      </ul></div></div>
+  <div class="row"><label for="tz">Time zone</label>
+    <select id="tz"><option>UTC</option><option>America/Mexico_City</option><option>Europe/Madrid</option><option>Asia/Tokyo</option></select></div>
+  <div class="row"><span id="l-dark">Dark mode</span><div class="sw" role="switch" aria-checked="false" aria-labelledby="l-dark" tabindex="0" data-k="dark"></div></div>
+</section>
+
+<section class="panel" id="notif" hidden>
+  <div class="row"><span id="l-email">Email notifications</span><div class="sw" role="switch" aria-checked="false" aria-labelledby="l-email" tabindex="0" data-k="email"></div></div>
+  <div class="row"><span id="l-push">Push notifications</span><div class="sw" role="switch" aria-checked="true" aria-labelledby="l-push" tabindex="0" data-k="push"></div></div>
+  <div class="row"><label for="vol">Alert volume</label><input id="vol" type="range" min="0" max="100" step="5" value="50"><output id="volout">50</output></div>
+  <div class="row"><label for="tag">Tags (press Enter to add)</label><div><input id="tag" placeholder="new tag"><div id="chips"></div></div></div>
+</section>
+
+<section class="panel" id="billing" hidden>
+  <div class="row"><span>Plan</span>
+    <div class="cards" role="radiogroup" aria-label="Plan">
+      <div class="card" role="radio" aria-checked="true" tabindex="0" data-plan="Free">Free<br><small>$0</small></div>
+      <div class="card" role="radio" aria-checked="false" tabindex="0" data-plan="Pro">Pro<br><small>$19</small></div>
+      <div class="card" role="radio" aria-checked="false" tabindex="0" data-plan="Enterprise">Enterprise<br><small>$99</small></div>
+    </div></div>
+  <div class="row"><span>Billing cycle</span>
+    <div class="cards" role="radiogroup" aria-label="Cycle">
+      <div class="card" role="radio" aria-checked="true" tabindex="0" data-cycle="monthly">Monthly</div>
+      <div class="card" role="radio" aria-checked="false" tabindex="0" data-cycle="yearly">Yearly (-20%)</div>
+    </div></div>
+  <div class="row"><span>Start date</span>
+    <div class="dd"><button id="datebtn" aria-haspopup="dialog">Pick a date</button><div class="cal" id="cal" role="dialog" aria-label="Calendar" hidden></div></div></div>
+  <div class="row"><label for="logo">Company logo</label><div><input id="logo" type="file" accept="image/*"><div id="logoname"></div></div></div>
+</section>
+
+<section class="panel" id="security" hidden>
+  <details><summary>Advanced security</summary>
+    <div class="row"><span id="l-2fa">Two-factor authentication</span><div class="sw" role="switch" aria-checked="false" aria-labelledby="l-2fa" tabindex="0" data-k="twofa"></div></div>
+  </details>
+  <div class="row"><span>API keys</span><button id="del">Delete all keys</button></div>
+</section>
+
+<div id="bar"><span id="toast"></span><button id="save">Save changes</button></div>
+</main>
+<div id="modal" class="modal" hidden><div><p><b>Delete all API keys?</b></p><button id="mno">Cancel</button> <button id="myes">Yes, delete</button></div></div>
+
+<script>
+const S={lang:"English (US)",tz:"UTC",dark:false,email:false,push:true,volume:50,tags:[],plan:"Free",cycle:"monthly",start:null,logo:null,twofa:false,keysDeleted:false};
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+$$('[role=tab]').forEach(t=>t.onclick=()=>{$$('[role=tab]').forEach(x=>x.setAttribute('aria-selected',x===t));$$('.panel').forEach(p=>p.hidden=p.id!==t.dataset.p)});
+const lb=$('#lang+ul');$('#lang').onclick=()=>{lb.hidden=!lb.hidden;$('#lang').setAttribute('aria-expanded',!lb.hidden)};
+$$('#lang+ul li').forEach(li=>li.onclick=()=>{S.lang=li.textContent;$('#lang').textContent=li.textContent;lb.hidden=true});
+$('#tz').onchange=e=>S.tz=e.target.value;
+$$('.sw').forEach(s=>{const f=()=>{const v=s.getAttribute('aria-checked')!=='true';s.setAttribute('aria-checked',v);S[s.dataset.k]=v};s.onclick=f;s.onkeydown=e=>{if(e.key===' '||e.key==='Enter'){e.preventDefault();f()}}});
+$('#vol').oninput=e=>{S.volume=+e.target.value;$('#volout').textContent=e.target.value};
+$('#tag').onkeydown=e=>{if(e.key==='Enter'&&e.target.value.trim()){S.tags.push(e.target.value.trim());$('#chips').innerHTML=S.tags.map(t=>`<span class="chip">${t}</span>`).join('');e.target.value='';e.preventDefault()}};
+function radio(sel,key,attr){$$(sel).forEach(c=>{const f=()=>{$$(sel).forEach(x=>x.setAttribute('aria-checked',x===c));S[key]=c.dataset[attr]};c.onclick=f;c.onkeydown=e=>{if(e.key===' '||e.key==='Enter')f()}})}
+radio('[data-plan]','plan','plan');radio('[data-cycle]','cycle','cycle');
+let view=new Date(2026,10,1);const cal=$('#cal');
+function drawCal(){const y=view.getFullYear(),m=view.getMonth();const name=view.toLocaleString('en',{month:'long'});
+ const days=new Date(y,m+1,0).getDate();let h=`<div style="display:flex;justify-content:space-between;margin-bottom:8px"><button id="prev" aria-label="Previous month">‹</button><b>${name} ${y}</b><button id="next" aria-label="Next month">›</button></div><div class="grid">`;
+ for(let d=1;d<=days;d++){h+=`<button data-d="${d}" aria-label="${name} ${d}, ${y}">${d}</button>`}
+ cal.innerHTML=h+'</div>';
+ $('#prev').onclick=()=>{view=new Date(y,m-1,1);drawCal()};$('#next').onclick=()=>{view=new Date(y,m+1,1);drawCal()};
+ $$('#cal [data-d]').forEach(b=>b.onclick=()=>{S.start=`${y}-${String(m+1).padStart(2,'0')}-${String(b.dataset.d).padStart(2,'0')}`;$('#datebtn').textContent=b.getAttribute('aria-label');cal.hidden=true})}
+$('#datebtn').onclick=()=>{cal.hidden=!cal.hidden;if(!cal.hidden)drawCal()};
+$('#logo').onchange=e=>{S.logo=e.target.files[0]?.name||null;$('#logoname').textContent='Logo: '+S.logo};
+$('#del').onclick=()=>{if(confirm('This will delete all your API keys. Continue?'))$('#modal').hidden=false};
+$('#mno').onclick=()=>$('#modal').hidden=true;$('#myes').onclick=()=>{S.keysDeleted=true;$('#modal').hidden=true};
+$('#save').onclick=async()=>{await fetch('/save?page=settings',{method:'POST',body:JSON.stringify(S)});$('#toast').textContent='Saved ✓';document.title='Saved'};
+</script></body></html>

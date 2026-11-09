@@ -34,7 +34,8 @@ impl App {
                         .split(',')
                         .map(str::trim)
                         .filter(|p| !p.is_empty())
-                        .map(|p| match self.add_directory(p) {
+                        .map(crate::file_completion::unescape_path)
+                        .map(|p| match self.add_directory(&p) {
                             Ok((dir, true)) => format!("Added {}: already readable, now indexed for @path.", dir.display()),
                             Ok((dir, false)) => {
                                 format!("Added {}: the agent can read it without confirmation.", dir.display())
@@ -107,20 +108,12 @@ impl App {
                     group_thousands(cfg.effective_compact_threshold() as u64),
                     group_thousands(cfg.effective_history_limit() as u64),
                 ));
-                if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled && u.total_tokens > 0 {
-                    let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
-                    let (cached_rate, miss_rate, comp_rate) = if is_pro {
-                        (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
-                    } else {
-                        (0.014 / 1_000_000.0, 0.14 / 1_000_000.0, 0.28 / 1_000_000.0)
-                    };
-                    let miss = u.prompt_tokens.saturating_sub(u.prompt_cache_hit_tokens);
-                    let actual_cost = (u.prompt_cache_hit_tokens as f64 * cached_rate)
-                        + (miss as f64 * miss_rate)
-                        + (u.completion_tokens as f64 * comp_rate);
-                    let un_cached = (u.prompt_tokens as f64 * miss_rate) + (u.completion_tokens as f64 * comp_rate);
-                    let saved = (un_cached - actual_cost).max(0.0);
-                    msg.push_str(&format!("\n- Estimated DeepSeek Cost: ${:.6} USD (Saved ${:.6} with KV Cache)", actual_cost, saved));
+                let spend = self.llm_client.spend();
+                if spend.cost > 0.0 {
+                    msg.push_str(&format!(
+                        "\n- Estimated cost since launch: ${:.6} USD (saved ${:.6} with KV cache)",
+                        spend.cost, spend.saved
+                    ));
                 }
                 self.session.add_message(Message::system(msg));
                 true
@@ -326,6 +319,14 @@ impl App {
                     self.slash_popup_height_current = 0.0;
                     self.session_dialog.open(&self.workspace_dir.display().to_string(), is_fleet);
                 }
+                true
+            }
+            "/export" => {
+                let msg = match super::export::ExportRequest::parse(&parts[1..]) {
+                    Ok(request) => self.export_chat(&request),
+                    Err(usage) => usage,
+                };
+                self.session.add_message(Message::system(msg));
                 true
             }
             "/save" => {
@@ -1056,10 +1057,12 @@ pub(crate) fn shortcuts_help() -> String {
         "  Shift+Tab        cycle modes: normal · accept edits · plan (/yolo approves everything)",
         "  Esc              take back a queued message, then cancel the reply",
         "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
-        "  Ctrl+V           paste an image from the clipboard, or its text",
+        "  Ctrl+V           paste an image (or a copied image file) from the clipboard, or its text",
+        "  Alt+V            paste the clipboard's text only, even if it is the path of an image",
         "  Ctrl+Z           undo in the prompt · twice on an empty prompt: suspend",
         "  Ctrl+O           full logs and commands · Ctrl+T: thinking",
         "  Ctrl+C           copy the selection, cancel, or twice to exit",
+        "  Alt+Y            copy the last code block · click ⧉ copy above a block for any other",
         "  Wheel / PageUp   scroll the chat · F2: mouse reporting on or off",
     ]
     .join("\n")

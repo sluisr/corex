@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Overlay</title>
+<body style="font-family:sans-serif">
+<h1>Checkout</h1>
+<button id="save" onclick="fetch('/save?page=overlay',{method:'POST',body:'saved'});document.title='Saved'">Save order</button>
+<div id="cookie" style="position:fixed;inset:0;background:#0005;display:flex;align-items:center;justify-content:center">
+  <div style="background:#fff;padding:24px"><p>We use cookies</p><button onclick="document.getElementById('cookie').remove()">Accept cookies</button></div>
+</div></body>

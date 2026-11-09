@@ -299,6 +299,8 @@ pub struct App {
     pub drag_point: Option<(u16, u16)>,
     /// Shown in the empty prompt for a moment after a selection is copied.
     pub copy_notice: Option<(Instant, &'static str)>,
+    pub copied_block: Option<(usize, Instant)>,
+    pub copy_headers: crate::app::copy::CopyHeaders,
     /// Under tmux a selection ends on release, as tmux's own does.
     pub inside_tmux: bool,
     pub app_start_time: Instant,
@@ -311,6 +313,8 @@ pub struct App {
     pub git_branch: String,
     pub last_turn_start: Option<Instant>,
     pub last_esc_press: Option<Instant>,
+    pub launched_at: Instant,
+    pub prompts_this_run: usize,
     pub last_ctrl_c_press: Option<Instant>,
     /// First Ctrl+Z of the pair that suspends to the shell.
     pub last_ctrl_z_press: Option<Instant>,
@@ -335,6 +339,7 @@ pub struct App {
     pub last_file_query: Option<String>,
     /// That query was a `/directory add` folder, not an `@path`.
     pub last_query_is_folder: bool,
+    pub term_width: u16,
     pub local_llm_online: Arc<AtomicBool>,
     pub last_local_check: Option<Instant>,
     pub cached_message_lines: Vec<Line<'static>>,
@@ -346,6 +351,7 @@ pub struct App {
     /// Whether any cached message hid lines behind a collapsed log, so the footer shows the
     /// Ctrl+O hint once instead of every block repeating it.
     pub cached_has_collapsed_logs: bool,
+    pub(crate) message_clock: super::browser_run::MessageClock,
     /// Parsed markdown of `streaming_text`, reused across frames until the text grows.
     pub streaming_md_cache: Vec<Line<'static>>,
     pub streaming_md_cache_len: usize,

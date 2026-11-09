@@ -514,6 +514,7 @@ pub struct AnthropicErrorInfo {
 #[derive(Debug, Default)]
 pub struct AnthropicStreamState {
     pub usage: Usage,
+    reported: Usage,
     open_thinking: std::collections::BTreeMap<usize, AnthropicBlock>,
     finished_thinking: Vec<serde_json::Value>,
     completed: bool,
@@ -538,6 +539,20 @@ impl AnthropicStreamState {
         }
         self.usage.total_tokens = self.usage.prompt_tokens + self.usage.completion_tokens;
     }
+
+    // Anthropic repeats running totals, while consumers add up every UsageUpdate.
+    fn unreported_usage(&mut self) -> Usage {
+        let (now, before) = (&self.usage, &self.reported);
+        let delta = Usage {
+            prompt_tokens: now.prompt_tokens.saturating_sub(before.prompt_tokens),
+            prompt_cache_hit_tokens: now.prompt_cache_hit_tokens.saturating_sub(before.prompt_cache_hit_tokens),
+            prompt_cache_miss_tokens: now.prompt_cache_miss_tokens.saturating_sub(before.prompt_cache_miss_tokens),
+            completion_tokens: now.completion_tokens.saturating_sub(before.completion_tokens),
+            total_tokens: now.total_tokens.saturating_sub(before.total_tokens),
+        };
+        self.reported = self.usage.clone();
+        delta
+    }
 }
 
 /// Parses one Anthropic SSE event string into Corex `StreamEvent`s.
@@ -551,7 +566,7 @@ pub fn parse_anthropic_sse_data(
         AnthropicSseData::MessageStart { message } => {
             if let Some(u) = message.usage {
                 state.apply_usage(&u, true);
-                events.push(StreamEvent::UsageUpdate(state.usage.clone()));
+                events.push(StreamEvent::UsageUpdate(state.unreported_usage()));
             }
         }
         AnthropicSseData::ContentBlockStart { index, content_block } => {
@@ -642,7 +657,7 @@ pub fn parse_anthropic_sse_data(
         AnthropicSseData::MessageDelta { delta, usage } => {
             if let Some(u) = usage {
                 state.apply_usage(&u, false);
-                events.push(StreamEvent::UsageUpdate(state.usage.clone()));
+                events.push(StreamEvent::UsageUpdate(state.unreported_usage()));
             }
             if let Some(reason) = delta.stop_reason {
                 let normalized = match reason.as_str() {
@@ -853,7 +868,7 @@ mod tests {
         let evs = parse_anthropic_sse_data(delta_json, &mut usage).unwrap();
         assert_eq!(evs.len(), 2);
         match &evs[0] {
-            StreamEvent::UsageUpdate(u) => assert_eq!(u.completion_tokens, 45),
+            StreamEvent::UsageUpdate(u) => assert_eq!((u.prompt_tokens, u.completion_tokens), (0, 45)),
             _ => panic!("Expected UsageUpdate"),
         }
         match &evs[1] {

@@ -2,6 +2,7 @@
 members = [
     "crates/corex-core",
     "crates/corex-tools",
+    "crates/corex-browser",
     "crates/corex-prompt",
     "crates/corex-tui",
     "crates/corex-cli",
@@ -10,16 +11,16 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 authors = ["sluisr <contact@sluisr.com>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/sluisr/corex"
-homepage = "https://github.com/sluisr/corex"
+homepage = "https://corex.sluisr.com"
 readme = "README.md"
 
 [workspace.dependencies]
-tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "io-util", "fs", "net"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "io-util", "io-std", "fs", "net"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 reqwest-eventsource = "0.6"
@@ -51,11 +52,12 @@ zip = { version = "9.1", default-features = false, features = ["deflate-flate2"]
 toml = "0.8"
 
 # Internal crates
-corex-core = { path = "crates/corex-core", version = "0.10.1" }
-corex-tools = { path = "crates/corex-tools", version = "0.10.1" }
-corex-prompt = { path = "crates/corex-prompt", version = "0.10.1" }
-corex-tui = { path = "crates/corex-tui", version = "0.10.1" }
-corex-fleet = { path = "crates/corex-fleet", version = "0.10.1" }
+corex-core = { path = "crates/corex-core", version = "0.11.0" }
+corex-browser = { path = "crates/corex-browser", version = "0.11.0" }
+corex-tools = { path = "crates/corex-tools", version = "0.11.0" }
+corex-prompt = { path = "crates/corex-prompt", version = "0.11.0" }
+corex-tui = { path = "crates/corex-tui", version = "0.11.0" }
+corex-fleet = { path = "crates/corex-fleet", version = "0.11.0" }
 
 [profile.release]
 opt-level = "s"

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Gestures</title>
+<style>[hidden]{display:none!important}</style></head>
+<body style="font-family:system-ui,sans-serif">
+<h1>Gestures</h1>
+
+<button id="dd" aria-haspopup="listbox" onclick="list.hidden=!list.hidden">Country</button>
+<div id="list" role="listbox" hidden>
+  <div role="option" tabindex="0" onclick="pick('Mexico')">Mexico</div>
+  <div role="option" tabindex="0" onclick="pick('Spain')">Spain</div>
+</div>
+<p id="picked">Picked: none</p>
+
+<div role="button" tabindex="0" id="hover-target" onmouseover="menu.hidden=false">Menu</div>
+<div id="menu" hidden><a href="#" role="menuitem" onclick="log('hover-ok')">Hover option</a></div>
+
+<p><button ondblclick="log('double-ok')">Double</button></p>
+<p><div role="button" tabindex="0" oncontextmenu="log('right-ok');return false">Right</div></p>
+
+<p><input type="file" aria-label="attachment" onchange="log('file:' + this.files[0].name)"></p>
+<p><button onclick="alert('hello')">Alert</button></p>
+
+<div id="out"></div>
+<script>
+function pick(v){document.getElementById('picked').textContent='Picked: '+v;document.getElementById('list').hidden=true}
+function log(t){const p=document.createElement('p');p.textContent=t;document.getElementById('out').append(p)}
+</script></body></html>

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Corex Browser Bridge",
+  "version": "1.0.10",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvz8335JjuuUH4ibXico14FvPCnNR2Zo8jgKNwPAISCTDmf5HdHswgRpUTzd4cnISQiNkvkDcWdkUiC/wf9V2zubApsDFjc/0Fa6md8UUzzG2Avj1WtElK3RELPNLTtkHKTerWWdh7ePNLt9F33ex5euquBo+yq2K6RH3gccsQw81eklOskZv5zl5z/xJ9qkdOoUfdC8jHDBYGrnkA8eDjCZsvT6PoAlLzL9mGJ/2+hyBHdIgf88V3J3RnE431LQFL3rboT4CHeLIsZTkYXwjepDKG3E/yITiipPubmJdyPvshZj9TsqT1k5PyppHsXlpQy7crBSAaIWzyzkZDct7xwIDAQAB",
+  "description": "Native browser companion for the Corex autonomous CLI agent. Controls designated tabs upon user request.",
+  "permissions": ["debugger", "tabGroups", "alarms", "nativeMessaging"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  }
+}

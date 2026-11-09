@@ -14,7 +14,6 @@ use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive, shorten_
 use crate::auth_dialog::render_auth_dialog;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::fleet_dialog::render_fleet_dialog;
-use crate::markdown::render_markdown;
 use crate::model_dialog::render_model_dialog;
 use crate::session_dialog::render_session_dialog;
 use crate::file_completion::{render_file_popup, IndexState};
@@ -23,6 +22,7 @@ use crate::sudo_dialog::render_sudo_dialog;
 use crate::theme::Theme;
 use crate::user_dialog::render_user_dialog;
 
+use super::browser_run;
 use super::formatting::*;
 use super::mobile::is_mobile_portrait;
 use super::state::{App, PendingToolBatch, Selection, SelectionLines};
@@ -559,6 +559,7 @@ pub fn render_single_message_with_pending(
         logs_expanded,
         logs_expanded,
         None,
+        false,
     )
 }
 
@@ -575,6 +576,7 @@ pub fn render_single_message_with_pending_and_thinking(
     // `(name, arguments)` of the call a tool message answers. Tool responses carry no name of
     // their own, so without it the renderer would have to guess the tool from the output text.
     tool_call: Option<(&str, &str)>,
+    copy_buttons: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match msg.role.as_str() {
@@ -637,7 +639,7 @@ pub fn render_single_message_with_pending_and_thinking(
             }
 
             if let Some(text) = msg.text_content() {
-                let mut md_lines = render_markdown(text, theme, content_max_width);
+                let mut md_lines = crate::markdown::render_markdown_with_copy(text, theme, content_max_width, copy_buttons);
                 md_lines.push(Line::from(""));
                 lines.extend(md_lines);
             }
@@ -801,12 +803,22 @@ pub fn render_single_message_with_pending_and_thinking(
                     .filter(|l| !l.trim().is_empty())
                     .collect();
 
-                let is_err = content.starts_with("Error")
-                    || content.starts_with("Failed")
-                    || content.starts_with("Command exited with status code");
+                // grep, diff or a test run exit non-zero without anything going wrong; -1 means a signal.
+                let exit_code = content
+                    .strip_prefix("Command exited with status code ")
+                    .and_then(|rest| rest.split(':').next())
+                    .map(str::trim)
+                    .filter(|code| *code != "-1");
+                let is_err = exit_code.is_none()
+                    && (content.starts_with("Error")
+                        || content.starts_with("Failed")
+                        || content.starts_with("Command exited with status code"));
 
-                let icon = if is_err { "    ✕ " } else { "    ✓ " };
-                let icon_color = if is_err { theme.error } else { theme.success };
+                let (icon, icon_color) = match (is_err, exit_code) {
+                    (true, _) => ("    ✕ ", theme.error),
+                    (false, Some(_)) => ("    · ", theme.warning),
+                    (false, None) => ("    ✓ ", theme.success),
+                };
 
                 if raw_output_lines.len() <= 1 {
                     let first_line_raw = raw_output_lines.first().copied().unwrap_or("Done").replace('\t', "    ");
@@ -820,10 +832,10 @@ pub fn render_single_message_with_pending_and_thinking(
                     lines.extend(wrapped);
                 } else {
                     let total = raw_output_lines.len();
-                    let header_label = if is_err {
-                        format!("Command failed ({} lines)", total)
-                    } else {
-                        format!("Output ({} lines)", total)
+                    let header_label = match (is_err, exit_code) {
+                        (true, _) => format!("Command failed ({} lines)", total),
+                        (false, Some(code)) => format!("Exit code {} ({} lines)", code, total),
+                        (false, None) => format!("Output ({} lines)", total),
                     };
 
                     lines.push(Line::from(vec![
@@ -935,6 +947,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.last_file_query = None;
     }
 
+    app.term_width = size.width;
     app.advance_slash_popup();
 
     // Bordered popup needs at least 3 lines (top border, 1 item, bottom border).
@@ -1057,6 +1070,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.cached_message_lines.clear();
         app.cached_message_line_offsets.clear();
         app.selection_lines.cached.clear();
+        app.copy_headers.cached.clear();
         app.cached_message_count = 0;
         app.cached_has_collapsed_logs = false;
         app.cached_render_width = content_max_width;
@@ -1064,22 +1078,44 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.cached_logs_expanded = app.logs_expanded;
     }
 
-    let target_cache_count = if app.pending_confirmation.is_some() {
-        app.session.display_messages().len().saturating_sub(1)
+    let message_total = app.session.display_messages().len();
+    app.message_clock.observe(&app.session.id, message_total);
+
+    let mut target_cache_count = if app.pending_confirmation.is_some() {
+        message_total.saturating_sub(1)
     } else {
-        app.session.display_messages().len()
+        message_total
     };
 
-    if app.cached_message_count > target_cache_count {
-        let keep_lines = if target_cache_count < app.cached_message_line_offsets.len() {
-            app.cached_message_line_offsets[target_cache_count]
+    let live_run = if !app.logs_expanded && (app.is_streaming || app.pending_confirmation.is_some()) {
+        message_total
+            .checked_sub(1)
+            .and_then(|last| browser_run::run_start(app.session.display_messages(), last))
+    } else {
+        None
+    };
+    if let Some(start) = live_run {
+        target_cache_count = target_cache_count.min(start);
+    }
+
+    let mut keep_messages = target_cache_count;
+    if !app.logs_expanded && app.cached_message_count < target_cache_count {
+        if let Some(start) = browser_run::run_start(app.session.display_messages(), app.cached_message_count) {
+            keep_messages = keep_messages.min(start);
+        }
+    }
+
+    if app.cached_message_count > keep_messages {
+        let keep_lines = if keep_messages < app.cached_message_line_offsets.len() {
+            app.cached_message_line_offsets[keep_messages]
         } else {
             0
         };
         app.cached_message_lines.truncate(keep_lines);
-        app.cached_message_line_offsets.truncate(target_cache_count + 1);
+        app.copy_headers.cached.retain(|(line, _)| *line < keep_lines);
+        app.cached_message_line_offsets.truncate(keep_messages + 1);
         app.selection_lines.cached.truncate(keep_lines);
-        app.cached_message_count = target_cache_count;
+        app.cached_message_count = keep_messages;
     }
 
     if app.cached_message_count < target_cache_count {
@@ -1087,23 +1123,58 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.cached_message_line_offsets.push(0);
         }
         let start_idx = app.cached_message_count;
+        let mut next_block = super::copy::blocks_before(app.session.display_messages(), start_idx) + 1;
         for msg_idx in start_idx..target_cache_count {
-            let msg = &app.session.display_messages()[msg_idx];
-            let next_msg = app.session.display_messages()[..target_cache_count].get(msg_idx + 1);
-            let rendered = render_single_message_with_pending_and_thinking(
-                msg_idx,
-                msg,
-                next_msg,
-                &app.theme,
-                content_max_width,
-                None,
-                app.logs_expanded,
-                app.thinking_state.is_expanded,
-                answered_tool_call(&app.session.display_messages(), msg_idx),
-            );
+            let messages = app.session.display_messages();
+            let msg = &messages[msg_idx];
+            let first_block = next_block;
+            next_block += super::copy::block_count(msg);
+            let next_msg = messages[..target_cache_count].get(msg_idx + 1);
+            let run = if app.logs_expanded { None } else { browser_run::run_start(messages, msg_idx) };
+            let rendered = match run {
+                Some(start) if start < msg_idx => Vec::new(),
+                Some(start) => {
+                    let end = browser_run::run_end(messages, start, target_cache_count);
+                    let mut lines = render_single_message_with_pending_and_thinking(
+                        msg_idx,
+                        &browser_run::without_calls(msg),
+                        next_msg,
+                        &app.theme,
+                        content_max_width,
+                        None,
+                        app.logs_expanded,
+                        app.thinking_state.is_expanded,
+                        None,
+                        true,
+                    );
+                    lines.extend(browser_run::summary_lines(
+                        &messages[start..end],
+                        start,
+                        &app.message_clock,
+                        false,
+                        &app.theme,
+                        content_max_width,
+                    ));
+                    lines
+                }
+                None => render_single_message_with_pending_and_thinking(
+                    msg_idx,
+                    msg,
+                    next_msg,
+                    &app.theme,
+                    content_max_width,
+                    None,
+                    app.logs_expanded,
+                    app.thinking_state.is_expanded,
+                    answered_tool_call(messages, msg_idx),
+                    true,
+                ),
+            };
             if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
                 app.cached_has_collapsed_logs = true;
             }
+            let base = app.cached_message_lines.len();
+            app.copy_headers.cached.extend(super::copy::number_headers(&rendered, base, first_block));
             app.cached_message_lines.extend(rendered);
             app.cached_message_line_offsets.push(app.cached_message_lines.len());
         }
@@ -1125,8 +1196,34 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     // Live tail, never cached: pending message, approval dialog, streaming output, queue.
     let mut tail_lines: Vec<Line<'static>> = Vec::new();
+    app.copy_headers.tail.clear();
 
-    if target_cache_count < app.session.display_messages().len() {
+    if let Some(start) = live_run {
+        let messages = app.session.display_messages();
+        let first_block = super::copy::blocks_before(messages, start) + 1;
+        let rendered = render_single_message_with_pending_and_thinking(
+            start,
+            &browser_run::without_calls(&messages[start]),
+            None,
+            &app.theme,
+            content_max_width,
+            None,
+            app.logs_expanded,
+            app.thinking_state.is_expanded,
+            None,
+            true,
+        );
+        app.copy_headers.tail.extend(super::copy::number_headers(&rendered, 0, first_block));
+        tail_lines.extend(rendered);
+        tail_lines.extend(browser_run::summary_lines(
+            &messages[start..],
+            start,
+            &app.message_clock,
+            true,
+            &app.theme,
+            content_max_width,
+        ));
+    } else if target_cache_count < app.session.display_messages().len() {
         let msg_idx = target_cache_count;
         let msg = &app.session.display_messages()[msg_idx];
         let next_msg = app.session.display_messages().get(msg_idx + 1);
@@ -1140,7 +1237,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.logs_expanded,
             app.thinking_state.is_expanded,
             answered_tool_call(&app.session.display_messages(), msg_idx),
+            true,
         );
+        let first_block = super::copy::blocks_before(app.session.display_messages(), msg_idx) + 1;
+        app.copy_headers.tail.extend(super::copy::number_headers(&rendered, 0, first_block));
         tail_lines.extend(rendered);
     }
 
@@ -1198,7 +1298,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 && app.streaming_md_cache_width == content_max_width
                 && !app.streaming_md_cache.is_empty();
             if !cache_valid {
-                app.streaming_md_cache = render_markdown(&app.streaming_text, &app.theme, content_max_width);
+                app.streaming_md_cache = crate::markdown::render_markdown(&app.streaming_text, &app.theme, content_max_width);
                 app.streaming_md_cache_len = app.streaming_text.len();
                 app.streaming_md_cache_width = content_max_width;
             }
@@ -1299,6 +1399,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             &app.selection_lines,
             &app.theme,
         );
+    }
+    if let Some((number, at)) = app.copied_block {
+        if at.elapsed() < super::copy::COPIED_FLASH {
+            if let Some(line) = app.copy_header_line(number) {
+                paint_copied(frame.buffer_mut(), chat_chunk, app.scroll_offset, line, &app.selection_lines, &app.theme);
+            }
+        }
     }
 
     // 2.5. Fixed Activity / Status Bar (Directly above the Composer!)
@@ -1851,6 +1958,19 @@ fn mode_badges(app: &App) -> Vec<Span<'static>> {
 ///
 /// The feed is drawn from generated lines, so rather than threading selection state through the
 /// renderer this simply restyles the cells that already reached the screen.
+fn paint_copied(buffer: &mut Buffer, chat: Rect, scroll: usize, line_idx: usize, lines: &SelectionLines, theme: &Theme) {
+    use unicode_width::UnicodeWidthStr;
+
+    let Some(row) = line_idx.checked_sub(scroll).filter(|row| *row < chat.height as usize) else { return };
+    let Some(line) = lines.get(line_idx) else { return };
+    let Some(at) = line.rfind(crate::markdown::COPY_LABEL) else { return };
+    let col = line[..at].width() as u16;
+    if col < chat.width {
+        let style = Style::default().fg(theme.success);
+        buffer.set_stringn(chat.x + col, chat.y + row as u16, "✓ copied", (chat.width - col) as usize, style);
+    }
+}
+
 pub fn paint_selection(
     buffer: &mut Buffer,
     chat: Rect,

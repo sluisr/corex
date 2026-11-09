@@ -5,6 +5,8 @@
 //! command line run as background tasks and report through `FleetDialogState::task_rx`, which
 //! `poll_tasks` drains once per loop iteration, so the keyboard answers while SSH works.
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -201,6 +203,9 @@ fn selector_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab => app.fleet_dialog.select_next(),
         KeyCode::BackTab => app.fleet_dialog.select_prev(),
+        KeyCode::Char('s') | KeyCode::Char('S') if ctrl => {
+            app.fleet_dialog.cycle_source_filter();
+        }
         KeyCode::Up | KeyCode::Char('k') if app.fleet_dialog.search_query.is_empty() || key.code == KeyCode::Up => {
             app.fleet_dialog.select_prev();
         }
@@ -238,6 +243,12 @@ fn keep_selection_in_filter(app: &mut App) {
 /// Keys for a connected server: straight to the remote shell when a PTY is live, else the
 /// simulated terminal (command line, remote completion, scrolling).
 fn terminal_key(app: &mut App, key: KeyEvent) {
+    if app.fleet_dialog.reconnect.is_some() {
+        if key.code == KeyCode::Esc {
+            cancel_reconnect(app);
+        }
+        return;
+    }
     if let Some(ref pty) = app.fleet_dialog.pty_session {
         if !pty.is_alive() {
             app.fleet_dialog.pty_session = None;
@@ -392,7 +403,7 @@ fn run_typed_command(app: &mut App) {
     let tx = app.fleet_dialog.cmd_done_tx.clone();
     let nid = sess.node.id.clone();
     tokio::spawn(async move {
-        let _ = sess.execute_command(&cmd, CommandInitiator::User, false, 20).await;
+        let _ = sess.execute_command(&cmd, CommandInitiator::User, false, 20, false).await;
         corex_fleet::global_session_manager().set_session(nid.clone(), sess.clone()).await;
         let _ = tx.send((nid, sess));
     });
@@ -501,7 +512,7 @@ fn spawn_approved(app: &mut App, pending: PendingRemoteApproval, command: String
             }
         };
         let result = session
-            .execute_command(&command, CommandInitiator::AI, pending.sudo, 15)
+            .execute_command(&command, CommandInitiator::AI, pending.sudo, 15, false)
             .await
             .map_err(|e| e.to_string());
         if result.is_ok() {
@@ -631,6 +642,103 @@ pub(super) fn echo_remote_command(app: &App, call_id: &str) {
     pty.feed_text(&format!("\r\n\x1b[1;33m› [corex] {}$ {}\x1b[0m\r\n", target, command.replace('\n', "\r\n")));
 }
 
+const SSH_CONNECTION_ERROR: u32 = 255;
+const RECONNECT_DELAYS_SECS: [u64; 5] = [2, 5, 10, 20, 30];
+const RECONNECT_SETTLE: Duration = Duration::from_secs(1);
+const RECONNECT_ATTEMPT_LIMIT: Duration = Duration::from_secs(15);
+
+fn reconnect_delay(attempt: usize) -> Duration {
+    Duration::from_secs(RECONNECT_DELAYS_SECS[attempt.min(RECONNECT_DELAYS_SECS.len() - 1)])
+}
+
+pub(super) fn watch_pty(app: &mut App) -> bool {
+    if !app.fleet_dialog.is_open {
+        return false;
+    }
+    if app.fleet_dialog.reconnect.is_some() {
+        return step_reconnect(app);
+    }
+    let Some(pty) = app.fleet_dialog.pty_session.as_ref() else { return false };
+    let Some(code) = pty.exit_code() else { return false };
+    let node_id = pty.node_id.clone();
+    let node = app
+        .fleet_dialog
+        .active_session
+        .as_ref()
+        .map(|s| s.node.clone())
+        .filter(|n| n.id == node_id)
+        .or_else(|| app.fleet_dialog.items.iter().map(|i| i.config.clone()).find(|n| n.id == node_id));
+    match node {
+        Some(node) if code == SSH_CONNECTION_ERROR => {
+            pty.feed_text(&format!("\r\n\x1b[1;31m› [corex] Connection to {} lost.\x1b[0m\r\n", node.id));
+            app.fleet_dialog.reconnect = Some(crate::fleet_dialog::PtyReconnect {
+                node,
+                attempt: 0,
+                next_try: Instant::now() + reconnect_delay(0),
+                candidate: None,
+            });
+            step_reconnect(app);
+        }
+        _ => {
+            app.fleet_dialog.pty_session = None;
+            app.fleet_dialog.active_session = None;
+            app.fleet_dialog.status_msg = Some(format!("Disconnected from {}.", node_id));
+        }
+    }
+    true
+}
+
+fn step_reconnect(app: &mut App) -> bool {
+    let dialog = &mut app.fleet_dialog;
+    let Some(r) = dialog.reconnect.as_mut() else { return false };
+    let now = Instant::now();
+    if let Some((candidate, started)) = r.candidate.as_ref() {
+        let gave_up = started.elapsed() >= RECONNECT_ATTEMPT_LIMIT;
+        if candidate.exit_code().is_some() || gave_up {
+            r.candidate = None;
+            r.attempt += 1;
+            r.next_try = now + reconnect_delay(r.attempt);
+        } else if candidate.has_output() && started.elapsed() >= RECONNECT_SETTLE {
+            let (candidate, _) = r.candidate.take().expect("checked above");
+            let node_id = r.node.id.clone();
+            dialog.pty_session = Some(candidate);
+            dialog.reconnect = None;
+            dialog.status_msg = Some(format!("Reconnected to {}.", node_id));
+            return true;
+        }
+    } else if now >= r.next_try {
+        match crate::fleet_pty::FleetPtySession::spawn(&r.node, 24, 80) {
+            Ok(candidate) => r.candidate = Some((candidate, now)),
+            Err(err) => {
+                let node_id = r.node.id.clone();
+                dialog.reconnect = None;
+                dialog.pty_session = None;
+                dialog.active_session = None;
+                dialog.status_msg = Some(format!("Could not reconnect to {} ({}).", node_id, err));
+                return true;
+            }
+        }
+    }
+    let status = match &r.candidate {
+        Some(_) => format!("Reconnecting to {} (attempt {})… Esc to cancel", r.node.id, r.attempt + 1),
+        None => format!(
+            "Connection to {} lost: reconnecting in {}s. Esc to cancel",
+            r.node.id,
+            r.next_try.saturating_duration_since(now).as_secs() + 1
+        ),
+    };
+    let changed = dialog.status_msg.as_deref() != Some(status.as_str());
+    dialog.status_msg = Some(status);
+    changed
+}
+
+fn cancel_reconnect(app: &mut App) {
+    let Some(r) = app.fleet_dialog.reconnect.take() else { return };
+    app.fleet_dialog.pty_session = None;
+    app.fleet_dialog.active_session = None;
+    app.fleet_dialog.status_msg = Some(format!("Stopped reconnecting to {}.", r.node.id));
+}
+
 /// Returns the live SSH session for the selected node when there is one. Otherwise it starts
 /// connecting in the background and returns `None`: `on_connected` picks the session up.
 pub(super) fn ensure_session(app: &mut App) -> Option<RemoteSession> {
@@ -667,6 +775,7 @@ pub(super) fn ensure_session(app: &mut App) -> Option<RemoteSession> {
 
 /// Opens the interactive terminal pane for `node`, saying in the status line why it could not.
 fn spawn_pty(app: &mut App, node: &corex_fleet::NodeConfig, fallback: &str) {
+    app.fleet_dialog.reconnect = None;
     match crate::fleet_pty::FleetPtySession::spawn(node, 24, 80) {
         Ok(pty) => app.fleet_dialog.pty_session = Some(pty),
         Err(err) => {
@@ -717,5 +826,62 @@ mod tests {
         assert_eq!(split_streams(both), ("line one\nline two\n", "warn\n"));
         assert_eq!(split_streams("--- STDOUT ---\nonly\n"), ("only\n", ""));
         assert_eq!(split_streams("no markers"), ("no markers", ""));
+    }
+
+    fn offline_node() -> corex_fleet::NodeConfig {
+        corex_fleet::NodeConfig {
+            id: "offline".to_string(),
+            name: None,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            user: "nobody".to_string(),
+            key_path: None,
+            auth: corex_fleet::AuthMethod::Agent,
+            tags: vec![],
+            sudo: false,
+            proxy_jump: None,
+            source: corex_fleet::NodeSource::Fleet,
+        }
+    }
+
+    async fn wait_for_exit(pty: &crate::fleet_pty::FleetPtySession) {
+        let started = Instant::now();
+        while pty.exit_code().is_none() {
+            assert!(started.elapsed() < Duration::from_secs(10), "ssh never exited");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_terminal_reconnects_until_esc() {
+        crate::test_support::isolate_home();
+        let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, std::path::PathBuf::from("/tmp"), false);
+        let node = offline_node();
+        let pty = crate::fleet_pty::FleetPtySession::spawn(&node, 24, 80).unwrap();
+        wait_for_exit(&pty).await;
+        assert_eq!(pty.exit_code(), Some(SSH_CONNECTION_ERROR));
+        app.fleet_dialog.is_open = true;
+        app.fleet_dialog.active_session = Some(RemoteSession::new(node));
+        app.fleet_dialog.pty_session = Some(pty);
+
+        assert!(watch_pty(&mut app));
+        assert!(app.fleet_dialog.reconnect.is_some());
+        assert!(app.fleet_dialog.pty_session.is_some(), "the last screen stays visible");
+        let status = app.fleet_dialog.status_msg.clone().unwrap_or_default();
+        assert!(status.contains("Connection to offline lost: reconnecting in"), "{status}");
+
+        app.fleet_dialog.reconnect.as_mut().unwrap().next_try = Instant::now();
+        watch_pty(&mut app);
+        let candidate = &app.fleet_dialog.reconnect.as_ref().unwrap().candidate;
+        wait_for_exit(&candidate.as_ref().expect("a new attempt started").0).await;
+        watch_pty(&mut app);
+        let r = app.fleet_dialog.reconnect.as_ref().unwrap();
+        assert!(r.candidate.is_none() && r.attempt == 1, "a failed attempt waits longer");
+
+        terminal_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.fleet_dialog.reconnect.is_none());
+        assert!(app.fleet_dialog.pty_session.is_none() && app.fleet_dialog.active_session.is_none());
+        assert_eq!(app.fleet_dialog.status_msg.as_deref(), Some("Stopped reconnecting to offline."));
     }
 }

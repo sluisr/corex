@@ -40,9 +40,12 @@ pub use terminal::*;
 pub mod summary;
 pub use summary::*;
 pub mod render;
+pub(crate) mod browser_run;
 pub use render::*;
 pub mod event_loop;
 mod commands;
+pub(crate) mod copy;
+mod export;
 mod undo;
 pub use event_loop::*;
 
@@ -114,6 +117,8 @@ impl App {
             selection_lines: SelectionLines::default(),
             drag_point: None,
             copy_notice: None,
+            copied_block: None,
+            copy_headers: Default::default(),
             inside_tmux: std::env::var_os("TMUX").is_some(),
             app_start_time: Instant::now(),
             last_focus_gained: None,
@@ -125,6 +130,8 @@ impl App {
             git_branch: branch,
             last_turn_start: None,
             last_esc_press: None,
+            launched_at: Instant::now(),
+            prompts_this_run: 0,
             last_ctrl_c_press: None,
             last_ctrl_z_press: None,
             undo: undo::ComposerUndo::default(),
@@ -140,6 +147,7 @@ impl App {
             context_files_checked: None,
             last_file_query: None,
             last_query_is_folder: false,
+            term_width: 80,
             local_llm_online: is_online,
             last_local_check: None,
             cached_message_lines: Vec::new(),
@@ -149,6 +157,7 @@ impl App {
             cached_session_id: String::new(),
             cached_logs_expanded: false,
             cached_has_collapsed_logs: false,
+            message_clock: Default::default(),
             streaming_md_cache: Vec::new(),
             streaming_md_cache_len: 0,
             streaming_md_cache_width: 0,
@@ -176,6 +185,11 @@ impl App {
                 None => app.session.add_message(Message::system(format!(
                     "user_color \"{raw}\" in settings.json is not a #rrggbb colour; your messages keep the default."
                 ))),
+            }
+        }
+        if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+            if let Err(why) = export::exports_root(cfg.exports_dir.as_deref(), &home) {
+                app.session.add_message(Message::system(format!("{why}; /export saves to ~/.corex/exports until it is fixed.")));
             }
         }
         app.trigger_local_health_check();
@@ -383,6 +397,11 @@ impl App {
 
         if is_point_click && !is_focus_activation && !is_startup_grace {
             let (line_idx, char_col) = selection.anchor;
+            if let Some(number) = self.copy_number_at(line_idx) {
+                self.clear_selection();
+                self.copy_block(Some(number));
+                return;
+            }
             if let Some(line) = self.selection_lines.get(line_idx) {
                 if let Some(url) = formatting::find_url_in_line(line, Some(char_col as usize)) {
                     let already_opened_recently = self.last_url_open
@@ -486,18 +505,24 @@ impl App {
         };
         let ((start_line, start_col), (end_line, end_col)) = selection.ordered();
         let mut out = String::new();
+        let multi_line = start_line != end_line;
 
         for line_idx in start_line..=end_line {
             let Some(line) = self.selection_lines.get(line_idx) else {
                 continue;
             };
-            if line_idx > start_line {
-                out.push('\n');
+            if multi_line && crate::markdown::is_copy_header(line) {
+                continue;
             }
             let from = if line_idx == start_line { start_col } else { 0 };
             let to = if line_idx == end_line { end_col } else { u16::MAX };
             let (first_char, last_char) = char_range_for_display_columns(line, from, to);
-            out.extend(line.chars().skip(first_char).take(last_char.saturating_sub(first_char)));
+            let piece: String = line.chars().skip(first_char).take(last_char.saturating_sub(first_char)).collect();
+            let (piece, wrapped) = strip_code_rail(&piece, from == 0);
+            if line_idx > start_line && !wrapped && !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(piece);
         }
         out
     }
@@ -549,7 +574,7 @@ impl App {
         if self.history_idx.is_some() {
             return None;
         }
-        crate::file_completion::at_token(&self.input_buffer, self.cursor_idx).map(|(_, q)| q.to_string())
+        crate::file_completion::at_token(&self.input_buffer, self.cursor_idx).map(|(_, q)| crate::file_completion::token_query(q))
     }
 
     /// The folder being typed after `/directory add`, unless the user is browsing history.
@@ -700,6 +725,7 @@ impl App {
         let (start, replacement) = if let Some((start, _)) = crate::file_completion::dir_arg_token(&self.input_buffer, self.cursor_idx) {
             (start, path.to_string())
         } else if let Some((start, _)) = crate::file_completion::at_token(&self.input_buffer, self.cursor_idx) {
+            let path = crate::file_completion::escape_path(path);
             (start, if path.ends_with('/') { format!("@{}", path) } else { format!("@{} ", path) })
         } else {
             return;
@@ -726,7 +752,8 @@ impl App {
         }
 
         if let Some(files) = self.file_completions() {
-            return (files.len().max(1) as f32 + 2.0).min(10.0);
+            let detail = crate::file_completion::detail_rows(&files, self.term_width);
+            return files.len().clamp(1, 8) as f32 + 2.0 + detail as f32;
         }
 
         let count = self.matching_slash_commands().len();
@@ -1009,6 +1036,7 @@ impl App {
     pub fn user_message(&mut self, text: String) -> Message {
         use base64::Engine;
 
+        self.prompts_this_run += 1;
         let images: Vec<_> = image_tag_ids(&text)
             .into_iter()
             .filter_map(|id| self.images.remove(&id))
@@ -1072,25 +1100,7 @@ impl App {
         }
         match clipboard::read_image() {
             Ok(Some(image)) => {
-                self.clamp_cursor();
-                let id = self.next_image_id;
-                self.next_image_id += 1;
-                self.images.insert(id, image);
-                let tag = format!("[Image #{}] ", id);
-                self.input_buffer.insert_str(self.cursor_idx, &tag);
-                self.cursor_idx += tag.len();
-                self.slash_selected_idx = 0;
-                self.last_esc_press = None;
-                let cfg = self.llm_client.get_config();
-                if !cfg.can_see_images() {
-                    self.session.add_message(Message::system(format!(
-                        "{} cannot see images: it will only read a note where [Image #{}] is. \
-                         Switch with /model to Claude, GPT-4o or Gemini to have it look at the picture.",
-                        cfg.model,
-                        id
-                    )));
-                    self.invalidate_message_cache();
-                }
+                self.attach_image(image);
                 true
             }
             Ok(None) => false,
@@ -1102,13 +1112,60 @@ impl App {
         }
     }
 
-    /// Ctrl+V: the clipboard image if there is one, otherwise its text.
+    fn attach_image(&mut self, image: clipboard::ClipboardImage) {
+        self.clamp_cursor();
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.images.insert(id, image);
+        let tag = format!("[Image #{}] ", id);
+        self.input_buffer.insert_str(self.cursor_idx, &tag);
+        self.cursor_idx += tag.len();
+        self.slash_selected_idx = 0;
+        self.last_esc_press = None;
+        let cfg = self.llm_client.get_config();
+        if !cfg.can_see_images() {
+            self.session.add_message(Message::system(format!(
+                "{} cannot see images: it will only read a note where [Image #{}] is. \
+                 Switch with /model to Claude, GPT-4o or Gemini to have it look at the picture.",
+                cfg.model,
+                id
+            )));
+            self.invalidate_message_cache();
+        }
+    }
+
+    pub fn paste_image_files(&mut self, text: &str) -> bool {
+        if !self.composer_takes_paste() {
+            return false;
+        }
+        let Some(paths) = clipboard::image_files_in(text) else { return false };
+        for path in paths {
+            match clipboard::read_image_file(&path) {
+                Ok(image) => self.attach_image(image),
+                Err(err) => {
+                    self.session.add_message(Message::system(format!("Could not attach {}: {}", path.display(), err)));
+                    self.invalidate_message_cache();
+                }
+            }
+        }
+        true
+    }
+
+    pub fn paste_clipboard_text(&mut self) {
+        if let Some(text) = clipboard::read_text().filter(|t| !t.is_empty()) {
+            self.handle_paste(text);
+        }
+    }
+
+    /// Ctrl+V: the clipboard image if there is one, then an image file it names, otherwise its text.
     pub fn paste_from_clipboard(&mut self) {
         if self.paste_clipboard_image() {
             return;
         }
         if let Some(text) = clipboard::read_text().filter(|t| !t.is_empty()) {
-            self.handle_paste(text);
+            if !self.paste_image_files(&text) {
+                self.handle_paste(text);
+            }
         }
     }
 
@@ -1130,6 +1187,8 @@ impl App {
             }
         } else if self.pending_confirmation.is_none() {
             self.clamp_cursor();
+            // Some terminals end pasted lines with a bare CR.
+            let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
             let line_count = pasted.lines().count();
             if line_count > 1 || pasted.len() > 120 {
                 let id = self.next_paste_id;
@@ -1434,6 +1493,18 @@ impl App {
             self.scroll_to_bottom();
         }
         self.fleet_dialog.close();
+    }
+}
+
+// Code rows carry a rail the reader should not paste; a wrapped row continues the previous line.
+fn strip_code_rail(piece: &str, from_line_start: bool) -> (&str, bool) {
+    if !from_line_start {
+        return (piece, false);
+    }
+    if let Some(rest) = piece.strip_prefix(crate::markdown::CODE_RAIL_WRAPPED) {
+        (rest, true)
+    } else {
+        (piece.strip_prefix(crate::markdown::CODE_RAIL).unwrap_or(piece), false)
     }
 }
 

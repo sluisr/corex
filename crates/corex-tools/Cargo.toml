@@ -11,6 +11,7 @@ description = "Autonomous developer tools, diff patch engine, and system sandbox
 
 [dependencies]
 corex-core = { workspace = true }
+corex-browser = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 serde = { workspace = true }

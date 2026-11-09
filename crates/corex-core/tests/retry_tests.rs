@@ -37,6 +37,7 @@ async fn flaky_server_with_body(failures: usize, status: &'static str, error_bod
                     let events = [
                         r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hola"},"finish_reason":null}]}"#,
                         r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                        r#"{"choices":[],"usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":4,"completion_tokens":2,"total_tokens":12}}"#,
                         "[DONE]",
                     ];
                     let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
@@ -74,6 +75,20 @@ async fn collect(client: &LlmClient, cancel: CancellationToken) -> (String, Vec<
         }
     }
     (text, notices, errors)
+}
+
+#[tokio::test]
+async fn every_clone_of_the_client_adds_to_one_meter() {
+    let (url, _) = flaky_server(0, "200 OK").await;
+    let main = client(&url);
+    let subagent = main.clone();
+    collect(&main, CancellationToken::new()).await;
+    collect(&subagent, CancellationToken::new()).await;
+    let spend = main.spend();
+    assert_eq!(spend.usage.prompt_tokens, 20);
+    assert_eq!(spend.usage.prompt_cache_hit_tokens, 8);
+    assert_eq!(spend.usage.total_tokens, 24);
+    assert_eq!(spend.unpriced_tokens, 24);
 }
 
 #[tokio::test]

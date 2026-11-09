@@ -7,7 +7,9 @@ description: >-
   are stored. Trigger phrases: 'config', 'configuracion', 'archivos de configuracion',
   'donde configurar', 'personalidad', 'comandos permitidos', 'safe_commands',
   'fleet.toml', 'system.md', 'corex.md', 'agents.md', 'deepseek.md', 'settings',
-  'como personalizar', 'memory', 'memoria', '/memory', 'instrucciones ignoradas'.
+  'como personalizar', 'memory', 'memoria', '/memory', 'instrucciones ignoradas',
+  'exportar', 'exportaciones', 'exports', 'exports_dir', 'carpeta de exportaciones',
+  'donde se guardan los chats exportados', 'cambiar ruta de exportacion'.
 ---
 
 # Corex Configuration & Customization Guide
@@ -20,11 +22,12 @@ Corex uses a clear, human-readable hierarchy of configuration files in **TOML** 
 
 |File | Scope | Format | Purpose |
 |:--- | :--- | :--- | :--- |
-|**`~/.corex/SYSTEM.md`** *(+ `~/.corex/COREX.md`, `~/.deepseek/DEEPSEEK.md`)* | **Global** | Markdown | **User Personality & Global Rules**: custom tone, role instructions, language, conventions applied to all projects and sessions. |
+|**`~/.corex/SYSTEM.md`** *(+ `~/.corex/COREX.md`)* | **Global** | Markdown | **User Personality & Global Rules**: custom tone, role instructions, language, conventions applied to all projects and sessions. |
 |**`.corex/SYSTEM.md`** *(+ `./COREX.md`, `./AGENTS.md`, `./DEEPSEEK.md`)* | **Project Local** | Markdown | **Project Instructions**: repository-specific architecture, build commands, and rules. |
 |**`~/.corex/fleet.toml`** *(or `.corex/fleet.toml`)* | **Global or Local** | TOML | **Remote Fleet & Allowed Commands**: SSH server inventory, `safe_commands` (auto-approved commands), and `dangerous_commands`. A workspace `.corex/fleet.toml` only contributes servers: its command lists are ignored and its servers always ask before Corex reaches them. |
 |**`~/.corex/settings.json`** | **Global** | JSON | **Corex Engine Settings**: active model and provider, reasoning effort, temperature, YOLO mode default, allowed commands. Only values that differ from the defaults are written. |
 |**System keyring** (`corex` / `credentials`) | **Global** | JSON secret | **API keys**: kept in GNOME Keyring/KWallet (Secret Service), macOS Keychain or Windows Credential Manager. Where no keyring answers, or with `COREX_KEYRING=0`, they go to `~/.corex/credentials.json` (mode 600). Never edit or print them; to change a key the user runs `/key`. |
+|**`~/.corex/exports/`** | **Global** | Folder | **Exported chats**: what `/export` writes, one folder per project. Moved elsewhere with `exports_dir` in `settings.json` (see section 3). |
 |**`~/.ssh/config`** | **System** | OpenSSH | Fallback server discovery for Fleet mode. |
 
 Every instruction file found is loaded, global first and then project, in the order listed. Use `/memory list` to see which are in use and `/memory reload` after editing one.
@@ -59,12 +62,11 @@ Corex's memory is the set of instruction files you write, plus the notes saved w
 
 1. `~/.corex/SYSTEM.md`
 2. `~/.corex/COREX.md`
-3. `~/.deepseek/DEEPSEEK.md`
-4. `./.corex/SYSTEM.md`
-5. `./COREX.md`
-6. `./AGENTS.md`
-7. `./DEEPSEEK.md`
-8. `~/.corex/projects/<workspace path>/MEMORY.md` (private project notes, never inside the repository)
+3. `./.corex/SYSTEM.md`
+4. `./COREX.md`
+5. `./AGENTS.md`
+6. `./DEEPSEEK.md`
+7. `~/.corex/projects/<workspace path>/MEMORY.md` (private project notes, never inside the repository)
 
 Project files are read from the directory where `cx` was started, not from parent directories. Each file is capped at 20,000 bytes.
 
@@ -182,10 +184,35 @@ Your messages are labelled with the login of the machine (`$USER`) and drawn in 
 
 When the user asks to change their name or the colour of their messages, edit these keys in `~/.corex/settings.json` (keep the other keys as they are) and tell them to restart `cx`: settings are read at startup.
 
+### Where `/export` saves chats (`exports_dir`)
+By default `/export` writes to `~/.corex/exports/<project>/`, where `<project>` is the name of the folder `cx` was started in (`home` when started in the home folder). Files are named by date and chat title, such as `2026-11-09_22-50_check-the-disk.md`, and an export never overwrites an earlier one (`-2`, `-3`… is added).
+
+To keep them somewhere else, set `exports_dir` in the global `~/.corex/settings.json`:
+```json
+{
+  "exports_dir": "~/Documents/corex"
+}
+```
+* The value must be a full path: absolute (`/data/chats`) or starting with `~/`. A relative path such as `chats` is rejected.
+* It must be a folder. If it does not exist yet, Corex creates it on the first export.
+* The per-project folders and file names stay the same inside it.
+* It is read on every `/export`, so a change applies at once, without restarting.
+* If the value is invalid (relative, or pointing at a file), Corex says so at startup and in the export message, and saves to `~/.corex/exports` meanwhile. Nothing is lost.
+* `/export <path>` still saves one export to a given folder or file, without changing the setting.
+
+When the user asks to change where exports go:
+1. Work out the folder they mean and write it as a full path (`~/Documents/corex`, not `Documents/corex`). Ask only if it is really unclear.
+2. Check it is not an existing file. Create it with `mkdir -p` if it does not exist, so a typo shows up now rather than on the next export.
+3. Set `exports_dir` in `~/.corex/settings.json`, keeping every other key as it is. To go back to the default, remove the key.
+4. Tell them where the next export will land, for example `~/Documents/corex/cx/`. No restart is needed.
+
+Do not move earlier exports unless the user asks; if they do, move the per-project folders from the old location into the new one.
+
 ---
 
 ## 4. Quick Commands
 * `/yolo on` / `/yolo off`: Enable or disable interactive confirmations on the fly.
 * `/model`: Open interactive model selector.
 * `/fleet`: Open the dual-pane Fleet console.
+* `/export [md|txt|html] [full] [path]`: Save the chat to the exports folder (see section 3).
 * `/info`: Show active environment, workspace, and config paths.

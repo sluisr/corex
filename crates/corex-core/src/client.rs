@@ -166,6 +166,7 @@ pub struct LlmClient {
     config: Arc<Mutex<Config>>,
     reasoning_cache: ReasoningCache,
     local_client: Arc<Mutex<crate::local_client::LocalLlmClient>>,
+    meter: crate::pricing::UsageMeter,
 }
 
 impl LlmClient {
@@ -188,6 +189,7 @@ impl LlmClient {
             config: Arc::new(Mutex::new(config.clone())),
             reasoning_cache: ReasoningCache::new(),
             local_client: Arc::new(Mutex::new(local_client)),
+            meter: crate::pricing::UsageMeter::default(),
         };
         client.look_up_context_window(&config);
         client
@@ -805,6 +807,19 @@ impl LlmClient {
                     .await
                 {
                     if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                        if let Some(u) = json_resp.get("usage") {
+                            let field = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                            let hit = field("cache_read_input_tokens");
+                            let miss = field("input_tokens") + field("cache_creation_input_tokens");
+                            let out = field("output_tokens");
+                            self.record_usage(&cfg.model, &Usage {
+                                prompt_tokens: hit + miss,
+                                prompt_cache_hit_tokens: hit,
+                                prompt_cache_miss_tokens: miss,
+                                completion_tokens: out,
+                                total_tokens: hit + miss + out,
+                            });
+                        }
                         if let Some(text) = json_resp
                             .get("content")
                             .and_then(|c| c.as_array())
@@ -841,6 +856,9 @@ impl LlmClient {
                     .await
                 {
                     if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                        if let Some(usage) = json_resp.get("usage").and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok()) {
+                            self.record_usage(&target_model, &usage);
+                        }
                         if let Some(text) = json_resp
                             .get("choices")
                             .and_then(|c| c.get(0))
@@ -971,7 +989,38 @@ impl LlmClient {
         );
     }
 
+    pub fn spend(&self) -> crate::pricing::Spend {
+        self.meter.spend()
+    }
+
+    fn record_usage(&self, model: &str, usage: &Usage) {
+        let cfg = self.get_config();
+        self.meter.record(usage, crate::pricing::rates_for(&cfg, model));
+    }
+
     pub async fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancel_token: CancellationToken,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let mut inner = self.stream_chat_retrying(messages, tools, cancel_token).await?;
+        let (tx, out) = mpsc::channel::<StreamEvent>(100);
+        let client = self.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = inner.recv().await {
+                if let StreamEvent::UsageUpdate(ref usage) = ev {
+                    client.record_usage(&client.get_config().model, usage);
+                }
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(out)
+    }
+
+    async fn stream_chat_retrying(
         &self,
         messages: Vec<Message>,
         tools: Option<Vec<ToolDefinition>>,
@@ -1109,6 +1158,7 @@ impl LlmClient {
                 });
                 Self::cap_history_with_limit(&mut messages, Self::LOCAL_HISTORY_TOKEN_LIMIT);
                 Self::sanitize_tool_call_sequences(&mut messages);
+                crate::context_prune::collapse_stale_browser_snapshots(&mut messages);
                 Self::truncate_tool_outputs(&mut messages);
                 crate::language::sanitize_messages_cjk_drift(&mut messages);
 
@@ -1181,6 +1231,7 @@ impl LlmClient {
         if cfg.provider_kind() == crate::providers::ProviderKind::Google {
             Self::sanitize_for_google_tool_calls(&mut messages);
         }
+        crate::context_prune::collapse_stale_browser_snapshots(&mut messages);
         Self::truncate_tool_outputs(&mut messages);
         crate::language::sanitize_messages_cjk_drift(&mut messages);
 

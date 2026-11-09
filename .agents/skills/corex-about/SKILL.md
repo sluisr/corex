@@ -53,12 +53,14 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 - **Forensic telemetry** — TTFT, tokens/sec, USD cost per turn
 - **Silent sudo / 0ms AskPass** — native non-blocking auth
 - **MCP support** — connect external tools, databases, GitHub, Docker
+- **Browser control** — works in tabs of your own browser through the [Corex Browser Bridge](https://chromewebstore.google.com/detail/pgbencaoenigjeekljfindfeaolenaip) extension (Linux and macOS)
+- **Copy & export** — `⧉ copy` on every code block, `/export` to Markdown, text or HTML in `~/.corex/exports/`
 
 ---
 
 ## Current Status
 
-- **Version:** `0.10.1` (actively developed)
+- **Version:** `0.11.0` (actively developed)
 - **License:** GNU AGPLv3 (`AGPL-3.0-only`) with dual-licensing options
 - **Platforms:** Linux, macOS, Windows
 
@@ -71,6 +73,7 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 |Repository | https://github.com/sluisr/corex |
 |Releases | https://github.com/sluisr/corex/releases |
 |Bug Reports | https://github.com/sluisr/corex/issues |
+|Browser extension | https://chromewebstore.google.com/detail/pgbencaoenigjeekljfindfeaolenaip |
 |Author site | https://sluisr.com |
 
 ---

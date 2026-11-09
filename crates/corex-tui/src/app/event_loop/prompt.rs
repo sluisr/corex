@@ -94,6 +94,8 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.clamp_cursor();
             }
         }
+        KeyCode::Char('v' | 'V') if alt && !ctrl => app.paste_clipboard_text(),
+        KeyCode::Char('y' | 'Y') if alt && !ctrl => app.copy_block(None),
         KeyCode::Char(c) if ctrl || c.is_control() => match c {
             'a' | 'A' | '\x01' => app.cursor_idx = 0,
             'e' | 'E' | '\x05' => app.cursor_idx = app.input_buffer.len(),
@@ -153,8 +155,6 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.stop_user_shell();
             } else if is_slash_open {
                 clear_prompt(app);
-            } else if app.fleet_dialog.is_open && !app.fleet_dialog.command_mode {
-                app.exit_fleet_mode();
             } else if !app.auto_scroll {
                 // 1st ESC when scrolled up -> jump straight to bottom without modifying input buffer!
                 app.scroll_to_bottom();
@@ -449,7 +449,12 @@ fn show_history_entry(app: &mut App, idx: usize) {
 /// Byte index where the word ending at the end of `before` starts (spaces before the cursor are
 /// skipped), as Ctrl+Left and Ctrl+W use it.
 fn word_start(before: &str) -> usize {
-    before.trim_end().rfind(' ').map_or(0, |pos| pos + 1)
+    let before = before.trim_end();
+    before
+        .match_indices(' ')
+        .rev()
+        .find(|&(pos, _)| !before[..pos].ends_with('\\'))
+        .map_or(0, |(pos, _)| pos + 1)
 }
 
 /// Byte index of the last character of `before`.
@@ -619,6 +624,91 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn code_blocks_are_numbered_and_copy_cleanly() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-copy-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            let reply = |text: &str| corex_core::types::Message { role: "assistant".to_string(), ..corex_core::types::Message::user(text) };
+            let long = format!("echo {}", "x".repeat(150));
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT), &tx).await;
+            assert_eq!(last_text(&app), "No code blocks in this chat yet.");
+            app.session.add_message(corex_core::types::Message::user("give me commands"));
+            app.session.add_message(reply("First:\n```bash\nsudo apt update\n```"));
+            app.session.add_message(reply(&format!("Then:\n```\n{long}\nreboot\n```")));
+            app.invalidate_message_cache();
+
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("  ▎ bash  ⧉ copy") && all.contains("  ▎ ⧉ copy"), "{all}");
+            assert!(!all.contains("[1]") && !all.contains("[2]"), "{all}");
+
+            app.copied_block = Some((1, Instant::now()));
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("  ▎ bash  ✓ copied") && all.contains("  ▎ ⧉ copy"), "{all}");
+            app.copied_block = None;
+
+            let lines: Vec<String> = (0..2000).map_while(|i| app.selection_lines.get(i).cloned()).collect();
+            let header = app.copy_header_line(2).unwrap();
+            assert_eq!(app.copy_number_at(header), Some(2));
+            assert_eq!(app.copy_number_at(app.copy_header_line(1).unwrap()), Some(1));
+            assert_eq!(app.copy_number_at(header + 1), None);
+            let last = lines.iter().position(|l| l.ends_with("reboot")).unwrap();
+            app.selection = Some(crate::app::state::Selection { anchor: (header, 0), cursor: (last, u16::MAX) });
+            assert_eq!(app.selection_text(), format!("{long}\nreboot"));
+
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx).await;
+            assert!(last_text(&app).contains("Alt+Y"), "{}", last_text(&app));
+
+
+            type_text(&mut app, "/export html full", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            let note = last_text(&app);
+            let path = note.strip_prefix("Chat exported to ").and_then(|r| r.split(".html").next()).map(|p| format!("{p}.html"));
+            let html = std::fs::read_to_string(path.as_deref().unwrap_or("")).unwrap_or_else(|_| panic!("{note}"));
+            assert!(html.contains("sudo apt update") && html.contains("reboot") && !html.contains("Ctrl+P"), "{html}");
+            assert!(note.contains("Ctrl+P"), "{note}");
+            let home = std::env::var("HOME").unwrap();
+            let folder = format!("{home}/.corex/exports/corex-e2e-copy-{}/", std::process::id());
+            let path = path.unwrap();
+            assert!(path.starts_with(&folder) && path.ends_with("_give-me-commands.html"), "{path}");
+
+            type_text(&mut app, "/export html", &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+            let again = last_text(&app);
+            assert!(again.contains("_give-me-commands-2.html") || again.contains(&folder), "{again}");
+            assert!(!again.contains(&path), "the first export is kept: {again}");
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
+        async fn esc_never_leaves_fleet_mode() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-fleet-esc-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            app.enter_fleet_mode();
+            app.fleet_dialog.is_open = true;
+            app.fleet_dialog.command_mode = false;
+
+            for _ in 0..5 {
+                prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
+            }
+            assert!(app.fleet_dialog.is_open);
+            assert!(app.normal_session_stash.is_some());
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
         async fn directory_add_completes_folders() {
             crate::test_support::isolate_home();
             let home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap();
@@ -655,6 +745,180 @@ mod tests {
             prompt_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
             assert!(app.input_buffer.is_empty(), "Enter on a complete folder runs the command");
             assert!(last_text(&app).contains("Added") && last_text(&app).contains("Escritorio"), "{}", last_text(&app));
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
+        async fn a_pasted_image_file_path_attaches_the_image() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-imgpaste-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let photo = ws.join("Phone Photo 1.jpeg");
+            let shot = ws.join("shot.png");
+            std::fs::write(&photo, [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).unwrap();
+            std::fs::write(&shot, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 4, 5]).unwrap();
+            std::fs::write(ws.join("notes.txt"), "plain").unwrap();
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            let paste = crate::app::event_loop::handle_paste;
+
+            paste(&mut app, photo.display().to_string());
+            assert_eq!(app.input_buffer, "[Image #1] ", "the path of a copied file becomes the image");
+            assert_eq!(app.images[&1].media_type, "image/jpeg");
+
+            paste(&mut app, format!("{}\n{}\n", shot.display(), crate::file_completion::escape_path(&photo.display().to_string())));
+            assert_eq!(app.input_buffer, "[Image #1] [Image #2] [Image #3] ", "one tag per file");
+            assert_eq!(app.images[&2].media_type, "image/png");
+            assert_eq!(app.cursor_idx, app.input_buffer.len());
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            app.handle_paste(shot.display().to_string());
+            assert_eq!(app.input_buffer, shot.display().to_string(), "the plain-text paste (Alt+V) keeps the path as text");
+            assert_eq!(app.images.len(), 3, "and attaches nothing");
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            paste(&mut app, format!("{}\r{}\r", shot.display(), shot.display()));
+            assert_eq!(app.input_buffer, "[Image #4] [Image #5] ", "lines ended with a bare CR are lines too");
+            app.images.remove(&4);
+            app.images.remove(&5);
+            app.input_buffer = "[Image #1] [Image #2] [Image #3] ".to_string();
+            app.cursor_idx = app.input_buffer.len();
+
+            paste(&mut app, "one\rtwo\r\nthree".to_string());
+            assert_eq!(app.input_buffer, "[Image #1] [Image #2] [Image #3] [Pasted text #1 +2 lines]", "no raw CR reaches the prompt");
+            assert_eq!(app.pastes[&1], "one\ntwo\nthree");
+            app.input_buffer = "[Image #1] [Image #2] [Image #3] ".to_string();
+            app.cursor_idx = app.input_buffer.len();
+
+            paste(&mut app, "describe them".to_string());
+            let notes = ws.join("notes.txt").display().to_string();
+            paste(&mut app, notes.clone());
+            paste(&mut app, format!(" see {}", shot.display()));
+            assert_eq!(app.input_buffer, format!("[Image #1] [Image #2] [Image #3] describe them{notes} see {}", shot.display()), "anything else stays text");
+            assert_eq!(app.images.len(), 3);
+
+            let (_, rows) = screen(&mut app);
+            assert!(rows.join("\n").contains("[Image #1] [Image #2] [Image #3]"), "{}", rows.join("\n"));
+            let message = app.user_message("[Image #1] and [Image #3]".to_string());
+            let parts = match message.content {
+                Some(corex_core::types::MessageContent::Parts(parts)) => parts.len(),
+                _ => 0,
+            };
+            assert_eq!(parts, 3, "text plus the two images that are still referenced");
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            app.sudo_dialog.is_open = true;
+            paste(&mut app, shot.display().to_string());
+            assert!(app.input_buffer.is_empty() && app.images.len() == 1, "a dialog that asks for something else keeps the paste");
+            app.sudo_dialog.is_open = false;
+
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
+        async fn directory_add_reads_names_with_spaces_and_backslashes() {
+            crate::test_support::isolate_home();
+            let base = std::env::temp_dir().join(format!("corex-e2e-diradd-{}", std::process::id()));
+            let ws = base.join("ws");
+            let names = ["Shared Docs", "two  spaces dir", "odd\\tmp", "Raw Spaces", "Plain"];
+            std::fs::create_dir_all(&ws).unwrap();
+            for name in names {
+                std::fs::create_dir_all(base.join(name)).unwrap();
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            let root = base.display().to_string();
+            let enter = || KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            let added = |app: &App| app.extra_dirs.iter().map(|d| d.file_name().unwrap().to_str().unwrap().to_string()).collect::<Vec<_>>();
+
+            type_text(&mut app, &format!("/directory add {root}/Shared\\ Docs"), &tx).await;
+            prompt_key(&mut app, enter(), &tx).await;
+            assert_eq!(added(&app), ["Shared Docs"], "{}", last_text(&app));
+
+            type_text(&mut app, &format!("/directory add {root}/two\\ \\ spaces\\ dir, {root}/odd\\tmp"), &tx).await;
+            prompt_key(&mut app, enter(), &tx).await;
+            assert_eq!(added(&app), ["Shared Docs", "two  spaces dir", "odd\\tmp"], "a doubled space and a typed backslash survive: {}", last_text(&app));
+
+            type_text(&mut app, &format!("/directory add {root}/Raw Spaces"), &tx).await;
+            prompt_key(&mut app, enter(), &tx).await;
+            type_text(&mut app, &format!("/directory add {root}/Plain"), &tx).await;
+            prompt_key(&mut app, enter(), &tx).await;
+            assert_eq!(added(&app).len(), 5, "spaces typed as they are, and plain names, still work: {}", last_text(&app));
+            assert!(!last_text(&app).contains("Could not"), "{}", last_text(&app));
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[tokio::test]
+        async fn at_paths_with_spaces_and_long_paths() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-spaces-{}", std::process::id()));
+            let head = "Faculty_of_Engineering_and_Applied_Sciences/Department_of_Computing";
+            let deep = ws.join(head).join("engineering/semester_04/Software_Eng/Course_2/examinations/submission/last delivery");
+            std::fs::create_dir_all(&deep).unwrap();
+            for i in 1..=3 {
+                std::fs::write(deep.join(format!("Summary0{i}.pdf")), "").unwrap();
+            }
+            std::fs::create_dir_all(ws.join("Project Files/Sprint 1")).unwrap();
+            std::fs::write(ws.join("Project Files/Sprint 1/final notes.md"), "").unwrap();
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            let tab = || KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+            type_text(&mut app, "read @Proj", &tx).await;
+            wait_for_index(&mut app);
+            prompt_key(&mut app, tab(), &tx).await;
+            assert_eq!(app.input_buffer, "read @Project\\ Files/", "the space is escaped and the folder stays open");
+            let (terminal, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            assert!(all.contains("Project Files/Sprint 1/final notes.md"), "its contents are listed, names readable:\n{all}");
+            let prompt_row = rows.iter().position(|r| r.contains("> read @Proj")).expect("prompt row");
+            let end_col = rows[prompt_row].find("Files/").unwrap() as u16 + 5;
+            assert_eq!(
+                terminal.backend().buffer()[(end_col, prompt_row as u16)].fg,
+                app.theme.accent_purple,
+                "the colour follows the whole escaped name"
+            );
+
+            let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+            prompt_key(&mut app, down(), &tx).await;
+            prompt_key(&mut app, tab(), &tx).await;
+            assert_eq!(app.input_buffer, "read @Project\\ Files/Sprint\\ 1/");
+            prompt_key(&mut app, down(), &tx).await;
+            prompt_key(&mut app, tab(), &tx).await;
+            assert_eq!(app.input_buffer, "read @Project\\ Files/Sprint\\ 1/final\\ notes.md ", "a file ends the token");
+            assert!(app.file_query().is_none(), "nothing left to complete");
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            type_text(&mut app, "@Summary", &tx).await;
+            let (_, rows) = screen(&mut app);
+            let all = rows.join("\n");
+            for i in 1..=3 {
+                assert!(all.contains(&format!("submission/last delivery/Summary0{i}.pdf")), "every row ends in its own file:\n{all}");
+            }
+            assert!(all.contains("…/"), "the middle is what gives way:\n{all}");
+            let popup_rows = |rows: &[String]| rows.iter().filter(|r| r.contains("Summary0") && !r.contains('>')).count();
+            assert!(rows.iter().any(|r| r.contains(&format!("  {head}/engineering/"))), "the selected path is written out whole under the list:\n{all}");
+            let height = rows.iter().position(|r| r.contains("(1/")).unwrap();
+            let whole = format!("{}{}", rows[height - 2].trim(), rows[height - 1].trim());
+            assert_eq!(whole, format!("{head}/engineering/semester_04/Software_Eng/Course_2/examinations/submission/last delivery/Summary01.pdf"), "{all}");
+            assert!(rows[height - 2].trim().ends_with('/'), "the break falls after a folder:\n{all}");
+            assert_eq!(popup_rows(&rows), 3 + 1, "three rows plus the detail's last line");
+
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx).await;
+            let (_, rows) = screen(&mut app);
+            let height = rows.iter().position(|r| r.contains("(2/")).unwrap();
+            assert!(rows[height - 1].trim().ends_with("last delivery/Summary02.pdf"), "the detail follows the selection:\n{}", rows.join("\n"));
 
             let _ = std::fs::remove_dir_all(&ws);
         }
@@ -747,6 +1011,7 @@ mod tests {
     fn word_and_char_boundaries() {
         assert_eq!(word_start("git commit "), 4);
         assert_eq!(word_start("single"), 0);
+        assert_eq!(word_start("read @Project\\ Files/x"), 5, "an escaped space does not end the word");
         assert_eq!(prev_char_start("añ"), 1);
         assert_eq!(next_char_len("ñx"), 2);
         assert_eq!(next_char_len(""), 0);

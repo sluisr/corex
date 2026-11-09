@@ -1405,14 +1405,30 @@ use corex_core::types::ToolCall;
         let theme = Theme::default();
         let msg = Message::tool_response("call_1", "Description: Specialized procedural skill for docs\nmore");
         let shown = render_single_message_with_pending_and_thinking(
-            0, &msg, None, &theme, 80, None, false, false, Some(("read_file", "{}")),
+            0, &msg, None, &theme, 80, None, false, false, Some(("read_file", "{}")), false,
         );
         assert!(plain(&shown).join("\n").contains("Specialized procedural skill"));
 
         let hidden = render_single_message_with_pending_and_thinking(
-            0, &msg, None, &theme, 80, None, false, false, Some(("activate_skill", "{}")),
+            0, &msg, None, &theme, 80, None, false, false, Some(("activate_skill", "{}")), false,
         );
         assert!(!plain(&hidden).join("\n").contains("Specialized procedural skill"));
+    }
+
+    #[test]
+    fn a_non_zero_exit_is_not_shown_as_a_failure() {
+        let theme = Theme::default();
+        let call = Some(("run_shell_command", r#"{"command":"cat a; ls ~/.corex/exports"}"#));
+        let render = |content: &str| {
+            let msg = Message::tool_response("call_1", content);
+            plain(&render_single_message_with_pending_and_thinking(0, &msg, None, &theme, 100, None, false, false, call, false)).join("\n")
+        };
+        let exited = render("Command exited with status code 2:\n{}\nls: cannot access '/home/me/.corex/exports': No such file");
+        assert!(exited.contains("· Exit code 2 (3 lines)") && !exited.contains("✕"), "{exited}");
+        let killed = render("Command exited with status code -1:\nKilled\nmore");
+        assert!(killed.contains("✕ Command failed"), "{killed}");
+        let error = render("Error: command timed out\nafter 30s");
+        assert!(error.contains("✕ Command failed"), "{error}");
     }
 
     #[test]
@@ -1422,6 +1438,7 @@ use corex_core::types::ToolCall;
         let lines = render_single_message_with_pending_and_thinking(
             0, &msg, None, &theme, 80, None, false, false,
             Some(("delegate_subagent", r#"{"role":"SCOUT","prompt":"x"}"#)),
+            false,
         );
         assert!(plain(&lines)[0].contains("[scout:sub_9]"));
     }
@@ -1873,3 +1890,68 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
     assert_eq!(app.session.file_edits.len(), 1, "turn 1 can still be rewound later");
     assert!(!app.rewind_dialog.is_open);
 }
+
+    #[tokio::test]
+    async fn browser_steps_collapse_into_one_live_line() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        let step = |id: &str, args: &str| Message {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                call_type: "function".to_string(),
+                function: corex_core::types::FunctionCall { name: "browser".to_string(), arguments: args.to_string() },
+                extra_content: None,
+            }]),
+            ..Default::default()
+        };
+        let result = |id: &str, text: &str| Message {
+            role: "tool".to_string(),
+            tool_call_id: Some(id.to_string()),
+            ..Message::user(text.to_string())
+        };
+        let screen = |app: &mut App| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            terminal.draw(|f| render_ui(f, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..40)
+                .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        app.is_streaming = true;
+        app.session.add_message(Message::user("tell Ana I arrived".to_string()));
+        app.session.add_message(step("a", r#"{"action":"navigate","url":"https://web.whatsapp.com/"}"#));
+        screen(&mut app);
+        app.session.add_message(result("a", "Opened web.whatsapp.com\n- textbox \"Search\" [ref=e4]"));
+        screen(&mut app);
+        app.session.add_message(Message {
+            content: Some(corex_core::types::MessageContent::Text("Now I'll write to Ana".to_string())),
+            reasoning_content: Some("the chat is open".to_string()),
+            ..step("b", r#"{"action":"type","ref":"e9","text":"hola, ya llegué"}"#)
+        });
+        let live = screen(&mut app);
+        assert_eq!(live.matches("Browser").count(), 1, "{live}");
+        assert!(!live.contains("Now I'll write to Ana"), "{live}");
+        assert!(!live.contains("Thought"), "{live}");
+        assert!(live.contains("● Browser · 2 steps"), "{live}");
+        assert!(live.contains("typing \"hola, ya llegué\"…"), "{live}");
+        assert!(!live.contains("Executing"), "{live}");
+
+        app.session.add_message(result("b", "Typed"));
+        app.session.add_message(Message { role: "assistant".to_string(), ..Message::user("Sent.".to_string()) });
+        app.is_streaming = false;
+        let done = screen(&mut app);
+        assert_eq!(done.matches("Browser").count(), 1, "{done}");
+        assert!(done.contains("✓ Browser · 2 steps — typing \"hola, ya llegué\""), "{done}");
+        assert!(done.contains("Sent."), "{done}");
+
+        app.logs_expanded = true;
+        let expanded = screen(&mut app);
+        assert!(!expanded.contains("✓ Browser · 2 steps"), "{expanded}");
+    }

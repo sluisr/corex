@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8"><title>Contact</title>
+<body style="font-family:system-ui,sans-serif;padding:14px">
+<label>Topic<br><select id="topic"><option>General</option><option>Billing</option><option>Technical support</option></select></label><br><br>
+<label>Message<br><textarea id="msg" rows="4" cols="40"></textarea></label><br><br>
+<button id="send">Send message</button> <span id="res"></span>
+<script>document.getElementById('send').onclick=async()=>{await fetch('/save?page=iframe',{method:'POST',body:JSON.stringify({topic:topic.value,msg:msg.value})});res.textContent='Sent ✓'}</script>
+</body>

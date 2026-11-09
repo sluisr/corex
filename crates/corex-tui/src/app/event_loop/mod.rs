@@ -139,6 +139,11 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         let has_active_tasks = background::has_active_tasks(&app);
         let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
 
+        if app.copied_block.is_some_and(|(_, at)| at.elapsed() >= crate::app::copy::COPIED_FLASH) {
+            app.copied_block = None;
+            needs_redraw = true;
+        }
+
         // The caret blinks off the idle clock; a phase change is the only reason to repaint a still screen.
         if crate::cursor::tick(app.last_interaction.elapsed()) {
             needs_redraw = true;
@@ -166,6 +171,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 fleet::ensure_session(&mut app);
                 needs_redraw = true;
             }
+        }
+
+        if fleet::watch_pty(&mut app) {
+            needs_redraw = true;
         }
 
         let pty_dirty = app.fleet_dialog.is_open && app.fleet_dialog.pty_session.as_ref().map(|p| p.is_alive() && p.take_dirty()).unwrap_or(false);
@@ -314,7 +323,7 @@ fn handle_paste(app: &mut App, pasted: String) {
     }
     // A terminal that has nothing to paste as text (the clipboard holds an image)
     // sends an empty paste: that is the cue to look for an image instead.
-    if !(pasted.trim().is_empty() && app.paste_clipboard_image()) {
+    if !(pasted.trim().is_empty() && app.paste_clipboard_image()) && !app.paste_image_files(&pasted) {
         app.handle_paste(pasted);
     }
 }

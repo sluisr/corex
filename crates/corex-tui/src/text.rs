@@ -30,6 +30,76 @@ pub fn fit_text(s: &str, width: usize) -> String {
     format!("{}…", kept)
 }
 
+pub fn fit_path(path: &str, width: usize) -> String {
+    let cols = UnicodeWidthStr::width;
+    if cols(path) <= width {
+        return path.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let trimmed = path.trim_end_matches('/');
+    let trailing = &path[trimmed.len()..];
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    let n = parts.len();
+    let tail = |k: usize| format!("{}{trailing}", parts[n - k..].join("/"));
+    let Some(k) = (1..n).rev().find(|&k| 2 + cols(&tail(k)) <= width) else {
+        let name = tail(1);
+        let mut kept: Vec<char> = Vec::new();
+        let mut used = 1;
+        for ch in name.chars().rev() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > width {
+                break;
+            }
+            kept.push(ch);
+            used += w;
+        }
+        return format!("…{}", kept.into_iter().rev().collect::<String>());
+    };
+    let head = (0..n - k)
+        .rev()
+        .find(|&h| h == 0 || cols(&parts[..h].join("/")) + 3 + cols(&tail(k)) <= width)
+        .unwrap_or(0);
+    if head == 0 {
+        format!("…/{}", tail(k))
+    } else {
+        format!("{}/…/{}", parts[..head].join("/"), tail(k))
+    }
+}
+
+pub fn wrap_path(path: &str, width: usize, rows: usize) -> Vec<String> {
+    let cols = UnicodeWidthStr::width;
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = path;
+    while !rest.is_empty() && width > 0 {
+        if lines.len() + 1 == rows || cols(rest) <= width {
+            lines.push(fit_path(rest, width));
+            break;
+        }
+        let mut used = 0;
+        let mut cut = rest.len();
+        for (i, ch) in rest.char_indices() {
+            used += ch.width().unwrap_or(0);
+            if used > width {
+                cut = i;
+                break;
+            }
+        }
+        if let Some(slash) = rest[..cut].rfind('/').filter(|&s| cols(&rest[..=s]) * 2 >= width) {
+            cut = slash + 1;
+        }
+        if cut == 0 {
+            // A character wider than the line cannot be drawn.
+            rest = &rest[rest.chars().next().map_or(rest.len(), char::len_utf8)..];
+            continue;
+        }
+        lines.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    lines
+}
+
 /// `fit_text` followed by spaces up to exactly `w` columns.
 pub fn pad_right(s: &str, w: usize) -> String {
     let fitted = fit_text(s, w);
@@ -191,6 +261,94 @@ mod tests {
         assert!(UnicodeWidthStr::width(fit_text("日本語日本語", 7).as_str()) <= 7);
         assert_eq!(UnicodeWidthStr::width(pad_right("café for the señor and the niño", 12).as_str()), 12);
         assert_eq!(pad_right("ab", 5), "ab   ");
+    }
+
+    #[test]
+    fn fit_path_keeps_the_file_name_and_drops_the_middle() {
+        let long = "workspaces/engineering/semester_04/Software_Eng/Course_2/examinations/submission/Summary01.pdf";
+        assert_eq!(fit_path("src/main.rs", 20), "src/main.rs");
+        for width in [20, 40, 71] {
+            let shown = fit_path(long, width);
+            assert!(UnicodeWidthStr::width(shown.as_str()) <= width, "{width}: {shown}");
+            assert!(shown.ends_with("submission/Summary01.pdf") || shown.ends_with("Summary01.pdf"), "{width}: {shown}");
+            assert!(shown.contains('…'), "a cut is marked: {shown}");
+        }
+        assert_eq!(fit_path(long, 71), "…/Software_Eng/Course_2/examinations/submission/Summary01.pdf");
+        assert_eq!(fit_path(long, 40), "…/examinations/submission/Summary01.pdf");
+        assert_eq!(fit_path(long, 26), "…/submission/Summary01.pdf");
+        assert_eq!(fit_path(long, 25), "…/Summary01.pdf");
+        assert_eq!(fit_path("alpha/beta_long_dir/gamma/file.rs", 28), "alpha/…/gamma/file.rs", "room left over keeps the start");
+        assert_eq!(fit_path("a/b/c/d/e/f/file.rs", 16), "…/d/e/f/file.rs");
+        assert_eq!(fit_path("/usr/share/doc/pkg/readme", 18), "/…/doc/pkg/readme");
+        assert_eq!(fit_path("~/workspaces/notes/tasks.md", 22), "~/…/notes/tasks.md");
+    }
+
+    #[test]
+    fn fit_path_keeps_the_trailing_slash_of_a_folder() {
+        assert_eq!(fit_path("one/two/three/four/", 14), "…/three/four/");
+    }
+
+    #[test]
+    fn fit_path_cuts_a_name_longer_than_the_line_from_its_start() {
+        let shown = fit_path("dir/an_extremely_long_report_name_final_v2.pdf", 16);
+        assert_eq!(UnicodeWidthStr::width(shown.as_str()), 16, "{shown}");
+        assert!(shown.starts_with('…') && shown.ends_with("final_v2.pdf"), "{shown}");
+        assert_eq!(fit_path("anything", 0), "");
+        assert!(UnicodeWidthStr::width(fit_path("日本語/日本語日本語.txt", 9).as_str()) <= 9);
+    }
+
+    #[test]
+    fn wrap_path_breaks_after_a_slash_and_loses_nothing_when_it_fits() {
+        let long = "workspaces/engineering/semester_04/Software_Eng/Course_2/examinations/submission/Summary01.pdf";
+        assert_eq!(wrap_path("src/main.rs", 40, 2), ["src/main.rs"]);
+        let lines = wrap_path(long, 60, 2);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 60), "{lines:?}");
+        assert!(lines[0].ends_with('/'), "the first line breaks after a folder: {lines:?}");
+        assert_eq!(lines.concat(), long, "wrapping drops nothing while it fits in the rows");
+        assert!(lines[1].ends_with("Summary01.pdf"));
+        let tight = wrap_path(long, 30, 2);
+        assert!(tight[1].starts_with('…') && tight[1].ends_with("Summary01.pdf"), "the last line gives way, not the file: {tight:?}");
+        assert!(wrap_path("", 10, 2).is_empty() && wrap_path("abc", 0, 2).is_empty());
+        let wide = wrap_path("日本語日本語日本語日本語", 10, 3);
+        assert!(wide.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 10), "{wide:?}");
+    }
+
+    #[test]
+    fn path_fitting_holds_on_random_paths() {
+        let cols = |s: &str| UnicodeWidthStr::width(s);
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let pieces = ["a", "bb", "long_segment", "x y", "日本", "é", "dir", "_", "-", "."];
+        for _ in 0..5000 {
+            let segments: Vec<String> = (0..1 + next(9)).map(|_| (0..1 + next(3)).map(|_| pieces[next(pieces.len())]).collect()).collect();
+            let path = format!("{}{}{}", ["", "/", "~/"][next(3)], segments.join("/"), ["", "/"][next(2)]);
+            let width = next(90);
+
+            let shown = fit_path(&path, width);
+            assert!(cols(&shown) <= width, "{path:?} in {width}: {shown:?}");
+            if cols(&path) <= width {
+                assert_eq!(shown, path);
+            } else if width > 0 {
+                let name = format!("{}{}", segments.last().unwrap(), if path.ends_with('/') { "/" } else { "" });
+                assert!(shown.contains('…'), "a cut is marked: {path:?} in {width}: {shown:?}");
+                if width >= cols(&name) + 2 {
+                    assert!(shown.ends_with(&name), "the file name stays: {path:?} in {width}: {shown:?}");
+                }
+            }
+
+            let rows = 1 + next(3);
+            let lines = wrap_path(&path, width, rows);
+            assert!(lines.len() <= rows && lines.iter().all(|l| cols(l) <= width), "{path:?} in {width}x{rows}: {lines:?}");
+            if width >= 2 && !lines.iter().any(|l| l.contains('…')) {
+                assert_eq!(lines.concat(), path, "nothing is lost unless a line says so");
+            }
+        }
     }
 
     #[test]

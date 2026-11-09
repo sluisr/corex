@@ -11,6 +11,7 @@ pub mod json_repair;
 pub mod language;
 pub mod local_client;
 pub mod memory;
+pub mod pricing;
 pub mod model_info;
 pub mod providers;
 pub mod reasoning_cache;

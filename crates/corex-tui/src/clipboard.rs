@@ -134,21 +134,81 @@ const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 /// `Ok(None)` means the clipboard holds no image (the usual case: it holds text). `Err` means there
 /// is one but it cannot be used, or the clipboard could not be read at all.
 pub fn read_image() -> Result<Option<ClipboardImage>, String> {
-    let Some(data) = read_image_bytes()? else {
-        return Ok(None);
-    };
+    read_image_bytes()?.map(image_from_bytes).transpose()
+}
+
+fn image_from_bytes(data: Vec<u8>) -> Result<ClipboardImage, String> {
     let limit = corex_tools::fs_tools::READ_IMAGE_MAX_BYTES;
     if data.len() as u64 > limit {
         return Err(format!(
-            "the image is {:.1} MB, over the {} MB limit; take a smaller screenshot",
+            "the image is {:.1} MB, over the {} MB limit; use a smaller one",
             data.len() as f64 / (1024.0 * 1024.0),
             limit / (1024 * 1024)
         ));
     }
     match corex_tools::fs_tools::sniff_image_media_type(&data) {
-        Some(media_type) => Ok(Some(ClipboardImage { media_type, data })),
-        None => Err("the clipboard image is not PNG, JPEG, GIF or WebP".to_string()),
+        Some(media_type) => Ok(ClipboardImage { media_type, data }),
+        None => Err("it is not a PNG, JPEG, GIF or WebP image".to_string()),
     }
+}
+
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+
+/// A copied file lands on the clipboard as its path, not its pixels; a dropped one is typed the same way.
+pub fn image_files_in(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    let paths = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(image_file)
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn image_file(line: &str) -> Option<std::path::PathBuf> {
+    let unquoted = ['\'', '"']
+        .iter()
+        .find_map(|q| line.strip_prefix(*q).and_then(|rest| rest.strip_suffix(*q)))
+        .unwrap_or(line);
+    let text = match unquoted.strip_prefix("file://") {
+        Some(uri) => percent_decode(uri.strip_prefix("localhost").unwrap_or(uri))?,
+        None => crate::file_completion::unescape_path(unquoted),
+    };
+    let path = match text.strip_prefix("~/") {
+        Some(rest) => directories::BaseDirs::new()?.home_dir().join(rest),
+        None => std::path::PathBuf::from(text),
+    };
+    let is_image = path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    (path.is_absolute() && is_image && path.is_file()).then_some(path)
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = text.get(i + 1..i + 3).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+pub fn read_image_file(path: &std::path::Path) -> Result<ClipboardImage, String> {
+    if corex_tools::fs_tools::is_sensitive_system_path(path) {
+        return Err("it holds credentials or system files".to_string());
+    }
+    let limit = corex_tools::fs_tools::READ_IMAGE_MAX_BYTES;
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > limit {
+        return Err(format!("the image is {:.1} MB, over the {} MB limit; use a smaller one", size as f64 / (1024.0 * 1024.0), limit / (1024 * 1024)));
+    }
+    image_from_bytes(std::fs::read(path).map_err(|e| e.to_string())?)
 }
 
 #[cfg(target_os = "macos")]
@@ -344,6 +404,70 @@ mod tests {
         assert_eq!(osc52_payload("hey"), "aGV5");
         assert_eq!(osc52_payload("a"), "YQ==");
         assert_eq!(osc52_payload(""), "");
+    }
+
+    const PNG: [u8; 10] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0];
+    const JPEG: [u8; 6] = [0xff, 0xd8, 0xff, 0xe0, 0, 0];
+
+    #[test]
+    fn a_copied_or_dropped_image_file_is_recognised_from_its_path() {
+        crate::test_support::isolate_home();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let dir = std::env::temp_dir().join(format!("corex-clip-files-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Photo Album")).unwrap();
+        std::fs::create_dir_all(dir.join("folder.png")).unwrap();
+        let spaced = dir.join("Photo Album/Phone Photo 1.JPEG");
+        let plain = dir.join("shot.png");
+        std::fs::write(&spaced, JPEG).unwrap();
+        std::fs::write(&plain, PNG).unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(home.join("home-pic.webp"), b"RIFF").unwrap();
+        let (spaced_s, plain_s) = (spaced.display().to_string(), plain.display().to_string());
+        let one = |text: &str| image_files_in(text);
+
+        assert_eq!(one(&plain_s), Some(vec![plain.clone()]));
+        assert_eq!(one(&spaced_s), Some(vec![spaced.clone()]), "spaces as a file manager copies them");
+        assert_eq!(one(&format!("{spaced_s}\n")), Some(vec![spaced.clone()]));
+        assert_eq!(one(&format!("  {plain_s} ")), Some(vec![plain.clone()]), "padding from a terminal");
+        assert_eq!(one(&format!("'{spaced_s}'")), Some(vec![spaced.clone()]), "single quotes");
+        assert_eq!(one(&format!("\"{spaced_s}\"")), Some(vec![spaced.clone()]), "double quotes");
+        assert_eq!(one(&crate::file_completion::escape_path(&spaced_s)), Some(vec![spaced.clone()]), "escaped spaces");
+        let uri = format!("file://{}", spaced_s.replace(' ', "%20"));
+        assert_eq!(one(&uri), Some(vec![spaced.clone()]), "a file:// link");
+        assert_eq!(one(&format!("file://localhost{plain_s}")), Some(vec![plain.clone()]));
+        assert_eq!(one(&format!("# copied\n{plain_s}\n{uri}\n")), Some(vec![plain.clone(), spaced.clone()]), "several files, as a uri-list");
+        assert_eq!(one(&format!("{plain_s}\r{spaced_s}\r\n")), Some(vec![plain.clone(), spaced.clone()]), "terminals that end lines with CR");
+        assert_eq!(one("~/home-pic.webp"), Some(vec![home.join("home-pic.webp")]), "~ is the home directory");
+
+        assert_eq!(one(""), None);
+        assert_eq!(one("   \n "), None);
+        assert_eq!(one("shot.png"), None, "a relative path is text, not a copied file");
+        assert_eq!(one(&format!("{plain_s}x")), None, "a file that does not exist");
+        assert_eq!(one(&dir.join("notes.txt").display().to_string()), None, "not an image extension");
+        assert_eq!(one(&dir.join("folder.png").display().to_string()), None, "a folder named like an image");
+        assert_eq!(one(&format!("look at {plain_s} please")), None, "a sentence that mentions a path");
+        assert_eq!(one(&format!("{plain_s}\nand some text")), None, "a path with other text");
+        assert_eq!(one(&format!("{plain_s}\n{}", dir.join("notes.txt").display())), None, "all or nothing");
+        assert_eq!(one("file:///tmp/%zz.png"), None, "a broken percent escape");
+
+        assert_eq!(read_image_file(&spaced).unwrap().media_type, "image/jpeg");
+        assert_eq!(read_image_file(&plain).unwrap().media_type, "image/png");
+        std::fs::write(dir.join("fake.png"), "not really an image").unwrap();
+        assert!(read_image_file(&dir.join("fake.png")).unwrap_err().contains("not a PNG"));
+        let big = std::fs::File::create(dir.join("big.png")).unwrap();
+        big.set_len(corex_tools::fs_tools::READ_IMAGE_MAX_BYTES + 1).unwrap();
+        assert!(read_image_file(&dir.join("big.png")).unwrap_err().contains("over the 5 MB limit"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(home.join("home-pic.webp"));
+    }
+
+    #[test]
+    fn percent_escapes_decode_whole_utf8() {
+        assert_eq!(percent_decode("a%20b%C3%A9"), Some("a bé".to_string()));
+        assert_eq!(percent_decode("plain"), Some("plain".to_string()));
+        assert_eq!(percent_decode("100%"), None);
+        assert_eq!(percent_decode("%+f"), None);
+        assert_eq!(percent_decode("%ff"), None, "bytes that are not UTF-8");
     }
 
     #[test]

@@ -177,16 +177,12 @@ impl ForensicLogger {
                 token_lines.push(format!("  Completion Tokens:   {}", completion));
                 token_lines.push(format!("  Total Tokens:        {}", total));
                 token_lines.push("  Cost:                $0.000000 USD (local)".to_string());
-                let cloud_saved = (prompt as f64 * (0.14 / 1_000_000.0)) + (completion as f64 * (0.28 / 1_000_000.0));
+                let cloud_saved = crate::pricing::deepseek_rates("deepseek-flash").uncached_cost(usage);
                 token_lines.push(format!("  Cloud Equivalent:    ${:.6} USD", cloud_saved));
             } else {
-                let miss = prompt.saturating_sub(cached);
-                let hit_cost = cached as f64 * (0.014 / 1_000_000.0);
-                let miss_cost = miss as f64 * (0.14 / 1_000_000.0);
-                let completion_cost = completion as f64 * (0.28 / 1_000_000.0);
-                let actual_cost = hit_cost + miss_cost + completion_cost;
-
-                let un_cached_cost = (prompt as f64 * (0.14 / 1_000_000.0)) + completion_cost;
+                let rates = crate::pricing::deepseek_rates(model);
+                let actual_cost = rates.cost(usage);
+                let un_cached_cost = rates.uncached_cost(usage);
                 let savings = un_cached_cost - actual_cost;
                 let savings_pct = if un_cached_cost > 0.0 { (savings / un_cached_cost) * 100.0 } else { 0.0 };
 

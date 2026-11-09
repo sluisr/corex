@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>New project</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0}
+main{max-width:640px;margin:30px auto;background:#fff;border-radius:10px;padding:26px;box-shadow:0 1px 3px #0002}
+[hidden]{display:none!important}
+.steps{display:flex;gap:8px;margin-bottom:18px}.steps span{padding:4px 10px;border-radius:10px;background:#e5e7eb}.steps .on{background:#2563eb;color:#fff}
+label{display:block;margin:12px 0 4px;font-weight:600}input,textarea{width:100%;padding:8px;box-sizing:border-box}
+.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px}.opt{border:2px solid #ccc;border-radius:8px;padding:14px;cursor:pointer}
+.opt.sel{border-color:#2563eb;background:#eff6ff}
+nav{margin-top:22px;display:flex;justify-content:space-between}button{padding:9px 18px;cursor:pointer}
+.err{color:#b91c1c;font-size:13px}
+</style></head><body><main>
+<div class="steps"><span id="s1" class="on">1 Company</span><span id="s2">2 Infrastructure</span><span id="s3">3 Confirm</span></div>
+
+<div id="p1">
+  <label for="co">Company name</label><input id="co">
+  <label for="em">Contact email</label><input id="em" type="email">
+  <label for="sz">Team size</label>
+  <select id="sz"><option value="">Select…</option><option>1-10</option><option>11-50</option><option>51-200</option><option>200+</option></select>
+  <div class="err" id="e1"></div>
+</div>
+
+<div id="p2" hidden>
+  <label>Deployment region</label>
+  <div class="opts" role="radiogroup" aria-label="Region">
+    <div class="opt" role="radio" aria-checked="false" tabindex="0" data-r="eu-west">Europe (Ireland)</div>
+    <div class="opt" role="radio" aria-checked="false" tabindex="0" data-r="us-east">US East</div>
+    <div class="opt" role="radio" aria-checked="false" tabindex="0" data-r="sa-east">South America (Sao Paulo)</div>
+    <div class="opt" role="radio" aria-checked="false" tabindex="0" data-r="ap-south">Asia (Mumbai)</div>
+  </div>
+  <label>Add-on services</label>
+  <label style="font-weight:400"><input type="checkbox" id="c-db" style="width:auto"> Managed database</label>
+  <label style="font-weight:400"><input type="checkbox" id="c-cdn" style="width:auto"> Global CDN</label>
+  <label style="font-weight:400"><input type="checkbox" id="c-bk" style="width:auto"> Daily backups</label>
+  <label for="notes">Notes for the support team</label><textarea id="notes" rows="3"></textarea>
+  <div class="err" id="e2"></div>
+</div>
+
+<div id="p3" hidden><h3>Summary</h3><pre id="sum"></pre>
+  <label style="font-weight:400"><input type="checkbox" id="terms" style="width:auto"> I accept the terms and conditions</label>
+  <div class="err" id="e3"></div></div>
+
+<div id="done" hidden><h2>Project created!</h2><p id="ok"></p></div>
+
+<nav id="nav"><button id="back" disabled>Back</button><button id="next">Next</button></nav>
+</main>
+<script>
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const D={region:null};let step=1;
+$$('.opt').forEach(o=>o.onclick=()=>{$$('.opt').forEach(x=>{x.classList.toggle('sel',x===o);x.setAttribute('aria-checked',x===o)});D.region=o.dataset.r});
+function show(){[1,2,3].forEach(i=>{$('#p'+i).hidden=i!==step;$('#s'+i).classList.toggle('on',i===step)});$('#back').disabled=step===1;$('#next').textContent=step===3?'Create project':'Next'}
+$('#back').onclick=()=>{step--;show()};
+$('#next').onclick=async()=>{
+ if(step===1){if(!$('#co').value||!/.+@.+\..+/.test($('#em').value)||!$('#sz').value){$('#e1').textContent='Fill in company, a valid email and team size.';return}$('#e1').textContent='';step=2;show();return}
+ if(step===2){if(!D.region){$('#e2').textContent='Pick a region.';return}$('#e2').textContent='';
+   Object.assign(D,{company:$('#co').value,email:$('#em').value,size:$('#sz').value,db:$('#c-db').checked,cdn:$('#c-cdn').checked,backups:$('#c-bk').checked,notes:$('#notes').value});
+   $('#sum').textContent=JSON.stringify(D,null,2);step=3;show();return}
+ if(!$('#terms').checked){$('#e3').textContent='You must accept the terms.';return}
+ await fetch('/save?page=wizard',{method:'POST',body:JSON.stringify(D)});
+ [1,2,3].forEach(i=>$('#p'+i).hidden=true);$('#nav').hidden=true;$('#done').hidden=false;$('#ok').textContent='Project '+D.company+' created in '+D.region;document.title='Project created'};
+</script></body></html>

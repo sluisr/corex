@@ -5,7 +5,7 @@ description: >-
   are available inside the TUI, how to use a specific command like /model,
   /chat, /resume, /stats, /yolo, /fim, /web, /local, /plan, /compress,
   /compact, /memory, /rewind, /prefix, /tasks, /mcp, /balance, /wallet,
-  /save, /update, /info, /clear, /help, /quit. Also activate for questions
+  /save, /export, /update, /info, /clear, /help, /quit. Also activate for questions
   like 'what can I type with /', 'list commands', 'how do I switch model',
   'how do I check balance', 'how do I resume a session', 'how to compress context'.
 ---
@@ -27,6 +27,7 @@ Inside the interactive TUI (`cx`), type `/` to trigger the command autocomplete 
 |`/new` | Shortcut for `/chat new` |
 |`/resume [tag\|id]` | Shortcut to resume the last or a specific session |
 |`/save <tag>` | Save a checkpoint of the current conversation |
+|`/export [md\|txt\|html] [full] [path]` | Save the chat as Markdown, text or HTML (print the HTML to PDF) to `~/.corex/exports/<project>/`, or to `exports_dir` when set |
 |`/rewind` | Pick a past message and rewind the conversation, revert the agent's file edits since then, or both |
 
 **Resume from CLI (outside TUI):**
@@ -43,7 +44,7 @@ cx -l                          # Short alias for --list-sessions
 |Command | Description |
 |:--- | :--- |
 |`/model` | Open the interactive model selector (Cloud / Local across 15 providers) |
-|`/key [api_key]` | Configure or update API key for the active provider (saved to `~/.corex/settings.json`) |
+|`/key [api_key]` | Configure or update the API key for the active provider (kept in the system keyring, not in `settings.json`) |
 |`/auth [api_key]` | Alias for `/key` |
 
 Available flagship DeepSeek models inside `/model`:
@@ -200,7 +201,8 @@ cx --yolo
 |`Enter` | Send message / confirm (queued while the agent works) |
 |`Alt+Enter` | While the agent works: deliver the message at the next safe point |
 |`Esc` | Cancel the generation / close popup / snap scroll to bottom; twice within 0.5 s clears the prompt |
-|`Ctrl+C` | Cancel the generation; twice within 2 s quits |
+|`Ctrl+C` | Copy the mouse selection; otherwise cancel the generation, twice within 2 s quits |
+|`Alt+Y` | Copy the last code block of the chat (any block: click the `⧉ copy` label above it) |
 |`Ctrl+Z` | Undo the last letter, paste or deletion in the prompt; on an empty prompt, twice suspends to the shell (`fg` resumes) |
 |`Ctrl+T` | Expand / collapse Chain-of-Thought reasoning blocks |
 |`Ctrl+O` | Expand / collapse full tool output & diff previews |

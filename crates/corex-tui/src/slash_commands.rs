@@ -65,6 +65,18 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         subcommands: &[],
     },
     CommandItem {
+        name: "/export",
+        args: "[md|txt|html] [full] [path]",
+        description: "Save this chat to ~/.corex/exports as Markdown, text or HTML (print the HTML to get a PDF)",
+        aliases: &[],
+        group: SESSION,
+        subcommands: &[
+            sub("md", "[full] [path]", "Markdown, tool steps summed up in one line each"),
+            sub("txt", "[full] [path]", "Plain text"),
+            sub("html", "[full] [path]", "A page to read or print to PDF"),
+        ],
+    },
+    CommandItem {
         name: "/new",
         args: "",
         description: "Start a fresh chat session",

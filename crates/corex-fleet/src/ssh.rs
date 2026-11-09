@@ -412,6 +412,77 @@ pub struct SshOutput {
     pub success: bool,
 }
 
+impl SshOutput {
+    pub fn connection_failure(&self) -> Option<ConnectionFailure> {
+        connection_failure(self.exit_code, &self.stderr)
+    }
+}
+
+pub const KEEPALIVE_OPTIONS: [&str; 2] = ["ServerAliveInterval=5", "ServerAliveCountMax=3"];
+
+pub const RETRY_DELAYS_SECS: [u64; 2] = [2, 5];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionFailure {
+    NotConnected,
+    DroppedMidway,
+}
+
+impl ConnectionFailure {
+    pub fn explain(self, node_id: &str, stderr: &str, retried: usize, may_repeat: bool) -> String {
+        let reason = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("ssh exited with code 255");
+        let tries = if retried > 0 { format!(" after {} retries", retried) } else { String::new() };
+        match self {
+            ConnectionFailure::NotConnected => format!(
+                "Could not reach '{node_id}'{tries} ({reason}). The command did not run; check the network and try again."
+            ),
+            ConnectionFailure::DroppedMidway if may_repeat => format!(
+                "The connection to '{node_id}' dropped while the command was running{tries} ({reason}). It is read-only, so it is safe to run again once the server is reachable."
+            ),
+            ConnectionFailure::DroppedMidway => format!(
+                "The connection to '{node_id}' dropped while the command was running ({reason}). The command may or may not have run, so it was not retried: check the server's state before running it again."
+            ),
+        }
+    }
+}
+
+const CONNECT_ERRORS: [&str; 7] = [
+    "connect to host",
+    "Could not resolve hostname",
+    "Network is unreachable",
+    "No route to host",
+    "Connection refused",
+    "Connection timed out during banner exchange",
+    "Temporary failure in name resolution",
+];
+
+const DROP_ERRORS: [&str; 6] = [
+    "not responding",
+    "Broken pipe",
+    "Connection reset",
+    "closed by remote host",
+    "Connection closed",
+    "client_loop",
+];
+
+// ssh reports its own failures as exit code 255, which a remote command can also return.
+pub fn connection_failure(exit_code: i32, stderr: &str) -> Option<ConnectionFailure> {
+    if exit_code != 255 {
+        return None;
+    }
+    if CONNECT_ERRORS.iter().any(|e| stderr.contains(e)) {
+        Some(ConnectionFailure::NotConnected)
+    } else if DROP_ERRORS.iter().any(|e| stderr.contains(e)) {
+        Some(ConnectionFailure::DroppedMidway)
+    } else {
+        None
+    }
+}
+
+pub fn may_retry(failure: ConnectionFailure, may_repeat: bool) -> bool {
+    failure == ConnectionFailure::NotConnected || may_repeat
+}
+
 pub struct SshExecutor;
 
 impl SshExecutor {
@@ -425,6 +496,9 @@ impl SshExecutor {
         cmd.arg("-o").arg(format!("ConnectTimeout={}", timeout_secs.min(10)));
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        for option in KEEPALIVE_OPTIONS {
+            cmd.arg("-o").arg(option);
+        }
 
         // ControlMaster socket in a private 0700 directory for connection multiplexing
         let socket_dir = directories::BaseDirs::new()
@@ -554,7 +628,13 @@ impl SshExecutor {
             wait_fut,
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Remote command on '{}' timed out after {}s", node.id, timeout_secs))?;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Remote command on '{}' timed out after {}s. It may still be running on the server.",
+                node.id,
+                timeout_secs
+            )
+        })?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -569,6 +649,31 @@ impl SshExecutor {
         })
     }
 
+    pub async fn execute_retrying(
+        node: &NodeConfig,
+        command: &str,
+        run_sudo: bool,
+        timeout_secs: u64,
+        may_repeat: bool,
+    ) -> Result<SshOutput> {
+        let mut attempt = 0;
+        loop {
+            let out = Self::execute(node, command, run_sudo, timeout_secs).await?;
+            match out.connection_failure() {
+                Some(failure) if may_retry(failure, may_repeat) && attempt < RETRY_DELAYS_SECS.len() => {
+                    tokio::time::sleep(Duration::from_secs(RETRY_DELAYS_SECS[attempt])).await;
+                    attempt += 1;
+                }
+                Some(failure) => {
+                    let mut out = out;
+                    out.stderr = failure.explain(&node.id, &out.stderr, attempt, may_repeat);
+                    return Ok(out);
+                }
+                None => return Ok(out),
+            }
+        }
+    }
+
     /// Broadcasts a command concurrently across multiple nodes using `tokio::task::JoinSet`,
     /// bounded to 16 concurrent SSH executions while preserving input node order.
     pub async fn broadcast(
@@ -576,6 +681,7 @@ impl SshExecutor {
         command: &str,
         run_sudo: bool,
         timeout_secs: u64,
+        may_repeat: bool,
     ) -> Vec<(String, Result<SshOutput>)> {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
         let mut set = JoinSet::new();
@@ -587,7 +693,7 @@ impl SshExecutor {
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await;
                 let node_id = n.id.clone();
-                let res = Self::execute(&n, &cmd, run_sudo, timeout_secs).await;
+                let res = Self::execute_retrying(&n, &cmd, run_sudo, timeout_secs, may_repeat).await;
                 (idx, node_id, res)
             });
         }
@@ -803,6 +909,7 @@ mod tests {
             tags: vec!["prod".to_string()],
             sudo: true,
             proxy_jump: Some("-oInjectedJump".to_string()),
+            source: crate::config::NodeSource::Fleet,
         };
 
         let cmd = SshExecutor::build_ssh_command(&node, 8);
@@ -813,6 +920,8 @@ mod tests {
         assert!(args.contains(&"ConnectTimeout=8".to_string()));
         assert!(args.contains(&"BatchMode=yes".to_string()));
         assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
+        assert!(args.contains(&"ServerAliveInterval=5".to_string()));
+        assert!(args.contains(&"ServerAliveCountMax=3".to_string()));
 
         // Check non-default port
         let port_idx = args.iter().position(|a| a == "-p").expect("Port -p arg must exist");
@@ -864,5 +973,60 @@ mod tests {
         assert_ne!(sed_risk("sed -e 's/.*/id/e' /etc/hosts"), CommandRiskLevel::Safe);
         assert_ne!(sed_risk("sed '1w /tmp/out' /etc/hosts"), CommandRiskLevel::Safe);
         assert_eq!(sed_risk("sed -n '1,5p' /etc/hosts"), CommandRiskLevel::Safe);
+    }
+
+    fn closed_port_node() -> NodeConfig {
+        NodeConfig {
+            id: "offline".to_string(),
+            name: None,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            user: "nobody".to_string(),
+            key_path: None,
+            auth: AuthMethod::Agent,
+            tags: vec![],
+            sudo: false,
+            proxy_jump: None,
+            source: crate::config::NodeSource::Fleet,
+        }
+    }
+
+    #[test]
+    fn ssh_failures_are_told_apart_from_remote_exit_codes() {
+        let refused = "ssh: connect to host 10.0.0.5 port 22: Network is unreachable";
+        assert_eq!(connection_failure(255, refused), Some(ConnectionFailure::NotConnected));
+        assert_eq!(connection_failure(255, "Timeout, server 10.0.0.5 not responding."), Some(ConnectionFailure::DroppedMidway));
+        assert_eq!(
+            connection_failure(255, "client_loop: send disconnect: Broken pipe"),
+            Some(ConnectionFailure::DroppedMidway)
+        );
+        assert_eq!(connection_failure(255, "my script failed"), None);
+        assert_eq!(connection_failure(1, refused), None);
+    }
+
+    #[test]
+    fn only_commands_that_never_ran_or_are_read_only_are_retried() {
+        assert!(may_retry(ConnectionFailure::NotConnected, false));
+        assert!(may_retry(ConnectionFailure::DroppedMidway, true));
+        assert!(!may_retry(ConnectionFailure::DroppedMidway, false));
+    }
+
+    #[test]
+    fn the_agent_is_told_whether_the_command_ran() {
+        let stderr = "Timeout, server 10.0.0.5 not responding.";
+        let mutating = ConnectionFailure::DroppedMidway.explain("vps1", stderr, 0, false);
+        assert!(mutating.contains("may or may not have run") && mutating.contains("not retried"), "{mutating}");
+        assert!(mutating.contains("not responding"), "{mutating}");
+        let read_only = ConnectionFailure::DroppedMidway.explain("vps1", stderr, 2, true);
+        assert!(read_only.contains("after 2 retries") && read_only.contains("safe to run again"), "{read_only}");
+        let never = ConnectionFailure::NotConnected.explain("vps1", "ssh: connect to host x port 22: No route to host", 2, false);
+        assert!(never.contains("did not run"), "{never}");
+    }
+
+    #[tokio::test]
+    async fn a_real_unreachable_server_is_reported_as_not_connected() {
+        let out = SshExecutor::execute(&closed_port_node(), "rm -rf /tmp/x", false, 10).await.unwrap();
+        assert_eq!(out.exit_code, 255, "{}", out.stderr);
+        assert_eq!(out.connection_failure(), Some(ConnectionFailure::NotConnected), "{}", out.stderr);
     }
 }

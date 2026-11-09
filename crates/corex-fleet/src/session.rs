@@ -128,13 +128,14 @@ impl RemoteSession {
         initiator: CommandInitiator,
         sudo: bool,
         timeout_secs: u64,
+        may_repeat: bool,
     ) -> Result<RemoteCommandRecord> {
         let timestamp = Local::now().format("%H:%M:%S").to_string();
         let cwd_before = self.current_dir.clone();
 
         let wrapped = build_wrapped_command(&cwd_before, cmd);
 
-        let out = SshExecutor::execute(&self.node, &wrapped, sudo, timeout_secs).await?;
+        let out = SshExecutor::execute_retrying(&self.node, &wrapped, sudo, timeout_secs, may_repeat).await?;
 
         // Split stdout by DELIM
         let (actual_stdout, cwd_after) = if let Some(idx) = out.stdout.find(DELIM) {

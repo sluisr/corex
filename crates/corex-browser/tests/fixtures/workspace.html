@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Workspace settings</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:24px}
+#list{height:150px;overflow:auto;border:1px solid #ccc;width:300px}
+#list div{padding:8px}
+</style></head><body>
+<h1>Workspace settings</h1>
+<p><button onclick="window.open('help.html')">Open help</button> <span id="clock" class="a"></span></p>
+<p><input placeholder="Search or start a new chat"></p>
+<div id="list" role="listbox" aria-label="Members"></div>
+<p id="scrolled">scrolled: 0</p>
+<p><label>Name <input id="name" value="old value"></label></p>
+<p id="echo">Name is: old value</p>
+<p><label>Billing email <input type="email" value="nope" aria-invalid="true" aria-describedby="err"></label>
+<span id="err">Enter a valid address</span></p>
+<p><button id="save">Save</button> <span id="status"></span></p>
+<script>
+setInterval(() => {
+  const clock = document.getElementById("clock");
+  clock.textContent = new Date().toISOString();
+  clock.className = clock.className === "a" ? "b" : "a";
+}, 50);
+const list = document.getElementById("list");
+for (let i = 1; i <= 40; i++) {
+  const item = document.createElement("div");
+  item.setAttribute("role", "option");
+  item.textContent = "Member " + i;
+  list.appendChild(item);
+}
+list.addEventListener("scroll", () => { document.getElementById("scrolled").textContent = "scrolled: " + list.scrollTop; });
+const name = document.getElementById("name");
+name.addEventListener("input", () => { document.getElementById("echo").textContent = "Name is: " + name.value; });
+document.getElementById("save").addEventListener("click", () => {
+  const status = document.getElementById("status");
+  status.textContent = "Saving";
+  setTimeout(() => { status.textContent = "Saved changes"; }, 1200);
+});
+</script>
+</body></html>

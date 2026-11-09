@@ -10,7 +10,7 @@ use ratatui::Frame;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use corex_fleet::session::CompletionResult;
-use corex_fleet::{FleetConfig, NodeConfig, NodeTelemetry, RemoteCommandRecord, RemoteSession};
+use corex_fleet::{FleetConfig, NodeConfig, NodeSource, NodeTelemetry, RemoteCommandRecord, RemoteSession};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -54,11 +54,55 @@ pub struct FleetItem {
     pub telemetry: Option<NodeTelemetry>,
 }
 
+/// Which inventory the selector lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SourceFilter {
+    #[default]
+    All,
+    Corex,
+    Ssh,
+}
+
+impl SourceFilter {
+    pub fn next(self) -> Self {
+        match self {
+            SourceFilter::All => SourceFilter::Corex,
+            SourceFilter::Corex => SourceFilter::Ssh,
+            SourceFilter::Ssh => SourceFilter::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceFilter::All => "all",
+            SourceFilter::Corex => "corex",
+            SourceFilter::Ssh => "ssh",
+        }
+    }
+
+    fn accepts(self, source: NodeSource) -> bool {
+        match self {
+            SourceFilter::All => true,
+            SourceFilter::Corex => source == NodeSource::Fleet,
+            SourceFilter::Ssh => source == NodeSource::SshConfig,
+        }
+    }
+}
+
+pub struct PtyReconnect {
+    pub node: corex_fleet::NodeConfig,
+    pub attempt: usize,
+    pub next_try: std::time::Instant,
+    pub candidate: Option<(crate::fleet_pty::FleetPtySession, std::time::Instant)>,
+}
+
 pub struct FleetDialogState {
     pub is_open: bool,
     pub selected_idx: usize,
     pub items: Vec<FleetItem>,
     pub search_query: String,
+    /// Narrows the list to one inventory.
+    pub source_filter: SourceFilter,
     pub is_refreshing: bool,
     pub status_msg: Option<String>,
     pub command_input: String,
@@ -75,6 +119,7 @@ pub struct FleetDialogState {
     pub wide_layout: bool,
     pub last_tab_input: Option<String>,
     pub pty_session: Option<crate::fleet_pty::FleetPtySession>,
+    pub reconnect: Option<PtyReconnect>,
     pub cmd_done_tx: UnboundedSender<(String, RemoteSession)>,
     pub cmd_done_rx: UnboundedReceiver<(String, RemoteSession)>,
     pub telemetry_tx: UnboundedSender<(String, NodeTelemetry)>,
@@ -103,6 +148,7 @@ impl FleetDialogState {
             selected_idx: 0,
             items: Vec::new(),
             search_query: String::new(),
+            source_filter: SourceFilter::All,
             is_refreshing: false,
             status_msg: None,
             command_input: String::new(),
@@ -114,6 +160,7 @@ impl FleetDialogState {
             wide_layout: false,
             last_tab_input: None,
             pty_session: None,
+            reconnect: None,
             cmd_done_tx,
             cmd_done_rx,
             telemetry_tx,
@@ -192,6 +239,7 @@ impl FleetDialogState {
                     .map(|p| !p.is_alive() || p.node_id != sess.node.id)
                     .unwrap_or(true);
                 if need_spawn {
+                    self.reconnect = None;
                     match crate::fleet_pty::FleetPtySession::spawn(&sess.node, 24, 80) {
                         Ok(pty) => {
                             self.pty_session = Some(pty);
@@ -296,6 +344,7 @@ impl FleetDialogState {
     pub fn close(&mut self) {
         self.is_open = false;
         self.pty_session = None;
+        self.reconnect = None;
         if let Some(ref mut pending) = self.pending_approval {
             pending.edit_mode = false;
             pending.instructions_mode = false;
@@ -303,20 +352,33 @@ impl FleetDialogState {
     }
 
     pub fn filtered_items(&self) -> Vec<(usize, &FleetItem)> {
-        if self.search_query.trim().is_empty() {
-            return self.items.iter().enumerate().collect();
-        }
         let q = self.search_query.trim().to_lowercase();
         self.items
             .iter()
             .enumerate()
+            .filter(|(_, it)| self.source_filter.accepts(it.config.source))
             .filter(|(_, it)| {
-                it.config.id.to_lowercase().contains(&q)
+                q.is_empty()
+                    || it.config.id.to_lowercase().contains(&q)
                     || it.config.host.to_lowercase().contains(&q)
                     || it.config.user.to_lowercase().contains(&q)
                     || it.config.tags.iter().any(|t| t.to_lowercase().contains(&q))
             })
             .collect()
+    }
+
+    pub fn cycle_source_filter(&mut self) {
+        self.source_filter = self.source_filter.next();
+        self.keep_selection_visible();
+    }
+
+    pub fn keep_selection_visible(&mut self) {
+        let visible = self.filtered_items();
+        if !visible.iter().any(|(idx, _)| *idx == self.selected_idx) {
+            if let Some((first, _)) = visible.first() {
+                self.selected_idx = *first;
+            }
+        }
     }
 
     pub fn select_prev(&mut self) {
@@ -348,6 +410,10 @@ impl FleetDialogState {
     }
 
     pub fn selected_node(&self) -> Option<&NodeConfig> {
+        let visible = self.filtered_items().iter().any(|(idx, _)| *idx == self.selected_idx);
+        if !visible {
+            return None;
+        }
         self.items.get(self.selected_idx).map(|item| &item.config)
     }
 
@@ -400,7 +466,7 @@ pub fn render_fleet_dialog(
         return;
     }
 
-    let approval_height: u16 = if state.pending_approval.is_some() { 5 } else { 0 };
+    let approval_height = approval_height(state, area);
 
     if let Some(ref pty) = state.pty_session {
         let v = Layout::vertical([
@@ -489,15 +555,23 @@ fn render_server_selector(
     .split(area);
 
     let filtered = state.filtered_items();
+    let src_span = Span::styled(
+        state.source_filter.label(),
+        Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD),
+    );
     let title_line = if state.search_query.is_empty() {
         Line::from(vec![
             Span::styled(" SSH SERVERS ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({} available)", state.items.len()), dim),
+            Span::styled(format!("({} available)", filtered.len()), dim),
+            Span::styled("  ·  src: ", dim),
+            src_span,
         ])
     } else {
         Line::from(vec![
             Span::styled(" SSH SERVERS ", Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({}/{} available) · Filter: ", filtered.len(), state.items.len()), dim),
+            Span::styled(format!("({}/{} available) · src: ", filtered.len(), state.items.len()), dim),
+            src_span,
+            Span::styled(" · Filter: ", dim),
             Span::styled(&state.search_query, Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
             Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_yellow)),
         ])
@@ -516,12 +590,24 @@ fn render_server_selector(
         ]));
     } else if filtered.is_empty() {
         list_lines.push(Line::from(""));
-        list_lines.push(Line::from(vec![
-            Span::styled(format!("  No servers matching '{}'.", state.search_query), Style::default().fg(theme.accent_yellow)),
-        ]));
-        list_lines.push(Line::from(vec![
-            Span::styled("  Press Esc or Backspace to clear filter.", dim),
-        ]));
+        if state.search_query.trim().is_empty() {
+            list_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  No servers from source '{}'.", state.source_filter.label()),
+                    Style::default().fg(theme.accent_yellow),
+                ),
+            ]));
+            list_lines.push(Line::from(vec![
+                Span::styled("  Press Ctrl+S to switch source (all · corex · ssh).", dim),
+            ]));
+        } else {
+            list_lines.push(Line::from(vec![
+                Span::styled(format!("  No servers matching '{}'.", state.search_query), Style::default().fg(theme.accent_yellow)),
+            ]));
+            list_lines.push(Line::from(vec![
+                Span::styled("  Press Esc or Backspace to clear filter.", dim),
+            ]));
+        }
     } else {
         list_lines.push(Line::from("")); // subtle top padding
         for &(orig_idx, item) in &filtered {
@@ -533,12 +619,16 @@ fn render_server_selector(
             } else {
                 format!("[{:>2}] ", orig_idx + 1)
             };
+            let src_style = Style::default()
+                .fg(if is_selected { theme.accent_cyan } else { theme.dark_gray })
+                .bg(bg);
 
             let line = vec![
                 Span::styled(prefix, Style::default().fg(if is_selected { theme.accent_cyan } else { Color::Reset }).bg(bg).add_modifier(Modifier::BOLD)),
                 Span::styled(num_badge, Style::default().fg(if is_selected { theme.accent_yellow } else { theme.dark_gray }).bg(bg)),
                 Span::styled(format!("{:<18}", item.config.id), Style::default().fg(if is_selected { theme.text_on_selected } else { theme.gray }).bg(bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
                 Span::styled(format!("{}@{}", item.config.user, item.config.host), Style::default().fg(if is_selected { theme.text_strong } else { theme.dark_gray }).bg(bg)),
+                Span::styled(format!("  · {}", item.config.source.label()), src_style),
             ];
             list_lines.push(Line::from(line));
         }
@@ -573,8 +663,10 @@ fn render_server_selector(
         Span::styled(" Select VPS  ·  ", dim),
         Span::styled("Enter", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
         Span::styled(" Connect  ·  ", dim),
-        Span::styled("Esc", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(if focused { " Chat" } else { " Close" }, dim),
+        Span::styled("Ctrl+S", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" Source: {}  ·  ", state.source_filter.label()), dim),
+        Span::styled(if focused { "Esc" } else { "/fleet off" }, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
+        Span::styled(if focused { " Chat" } else { " Exit" }, dim),
     ];
     if !state.search_query.is_empty() {
         footer_spans.push(Span::styled("  ·  Esc", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)));
@@ -596,7 +688,7 @@ pub fn render_fleet_output(frame: &mut Frame, area: Rect, state: &FleetDialogSta
         render_server_selector(frame, area, state, theme);
         return;
     }
-    let approval_height: u16 = if state.pending_approval.is_some() { 5 } else { 0 };
+    let approval_height = approval_height(state, area);
     if let Some(ref pty) = state.pty_session {
         let v = Layout::vertical([
             Constraint::Length(1),               // title
@@ -1088,6 +1180,15 @@ fn render_feed(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme: &
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+const APPROVAL_PREFIX: usize = 3;
+
+fn approval_height(state: &FleetDialogState, area: Rect) -> u16 {
+    let Some(p) = state.pending_approval.as_ref() else { return 0 };
+    let room = (area.width as usize).saturating_sub(APPROVAL_PREFIX).max(1);
+    let rows = crate::sudo_dialog::wrap_command(&p.command, room).len() as u16;
+    (rows + 3).max(5).min((area.height / 2).max(5))
+}
+
 fn render_approval(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme: &Theme) {
     let Some(p) = state.pending_approval.as_ref() else { return };
     let block = Block::default()
@@ -1123,10 +1224,14 @@ fn render_approval(frame: &mut Frame, area: Rect, state: &FleetDialogState, them
         l.extend(key("Esc", "cancel", theme.gray));
         lines.push(Line::from(l));
     } else {
-        lines.push(Line::from(vec![
-            Span::styled(" $ ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(p.command.clone(), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
-        ]));
+        let room = (area.width as usize).saturating_sub(APPROVAL_PREFIX).max(1);
+        for (idx, row) in crate::sudo_dialog::wrap_command(&p.command, room).into_iter().enumerate() {
+            let lead = if idx == 0 { " $ " } else { "   " };
+            lines.push(Line::from(vec![
+                Span::styled(lead, Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(row, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
+            ]));
+        }
         let mut l = key("y", "allow", theme.accent_green);
         l.extend(key("e", "edit", theme.accent_yellow));
         l.extend(key("w", "instruct", theme.accent_cyan));
@@ -1184,8 +1289,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme:
             spans.push(Span::styled("Shift+Tab / Tab", key_style));
             spans.push(Span::styled(" VPS Terminal  ·  ", dim));
 
-            spans.push(Span::styled("Esc", key_style));
-            spans.push(Span::styled(" Close", dim));
+            spans.push(Span::styled("/fleet off", key_style));
+            spans.push(Span::styled(" Exit", dim));
         }
     } else if state.command_mode {
         spans.push(Span::styled("Tab", key_style));
@@ -1203,8 +1308,8 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme:
         spans.push(Span::styled("Tab", key_style));
         spans.push(Span::styled(" Terminal  ·  ", dim));
 
-        spans.push(Span::styled("Esc", key_style));
-        spans.push(Span::styled(" Close", dim));
+        spans.push(Span::styled("/fleet off", key_style));
+        spans.push(Span::styled(" Exit", dim));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1218,6 +1323,35 @@ fn make_progress_bar(pct: u8, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_long_remote_command_is_shown_whole_for_approval() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = Theme::default();
+        let mut state = FleetDialogState::new();
+        let command = format!("apt-get install -y {} && rm -rf /var/tmp/corex-danger-tail", "pkg ".repeat(30));
+        state.pending_approval = Some(PendingRemoteApproval {
+            call_id: "c".into(),
+            node_id: "vps1".into(),
+            command: command.clone(),
+            sudo: true,
+            edit_mode: false,
+            edited_command: String::new(),
+            instructions_mode: false,
+            instructions_text: String::new(),
+        });
+        let area = Rect::new(0, 0, 60, 40);
+        let height = approval_height(&state, area);
+        assert!(height > 5, "{height}");
+        let mut terminal = Terminal::new(TestBackend::new(60, height)).unwrap();
+        terminal.draw(|f| render_approval(f, Rect::new(0, 0, 60, height), &state, &theme)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..height).map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let shown: String = rows[1..].iter().take_while(|r| !r.contains(" allow")).map(|r| r[3..].trim_end()).collect();
+        assert_eq!(shown.replace(' ', ""), command.replace(' ', ""), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains(" allow")), "{rows:#?}");
+    }
+
     use super::*;
 
     fn dummy_node(id: &str) -> NodeConfig {
@@ -1291,6 +1425,51 @@ mod tests {
         let db_filtered = state.filtered_items();
         assert_eq!(db_filtered.len(), 1);
         assert_eq!(db_filtered[0].0, 1);
+    }
+
+    #[test]
+    fn source_filter_narrows_the_inventory_and_keeps_selection_visible() {
+        let mut state = FleetDialogState::new();
+        let mut corex_node = dummy_node("node-a");
+        corex_node.source = NodeSource::Fleet;
+        let mut ssh_node = dummy_node("host-b");
+        ssh_node.source = NodeSource::SshConfig;
+
+        state.items = vec![
+            FleetItem { config: corex_node, telemetry: None },
+            FleetItem { config: ssh_node, telemetry: None },
+        ];
+
+        assert_eq!(state.filtered_items().len(), 2);
+        state.selected_idx = 1;
+
+        state.cycle_source_filter();
+        assert_eq!(state.source_filter, SourceFilter::Corex);
+        assert_eq!(state.filtered_items().len(), 1);
+        assert_eq!(state.selected_idx, 0, "selection follows what stays visible");
+
+        state.cycle_source_filter();
+        assert_eq!(state.source_filter, SourceFilter::Ssh);
+        assert_eq!(state.selected_node().map(|n| n.id.as_str()), Some("host-b"));
+
+        state.cycle_source_filter();
+        assert_eq!(state.source_filter, SourceFilter::All);
+        assert_eq!(state.filtered_items().len(), 2);
+    }
+
+    #[test]
+    fn a_hidden_server_cannot_be_selected() {
+        let mut state = FleetDialogState::new();
+        let mut corex_node = dummy_node("node-a");
+        corex_node.source = NodeSource::Fleet;
+        state.items = vec![FleetItem { config: corex_node, telemetry: None }];
+
+        state.source_filter = SourceFilter::Ssh;
+        assert!(state.filtered_items().is_empty());
+        assert!(
+            state.selected_node().is_none(),
+            "Enter must not reach a server the filter hides"
+        );
     }
 
     #[test]

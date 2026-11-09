@@ -612,8 +612,8 @@ fn input_ranges(text: &str) -> Vec<(usize, usize, InputKind)> {
         let mut pos = from;
         while let Some(rel) = text[pos..to].find('@') {
             let at = pos + rel;
-            let starts_word = text[..at].chars().next_back().is_none_or(char::is_whitespace);
-            let end = text[at..to].find(char::is_whitespace).map_or(to, |e| at + e);
+            let starts_word = crate::file_completion::starts_token(text, at);
+            let end = at + crate::file_completion::token_end(&text[at..to]);
             if starts_word && end > at + 1 {
                 if at > pos {
                     ranges.push((pos, at, InputKind::Plain));

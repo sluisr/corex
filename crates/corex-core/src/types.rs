@@ -292,7 +292,7 @@ impl ResponseFormat {
 
 // ─── Usage ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: u64,
     #[serde(default)]

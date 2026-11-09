@@ -2,6 +2,8 @@
 
 use std::io::IsTerminal;
 
+use corex_core::pricing::Spend;
+
 use crate::app::App;
 use crate::text::group_thousands;
 
@@ -28,17 +30,44 @@ fn money(amount: f64) -> String {
     }
 }
 
-/// `4m 20s`, or just `45s` under a minute.
-fn duration_label(seconds: i64) -> String {
+/// `4m 20s`, `2h 5m`, or just `45s` under a minute.
+fn duration_label(seconds: u64) -> String {
     if seconds < 60 {
         format!("{}s", seconds)
-    } else {
+    } else if seconds < 3600 {
         format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
     }
+}
+
+fn cost_label(spend: &Spend) -> String {
+    let u = &spend.usage;
+    if u.total_tokens == 0 {
+        return "$0.00".to_string();
+    }
+    if spend.local_tokens == u.total_tokens {
+        return "free (local model)".to_string();
+    }
+    if spend.unpriced_tokens == u.total_tokens {
+        return "billed by the provider".to_string();
+    }
+    let mut text = money(spend.cost);
+    if spend.saved > 0.00001 {
+        text.push_str(&format!(" · {} saved by cache", money(spend.saved)));
+    }
+    if spend.unpriced_tokens > 0 {
+        text.push_str(" · plus provider-billed tokens");
+    }
+    text
 }
 
 /// The summary as the lines to print: dim labels, plain values, nothing decorative.
 pub fn format_session_summary(app: &App, color: bool) -> String {
+    format_summary(app, &app.llm_client.spend(), app.launched_at.elapsed().as_secs(), color)
+}
+
+fn format_summary(app: &App, spend: &Spend, elapsed: u64, color: bool) -> String {
     let cfg = app.llm_client.get_config();
     let is_local = cfg.local_llm_enabled;
     let is_deepseek = cfg.is_deepseek_endpoint();
@@ -65,9 +94,8 @@ pub fn format_session_summary(app: &App, color: bool) -> String {
             .unwrap_or_else(|| cfg.model.clone())
     };
 
-    let elapsed = chrono::Utc::now().signed_duration_since(app.session.created_at).num_seconds().max(0);
-    let messages = app.session.messages.len();
-    let u = &app.session.total_usage;
+    let prompts = app.prompts_this_run;
+    let u = &spend.usage;
 
     let tokens = if u.total_tokens == 0 {
         "none".to_string()
@@ -83,37 +111,11 @@ pub fn format_session_summary(app: &App, color: bool) -> String {
         text
     };
 
-    let cost = if is_local {
-        "free (local model)".to_string()
-    } else if u.total_tokens > 0 && is_deepseek {
-        let is_pro = cfg.model.contains("pro") || cfg.model.contains("reasoner");
-        let (cached_rate, miss_rate, comp_rate) = if is_pro {
-            (0.14 / 1_000_000.0, 0.55 / 1_000_000.0, 2.19 / 1_000_000.0)
-        } else {
-            (0.014 / 1_000_000.0, 0.14 / 1_000_000.0, 0.28 / 1_000_000.0)
-        };
-        let miss = u.prompt_tokens.saturating_sub(u.prompt_cache_hit_tokens);
-        let actual_cost = (u.prompt_cache_hit_tokens as f64 * cached_rate)
-            + (miss as f64 * miss_rate)
-            + (u.completion_tokens as f64 * comp_rate);
-        let uncached = (u.prompt_tokens as f64 * miss_rate) + (u.completion_tokens as f64 * comp_rate);
-        let saved = (uncached - actual_cost).max(0.0);
-        if saved > 0.00001 {
-            format!("{} · {} saved by cache", money(actual_cost), money(saved))
-        } else {
-            money(actual_cost)
-        }
-    } else if u.total_tokens > 0 {
-        "billed by the provider".to_string()
-    } else {
-        "$0.00".to_string()
-    };
-
     let rows = [
         ("Model", model_display),
-        ("Session", format!("{} · {} messages", duration_label(elapsed), messages)),
+        ("Session", format!("{} · {} {}", duration_label(elapsed), prompts, if prompts == 1 { "prompt" } else { "prompts" })),
         ("Tokens", tokens),
-        ("Cost", cost),
+        ("Cost", cost_label(spend)),
         ("Resume", format!("cx --resume {}", app.session.id)),
     ];
 
@@ -138,30 +140,44 @@ mod tests {
     use super::*;
     use crate::app::App;
     use corex_core::client::LlmClient;
+    use corex_core::pricing::{deepseek_rates_at, Rates};
+    use corex_core::types::Usage;
     use std::path::PathBuf;
 
     async fn app() -> App {
         App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false)
     }
 
+    fn off_peak() -> chrono::DateTime<chrono::Utc> {
+        "2026-11-07T12:00:00Z".parse().unwrap()
+    }
+
+    fn usage(prompt: u64, hit: u64, out: u64) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: prompt - hit,
+            completion_tokens: out,
+            total_tokens: prompt + out,
+        }
+    }
+
     #[tokio::test]
     async fn the_summary_is_plain_aligned_rows() {
         let mut app = app().await;
-        app.session.total_usage.prompt_tokens = 30_623;
-        app.session.total_usage.completion_tokens = 2_778;
-        app.session.total_usage.total_tokens = 33_401;
-        app.session.total_usage.prompt_cache_hit_tokens = 28_416;
+        app.prompts_this_run = 3;
+        let mut spend = Spend::default();
+        spend.add(&usage(30_623, 28_416, 2_778), Some(deepseek_rates_at("deepseek-flash", off_peak())));
 
-        let text = format_session_summary(&app, false);
+        let text = format_summary(&app, &spend, 72, false);
         let rows: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(rows.len(), 5, "{text}");
         assert!(rows[0].starts_with("  Model    "), "{text}");
+        assert!(text.contains("1m 12s · 3 prompts"), "{text}");
         assert!(text.contains("30,623 in · 2,778 out · 92.8% cached"), "{text}");
         assert!(text.contains("saved by cache"), "{text}");
         assert!(text.contains(&format!("cx --resume {}", app.session.id)), "{text}");
-        // Nothing decorative and no colour when it is not asked for.
         assert!(!text.contains('✦') && !text.contains('\x1b'), "{text}");
-        // Every value starts in the same column.
         let columns: Vec<usize> = rows.iter().map(|r| r.len() - r.trim_start().len() + LABEL_WIDTH + 1).collect();
         assert!(columns.iter().all(|c| *c == columns[0]));
     }
@@ -172,6 +188,29 @@ mod tests {
         let text = format_session_summary(&app, false);
         assert!(text.contains("Tokens   none"), "{text}");
         assert!(text.contains("Cost     $0.00"), "{text}");
+        assert!(text.contains("0s · 0 prompts"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_reports_only_this_run() {
+        let mut app = app().await;
+        app.session.created_at = chrono::Utc::now() - chrono::Duration::days(2);
+        app.session.update_usage(&usage(900_000, 0, 9_000));
+        let text = format_session_summary(&app, false);
+        assert!(text.contains("Session  0s"), "{text}");
+        assert!(text.contains("Tokens   none"), "{text}");
+    }
+
+    #[test]
+    fn costs_of_mixed_sources_are_labelled() {
+        let mut spend = Spend::default();
+        spend.add(&usage(100, 0, 10), Some(Rates::FREE));
+        assert_eq!(cost_label(&spend), "free (local model)");
+        let mut spend = Spend::default();
+        spend.add(&usage(100, 0, 10), None);
+        assert_eq!(cost_label(&spend), "billed by the provider");
+        spend.add(&usage(1_000_000, 0, 0), Some(deepseek_rates_at("deepseek-flash", off_peak())));
+        assert_eq!(cost_label(&spend), "$0.1500 · plus provider-billed tokens");
     }
 
     #[test]
@@ -183,8 +222,9 @@ mod tests {
     }
 
     #[test]
-    fn short_sessions_are_counted_in_seconds() {
+    fn durations_grow_into_hours() {
         assert_eq!(duration_label(45), "45s");
         assert_eq!(duration_label(260), "4m 20s");
+        assert_eq!(duration_label(2 * 86_400 + 300), "48h 5m");
     }
 }

@@ -28,34 +28,36 @@
 
 ## Overview
 
-**Corex** (invoked as `cx`, `corex`, or `cxs`) is a native terminal agent architected for software engineers and systems administrators who require low latency, deterministic execution, and air-gapped privacy:
+**Corex** (invoked as `cx` or `corex`; `cxs` is the same binary under another name, see [The `cxs` command](#the-cxs-command)) is a native terminal agent for software engineers and systems administrators who want low latency, tools that run on their own machine, and the option of fully local inference:
 
 - **`cx` / `corex`**: Autonomous coding and full-stack software development assistant with multi-turn reasoning, subagents, and fuzzy patching.
 - **`cxs` / `cx --fleet`**: Dedicated SysAdmin & Fleet automation console for remote VPS nodes and server clusters, featuring live SSH telemetries (CPU, RAM, Disk) and embedded interactive PTY terminal multiplexing.
 
-Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.4 ms (`cx --version`) and draws its first frame in about 3 ms, ships as one native binary per platform, and idles at about 11.7 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
+Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.6 ms (`cx --version`) and draws its first frame in about 10 ms, ships as one native binary per platform, and idles at about 13.4 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
-> **Release Status:** Active Development / Beta (`v0.10.1`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development / Beta (`v0.11.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 
 ## Key Highlights
 
 - **Server & Fleet Automation (`cxs`):** Built-in remote VPS cluster management and SysAdmin console (`cxs` or `cx --fleet`). Inspect remote CPU/RAM/Disk metrics, broadcast commands across node clusters, and open interactive SSH sessions in an embedded terminal. Fleet mode drives the OpenSSH `ssh` client, which must be installed.
-- **Native Systems Architecture:** One native Rust binary per platform (6.3 – 8.1 MB) that needs no Node.js, Python or other runtime to run. On Linux it links dynamically against `libc`, `libm` and `libgcc_s`. Startup in about 1.4 ms and about 11.7 MB of resident memory when idle, of which 1.9 MB is anonymous (heap and stacks).
+- **Native Systems Architecture:** One native Rust binary per platform (6.6 – 9.7 MB) that needs no Node.js, Python or other runtime to run. On Linux it links dynamically against `libc`, `libm`, `libpthread`, `libdl` and `libutil`. Startup in about 1.6 ms and about 13.4 MB of resident memory when idle, of which 2.3 MB is anonymous (heap and stacks).
 - **Multi-Provider Wire Protocols:** Native streaming adapters for DeepSeek V4.1, Google Gemini (Gemini 3.x Flash with Thought Signatures), Anthropic Claude (Opus, Sonnet and Haiku 5.5, and Fable 5.1, via `/v1/messages` SSE), OpenAI (`/chat/completions`, o1/o3-mini reasoning effort), Groq, GitHub Models, OpenRouter, and Mistral AI.
-- **Local Inference:** Direct integration with `llama-server` (llama.cpp) and `Ollama` on `http://127.0.0.1:8080/v1`: prompts, code and responses stay on your machine and inference costs $0.00. Corex checks for a newer release at startup unless you turn it off with `--no-update-check` or `COREX_NO_UPDATE_CHECK=1` (see [Offline Sovereign Local LLM](#2-offline-sovereign-local-llm-air-gapped--private)).
+- **Local Inference:** Direct integration with `llama-server` (llama.cpp, `http://127.0.0.1:8080/v1` by default) and `Ollama` (`http://127.0.0.1:11434/v1`, set with `--local-url`): prompts, code and responses stay on your machine and inference costs $0.00. Corex checks for a newer release at startup unless you turn it off with `--no-update-check` or `COREX_NO_UPDATE_CHECK=1` (see [Offline Sovereign Local LLM](#2-offline-sovereign-local-llm-air-gapped--private)).
 - **Mobile Vertical / Termux Responsive UX:** Auto-detection for Android Termux portrait screens, native tap-to-keyboard, non-overlapping 2-column status bar, and stacked modals for narrow terminals.
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
 - **File Locks & Protected Paths:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
 - **Session Audit Log:** A plain-text log of every tool call, shell command and LLM exchange, with millisecond timestamps, in `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`, kept for 7 days. It is not signed or encrypted.
 - **Global & Workspace Personality (`SYSTEM.md`):** Loads every instruction file it finds (`~/.corex/SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`, global first, then the workspace); `/memory list` shows which ones are in use.
-- **Clipboard Integration:** Copies text through `wl-copy`, `xclip`/`xsel` or OSC 52, and pastes images with `Ctrl+V` (as `[Image #N]`) for models that can see them.
+- **Clipboard Integration:** Copies text through `wl-copy`, `xclip`/`xsel` or OSC 52, and pastes images, or copied image files, with `Ctrl+V` (as `[Image #N]`) for models that can see them. `Alt+V` pastes the text only. Code blocks copy with one click on `⧉ copy`, without the rail or the line breaks added to fit the screen.
 - **KV Cache Preservation:** Context management and tool compression keep the prompt prefix stable so provider prompt caching applies. The hit rate depends on the provider and the conversation; `/stats` and the summary printed on exit report it.
 - **Non-Blocking Authentication:** Silent AskPass integration for Linux `sudo`, git, and SSH commands, plus contextual non-intrusive provider auth.
 - **Model Context Protocol (MCP):** Compatible with standard MCP servers (database connectors, GitHub tools, Docker controllers).
+- **Browser Control:** With the [Corex Browser Bridge](https://chromewebstore.google.com/detail/pgbencaoenigjeekljfindfeaolenaip) extension, Corex opens pages in your own browser and reads, clicks, types and fills forms there, using your sign-ins (see [Browser Control](#browser-control)).
+- **Copy & Export:** Every code block in a reply has a `⧉ copy` label (`Alt+Y` copies the last one), and `/export` saves the chat as Markdown, text or HTML to `~/.corex/exports/`.
 
 ---
 
@@ -63,32 +65,32 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 
 Corex is built with Link-Time Optimization (`lto = "fat"`), a single codegen unit, size optimization (`opt-level = "s"`), `panic = "abort"` and stripped symbols. On Linux it returns freed memory to the OS after heavy turns (`malloc_trim`).
 
-### Measured footprint (v0.8.1, Linux x86_64)
+### Measured footprint (v0.10.1, Linux x86_64)
 
 | Metric | Result |
 | :--- | :--- |
-| **Binary size** | 8,085,096 bytes (8.09 MB) |
-| **Download** (`.tar.gz`) | 7.23 MB |
-| **Startup**, `cx --version` | median 1.4 ms (min 1.3, max 1.7; 50 runs) |
-| **First frame** of the interactive TUI | median 3.2 ms (min 3.0, max 3.4; 10 runs) |
-| **Resident memory**, TUI idle | 11.7 MB, of which 1.9 MB anonymous (heap and stacks); peak 11.7 MB |
+| **Binary size** | 9,675,104 bytes (9.68 MB) |
+| **Download** (`.tar.gz`) | 8.65 MB |
+| **Startup**, `cx --version` | median 1.6 ms (min 1.4, max 2.0; 50 runs) |
+| **First frame** of the interactive TUI | median 10.4 ms (min 10.1, max 11.9; 10 runs) |
+| **Resident memory**, TUI idle | 13.4 MB, of which 2.3 MB anonymous (heap and stacks); peak 13.4 MB |
 | **CPU**, TUI idle | 0.10% over 10 s |
-| **Linking** | Dynamic: `libc`, `libm` and `libgcc_s`. Since `v0.8.5` the official x86_64 build is linked against glibc 2.17 with `cargo-zigbuild` and runs on Debian, Ubuntu, Linux Mint and Fedora out of the box. |
+| **Linking** | Dynamic: `libc`, `libm`, `libpthread`, `libdl` and `libutil`. The official Linux builds are linked against glibc 2.17 with `cargo-zigbuild` and run on Debian, Ubuntu, Linux Mint and Fedora out of the box. |
 
-### Binaries by platform (v0.8.1)
+### Binaries by platform (v0.10.1)
 
 | Platform | Download | Binary | Notes |
 | :--- | ---: | ---: | :--- |
-| Linux x86_64 | 7.23 MB | 8.09 MB | glibc 2.17 or newer |
-| Linux ARM64 | 6.86 MB | 7.35 MB | glibc 2.17 or newer since `v0.9.0` (2.39 in `v0.8.5`) |
-| macOS Apple Silicon | 6.39 MB | 6.31 MB | |
-| macOS Intel | 6.88 MB | 7.02 MB | |
-| Windows x86_64 | 6.77 MB | 6.91 MB | |
-| Android Termux (aarch64) | 6.80 MB | 7.33 MB | |
+| Linux x86_64 | 8.65 MB | 9.68 MB | glibc 2.17 or newer |
+| Linux ARM64 | 8.15 MB | 8.68 MB | glibc 2.17 or newer |
+| macOS Apple Silicon | 6.74 MB | 6.64 MB | |
+| macOS Intel | 7.27 MB | 7.40 MB | |
+| Windows x86_64 | 7.17 MB | 7.30 MB | |
+| Android Termux (aarch64) | 7.16 MB | 7.67 MB | |
 
 Sizes are in MB of 1,000,000 bytes.
 
-*Methodology:* Measured on 2026-10-24 on an AMD Ryzen 5 7430U, Linux 7.2.11 (Arch), with the official v0.8.1 x86_64 release binary. The TUI ran on a pseudo-terminal with an empty `HOME` and no API key, and sat idle with no input. Reproduce the Linux figures with [`scripts/benchmark.sh`](scripts/benchmark.sh) (`./scripts/benchmark.sh path/to/cx` measures any binary). The run-time measurements were taken on Linux x86_64 only.
+*Methodology:* Measured on 2026-11-02 on an AMD Ryzen 5 7430U, Linux 7.2.11 (Arch), with the official v0.10.1 x86_64 release binary. The TUI ran on a pseudo-terminal with an empty `HOME` and no API key, and sat idle with no input. Reproduce the Linux figures with [`scripts/benchmark.sh`](scripts/benchmark.sh) (`./scripts/benchmark.sh path/to/cx` measures any binary). The run-time measurements were taken on Linux x86_64 only.
 
 *Not measured:* memory while streaming a model response, the footprint of other tools, and run-time behaviour on macOS, Windows, ARM64 and Android.
 
@@ -118,7 +120,7 @@ Corex supports three unified execution paradigms:
 - **Best For:** Heavy architectural refactoring, full-stack implementations, and complex reasoning tasks.
 
 ### 2. Offline Sovereign Local LLM (Air-Gapped & Private)
-- **Engines:** Any GGUF model served via `llama-server` (llama.cpp) or `Ollama` on `http://127.0.0.1:8080/v1`.
+- **Engines:** Any model served through an OpenAI-compatible endpoint: `llama-server` (llama.cpp) on `http://127.0.0.1:8080/v1`, the default, or `Ollama` on `http://127.0.0.1:11434/v1` (pass it with `--local-url` or `COREX_LOCAL_LLM_URL`).
 - **Behavior:** Inference runs entirely on your machine: prompts, code and responses are never sent to a provider, and API cost is $0.00. At startup Corex makes a background request to find out whether a newer release exists (`corex.sluisr.com`, then GitHub), plain `GET` requests with a `corex/<version>` user agent and no conversation data (the GitHub API request adds your `GITHUB_TOKEN` or `GH_TOKEN` when one is set, to avoid rate limits). To turn it off, run `cx --no-update-check` or set `COREX_NO_UPDATE_CHECK=1`; no request is made then. Without it, a fully air-gapped machine will see the request fail silently.
 - **Best For:** Proprietary codebases, classified perimeters, air-gapped environments, and offline development.
 
@@ -165,7 +167,7 @@ Or download binaries manually from the [GitHub Releases](https://github.com/slui
 - macOS Apple Silicon (`aarch64-apple-darwin`)
 - macOS Intel (`x86_64-apple-darwin`)
 - Android Termux (`aarch64-linux-android`)
-- Windows (`x86_64-pc-windows-msvc`)
+- Windows (`x86_64-pc-windows-msvc`): unzip the `.zip` and put `cx.exe` in a folder on your `PATH`.
 
 ### Method 2: Homebrew (macOS & Linuxbrew)
 
@@ -223,6 +225,14 @@ cargo build --release
 sudo cp target/release/cx /usr/local/bin/
 ```
 
+### The `cxs` command
+
+`cxs` is the same binary started under another name: it opens the Fleet console, like `cx --fleet`. `install.sh`, the Nix flake and the npm package create it for you. With any other method, use `cx --fleet` or link it yourself:
+
+```bash
+ln -s "$(command -v cx)" ~/.local/bin/cxs
+```
+
 ---
 
 ## Authentication & Configuration
@@ -260,10 +270,17 @@ You can also configure credentials interactively at any time inside the TUI by t
 
 ### Local LLM Endpoint Setup (Optional)
 
-Start `llama-server` (from `llama.cpp`) or `Ollama` on port 8080:
+Start `llama-server` (from `llama.cpp`) on port 8080, which Corex uses by default:
 
 ```bash
 llama-server -m models/Llama-3.2-3B-Instruct-Q4_K_M.gguf --port 8080 -c 8192
+```
+
+For Ollama, which listens on port 11434, point Corex at it:
+
+```bash
+ollama serve
+cx --local --local-url http://127.0.0.1:11434/v1 --local-model qwen2.5-coder:32b
 ```
 
 ---
@@ -303,6 +320,18 @@ cxs broadcast cluster:production "uptime && free -h"
 cxs init
 ```
 
+### Browser Control
+
+Corex can work in a tab of your own browser: open a page, read it, click, type, fill a form, upload a file or take a screenshot, with the sessions you are already signed in to.
+
+1. Install **[Corex Browser Bridge](https://chromewebstore.google.com/detail/pgbencaoenigjeekljfindfeaolenaip)** from the Chrome Web Store, in Chrome, Chromium, Brave, Edge or Vivaldi.
+2. Start `cx` once. It registers the native messaging link to the extension (no ports, no pairing), and does it again on every start, so installing the browser later only needs another start.
+3. Ask for it in plain words: *"open my GitHub notifications and summarize them"*, *"fill in this form with…"*.
+
+- Corex only acts in the tabs it opens, kept in a Corex tab group. Closing them, or pressing **Release tabs** in the extension, takes them back.
+- While Corex works, the browser shows *"Corex Browser Bridge started debugging this browser"*: that is how Chromium browsers show the `debugger` permission the extension uses to click and type.
+- Supported on Linux and macOS. Browsers installed with Snap or Flatpak keep their configuration elsewhere and are not detected yet; Windows is not supported yet.
+
 ### Non-Interactive / Scripting Mode
 
 Execute automated one-shot tasks directly from your shell:
@@ -327,7 +356,7 @@ cx -C /path/to/project -p "Run tests"
 cx update
 cx update --force
 
-# Generate shell completions (Bash, Zsh, Fish)
+# Generate shell completions (Bash, Zsh, Fish, PowerShell, Elvish)
 cx --completions zsh > ~/.zfunc/_cx
 cx --completions bash > ~/.local/share/bash-completion/completions/cx
 cx --completions fish > ~/.config/fish/completions/cx.fish
@@ -341,27 +370,32 @@ Within the interactive TUI, type `/` to access built-in commands:
 
 | Command | Description |
 | :--- | :--- |
-| `/fleet` / `/sysadmin` | Open interactive Fleet dual-pane console: select remote VPS nodes, view metrics & attach PTY. |
+| `/fleet` / `/sysadmin` / `/vps` | Open interactive Fleet dual-pane console: select remote VPS nodes, view metrics & attach PTY. |
+| `/export [md\|txt\|html] [full]` | Save the chat to `~/.corex/exports/<project>/` (or `exports_dir`) as Markdown, text or an HTML page to print to PDF. |
 | `/model` | Master-detail catalog: select provider/model (DeepSeek, Gemini, Claude, OpenAI, Groq, Local) & tune CoT sliders. |
-| `/auth` | Configure API credentials securely. |
+| `/key [api_key]` (alias `/auth`) | Set or replace the API key of the active provider; without an argument it opens the credentials dialog. |
 | `/balance` | Check current account credits and token balance asynchronously (`/wallet`). |
 | `/fim <file>` | Fill-in-the-Middle code completion at cursor location. |
 | `/local <prompt>` | Query local offline LLM directly ($0.00 cost) or check status (`/local status`). |
 | `/web <query>` | Query the live internet via autonomous web search engine (`/search`). |
+| `/fetch <url>` | Fetch a web page as Markdown. |
 | `/yolo` | Toggle automatic tool approval (`/yolo [on \| off]`). |
 | `/plan` | Enter read-only architectural planning mode. |
 | `/prefix <text>` | Enforce specific response prefixes for strict formatting. |
-| `/chat` / `/resume` | List, save, or resume conversation sessions. |
+| `/chat` / `/resume` | List, save, resume or delete conversation sessions (`/chat list\|save\|resume\|delete\|new`). |
+| `/new` | Start a fresh chat session. |
 | `/save <tag>` | Save a checkpoint of the current session. |
 | `/rewind` | Go back to any earlier message: rewind the conversation, revert the agent's file edits since then, or both. |
 | `/compact` / `/compress` | Compress session context to conserve token limits. |
 | `/memory [list\|show\|add\|reload]` | List the instruction files in the prompt, show the memory block, save a note (`~/.corex/COREX.md`, or private to the project with `--project`), or reload them after editing. The model can save notes too with `save_memory`, after your approval. |
 | `/directory [add\|show]` | Let the agent read directories outside the workspace without confirmation, for this session (alias `/dir`). |
-| `/mcp` | Interactive Model Context Protocol server catalog (`/mcp catalog`, `/mcp add`, `/mcp reload`). |
-| `/tasks` | Manage background tasks (`status`, `kill`, `send_input`). |
+| `/mcp` | Interactive Model Context Protocol server catalog (`/mcp status`, `/mcp catalog`, `/mcp add`, `/mcp remove`, `/mcp reload`). |
+| `/tasks` | Manage background tasks (`list`, `status`, `kill`, `send`). |
 | `/stats` (alias `/context`) | View session metrics, KV Cache hit rates, financial cost, and the context in use against the compaction limit. |
 | `/info` | Display system telemetry, version, and links. |
 | `/update` | Check for updates or apply in-place atomically (`/update apply` / `/update force`). |
+| `/mouse` | Toggle mouse reporting: wheel and drag, or the terminal's native touch. |
+| `/keyboard` | Pause the mouse so the next tap raises the keyboard (Termux). |
 | `/clear` | Clear the terminal viewport. |
 | `/help` | Display shortcuts and usage guidelines. |
 | `/quit` / `/exit` | Terminate session and save state. |
@@ -373,7 +407,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 Corex exposes native tools directly to the reasoning engine:
 
 - **`apply_patch`:** Atomic unified diff patch tool with fuzzy whitespace tolerance, offset calculation, and CRLF/LF line ending preservation.
-- **File System:** `read_file`, `write_file`, `smart_replace`, `list_directory`, `glob`, and `grep`.
+- **File System:** `read_file`, `write_file`, `edit`, `list_directory`, `glob`, and `grep`.
 - **`run_shell_command`:** Sandboxed shell execution with safety checks, adaptive background detachment, and sudo AskPass.
 - **`manage_task`:** Background process manager supporting process inspection, signals, and standard input forwarding.
 - **`web_search` & `web_fetch`:** Live search engine integration and clean HTML-to-markdown extraction.
@@ -402,7 +436,7 @@ Configuration and logs are stored globally in `~/.corex/` and can be overridden 
 | `~/.corex/logs/` | Daily forensic audit logs (`corex-forensic-YYYY-MM-DD.log`, 7-day retention). |
 | `~/.corex/locks/` | Advisory per-path concurrency file locks (`<hash>.lock`). |
 
-Corex reads only `.corex/` and `~/.corex/` (plus the legacy `~/.deepseek/` for settings). It never reads `~/.gemini`, so it can run next to Gemini CLI without sharing its settings or skills.
+Corex reads only `.corex/` and `~/.corex/`. It never reads `~/.gemini` or `~/.deepseek`, so it can run next to Gemini CLI or deepseek-cli without sharing their settings or instructions.
 
 ### Context window and compaction
 
@@ -425,9 +459,18 @@ Earlier versions saved `"compact_threshold_tokens": 95000` to `settings.json`; t
 | Flag / variable | Effect |
 | :--- | :--- |
 | `--no-update-check` / `COREX_NO_UPDATE_CHECK=1` | Skip the startup request that looks for a newer release, and hide the cached "new version" notice. `cx --upgrade` still works. An empty value, `0` or `false` leaves the check on. |
-| `COREX_API_KEY` | API key for the active provider (see [Authentication](#authentication--configuration)). |
-| `COREX_LOCAL_LLM_URL` | Endpoint of the local model server. |
-| `COREX_MODEL` | Default model. |
+| `-p`, `--prompt` / `-w`, `--web` / `--fetch <url>` | Run one prompt, one web search or one page fetch and exit. |
+| `-m`, `--model` / `COREX_MODEL` | Model to use. |
+| `--base-url` / `COREX_BASE_URL` | API base URL of the active provider. |
+| `--api-key` / `COREX_API_KEY` | API key for the active provider (see [Authentication](#authentication--configuration)). |
+| `--local`, `--local-url`, `--local-model` / `COREX_LOCAL_LLM_URL` | Use the local model server, at this endpoint and with this model. |
+| `-y`, `--yolo` | Approve every tool call without asking. |
+| `-C`, `--directory` | Workspace to work in. |
+| `-r`, `--resume` / `-l`, `--list-sessions` | Resume a saved session by ID, tag or index / list this project's sessions. |
+| `--upgrade` (or `cx update`), `--force` | Update in place; reinstall even when up to date. |
+| `--completions <shell>` | Print the shell completion script. |
+| `--fleet` (or `cxs`) | Open the Fleet console. |
+| `COREX_KEYRING=0` | Keep API keys in `~/.corex/credentials.json` instead of the system keyring. |
 
 ---
 

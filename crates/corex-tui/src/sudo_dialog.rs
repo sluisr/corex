@@ -3,6 +3,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use corex_core::types::ToolCall;
 
@@ -64,6 +65,31 @@ impl SudoDialogState {
     }
 }
 
+const COMMAND_INDENT: usize = 11;
+
+// Hard-wrapped, never cut: the user must see every character before typing the password.
+pub(crate) fn wrap_command(command: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in command.replace('\t', "    ").lines() {
+        let mut row = String::new();
+        let mut row_width = 0;
+        for c in line.chars() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if row_width + w > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push(c);
+            row_width += w;
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
 pub fn render_sudo_dialog(
     frame: &mut Frame,
     area: Rect,
@@ -75,12 +101,22 @@ pub fn render_sudo_dialog(
     }
 
     let display_cmd = state.command.strip_prefix("sudo ").unwrap_or(&state.command).trim();
-    let dialog_width = 58.max(display_cmd.chars().count() as u16 + 16).min(area.width.saturating_sub(4));
+    let longest = display_cmd.lines().map(UnicodeWidthStr::width).max().unwrap_or(0) as u16;
+    let dialog_width = 58.max(longest + 16).min(area.width.saturating_sub(4));
+    let command_room = (dialog_width as usize).saturating_sub(COMMAND_INDENT + 1).max(1);
+    let mut command_rows = wrap_command(display_cmd, command_room);
+    let max_rows = (area.height.saturating_sub(7) as usize).max(1);
+    if command_rows.len() > max_rows {
+        let hidden = command_rows.len() - max_rows + 1;
+        command_rows.truncate(max_rows - 1);
+        command_rows.push(format!("… {} more lines: enlarge the terminal to read them all", hidden));
+    }
+    let height = (command_rows.len() as u16 + 1).min(area.height);
     let dialog_area = Rect::new(
         area.width.saturating_sub(dialog_width) / 2,
-        area.height.saturating_sub(7),
+        area.height.saturating_sub(5 + height),
         dialog_width,
-        2.min(area.height),
+        height,
     );
 
     // Dim the chat behind the modal so it does not visually collide. No vertical halo: this
@@ -90,14 +126,25 @@ pub fn render_sudo_dialog(
     // Red is the colour terminals give root: this command will run with full privileges.
     let rail = || Span::styled("▎ ", Style::default().fg(theme.error));
     let chip = Style::default().bg(theme.code_bg);
-    let command_room = (dialog_width as usize).saturating_sub(12);
-    let header = Line::from(vec![
-        rail(),
-        Span::styled("sudo  ", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
-        Span::styled(" $ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(corex_core::truncate_ellipsis(display_cmd, command_room).to_string(), chip.fg(theme.text_strong)),
-        Span::styled(" ", chip),
-    ]);
+    let command_lines: Vec<Line> = command_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let lead = if idx == 0 {
+                vec![
+                    Span::styled("sudo  ", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+                    Span::styled(" $ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                ]
+            } else {
+                vec![Span::raw("      "), Span::styled("   ", chip)]
+            };
+            let mut spans = vec![rail()];
+            spans.extend(lead);
+            spans.push(Span::styled(row.clone(), chip.fg(theme.text_strong)));
+            spans.push(Span::styled(" ", chip));
+            Line::from(spans)
+        })
+        .collect();
 
     let mut input = vec![rail(), Span::styled("› ", Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD))];
     if state.password_input.is_empty() {
@@ -119,13 +166,13 @@ pub fn render_sudo_dialog(
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(height.saturating_sub(1)), Constraint::Length(1)])
         .split(dialog_area);
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(23)])
         .split(rows[1]);
-    frame.render_widget(Paragraph::new(header), rows[0]);
+    frame.render_widget(Paragraph::new(command_lines), rows[0]);
     frame.render_widget(Paragraph::new(Line::from(input)), bottom[0]);
     frame.render_widget(Paragraph::new(hints).alignment(Alignment::Right), bottom[1]);
 }
@@ -177,6 +224,36 @@ mod tests {
         };
         assert_eq!(cell("▎", header).fg, theme.error, "root gets the red rail");
         assert_eq!(cell("whoami", header).bg, theme.code_bg, "the command sits on the shaded chip");
+    }
+
+    #[test]
+    fn a_long_command_is_shown_whole_before_the_password() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = Theme::default();
+        let mut state = SudoDialogState::new();
+        let command = format!("sudo apt install -y {} && echo done; rm -rf /tmp/corex-danger-tail", "package ".repeat(20));
+        state.open(ToolCall::new("c", "run_shell_command", "{}"), command.clone());
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| render_sudo_dialog(f, f.area(), &state, &theme)).unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..30).map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect()).collect();
+
+        let shown: String = rows
+            .iter()
+            .filter(|r| r.contains('▎') && !r.contains("Password"))
+            .map(|r| r.split_once(" $ ").map(|(_, c)| c).unwrap_or_else(|| &r[r.find('▎').unwrap() + 3 + 9..]).trim_end())
+            .collect();
+        let expected = command.strip_prefix("sudo ").unwrap().trim();
+        assert_eq!(shown.replace(' ', ""), expected.replace(' ', ""), "{rows:#?}");
+        assert!(!rows.iter().any(|r| r.contains('…')), "{rows:#?}");
+        let password = rows.iter().position(|r| r.contains("Password")).unwrap();
+        assert!(rows[password - 1].contains("corex-danger-tail"), "the end sits right above the password: {rows:#?}");
+    }
+
+    #[test]
+    fn multi_line_commands_keep_their_lines() {
+        assert_eq!(wrap_command("cd /etc\nrm x", 40), vec!["cd /etc", "rm x"]);
+        assert_eq!(wrap_command("abcdef", 4), vec!["abcd", "ef"]);
     }
 
     #[test]

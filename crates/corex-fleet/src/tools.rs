@@ -22,20 +22,25 @@ fn run_target_node<'a>(config: &'a FleetConfig, args: &serde_json::Value) -> Opt
         .or_else(|| config.default_or_single_node())
 }
 
-/// Servers listed by the repository's own `fleet.toml` are not trusted until the user approves
-/// reaching them, for the session or for good.
+/// Repository servers wait for approval; hosts from the user's `~/.ssh/config` do not.
 fn untrusted_inventory(config: &FleetConfig, tool: &str, context: &ToolContext) -> bool {
-    config.from_workspace && !context.allowed_commands.iter().any(|c| c == tool)
+    config.has_untrusted_nodes() && !context.allowed_commands.iter().any(|c| c == tool)
 }
 
 /// Whether running `command` needs approval, given how risky it is and where its servers come from.
-fn command_needs_confirmation(config: &FleetConfig, command: &str, tool: &str, context: &ToolContext) -> bool {
+fn command_needs_confirmation(
+    config: &FleetConfig,
+    command: &str,
+    tool: &str,
+    untrusted: bool,
+    context: &ToolContext,
+) -> bool {
     let risk = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands);
     if risk == CommandRiskLevel::Dangerous {
         return true;
     }
     let approved = context.allowed_commands.iter().any(|c| c == tool || c == command);
-    !approved && (risk != CommandRiskLevel::Safe || config.from_workspace)
+    !approved && (risk != CommandRiskLevel::Safe || untrusted)
 }
 
 fn run_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, tool: &str, context: &ToolContext) -> bool {
@@ -45,15 +50,20 @@ fn run_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, tool: 
     if args.get("sudo").and_then(|v| v.as_bool()).unwrap_or(false) {
         return true;
     }
-    let sudo_node = match run_target_node(config, args) {
+    let target = run_target_node(config, args);
+    let sudo_node = match target {
         Some(node) => node.sudo,
         None => config.all_nodes().iter().any(|n| n.sudo),
     };
     if sudo_node {
         return true;
     }
+    let untrusted = match target {
+        Some(node) => config.node_is_untrusted(node),
+        None => config.has_untrusted_nodes(),
+    };
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-    command_needs_confirmation(config, command, tool, context)
+    command_needs_confirmation(config, command, tool, untrusted, context)
 }
 
 fn broadcast_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, tool: &str, context: &ToolContext) -> bool {
@@ -64,17 +74,27 @@ fn broadcast_needs_confirmation(config: &FleetConfig, args: &serde_json::Value, 
         return true;
     }
     let targets = args.get("targets").and_then(|v| v.as_str()).unwrap_or("all");
-    if resolve_target_nodes(config, targets).iter().any(|n| n.sudo) {
+    let target_nodes = resolve_target_nodes(config, targets);
+    if target_nodes.iter().any(|n| n.sudo) {
         return true;
     }
+    let untrusted = if target_nodes.is_empty() {
+        config.has_untrusted_nodes()
+    } else {
+        target_nodes.iter().any(|n| config.node_is_untrusted(n))
+    };
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("").trim();
-    command_needs_confirmation(config, command, tool, context)
+    command_needs_confirmation(config, command, tool, untrusted, context)
 }
 
 /// Extra lines for the confirmation dialog when the servers come from the repository, so the
 /// user sees where the command really goes before approving it.
 fn workspace_origin(config: &FleetConfig, nodes: Vec<&NodeConfig>) -> String {
-    if !config.from_workspace {
+    let nodes: Vec<&NodeConfig> = nodes
+        .into_iter()
+        .filter(|node| config.node_is_untrusted(node))
+        .collect();
+    if nodes.is_empty() {
         return String::new();
     }
     let mut out = String::from("\nServers from this repository's .corex/fleet.toml:");
@@ -330,7 +350,10 @@ impl Tool for FleetRunCommandTool {
             }
         };
 
-        let record = session.execute_command(command, crate::session::CommandInitiator::AI, sudo, config.timeout_secs).await?;
+        let may_repeat = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands) == CommandRiskLevel::Safe;
+        let record = session
+            .execute_command(command, crate::session::CommandInitiator::AI, sudo, config.timeout_secs, may_repeat)
+            .await?;
         crate::session::global_session_manager()
             .update_session_after_command(&node.id, node, record.cwd_after.clone(), record.clone())
             .await;
@@ -442,7 +465,8 @@ impl Tool for FleetBroadcastTool {
             bail!("No nodes matched target selector '{}'", targets_str);
         }
 
-        let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs).await;
+        let may_repeat = assess_command_risk(command, &config.safe_commands, &config.dangerous_commands) == CommandRiskLevel::Safe;
+        let results = SshExecutor::broadcast(&target_nodes, command, sudo, config.timeout_secs, may_repeat).await;
 
         let mut output = format!(
             "Broadcast complete on {} nodes for command: `{}`\n\n",

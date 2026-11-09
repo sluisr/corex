@@ -101,6 +101,10 @@ struct Cli {
 
 pub async fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.message.is_none() && cli.query.first().is_some_and(|word| word == "browser-host") {
+        return corex_browser::run_native_host().await;
+    }
+    let _ = corex_browser::install_native_host();
     if let Some(arg0) = std::env::args().next() {
         if (arg0.ends_with("cxs") || arg0.ends_with("cx-fleet")) && !cli.fleet {
             cli.fleet = true;

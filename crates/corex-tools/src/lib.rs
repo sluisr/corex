@@ -1,5 +1,6 @@
 pub mod apply_patch;
 pub mod background;
+pub mod browser_tool;
 pub mod fs_tools;
 pub mod grep;
 pub mod policy;
@@ -16,6 +17,7 @@ pub mod subagent;
 pub use apply_patch::ApplyPatchTool;
 pub use background::{get_task_manager, FinishedTask, ManageTaskTool, TaskManager};
 pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
+pub use browser_tool::BrowserTool;
 pub use grep::GrepTool;
 pub use mcp::{
     find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,
