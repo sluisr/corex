@@ -21,7 +21,7 @@ pub use browser_tool::BrowserTool;
 pub use grep::GrepTool;
 pub use mcp::{
     find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,
-    McpServerStatus, McpTool,
+    McpServerStatus, McpTool, parse_header_args,
 };
 pub use memory_tool::SaveMemoryTool;
 pub use policy::needs_approval_even_in_yolo;

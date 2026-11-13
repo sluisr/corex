@@ -58,9 +58,13 @@ struct Cli {
     #[arg(short = 'l', long = "list-sessions")]
     list_sessions: bool,
 
-    /// Automatically approve all tool executions (YOLO mode)
+    /// Automatically approve tool executions (YOLO normal mode)
     #[arg(short = 'y', long)]
     yolo: bool,
+
+    /// Automatically approve all tool executions without restrictions (YOLO ALL mode)
+    #[arg(long = "yolo-all")]
+    yolo_all: bool,
 
     /// Working directory (defaults to current working directory)
     #[arg(short = 'C', long)]
@@ -238,6 +242,7 @@ pub async fn run() -> Result<()> {
             headless_prompt = Some(m);
         } else {
             config.model = m;
+            config.adopt_provider_for_model();
             explicit_model = true;
         }
     }
@@ -265,8 +270,10 @@ pub async fn run() -> Result<()> {
     if let Some(loc_m) = cli.local_model {
         config.local_llm_model = loc_m;
     }
-    if cli.yolo {
-        config.yolo_mode = true;
+    if cli.yolo_all {
+        config.yolo_mode = corex_core::config::YoloMode::All;
+    } else if cli.yolo {
+        config.yolo_mode = corex_core::config::YoloMode::Normal;
     }
 
     let mut resumed_session: Option<Session> = None;
@@ -365,7 +372,8 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let mut app = App::new(llm_client, workspace_dir.clone(), cli.yolo);
+    let mut app = App::new(llm_client, workspace_dir.clone(), config.yolo_mode.is_active());
+    app.set_yolo_mode(config.yolo_mode);
     let _ = app.reload_mcp_servers().await;
     if cli.fleet {
         app.enter_fleet_mode();
@@ -428,7 +436,7 @@ async fn run_headless(
     workspace_dir: PathBuf,
     user_prompt: String,
     display_prompt: Option<String>,
-    yolo: bool,
+    yolo: corex_core::config::YoloMode,
     mut session: Session,
 ) -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
@@ -466,9 +474,11 @@ async fn run_headless(
     println!("{} {}", you_badge, display_prompt.as_deref().unwrap_or(&user_prompt));
 
     let tools = tool_registry.list_definitions();
+    let tool_registry = std::sync::Arc::new(tool_registry);
     let context = ToolContext {
         workspace_dir: workspace_dir.clone(),
-        yolo_mode: yolo,
+        yolo_mode: yolo.is_active(),
+        yolo_all: yolo.is_all(),
         sudo_password: get_sudo_password(),
         allowed_commands: client.get_config().allowed_commands.clone(),
         extra_dirs: Vec::new(),
@@ -719,7 +729,31 @@ async fn run_headless(
             }
             truncated_retries = 0;
 
-            for call in &current_tool_calls {
+            struct HeadlessRunnable {
+                idx: usize,
+                call_id: String,
+                tool_name: String,
+                raw_args: String,
+                args_json: serde_json::Value,
+                action_label: &'static str,
+                display_detail: String,
+            }
+            struct HeadlessDone {
+                call_id: String,
+                tool_name: String,
+                raw_args: String,
+                output: String,
+                action_label: &'static str,
+                display_detail: String,
+                ok: bool,
+                err_msg: Option<String>,
+            }
+
+            let mut ordered_results: Vec<Option<HeadlessDone>> =
+                (0..current_tool_calls.len()).map(|_| None).collect();
+            let mut to_run: Vec<HeadlessRunnable> = Vec::new();
+
+            for (idx, call) in current_tool_calls.iter().enumerate() {
                 let args_json = corex_core::parse_lenient_json(&call.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
 
@@ -750,86 +784,155 @@ async fn run_headless(
 
                 let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(target_detail), 70);
 
-                {
-                    if let Some(tool) = tool_registry.get(&call.function.name) {
-                        let must_ask = corex_tools::policy::verdict(&tool_registry, &call.function.name, &args_json, &context, false)
-                            == corex_tools::policy::Verdict::Ask;
-                        if must_ask {
-                            if is_tty {
-                                print!("\r\x1b[2K");
-                                use std::io::Write;
-                                let _ = std::io::stdout().flush();
-                            }
-                            println!("\n[WARNING] Action requires confirmation: [{}]", call.function.name);
-                            if let Some(diff) = tool.format_diff(&args_json, &context.workspace_dir) {
-                                println!("{}", corex_core::sanitize_for_terminal(&diff));
-                            } else if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
-                                println!("  Command: {}", corex_core::sanitize_for_terminal(cmd));
-                            } else {
-                                println!("  Arguments: {}", corex_core::sanitize_for_terminal(&serde_json::to_string_pretty(&args_json).unwrap_or_default()));
-                            }
-
-                            print!("Allow execution? [y/N]: ");
+                if let Some(tool) = tool_registry.get(&call.function.name) {
+                    let must_ask = corex_tools::policy::verdict(&tool_registry, &call.function.name, &args_json, &context, false)
+                        == corex_tools::policy::Verdict::Ask;
+                    if must_ask {
+                        if is_tty {
+                            print!("\r\x1b[2K");
                             use std::io::Write;
                             let _ = std::io::stdout().flush();
+                        }
+                        println!("\n[WARNING] Action requires confirmation: [{}]", call.function.name);
+                        if let Some(diff) = tool.format_diff(&args_json, &context.workspace_dir) {
+                            println!("{}", corex_core::sanitize_for_terminal(&diff));
+                        } else if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
+                            println!("  Command: {}", corex_core::sanitize_for_terminal(cmd));
+                        } else {
+                            println!("  Arguments: {}", corex_core::sanitize_for_terminal(&serde_json::to_string_pretty(&args_json).unwrap_or_default()));
+                        }
 
-                            let mut input = String::new();
-                            let _ = std::io::stdin().read_line(&mut input);
-                            let trimmed = input.trim().to_lowercase();
-                            if trimmed != "y" && trimmed != "yes" {
-                                println!("Execution cancelled by user.");
-                                let denied_msg = Message::tool_response(call.id.clone(), "Execution denied by user.");
-                                messages.push(denied_msg.clone());
-                                session.add_message(denied_msg);
-                                continue;
-                            }
+                        print!("Allow execution? [y/N]: ");
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+
+                        let mut input = String::new();
+                        let _ = std::io::stdin().read_line(&mut input);
+                        let trimmed = input.trim().to_lowercase();
+                        if trimmed != "y" && trimmed != "yes" {
+                            println!("Execution cancelled by user.");
+                            ordered_results[idx] = Some(HeadlessDone {
+                                call_id: call.id.clone(),
+                                tool_name: call.function.name.clone(),
+                                raw_args: call.function.arguments.clone(),
+                                output: "Execution denied by user.".to_string(),
+                                action_label,
+                                display_detail,
+                                ok: true,
+                                err_msg: None,
+                            });
+                            continue;
                         }
                     }
                 }
 
                 if call.function.name == "ask_user" {
                     let answer = ask_user_on_stdin(&args_json);
-                    let msg = Message::tool_response(call.id.clone(), answer);
+                    ordered_results[idx] = Some(HeadlessDone {
+                        call_id: call.id.clone(),
+                        tool_name: call.function.name.clone(),
+                        raw_args: call.function.arguments.clone(),
+                        output: answer,
+                        action_label,
+                        display_detail,
+                        ok: true,
+                        err_msg: None,
+                    });
+                    continue;
+                }
+
+                to_run.push(HeadlessRunnable {
+                    idx,
+                    call_id: call.id.clone(),
+                    tool_name: call.function.name.clone(),
+                    raw_args: call.function.arguments.clone(),
+                    args_json,
+                    action_label,
+                    display_detail,
+                });
+            }
+
+            if !to_run.is_empty() {
+                let spinner_msg = if to_run.len() == 1 {
+                    format!("\x1b[1m{}:\x1b[0m \x1b[36m{}\x1b[0m", to_run[0].action_label, to_run[0].display_detail)
+                } else {
+                    format!("\x1b[1mRunning {} tools in parallel...\x1b[0m", to_run.len())
+                };
+                let mut tool_spinner = StatusSpinner::start(is_tty, "\x1b[33m", spinner_msg);
+
+                let mut join_set = tokio::task::JoinSet::new();
+                for item in to_run {
+                    let reg = tool_registry.clone();
+                    let ctx = context.clone();
+                    join_set.spawn(async move {
+                        let res = reg.execute(&item.tool_name, item.args_json, &ctx).await;
+                        (item.idx, item.call_id, item.tool_name, item.raw_args, item.action_label, item.display_detail, res)
+                    });
+                }
+
+                while let Some(joined) = join_set.join_next().await {
+                    if let Ok((idx, call_id, tool_name, raw_args, action_label, display_detail, res)) = joined {
+                        let done = match res {
+                            Ok(o) => HeadlessDone {
+                                call_id,
+                                tool_name,
+                                raw_args,
+                                output: o.output,
+                                action_label,
+                                display_detail,
+                                ok: true,
+                                err_msg: None,
+                            },
+                            Err(e) => {
+                                let msg = format!("Error executing {}: {}", tool_name, e);
+                                HeadlessDone {
+                                    call_id,
+                                    tool_name,
+                                    raw_args,
+                                    output: msg,
+                                    action_label,
+                                    display_detail,
+                                    ok: false,
+                                    err_msg: Some(e.to_string()),
+                                }
+                            }
+                        };
+                        ordered_results[idx] = Some(done);
+                    }
+                }
+                tool_spinner.stop().await;
+            }
+
+            for done in ordered_results.into_iter().flatten() {
+                if is_tty && done.tool_name != "ask_user" && done.output != "Execution denied by user." {
+                    if done.ok {
+                        println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m", done.action_label, done.display_detail);
+                    } else {
+                        println!(
+                            "\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m ({})",
+                            done.action_label,
+                            done.display_detail,
+                            done.err_msg.as_deref().unwrap_or("error")
+                        );
+                    }
+                }
+                if let Some(ref e) = done.err_msg {
+                    eprintln!("Error executing {}: {}", done.tool_name, e);
+                }
+                if done.tool_name == "ask_user" || done.output == "Execution denied by user." {
+                    let msg = Message::tool_response(done.call_id, done.output);
                     messages.push(msg.clone());
                     session.add_message(msg);
                     continue;
                 }
-
-                let mut tool_spinner = StatusSpinner::start(
-                    is_tty,
-                    "\x1b[33m",
-                    format!("\x1b[1m{}:\x1b[0m \x1b[36m{}\x1b[0m", action_label, display_detail),
-                );
-
-                let output = match tool_registry
-                    .execute(&call.function.name, args_json, &context)
-                    .await
-                {
-                    Ok(o) => {
-                        tool_spinner.stop().await;
-                        if is_tty {
-                            println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m", action_label, display_detail);
-                        }
-                        o.output
-                    }
-                    Err(e) => {
-                        tool_spinner.stop().await;
-                        if is_tty {
-                            println!("\x1b[31m✗\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m ({})", action_label, display_detail, e);
-                        }
-                        let msg = format!("Error executing {}: {}", call.function.name, e);
-                        eprintln!("{}", msg);
-                        msg
-                    }
-                };
                 // Huge output is cut to head + tail; the full text stays readable from a file.
-                let output = corex_core::spill_large_output(&call.function.name, output);
+                let output = corex_core::spill_large_output(&done.tool_name, done.output);
                 // Advisory nudge when the model keeps repeating the exact same call.
-                let output = match corex_core::observe_tool_call(&call.function.name, &call.function.arguments) {
+                let output = match corex_core::observe_tool_call(&done.tool_name, &done.raw_args) {
                     Some(reminder) => format!("{}\n\n{}", output, reminder),
                     None => output,
                 };
-                let tool_msg = Message::tool_response(call.id.clone(), output);
+                let tool_msg = Message::tool_response(done.call_id, output);
                 messages.push(tool_msg.clone());
                 session.add_message(tool_msg);
             }
@@ -908,9 +1011,14 @@ mod tests {
     fn test_cli_yolo_mode_flags() {
         let short = Cli::try_parse_from(["cx", "-y"]).unwrap();
         assert!(short.yolo);
+        assert!(!short.yolo_all);
 
         let long = Cli::try_parse_from(["cx", "--yolo"]).unwrap();
         assert!(long.yolo);
+        assert!(!long.yolo_all);
+
+        let all = Cli::try_parse_from(["cx", "--yolo-all"]).unwrap();
+        assert!(all.yolo_all);
     }
 
     #[test]

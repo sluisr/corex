@@ -89,6 +89,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<(u64, StreamEvent)>(100);
 
     let mut last_tick = Instant::now();
+    let mut last_draw = Instant::now();
     let mut needs_redraw = true;
 
     loop {
@@ -168,6 +169,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             if let Some(id) = app.fleet_dialog.selected_node().map(|n| n.id.clone()) {
                 app.fleet_dialog.status_msg = Some(format!("Connecting to {}...", id));
                 terminal.draw(|f| render_ui(f, &mut app))?;
+                crate::app::mobile::clean_trailing_margins(app.last_chat_rect, &app.visible_line_widths, terminal.backend_mut());
                 fleet::ensure_session(&mut app);
                 needs_redraw = true;
             }
@@ -178,9 +180,13 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         let pty_dirty = app.fleet_dialog.is_open && app.fleet_dialog.pty_session.as_ref().map(|p| p.is_alive() && p.take_dirty()).unwrap_or(false);
-        if needs_redraw || app.is_streaming || app.is_checking_balance || has_active_tasks || is_animating || pty_dirty {
+        // A running task changes nothing on screen by itself; once a second covers what it may show.
+        let task_tick = has_active_tasks && last_draw.elapsed() >= Duration::from_secs(1);
+        if needs_redraw || app.is_streaming || app.is_checking_balance || task_tick || is_animating || pty_dirty {
             terminal.draw(|f| render_ui(f, &mut app))?;
+            crate::app::mobile::clean_trailing_margins(app.last_chat_rect, &app.visible_line_widths, terminal.backend_mut());
             needs_redraw = false;
+            last_draw = Instant::now();
         }
 
         while let Ok((event_gen, event)) = event_rx.try_recv() {
@@ -295,32 +301,11 @@ async fn dispatch_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, t
 }
 
 fn handle_paste(app: &mut App, pasted: String) {
-    let looks_sensitive = app.sudo_dialog.is_open
-        || app.auth_dialog.is_open
-        || app.user_dialog.is_open
-        || app.fleet_dialog.is_open
-        || app.input_buffer.trim_start().starts_with("/key")
-        || app.input_buffer.trim_start().starts_with("/sudo")
-        || pasted.contains("/key")
-        || pasted.contains("/sudo")
-        || pasted.contains("$sudo:")
-        || pasted.contains("API_KEY")
-        || ["sk-", "AIza", "gsk_", "ghp_", "gho_", "github_pat_", "xox", "-----BEGIN"]
-            .iter()
-            .any(|p| pasted.contains(p));
-    if looks_sensitive {
-        corex_core::forensic::ForensicLogger::log_event(
-            "TUI_PASTE",
-            &format!("Paste event ({} chars, redacted)", pasted.len()),
-            "Content: [REDACTED]",
-        );
-    } else {
-        corex_core::forensic::ForensicLogger::log_event(
-            "TUI_PASTE",
-            &format!("Paste event ({} chars)", pasted.len()),
-            &format!("Content:\n{}", pasted),
-        );
-    }
+    corex_core::forensic::ForensicLogger::log_event(
+        "TUI_PASTE",
+        &format!("Paste event ({} chars)", pasted.len()),
+        "Content: [not logged]",
+    );
     // A terminal that has nothing to paste as text (the clipboard holds an image)
     // sends an empty paste: that is the cue to look for an image instead.
     if !(pasted.trim().is_empty() && app.paste_clipboard_image()) && !app.paste_image_files(&pasted) {

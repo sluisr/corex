@@ -139,7 +139,7 @@ fn poll_balance(app: &mut App) -> bool {
         app.clear_status();
         app.is_checking_balance = false;
 
-        let msg = match res {
+        let mut msg = match res {
             Ok(bal) => {
                 let mut msg = format!("DeepSeek Account Balance (Available: {}):\n", bal.is_available);
                 for info in bal.balance_infos {
@@ -152,8 +152,12 @@ fn poll_balance(app: &mut App) -> bool {
                 }
                 msg
             }
-            Err(e) => format!("Failed to retrieve balance: {}", e),
+            Err(e) => format!("Failed to retrieve balance: {}\n", e),
         };
+        if let Some(line) = crate::app::commands::session_spend_line(&app.llm_client.spend()) {
+            msg.push_str(&format!("\n{}", line));
+        }
+        let msg = msg.trim_end().to_string();
 
         match app.pending_balance_msg_index.take() {
             Some(idx) if idx < app.session.messages.len() => {

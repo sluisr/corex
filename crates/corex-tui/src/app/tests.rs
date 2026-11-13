@@ -1150,6 +1150,127 @@ use corex_core::types::ToolCall;
     }
 
     #[test]
+    fn patch_target_reads_the_codex_envelope_models_write() {
+        let codex = "*** Begin Patch\n*** Update File: crates/corex-tui/src/app/commands.rs\n@@\n-old\n+new\n*** End Patch";
+        assert_eq!(patch_target(codex).as_deref(), Some("crates/corex-tui/src/app/commands.rs"));
+
+        let unified = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-a\n+b";
+        assert_eq!(patch_target(unified).as_deref(), Some("src/main.rs"));
+
+        assert_eq!(patch_target("not a patch"), None);
+    }
+
+    #[test]
+    fn a_codex_patch_header_names_a_real_file_in_the_call_line() {
+        let theme = Theme::default();
+        let args = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: crates/corex-tui/src/app/commands.rs\n@@\n-old\n+new\n*** End Patch"
+        }).to_string();
+        let shown: String = format_tool_call_spans("apply_patch", &args, &theme, false)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(
+            shown, "edit crates/corex-tui/src/app/commands.rs",
+            "the header must not fall back to 'patch': {shown}"
+        );
+    }
+
+    #[test]
+    fn an_applied_patch_shows_its_code_in_the_conversation() {
+        let theme = Theme::default();
+        let args = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/a.rs\n@@ fn run\n-let old = 1;\n+let new = 2;\n*** End Patch"
+        }).to_string();
+        let msg = Message::tool_response("call_1", "Patched src/a.rs successfully via apply_patch.");
+        let shown = plain(&render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("apply_patch", args.as_str())), false,
+        ))
+        .join("\n");
+        assert!(shown.contains("@@ fn run"), "the hunk header stays visible: {shown}");
+        assert!(shown.contains("- let old = 1;"), "the removed line is shown: {shown}");
+        assert!(shown.contains("+ let new = 2;"), "the added line is shown: {shown}");
+    }
+
+    #[test]
+    fn a_long_patch_collapses_with_a_ctrl_o_hint() {
+        let theme = Theme::default();
+        let body = (0..40).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n");
+        let args = serde_json::json!({
+            "patch": format!("*** Begin Patch\n*** Add File: src/b.rs\n{body}\n*** End Patch")
+        })
+        .to_string();
+        let msg = Message::tool_response("call_1", "Created src/b.rs successfully via apply_patch.");
+        let render = |expanded: bool| {
+            plain(&render_single_message_with_pending_and_thinking(
+                0, &msg, None, &theme, 80, None, expanded, false, Some(("apply_patch", args.as_str())), false,
+            ))
+            .join("\n")
+        };
+
+        let collapsed = render(false);
+        assert!(collapsed.contains("Ctrl+O"), "the rest of the patch is advertised: {collapsed}");
+        assert!(!collapsed.contains("+ line 39"), "collapsed keeps the first rows: {collapsed}");
+
+        let expanded = render(true);
+        assert!(expanded.contains("+ line 39"), "Ctrl+O shows the whole patch: {expanded}");
+    }
+
+    #[test]
+    fn a_failed_edit_draws_no_diff() {
+        let theme = Theme::default();
+        let args = serde_json::json!({ "file_path": "src/a.rs", "old_string": "a", "new_string": "b" }).to_string();
+        let msg = Message::tool_response("call_1", "Failed to write edited content to src/a.rs: permission denied");
+        let shown = plain(&render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("edit", args.as_str())), false,
+        ))
+        .join("\n");
+        assert!(!shown.contains("+ b"), "a failed edit must not claim the change landed: {shown}");
+    }
+
+    #[test]
+    fn the_file_header_is_not_drawn_as_a_second_hunk_marker() {
+        let theme = Theme::default();
+        let args = serde_json::json!({
+            "patch": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n context line\n*** End Patch"
+        })
+        .to_string();
+        let msg = Message::tool_response("call_1", "Patched src/a.rs successfully via apply_patch.");
+        let rows = plain(&render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("apply_patch", args.as_str())), false,
+        ));
+        let markers: Vec<&String> = rows
+            .iter()
+            .filter(|r| {
+                let t = r.trim_start();
+                t.starts_with('▸') || t.starts_with("@@")
+            })
+            .collect();
+        assert_eq!(markers.len(), 2, "one file header and one hunk, never two @@ rows: {rows:#?}");
+        assert!(markers[0].trim_start().starts_with("▸ src/a.rs"), "the header is drawn once: {rows:#?}");
+        assert_eq!(markers[1].trim(), "@@", "only the real hunk keeps its @@: {rows:#?}");
+    }
+
+    #[test]
+    fn an_edit_shows_what_it_removed_and_added() {
+        let theme = Theme::default();
+        let args = serde_json::json!({
+            "file_path": "src/a.rs",
+            "old_string": "first old\nsecond old",
+            "new_string": "only new"
+        })
+        .to_string();
+        let msg = Message::tool_response("call_1", "Successfully edited src/a.rs.");
+        let shown = plain(&render_single_message_with_pending_and_thinking(
+            0, &msg, None, &theme, 80, None, false, false, Some(("edit", args.as_str())), false,
+        ))
+        .join("\n");
+        assert!(shown.contains("- first old"), "the removed lines are shown: {shown}");
+        assert!(shown.contains("- second old"), "every removed line is shown: {shown}");
+        assert!(shown.contains("+ only new"), "the added line is shown: {shown}");
+    }
+
+    #[test]
     fn test_format_call_preview_utf8_boundary_no_panic() {
         use crate::app::event_loop::format_call_preview;
         use corex_core::types::{FunctionCall, ToolCall};
@@ -1954,4 +2075,59 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
         app.logs_expanded = true;
         let expanded = screen(&mut app);
         assert!(!expanded.contains("✓ Browser · 2 steps"), "{expanded}");
+    }
+
+    #[test]
+    fn a_batch_of_calls_keeps_each_output_under_its_own_call() {
+        let theme = Theme::default();
+        let calls = vec![
+            ToolCall::new("call_a", "read_file", r#"{"file_path":"a.rs"}"#),
+            ToolCall::new("call_b", "read_file", r#"{"file_path":"b.rs"}"#),
+        ];
+        let assistant = Message::assistant_with_tools(None, None, calls);
+        let answer_a = Message::tool_response("call_a", "contenido_de_A");
+        let answer_b = Message::tool_response("call_b", "contenido_de_B");
+
+        let mut answers = ToolAnswers::new();
+        answers.insert("call_a", &answer_a);
+        answers.insert("call_b", &answer_b);
+
+        let rows = plain(&render_message_lines(
+            0, &assistant, None, &theme, 100, None, false, false, None, true, Some(&answers),
+        ));
+        let pos = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("'{needle}' is missing: {rows:#?}"))
+        };
+
+        let (head_a, body_a) = (pos("a.rs"), pos("contenido_de_A"));
+        let (head_b, body_b) = (pos("b.rs"), pos("contenido_de_B"));
+        assert!(
+            head_a < body_a && body_a < head_b && head_b < body_b,
+            "each call is followed by its own output: {rows:#?}"
+        );
+
+        // The bare tool messages are already drawn under their call.
+        let bare = render_message_lines(
+            1, &answer_a, None, &theme, 100, None, false, false, Some(("read_file", "{}")), true, Some(&answers),
+        );
+        assert!(bare.is_empty(), "a tool message must not be drawn twice: {bare:#?}");
+    }
+
+    #[test]
+    fn a_call_without_an_answer_is_drawn_on_its_own() {
+        let theme = Theme::default();
+        let calls = vec![ToolCall::new("call_a", "read_file", r#"{"file_path":"a.rs"}"#)];
+        let assistant = Message::assistant_with_tools(None, None, calls);
+        let answer = Message::tool_response("call_a", "contenido_de_A");
+
+        let mut answers = ToolAnswers::new();
+        answers.insert("call_a", &answer);
+
+        let pending = plain(&render_message_lines(
+            0, &assistant, None, &theme, 100, None, false, false, None, true, None,
+        ));
+        assert!(pending.iter().any(|r| r.contains("a.rs")), "{pending:#?}");
+        assert!(!pending.iter().any(|r| r.contains("contenido_de_A")), "{pending:#?}");
     }

@@ -48,12 +48,15 @@ pub(crate) mod copy;
 mod export;
 mod undo;
 pub use event_loop::*;
+pub use corex_core::YoloMode;
 
 const YOLO_ON_MESSAGE: &str = "YOLO on: tools run without asking, except shell commands that touch credentials, git hooks or shell startup files, and notes for the global memory.";
+const YOLO_ALL_ON_MESSAGE: &str = "YOLO ALL on: tools run without asking for ANY confirmation (all permissions bypassed).";
 const YOLO_OFF_MESSAGE: &str = "YOLO off: anything that changes files or runs a command asks first.";
 
 impl App {
     pub fn new(llm_client: LlmClient, workspace_dir: PathBuf, yolo: bool) -> Self {
+        let yolo_mode = if yolo { YoloMode::Normal } else { YoloMode::Off };
         // Tests build many Apps and some save sessions: keep them out of the real ~/.corex.
         #[cfg(test)]
         crate::test_support::isolate_home();
@@ -110,6 +113,7 @@ impl App {
             total_rendered_items: 0,
             plan_mode: false,
             always_allow_tools: yolo,
+            yolo_mode,
             mouse_capture: mouse_capture_enabled(),
             tap_keyboard: TapKeyboardGate::default(),
             touch_arrows: TouchArrowClassifier::default(),
@@ -129,6 +133,8 @@ impl App {
             logs_expanded: false,
             git_branch: branch,
             last_turn_start: None,
+            latency: SessionLatency::default(),
+            tool_starts: std::collections::HashMap::new(),
             last_esc_press: None,
             launched_at: Instant::now(),
             prompts_this_run: 0,
@@ -159,8 +165,11 @@ impl App {
             cached_has_collapsed_logs: false,
             message_clock: Default::default(),
             streaming_md_cache: Vec::new(),
+            streaming_md_committed_lines: Vec::new(),
+            streaming_md_committed_len: 0,
             streaming_md_cache_len: 0,
             streaming_md_cache_width: 0,
+            footer_model: None,
             active_background_pids: std::collections::HashSet::new(),
             pending_task_wakeup: false,
             current_generation_id: 0,
@@ -168,6 +177,7 @@ impl App {
             active_status: None,
             status_transition: StatusTransition::new(),
             last_chat_rect: None,
+            visible_line_widths: Vec::new(),
             balance_tx,
             balance_rx,
             is_checking_balance: false,
@@ -232,6 +242,7 @@ impl App {
         self.cached_message_line_offsets.clear();
         self.cached_render_width = 0;
         self.last_chat_rect = None;
+        self.visible_line_widths.clear();
     }
 
     // --- Chat text selection (driven by mouse drags, see `Selection`) ---
@@ -894,6 +905,24 @@ impl App {
         self.cached_logs_expanded = !self.logs_expanded;
     }
 
+    /// Drops the cached rendering from `msg_idx` on, so a message that was already drawn picks up
+    /// output that arrived later (a tool response is drawn under the call that produced it).
+    pub fn invalidate_message_cache_from(&mut self, msg_idx: usize) {
+        if msg_idx == 0 {
+            self.invalidate_message_cache();
+            return;
+        }
+        if msg_idx >= self.cached_message_count {
+            return;
+        }
+        let keep_lines = self.cached_message_line_offsets.get(msg_idx).copied().unwrap_or(0);
+        self.cached_message_lines.truncate(keep_lines);
+        self.selection_lines.cached.truncate(keep_lines);
+        self.copy_headers.cached.retain(|(line, _)| *line < keep_lines);
+        self.cached_message_line_offsets.truncate(msg_idx + 1);
+        self.cached_message_count = msg_idx;
+    }
+
     /// Height (in rendered lines) of the chat feed as of the last drawn frame.
     fn chat_visible_height(&self) -> usize {
         self.last_chat_rect.map(|r| r.height as usize).unwrap_or(0)
@@ -937,15 +966,56 @@ impl App {
         all
     }
 
-    /// Shift+Tab: normal → accept edits → plan → normal. Accept edits lets file edits inside the
-    /// workspace through (protected and outside paths still ask); YOLO stays a command of its own,
-    /// so a stray key press never lets every shell command run.
+    /// Changes the YOLO mode, keeping `always_allow_tools` in sync and clearing incompatible modes.
+    pub fn set_yolo_mode(&mut self, mode: YoloMode) {
+        self.yolo_mode = mode;
+        self.always_allow_tools = mode.is_active();
+        if mode.is_active() {
+            self.plan_mode = false;
+            self.accept_edits = false;
+        }
+    }
+
+    /// Shift+Tab: normal → accept edits → plan → yolo → yolo all → normal.
     pub fn cycle_permission_mode(&mut self) {
-        (self.accept_edits, self.plan_mode) = match (self.accept_edits, self.plan_mode) {
-            (false, false) => (true, false),
-            (true, _) => (false, true),
-            (false, true) => (false, false),
-        };
+        match (self.accept_edits, self.plan_mode, self.yolo_mode) {
+            (false, false, YoloMode::Off) => {
+                // Normal -> Accept Edits
+                self.accept_edits = true;
+                self.plan_mode = false;
+                self.set_yolo_mode(YoloMode::Off);
+            }
+            (true, false, YoloMode::Off) => {
+                // Accept Edits -> Plan Mode
+                self.accept_edits = false;
+                self.plan_mode = true;
+                self.set_yolo_mode(YoloMode::Off);
+            }
+            (false, true, YoloMode::Off) => {
+                // Plan Mode -> YOLO Normal
+                self.accept_edits = false;
+                self.plan_mode = false;
+                self.set_yolo_mode(YoloMode::Normal);
+            }
+            (false, false, YoloMode::Normal) => {
+                // YOLO Normal -> YOLO ALL
+                self.accept_edits = false;
+                self.plan_mode = false;
+                self.set_yolo_mode(YoloMode::All);
+            }
+            (false, false, YoloMode::All) => {
+                // YOLO ALL -> Normal
+                self.accept_edits = false;
+                self.plan_mode = false;
+                self.set_yolo_mode(YoloMode::Off);
+            }
+            _ => {
+                // Fallback -> Normal
+                self.accept_edits = false;
+                self.plan_mode = false;
+                self.set_yolo_mode(YoloMode::Off);
+            }
+        }
     }
 
     /// A dialog has the keyboard, so the composer behind it shows no caret of its own.
@@ -976,6 +1046,12 @@ impl App {
     }
 
     pub async fn reload_mcp_servers(&mut self) -> Vec<corex_tools::McpServerStatus> {
+        // The file is the truth: a key refreshed by hand, a server added or removed since
+        // start-up, applies here. `settings.json` is the only source of `mcp_servers` (a
+        // workspace copy never carries them), so this cannot leak a workspace value.
+        if let Some(on_disk) = Config::mcp_servers_from_disk() {
+            self.llm_client.set_mcp_servers(on_disk);
+        }
         let cfg = self.llm_client.get_config();
         self.tool_registry.unregister_prefix("mcp_");
         let (tools, statuses) = corex_tools::load_mcp_servers(&cfg.mcp_servers).await;
@@ -1229,6 +1305,8 @@ impl App {
             self.auto_scroll = true;
         }
         self.last_turn_start = Some(Instant::now());
+        self.latency.current_turn_first_token_ms = None;
+        self.tool_starts.clear();
 
         let prompt_builder = PromptBuilder::new(&self.workspace_dir)
             .with_sudo_password(get_sudo_password().is_some())
@@ -1267,8 +1345,22 @@ impl App {
             ));
         }
 
-        let mut messages = vec![Message::system(system_prompt)];
-        messages.extend(self.session.messages.clone());
+        let mut messages = Vec::with_capacity(self.session.messages.len() + 1);
+        messages.push(Message::system(system_prompt));
+        for m in &self.session.messages {
+            // Keep UI-only system notices ("Copied to clipboard", model switches, etc.) out of
+            // the LLM payload so they never mutate Anthropic's hoisted system prompt.
+            let is_preserved_system = m.role == "system"
+                && m.text_content().is_some_and(|c| {
+                    c.contains("<CONTEXT_SUMMARY>")
+                        || c.starts_with("TASK_DONE|")
+                        || c.starts_with("SUBAGENT_DONE|")
+                        || c.starts_with("USER_SHELL|")
+                });
+            if m.role != "system" || is_preserved_system {
+                messages.push(m.clone());
+            }
+        }
 
         let tools = self.active_tool_definitions();
         let cancel_token = CancellationToken::new();

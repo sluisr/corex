@@ -292,9 +292,58 @@ impl Session {
             bail!("Invalid session identifier.");
         }
         let file = dir.join(format!("{}.json", safe_id));
-        let serialized = serde_json::to_string_pretty(self)?;
+        let serialized = serde_json::to_string(self)?;
         crate::secure_fs::write_private_atomic(&file, serialized.as_bytes())?;
+        let summary = SessionSummary {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            tag: self.tag.clone(),
+            model: self.model.clone(),
+            message_count: self.messages.len(),
+            updated_at: self.updated_at,
+            workspace_dir: self.workspace_dir.clone(),
+        };
+        Self::write_summary(&file, &summary);
         Ok(())
+    }
+
+    fn summary_path(session_file: &Path) -> Option<PathBuf> {
+        Some(session_file.parent()?.join("index").join(session_file.file_name()?))
+    }
+
+    fn write_summary(session_file: &Path, summary: &SessionSummary) {
+        if let (Some(path), Ok(json)) = (Self::summary_path(session_file), serde_json::to_string(summary)) {
+            let _ = crate::secure_fs::write_private(&path, json);
+        }
+    }
+
+    /// The summary saved next to a session, unless the session file was written after it.
+    fn read_summary(session_file: &Path) -> Option<SessionSummary> {
+        let path = Self::summary_path(session_file)?;
+        let saved = fs::metadata(&path).ok()?.modified().ok()?;
+        if fs::metadata(session_file).ok()?.modified().ok()? > saved {
+            return None;
+        }
+        serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    }
+
+    fn summarize(session_file: &Path) -> Option<SessionSummary> {
+        if let Some(summary) = Self::read_summary(session_file) {
+            return Some(summary);
+        }
+        let content = fs::read_to_string(session_file).ok()?;
+        let sess = serde_json::from_str::<SessionSummaryDeserializer>(&content).ok()?;
+        let summary = SessionSummary {
+            id: sess.id,
+            title: sess.title,
+            tag: sess.tag,
+            model: sess.model,
+            message_count: sess.messages.len(),
+            updated_at: sess.updated_at,
+            workspace_dir: sess.workspace_dir,
+        };
+        Self::write_summary(session_file, &summary);
+        Some(summary)
     }
 
     pub fn save_checkpoint(&mut self, tag: &str) -> Result<()> {
@@ -412,13 +461,12 @@ impl Session {
         if !Self::is_safe_session_id(&session.id) {
             bail!("Refusing to delete session with unsafe ID '{}'.", session.id);
         }
-        let f1 = Self::sessions_dir().join(format!("{}.json", session.id));
-        if f1.exists() {
-            let _ = fs::remove_file(&f1);
-        }
-        let f2 = Self::fleet_sessions_dir().join(format!("{}.json", session.id));
-        if f2.exists() {
-            let _ = fs::remove_file(&f2);
+        for dir in [Self::sessions_dir(), Self::fleet_sessions_dir()] {
+            let file = dir.join(format!("{}.json", session.id));
+            let _ = fs::remove_file(&file);
+            if let Some(summary) = Self::summary_path(&file) {
+                let _ = fs::remove_file(summary);
+            }
         }
         Ok(session.id)
     }
@@ -429,30 +477,18 @@ impl Session {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        if let Ok(sess) = serde_json::from_str::<SessionSummaryDeserializer>(&content) {
-                            if !seen_ids.insert(sess.id.clone()) {
-                                continue;
-                            }
-                            if let Some(ws) = workspace_filter {
-                                if let Some(ref sess_ws) = sess.workspace_dir {
-                                    if sess_ws != ws {
-                                        continue;
-                                    }
-                                }
-                            }
-                            list.push(SessionSummary {
-                                id: sess.id,
-                                title: sess.title,
-                                tag: sess.tag,
-                                model: sess.model,
-                                message_count: sess.messages.len(),
-                                updated_at: sess.updated_at,
-                                workspace_dir: sess.workspace_dir,
-                            });
-                        }
-                    }
+                if path.extension().and_then(|s| s.to_str()) != Some("json") || !path.is_file() {
+                    continue;
+                }
+                let Some(summary) = Self::summarize(&path) else { continue };
+                if !seen_ids.insert(summary.id.clone()) {
+                    continue;
+                }
+                let other_workspace = workspace_filter
+                    .zip(summary.workspace_dir.as_deref())
+                    .is_some_and(|(wanted, actual)| wanted != actual);
+                if !other_workspace {
+                    list.push(summary);
                 }
             }
         }

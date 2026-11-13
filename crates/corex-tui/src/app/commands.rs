@@ -18,6 +18,10 @@ impl App {
             }
             "/plan" => {
                 self.plan_mode = !self.plan_mode;
+                if self.plan_mode {
+                    self.accept_edits = false;
+                    self.set_yolo_mode(corex_core::YoloMode::Off);
+                }
                 let msg = if self.plan_mode {
                     "Plan mode on: Corex reads and plans. Edits, memory, subagents and MCP are off, and shell commands that are not read-only wait for you."
                 } else {
@@ -85,36 +89,27 @@ impl App {
                 true
             }
             "/stats" | "/context" => {
-                let u = &self.session.total_usage;
-                let ratio = u.cache_hit_percentage();
                 let cfg = self.llm_client.get_config();
-                let mut msg = format!(
-                    "Session Usage Metrics:\n- Prompt Tokens: {}\n- Cached Prompt Tokens: {} ({:.1}% KV Cache Hit)\n- Completion Tokens: {}\n- Total Tokens: {}",
-                    u.prompt_tokens, u.prompt_cache_hit_tokens, ratio, u.completion_tokens, u.total_tokens
-                );
                 let used = self.session.context_tokens();
                 let (window, window_source) = if cfg.model.starts_with("local") {
                     (24_000, corex_core::WindowSource::Default)
                 } else {
                     cfg.context_window_with_source()
                 };
-                msg.push_str(&format!(
-                    "\n\nContext:\n- In use: ~{} of {} tokens ({:.1}%)\n- Window: {}\n- Auto-compact: {} at {} tokens\n- History cap (oldest turns dropped above): {} tokens\n- Change with `context_window_tokens`, `compact_threshold_tokens` and `history_token_limit` in ~/.corex/settings.json",
-                    group_thousands(used as u64),
-                    group_thousands(window as u64),
-                    used as f64 * 100.0 / window.max(1) as f64,
-                    window_source.label(),
-                    if cfg.auto_compact { "on" } else { "off" },
-                    group_thousands(cfg.effective_compact_threshold() as u64),
-                    group_thousands(cfg.effective_history_limit() as u64),
-                ));
-                let spend = self.llm_client.spend();
-                if spend.cost > 0.0 {
-                    msg.push_str(&format!(
-                        "\n- Estimated cost since launch: ${:.6} USD (saved ${:.6} with KV cache)",
-                        spend.cost, spend.saved
-                    ));
-                }
+                let full = parts.first() == Some(&"/context")
+                    || matches!(parts.get(1).copied(), Some("full" | "limits" | "all"));
+                let limits = full.then(|| ContextLimits {
+                    window_source: window_source.label().to_string(),
+                    history_cap: cfg.effective_history_limit() as u64,
+                });
+                let msg = stats_report_with_latency(
+                    &self.session.total_usage,
+                    used as u64,
+                    window as u64,
+                    cfg.auto_compact.then(|| cfg.effective_compact_threshold() as u64),
+                    limits.as_ref(),
+                    Some(&self.latency),
+                );
                 self.session.add_message(Message::system(msg));
                 true
             }
@@ -627,18 +622,22 @@ impl App {
                         for item in catalog {
                             msg.push_str(&format!("• **{}** (`{}`)\n", item.name, item.id));
                             msg.push_str(&format!("  *{}*\n", item.description));
-                            msg.push_str(&format!("  Command: `{} {}`\n", item.command, item.default_args.join(" ")));
+                            if let Some(url) = item.url {
+                                msg.push_str(&format!("  Remote URL: `{}`\n", url));
+                            } else {
+                                msg.push_str(&format!("  Command: `{} {}`\n", item.command, item.default_args.join(" ")));
+                            }
                             if !item.env_keys.is_empty() {
                                 msg.push_str(&format!("  Required Env: `{}`\n", item.env_keys.join("`, `")));
                             }
                             msg.push_str(&format!("  Quick Add: `{}`\n\n", item.example));
                         }
-                        msg.push_str("Tip: Add any server with `/mcp add <id>` (e.g. `/mcp add github` or `/mcp add sqlite app.db`)");
+                        msg.push_str("Tip: Add any server with `/mcp add <id>` (e.g. `/mcp add github`, `/mcp add sqlite app.db` or `/mcp add stitch`)");
                         self.session.add_message(Message::system(msg));
                     }
                     "add" => {
                         if parts.len() < 3 && parts.get(1).map(|&p| p == "add").unwrap_or(false) && parts.len() < 3 {
-                            let help = "Usage:\n  /mcp add <catalog-id> [args...]\n  /mcp add <custom-name> <command> [args...]\n\nExamples:\n  /mcp add github\n  /mcp add sqlite app.db\n  /mcp add filesystem .\n  /mcp add mytool python3 /path/server.py\n\nRun `/mcp catalog` to browse all vetted community templates.";
+                            let help = "Usage:\n  /mcp add <catalog-id> [args...]\n  /mcp add <custom-name> <command> [args...]\n  /mcp add <custom-name> <url> [Header=value ...]\n\nExamples:\n  /mcp add github\n  /mcp add sqlite app.db\n  /mcp add filesystem .\n  /mcp add mytool python3 /path/server.py\n  /mcp add stitch\n  /mcp add stitch https://stitch.googleapis.com/mcp \"X-Goog-Api-Key=${STITCH_API_KEY}\"\n\nRun `/mcp catalog` to browse all vetted community templates.";
                             self.session.add_message(Message::system(help));
                         } else {
                             let target_name = parts[2];
@@ -657,10 +656,15 @@ impl App {
                                         args.extend(parts[3..].iter().map(|s| s.to_string()));
                                     }
                                 }
-                                let mcp_cfg = corex_core::McpServerConfig {
-                                    command: cat.command.to_string(),
-                                    args,
-                                    env: std::collections::HashMap::new(),
+                                let mcp_cfg = match cat.url {
+                                    Some(url) => corex_core::McpServerConfig::remote(
+                                        url,
+                                        cat.headers
+                                            .iter()
+                                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                                            .collect(),
+                                    ),
+                                    None => corex_core::McpServerConfig::stdio(cat.command.to_string(), args),
                                 };
                                 let server_name = cat.id.to_string();
                                 if let Err(e) = cfg.add_mcp_server(server_name.clone(), mcp_cfg, Some(&self.workspace_dir)) {
@@ -683,27 +687,44 @@ impl App {
                                 }
                             } else if parts.len() >= 4 {
                                 let server_name = target_name.to_string();
-                                let command = parts[3].to_string();
-                                let args = parts[4..].iter().map(|s| s.to_string()).collect();
-                                let mcp_cfg = corex_core::McpServerConfig {
-                                    command,
-                                    args,
-                                    env: std::collections::HashMap::new(),
-                                };
-                                if let Err(e) = cfg.add_mcp_server(server_name.clone(), mcp_cfg, Some(&self.workspace_dir)) {
-                                    self.session.add_message(Message::system(format!("Failed to save MCP config: {}", e)));
-                                } else {
-                                    self.llm_client.update_config(cfg);
-                                    let statuses = self.reload_mcp_servers().await;
-                                    let mut msg = format!("✓ Added custom MCP server '{}'.\n", server_name);
-                                    if let Some(s) = statuses.iter().find(|s| s.name == server_name) {
-                                        let icon = if s.is_connected { "[Connected]" } else { "[Offline/Pending]" };
-                                        msg.push_str(&format!("Status: {} — {} tools discovered", icon, s.tools_count));
-                                        if let Some(ref err) = s.error {
-                                            msg.push_str(&format!("\nError: {}", err));
+                                let target = parts[3].to_string();
+                                // An http(s) target is a remote server (Streamable HTTP);
+                                // anything else is the command of a local one.
+                                let mcp_cfg = if target.starts_with("http://") || target.starts_with("https://") {
+                                    let header_args: Vec<String> =
+                                        parts[4..].iter().map(|s| s.to_string()).collect();
+                                    match corex_tools::parse_header_args(&header_args) {
+                                        Ok(headers) => Some(corex_core::McpServerConfig::remote(target, headers)),
+                                        Err(e) => {
+                                            self.session.add_message(Message::system(format!(
+                                                "Invalid header arguments: {}\nUsage: /mcp add <name> <url> [Header=value ...]",
+                                                e
+                                            )));
+                                            None
                                         }
                                     }
-                                    self.session.add_message(Message::system(msg));
+                                } else {
+                                    Some(corex_core::McpServerConfig::stdio(
+                                        target,
+                                        parts[4..].iter().map(|s| s.to_string()).collect(),
+                                    ))
+                                };
+                                if let Some(mcp_cfg) = mcp_cfg {
+                                    if let Err(e) = cfg.add_mcp_server(server_name.clone(), mcp_cfg, Some(&self.workspace_dir)) {
+                                        self.session.add_message(Message::system(format!("Failed to save MCP config: {}", e)));
+                                    } else {
+                                        self.llm_client.update_config(cfg);
+                                        let statuses = self.reload_mcp_servers().await;
+                                        let mut msg = format!("✓ Added custom MCP server '{}'.\n", server_name);
+                                        if let Some(s) = statuses.iter().find(|s| s.name == server_name) {
+                                            let icon = if s.is_connected { "[Connected]" } else { "[Offline/Pending]" };
+                                            msg.push_str(&format!("Status: {} — {} tools discovered", icon, s.tools_count));
+                                            if let Some(ref err) = s.error {
+                                                msg.push_str(&format!("\nError: {}", err));
+                                            }
+                                        }
+                                        self.session.add_message(Message::system(msg));
+                                    }
                                 }
                             } else {
                                 self.session.add_message(Message::system(format!(
@@ -736,7 +757,7 @@ impl App {
                     }
                     "reload" => {
                         let statuses = self.reload_mcp_servers().await;
-                        let mut msg = format!("Reloaded MCP Servers ({} configured):\n", statuses.len());
+                        let mut msg = format!("Reloaded MCP Servers from settings.json ({} configured):\n", statuses.len());
                         if statuses.is_empty() {
                             msg.push_str("  No servers configured. Type `/mcp catalog` to see available servers or `/mcp add <id>`.\n");
                         }
@@ -750,7 +771,12 @@ impl App {
                         self.session.add_message(Message::system(msg));
                     }
                     _ => {
-                        let cfg = self.llm_client.get_config();
+                        // Show what `settings.json` holds, not the copy loaded at start-up: a
+                        // server added or removed by hand is otherwise invisible until reload.
+                        let mut cfg = self.llm_client.get_config();
+                        if let Some(on_disk) = Config::mcp_servers_from_disk() {
+                            cfg.mcp_servers = on_disk;
+                        }
                         if cfg.mcp_servers.is_empty() {
                             let help = "No MCP (Model Context Protocol) servers configured.\n\n\
                                 Quick start:\n\
@@ -764,9 +790,10 @@ impl App {
                         } else {
                             let mut msg = format!("Configured MCP Servers ({}):\n", cfg.mcp_servers.len());
                             for (name, scfg) in &cfg.mcp_servers {
-                                msg.push_str(&format!("• {}: {} {}\n", name, scfg.command, scfg.args.join(" ")));
+                                let kind = if scfg.url.is_some() { "remote" } else { "local" };
+                                msg.push_str(&format!("• {} ({}): {}\n", name, kind, scfg.display_target()));
                             }
-                            msg.push_str("\nCommands:\n  /mcp catalog        - Browse available templates\n  /mcp add <name>     - Add new MCP server\n  /mcp remove <name>  - Remove an MCP server\n  /mcp reload         - Reload and reconnect servers");
+                            msg.push_str("\nCommands:\n  /mcp catalog        - Browse available templates\n  /mcp add <name>     - Add new MCP server\n  /mcp remove <name>  - Remove an MCP server\n  /mcp reload         - Re-read settings.json and reconnect servers");
                             self.session.add_message(Message::system(msg));
                         }
                     }
@@ -871,23 +898,28 @@ impl App {
                 if parts.len() > 1 {
                     let sub = parts[1].to_lowercase();
                     match sub.as_str() {
-                        "on" | "enable" | "true" => {
-                            self.always_allow_tools = true;
+                        "on" | "enable" | "true" | "normal" => {
+                            self.set_yolo_mode(corex_core::YoloMode::Normal);
                             self.session.add_message(Message::system(YOLO_ON_MESSAGE));
                         }
+                        "all" => {
+                            self.set_yolo_mode(corex_core::YoloMode::All);
+                            self.session.add_message(Message::system(YOLO_ALL_ON_MESSAGE));
+                        }
                         "off" | "disable" | "false" => {
-                            self.always_allow_tools = false;
+                            self.set_yolo_mode(corex_core::YoloMode::Off);
                             self.session.add_message(Message::system(YOLO_OFF_MESSAGE));
                         }
                         _ => {
-                            self.session.add_message(Message::system("Usage: /yolo on | /yolo off"));
+                            self.session.add_message(Message::system("Usage: /yolo [on|normal|all|off]"));
                         }
                     }
                 } else {
-                    self.always_allow_tools = !self.always_allow_tools;
-                    if self.always_allow_tools {
+                    if self.yolo_mode == corex_core::YoloMode::Off {
+                        self.set_yolo_mode(corex_core::YoloMode::Normal);
                         self.session.add_message(Message::system(YOLO_ON_MESSAGE));
                     } else {
+                        self.set_yolo_mode(corex_core::YoloMode::Off);
                         self.session.add_message(Message::system(YOLO_OFF_MESSAGE));
                     }
                 }
@@ -1054,7 +1086,7 @@ pub(crate) fn shortcuts_help() -> String {
         "  /command         run a command (/help lists them)",
         "  !command         run a shell command yourself; the agent sees its output next turn",
         "  Enter            send (queues while the agent works) · Alt+Enter: send now",
-        "  Shift+Tab        cycle modes: normal · accept edits · plan (/yolo approves everything)",
+        "  Shift+Tab        cycle modes: normal · accept edits · plan · yolo · yolo all",
         "  Esc              take back a queued message, then cancel the reply",
         "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
         "  Ctrl+V           paste an image (or a copied image file) from the clipboard, or its text",
@@ -1097,4 +1129,162 @@ fn memory_file_list(memory: &Memory) -> String {
         msg.push_str(&format!("\n{} {}", mark, memory.display_path(&path)));
     }
     msg
+}
+
+/// Limits shown only by `/stats full` (or `/context`): where the window size came from and the
+/// history cap. They are configuration, not usage, so the plain `/stats` leaves them out.
+pub(crate) struct ContextLimits {
+    pub window_source: String,
+    pub history_cap: u64,
+}
+
+/// The `/stats` report: numbers first, every count grouped by thousands so it reads at a glance.
+/// `auto_compact` is the compaction threshold when auto-compact is on.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn stats_report(
+    u: &corex_core::types::Usage,
+    used: u64,
+    window: u64,
+    auto_compact: Option<u64>,
+    limits: Option<&ContextLimits>,
+) -> String {
+    stats_report_with_latency(u, used, window, auto_compact, limits, None)
+}
+
+pub(crate) fn stats_report_with_latency(
+    u: &corex_core::types::Usage,
+    used: u64,
+    window: u64,
+    auto_compact: Option<u64>,
+    limits: Option<&ContextLimits>,
+    latency: Option<&crate::app::state::SessionLatency>,
+) -> String {
+    let mut msg = format!(
+        "Session usage:\n- Prompt: {} ({} cached, {:.1}% hit)\n- Completion: {}\n- Total: {}",
+        group_thousands(u.prompt_tokens),
+        group_thousands(u.prompt_cache_hit_tokens),
+        u.cache_hit_percentage(),
+        group_thousands(u.completion_tokens),
+        group_thousands(u.total_tokens),
+    );
+    msg.push_str(&format!(
+        "\n\nContext:\n- In use: ~{} of {} ({:.1}%)\n- Auto-compact: {}",
+        group_thousands(used),
+        group_thousands(window),
+        used as f64 * 100.0 / window.max(1) as f64,
+        match auto_compact {
+            Some(at) => format!("at {}", group_thousands(at)),
+            None => "off".to_string(),
+        },
+    ));
+    if let Some(lat) = latency.filter(|l| l.turn_count > 0 || l.tool_calls_count > 0) {
+        msg.push_str("\n\nLatency:");
+        if let Some(ttft) = lat.last_ttft_ms {
+            let avg_ttft = lat.ttft_sum_ms / lat.ttft_count.max(1);
+            msg.push_str(&format!(
+                "\n- TTFT: {} ms last (avg {} ms across {} turns)",
+                group_thousands(ttft),
+                group_thousands(avg_ttft),
+                group_thousands(lat.ttft_count),
+            ));
+        }
+        if let Some(turn_ms) = lat.last_turn_ms {
+            let avg_ms = lat.turn_sum_ms / lat.turn_count.max(1);
+            msg.push_str(&format!(
+                "\n- Turn: {:.2} s last (avg {:.2} s)",
+                turn_ms as f64 / 1000.0,
+                avg_ms as f64 / 1000.0,
+            ));
+        }
+        if lat.tool_calls_count > 0 {
+            msg.push_str(&format!(
+                "\n- Tools: {} calls (total {:.2} s)",
+                group_thousands(lat.tool_calls_count),
+                lat.tool_total_ms as f64 / 1000.0,
+            ));
+        }
+    }
+    match limits {
+        Some(l) => msg.push_str(&format!(
+            "\n- Window: {}\n- History cap: {} (oldest turns dropped above)\n\nChange with `context_window_tokens`, `compact_threshold_tokens` and `history_token_limit` in ~/.corex/settings.json",
+            l.window_source,
+            group_thousands(l.history_cap),
+        )),
+        None => msg.push_str("\n\nLimits: /stats full · Cost: /balance"),
+    }
+    msg
+}
+
+/// What this session has spent so far, appended to `/balance`. `None` when nothing priced was
+/// used (local models, unknown pricing), so the balance is not cluttered with a $0 line.
+pub(crate) fn session_spend_line(spend: &corex_core::pricing::Spend) -> Option<String> {
+    (spend.cost > 0.0).then(|| {
+        format!(
+            "This session: ~${:.6} USD (saved ${:.6} with KV cache)",
+            spend.cost, spend.saved
+        )
+    })
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    fn usage() -> corex_core::types::Usage {
+        corex_core::types::Usage {
+            prompt_tokens: 4_138_571,
+            prompt_cache_hit_tokens: 3_943_040,
+            prompt_cache_miss_tokens: 195_531,
+            completion_tokens: 79_036,
+            total_tokens: 4_217_607,
+        }
+    }
+
+    #[test]
+    fn every_count_is_grouped_by_thousands() {
+        let msg = stats_report(&usage(), 110_838, 1_048_576, Some(900_000), None);
+        for n in ["4,138,571", "3,943,040", "79,036", "4,217,607", "~110,838 of 1,048,576", "at 900,000"] {
+            assert!(msg.contains(n), "missing {n} in:\n{msg}");
+        }
+        assert!(!msg.contains("4138571"), "{msg}");
+    }
+
+    #[test]
+    fn plain_stats_leaves_configuration_noise_out() {
+        let msg = stats_report(&usage(), 1, 10, None, None);
+        assert!(msg.contains("Auto-compact: off"), "{msg}");
+        for noise in ["Window:", "History cap", "settings.json", "cost"] {
+            assert!(!msg.contains(noise), "{noise} should not be in:\n{msg}");
+        }
+    }
+
+    #[test]
+    fn full_stats_shows_the_limits() {
+        let limits = ContextLimits { window_source: "model default".into(), history_cap: 1_000_000 };
+        let msg = stats_report(&usage(), 1, 10, Some(5), Some(&limits));
+        assert!(msg.contains("Window: model default"), "{msg}");
+        assert!(msg.contains("History cap: 1,000,000"), "{msg}");
+        assert!(msg.contains("settings.json"), "{msg}");
+    }
+
+    #[test]
+    fn stats_includes_latency_when_recorded() {
+        let mut lat = crate::app::state::SessionLatency::default();
+        lat.record_first_token(320);
+        lat.record_turn_completed(1_450);
+        lat.record_tool_duration(250);
+        let msg = stats_report_with_latency(&usage(), 1, 10, None, None, Some(&lat));
+        assert!(msg.contains("Latency:"), "{msg}");
+        assert!(msg.contains("TTFT: 320 ms"), "{msg}");
+        assert!(msg.contains("Turn: 1.45 s"), "{msg}");
+        assert!(msg.contains("Tools: 1 calls (total 0.25 s)"), "{msg}");
+    }
+
+    #[test]
+    fn unpriced_sessions_add_no_cost_line_to_balance() {
+        assert!(session_spend_line(&corex_core::pricing::Spend::default()).is_none());
+        let spend = corex_core::pricing::Spend { cost: 0.08858, saved: 0.5, ..Default::default() };
+        let line = session_spend_line(&spend).unwrap();
+        assert!(line.contains("$0.088580"), "{line}");
+    }
 }

@@ -229,6 +229,7 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
     }
 
     let tools_defs = sub_reg.list_definitions();
+    let sub_reg = std::sync::Arc::new(sub_reg);
 
     // Subagents never get YOLO mode or the cached sudo password. They inherit the user's
     // approval rules; an approved Worker may additionally edit files inside the workspace
@@ -240,6 +241,7 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
     let subagent_ctx = ToolContext {
         workspace_dir: workspace.to_path_buf(),
         yolo_mode: false,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands,
         extra_dirs: extra_dirs.to_vec(),
@@ -419,42 +421,119 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
             extra_content: None,
         });
 
-        // Execute tool calls
-        for call in tool_calls {
-            if cancel_token.is_cancelled() {
-                trace.record_step("Subagent execution cancelled before tool execution");
-                return Err("Subagent task was cancelled".to_string());
-            }
-            let name = call.function.name.trim();
+        // Execute tool calls concurrently while preserving original call order for tool responses.
+        if cancel_token.is_cancelled() {
+            trace.record_step("Subagent execution cancelled before tool execution");
+            return Err("Subagent task was cancelled".to_string());
+        }
+
+        struct PreparedSubagentCall {
+            idx: usize,
+            call_id: String,
+            name: String,
+            args_val: serde_json::Value,
+        }
+        struct CompletedSubagentCall {
+            name: String,
+            call_id: String,
+            out_str: String,
+            is_err: bool,
+            duration_ms: u128,
+        }
+
+        let mut results: Vec<Option<CompletedSubagentCall>> = (0..tool_calls.len()).map(|_| None).collect();
+        let mut to_run: Vec<PreparedSubagentCall> = Vec::new();
+
+        for (idx, call) in tool_calls.into_iter().enumerate() {
+            let name = call.function.name.trim().to_string();
             let args_raw = &call.function.arguments;
             trace.record_step(format!("Subagent calling tool `{}` with args: {}", name, args_raw));
 
-            let start = std::time::Instant::now();
-            let (out_str, is_err) = if truncated {
-                (corex_core::TRUNCATED_TOOL_CALL_ERROR.to_string(), true)
+            if truncated {
+                results[idx] = Some(CompletedSubagentCall {
+                    name,
+                    call_id: call.id,
+                    out_str: corex_core::TRUNCATED_TOOL_CALL_ERROR.to_string(),
+                    is_err: true,
+                    duration_ms: 0,
+                });
             } else {
                 match corex_core::parse_lenient_json(args_raw) {
                     Ok(args_val) => {
-                        if let Some(reason) = crate::policy::subagent_denial(role, &sub_reg, name, &args_val, &subagent_ctx) {
-                            (reason, true)
+                        if let Some(reason) = crate::policy::subagent_denial(role, &sub_reg, &name, &args_val, &subagent_ctx) {
+                            results[idx] = Some(CompletedSubagentCall {
+                                name,
+                                call_id: call.id,
+                                out_str: reason,
+                                is_err: true,
+                                duration_ms: 0,
+                            });
                         } else {
-                            match sub_reg.execute(name, args_val, &subagent_ctx).await {
-                                Ok(res) => (res.output, res.is_error),
-                                Err(e) => (format!("Error executing tool {}: {}", name, e), true),
-                            }
+                            to_run.push(PreparedSubagentCall {
+                                idx,
+                                call_id: call.id,
+                                name,
+                                args_val,
+                            });
                         }
                     }
-                    Err(e) => (format!("Invalid arguments JSON for tool {}: {}", name, e), true),
+                    Err(e) => {
+                        results[idx] = Some(CompletedSubagentCall {
+                            out_str: format!("Invalid arguments JSON for tool {}: {}", name, e),
+                            name,
+                            call_id: call.id,
+                            is_err: true,
+                            duration_ms: 0,
+                        });
+                    }
                 }
-            };
-            let duration_ms = start.elapsed().as_millis();
+            }
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for prep in to_run {
+            let reg = sub_reg.clone();
+            let ctx = subagent_ctx.clone();
+            join_set.spawn(async move {
+                let start = std::time::Instant::now();
+                let (out_str, is_err) = match reg.execute(&prep.name, prep.args_val, &ctx).await {
+                    Ok(res) => (res.output, res.is_error),
+                    Err(e) => (format!("Error executing tool {}: {}", prep.name, e), true),
+                };
+                (
+                    prep.idx,
+                    CompletedSubagentCall {
+                        name: prep.name,
+                        call_id: prep.call_id,
+                        out_str,
+                        is_err,
+                        duration_ms: start.elapsed().as_millis(),
+                    },
+                )
+            });
+        }
+
+        while let Some(res) = join_set.join_next().await {
+            if cancel_token.is_cancelled() {
+                join_set.abort_all();
+                trace.record_step("Subagent execution cancelled during parallel tool execution");
+                return Err("Subagent task was cancelled".to_string());
+            }
+            if let Ok((idx, completed)) = res {
+                results[idx] = Some(completed);
+            }
+        }
+
+        for completed in results.into_iter().flatten() {
             trace.record_step(format!(
                 "Tool `{}` completed in {}ms (is_error={}):\n{}",
-                name, duration_ms, is_err, corex_core::truncate_ellipsis(&out_str, 500)
+                completed.name,
+                completed.duration_ms,
+                completed.is_err,
+                corex_core::truncate_ellipsis(&completed.out_str, 500)
             ));
-
-            let out_str = corex_core::spill_large_output(name, out_str);
-            messages.push(Message::tool_response(call.id, out_str));
+            let out_str = corex_core::spill_large_output(&completed.name, completed.out_str);
+            messages.push(Message::tool_response(completed.call_id, out_str));
         }
     }
 

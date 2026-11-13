@@ -714,6 +714,7 @@ mod tests {
         ToolContext {
             workspace_dir: std::env::temp_dir(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands,
             extra_dirs: Vec::new(),
@@ -733,6 +734,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -758,6 +760,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),

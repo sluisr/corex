@@ -122,131 +122,111 @@ pub fn parse_questions(raw_args: &str) -> Option<Vec<UserQuestion>> {
     }
 }
 
-fn wrap_question(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
+/// `text` broken into rows of at most `width` columns, at spaces when it can. A word wider than a
+/// row (a URL, a path) is split across rows instead of cut, so no part of an option is ever lost.
+fn wrap_rows(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let width = width.max(1);
+    let mut rows = Vec::new();
     for line in text.lines() {
         let mut cur = String::new();
         let mut cur_w = 0usize;
-        for ch in line.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + w > width && !cur.is_empty() {
-                out.push(Line::from(Span::styled(
-                    cur.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )));
-                cur.clear();
+        for word in line.split_whitespace() {
+            let word_w = UnicodeWidthStr::width(word);
+            let gap = usize::from(!cur.is_empty());
+            if cur_w + gap + word_w <= width {
+                if gap == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+                cur_w += gap + word_w;
+                continue;
+            }
+            if !cur.is_empty() {
+                rows.push(std::mem::take(&mut cur));
                 cur_w = 0;
             }
-            cur.push(ch);
-            cur_w += w;
+            for ch in word.chars() {
+                let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if cur_w + w > width && !cur.is_empty() {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(ch);
+                cur_w += w;
+            }
         }
         if !cur.is_empty() {
-            out.push(Line::from(Span::styled(
-                cur,
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
+            rows.push(cur);
         }
     }
-    if out.is_empty() {
-        out.push(Line::from(""));
+    if rows.is_empty() {
+        rows.push(String::new());
     }
-    out
+    rows
 }
 
-pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: u16) -> u16 {
-    let Some(q) = state.questions.get(state.current) else {
-        return 5;
-    };
-    let usable_w = (width as usize).saturating_sub(6).max(20);
-    let q_lines_count = wrap_question(&q.question, usable_w).len().max(1);
-    let opt_count = if q.has_options {
-        q.options.len().min(8)
-    } else {
-        1
-    };
-    // Content lines: question lines + opt_count + 1 hint
-    // Borders: top + bottom = 2
-    let content = q_lines_count + opt_count + 1;
-    (content as u16 + 2).min(max_height.saturating_sub(6)).max(5)
-}
+/// Most options listed at once; the rest scroll with the selection.
+const MAX_VISIBLE_OPTIONS: usize = 8;
 
-pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState, theme: &Theme) {
-    let Some(q) = state.questions.get(state.current) else {
-        return;
-    };
+/// Every row of the dialog body for `width` columns, plus the rows the selected option spans so
+/// the renderer can keep it on screen when the terminal is too short for everything.
+/// Long questions and options wrap with a hanging indent instead of being clipped at the edge,
+/// which on narrow terminals (Termux, split panes) used to hide most of the text.
+fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &Theme) -> (Vec<Line<'static>>, std::ops::Range<usize>) {
+    let width = width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    let usable_w = (area.width as usize).saturating_sub(6).max(20);
-    let mut lines: Vec<Line> = Vec::new();
-
-    // 1. Question text wrapped with clean prompt bullet
-    let q_lines = wrap_question(&q.question, usable_w);
-    for (i, ql) in q_lines.into_iter().enumerate() {
-        if i == 0 {
-            let mut spans = vec![
-                Span::styled(" › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-            ];
-            spans.extend(ql.spans);
-            lines.push(Line::from(spans));
-        } else {
-            let mut spans = vec![
-                Span::raw("   "),
-            ];
-            spans.extend(ql.spans);
-            lines.push(Line::from(spans));
-        }
+    // 1. The question, behind a prompt bullet; continuation rows align under its text.
+    let bullet = Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    for (i, row) in wrap_rows(&q.question, width.saturating_sub(4).max(10)).into_iter().enumerate() {
+        let lead = if i == 0 { Span::styled(" › ", bullet) } else { Span::raw("   ") };
+        lines.push(Line::from(vec![lead, Span::styled(row, bold)]));
     }
 
-    // 2. Options or text input
+    let mut selected_rows = lines.len()..lines.len();
+
+    // 2. Options or text input.
     if q.has_options {
-        let max_opts = q.options.len().min(8);
+        let max_opts = q.options.len().min(MAX_VISIBLE_OPTIONS);
         let cur_sel = state.selected[state.current];
-        let window_start = if cur_sel >= max_opts {
-            cur_sel + 1 - max_opts
-        } else {
-            0
-        };
+        let window_start = if cur_sel >= max_opts { cur_sel + 1 - max_opts } else { 0 };
+        let num_w = (q.options.len()).to_string().len() + 2; // "10. "
 
         for (idx, opt) in q.options.iter().enumerate().skip(window_start).take(max_opts) {
             let is_sel = idx == cur_sel;
-            let num = format!("{}. ", idx + 1);
-            let cursor = if is_sel { "  › " } else { "    " };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    cursor,
-                    if is_sel {
-                        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
-                Span::styled(
-                    num,
-                    if is_sel {
-                        Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.dark_gray)
-                    },
-                ),
-                Span::styled(
-                    opt.clone(),
-                    if is_sel {
-                        Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(theme.gray)
-                    },
-                ),
-            ]));
+            let (marker_style, num_style, text_style) = if is_sel {
+                (bullet, bullet, Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))
+            } else {
+                (Style::default(), Style::default().fg(theme.dark_gray), Style::default().fg(theme.gray))
+            };
+            let first = lines.len();
+            let text_w = width.saturating_sub(4 + num_w + 1).max(10);
+            for (i, row) in wrap_rows(opt, text_w).into_iter().enumerate() {
+                let lead = if i == 0 {
+                    vec![
+                        Span::styled(if is_sel { "  › " } else { "    " }, marker_style),
+                        Span::styled(format!("{:<num_w$}", format!("{}.", idx + 1)), num_style),
+                    ]
+                } else {
+                    vec![Span::raw(" ".repeat(4 + num_w))]
+                };
+                let mut spans = lead;
+                spans.push(Span::styled(row, text_style));
+                lines.push(Line::from(spans));
+            }
+            if is_sel {
+                selected_rows = first..lines.len();
+            }
         }
 
-        if q.options.len() > max_opts {
-            let remaining = q.options.len() - (window_start + max_opts);
-            if remaining > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!("     ... ({} more below)", remaining),
-                    Style::default().fg(theme.dark_gray),
-                )));
-            }
+        let remaining = q.options.len().saturating_sub(window_start + max_opts);
+        if remaining > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("     ... ({} more below)", remaining),
+                Style::default().fg(theme.dark_gray),
+            )));
         }
     } else {
         let input = &state.text_input[state.current];
@@ -259,20 +239,17 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
             || h_lower.contains("password")
             || h_lower.contains("contra");
 
-        let display_text = if is_secret {
-            "*".repeat(input.chars().count())
-        } else {
-            input.clone()
-        };
+        let display_text = if is_secret { "*".repeat(input.chars().count()) } else { input.clone() };
 
         lines.push(Line::from(vec![
-            Span::styled("  › ", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
+            Span::styled("  › ", bullet),
             Span::styled(display_text, Style::default().fg(theme.foreground)),
             Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
         ]));
+        selected_rows = lines.len() - 1..lines.len();
     }
 
-    // 3. Hint footer
+    // 3. Hint footer.
     let hint = if q.has_options {
         if q.options.len() <= 9 {
             format!("  ↑↓ or 1-{} · enter confirm · esc cancel", q.options.len())
@@ -282,17 +259,38 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
     } else {
         "  enter confirm · esc cancel".to_string()
     };
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(theme.dark_gray),
-    )));
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(theme.dark_gray))));
+
+    (lines, selected_rows)
+}
+
+pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: u16) -> u16 {
+    let Some(q) = state.questions.get(state.current) else {
+        return 5;
+    };
+    let (lines, _) = dialog_lines(q, state, width, &Theme::default());
+    // Borders: top + bottom = 2
+    (lines.len() as u16 + 2).min(max_height.saturating_sub(6)).max(5)
+}
+
+pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState, theme: &Theme) {
+    let Some(q) = state.questions.get(state.current) else {
+        return;
+    };
+
+    let (lines, selected_rows) = dialog_lines(q, state, area.width, theme);
+
+    // When the terminal is too short for every row, scroll just enough that the selected option
+    // stays fully visible rather than clipping it off the bottom.
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let scroll = selected_rows.end.saturating_sub(inner_h).min(selected_rows.start) as u16;
 
     // Clean unbroken border line
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(Color::Rgb(75, 110, 155)));
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
 #[cfg(test)]
@@ -347,5 +345,48 @@ mod tests {
         state.open(qs, Vec::new(), "call-1".to_string());
         let h = calculate_dialog_height(&state, 80, 24);
         assert!(h >= 7 && h <= 12, "height should be reasonably compact: {}", h);
+    }
+
+    fn open_with(raw: &str) -> UserDialogState {
+        let mut state = UserDialogState::new();
+        state.open(parse_questions(raw).unwrap(), Vec::new(), "call-1".to_string());
+        state
+    }
+
+    fn plain(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn long_options_wrap_instead_of_being_clipped() {
+        let state = open_with(
+            r#"{"questions":[{"question":"Which one?","options":["Rewrite the whole renderer so every option wraps on narrow terminals","B"]}]}"#,
+        );
+        let q = state.current_question().unwrap();
+        let (lines, sel) = dialog_lines(q, &state, 40, &Theme::default());
+        let rows: Vec<String> = lines.iter().map(plain).collect();
+        for row in &rows {
+            assert!(unicode_width::UnicodeWidthStr::width(row.as_str()) <= 40, "row overflows: {row:?}");
+        }
+        assert!(sel.len() > 1, "the long option should span several rows: {rows:#?}");
+        let joined = rows[sel.clone()].iter().map(|r| r.trim()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("narrow terminals"), "{joined}");
+        // Continuation rows hang under the option text, not under the number.
+        assert!(rows[sel.start + 1].starts_with("       "), "{rows:#?}");
+    }
+
+    #[test]
+    fn height_grows_with_wrapped_options() {
+        let state = open_with(
+            r#"{"questions":[{"question":"Q?","options":["one two three four five six seven eight nine ten eleven twelve","B"]}]}"#,
+        );
+        assert!(calculate_dialog_height(&state, 30, 60) > calculate_dialog_height(&state, 200, 60));
+    }
+
+    #[test]
+    fn words_wider_than_a_row_are_split_not_dropped() {
+        let rows = wrap_rows("see https://example.com/a/very/long/path/that/does/not/fit", 12);
+        assert!(rows.iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 12), "{rows:?}");
+        assert_eq!(rows.concat().replace(' ', ""), "seehttps://example.com/a/very/long/path/that/does/not/fit");
     }
 }

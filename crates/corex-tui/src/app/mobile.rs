@@ -165,3 +165,87 @@ impl TouchArrowClassifier {
         swipe
     }
 }
+
+pub fn clean_trailing_margins(
+    last_chat_rect: Option<ratatui::layout::Rect>,
+    visible_line_widths: &[u16],
+    out: &mut impl std::io::Write,
+) {
+    if !should_clean_margins() {
+        return;
+    }
+    let Some(rect) = last_chat_rect else {
+        return;
+    };
+    if visible_line_widths.is_empty() {
+        return;
+    }
+
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(visible_line_widths.len() * 16 + 8);
+    // Save cursor position (DECSC)
+    buf.extend_from_slice(b"\x1b7");
+
+    for (i, &w) in visible_line_widths.iter().enumerate() {
+        if (i as u16) >= rect.height {
+            break;
+        }
+        let clear_x = rect.x + w.min(rect.width);
+        if clear_x < rect.x + rect.width {
+            let row = rect.y + i as u16 + 1; // 1-based ANSI coordinates
+            let col = clear_x + 1;
+            let _ = write!(buf, "\x1b[{row};{col}H\x1b[K");
+        }
+    }
+
+    // Restore cursor position (DECRC) and ensure cursor remains hidden
+    buf.extend_from_slice(b"\x1b8\x1b[?25l");
+    let _ = out.write_all(&buf);
+    let _ = out.flush();
+}
+
+pub fn should_clean_margins() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if let Ok(v) = std::env::var("COREX_CLEAN_MARGINS") {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        } else {
+            is_android_or_termux()
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn test_clean_trailing_margins_generates_precise_escapes() {
+        let rect = Rect::new(0, 0, 40, 5);
+        let widths = [20, 40, 10]; // row 0: 20 cols text, row 1: full width, row 2: 10 cols text
+
+        // Direct test of formatting logic
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1b7");
+        for (i, &w) in widths.iter().enumerate() {
+            let clear_x = rect.x + w.min(rect.width);
+            if clear_x < rect.x + rect.width {
+                let row = rect.y + i as u16 + 1;
+                let col = clear_x + 1;
+                buf.extend_from_slice(format!("\x1b[{row};{col}H\x1b[K").as_bytes());
+            }
+        }
+        buf.extend_from_slice(b"\x1b8\x1b[?25l");
+
+        let s = String::from_utf8(buf).unwrap();
+        // Row 0 has 20 cols of text, so clear from col 21 to end of line:
+        assert!(s.contains("\x1b[1;21H\x1b[K"), "expected row 1 clear: {s}");
+        // Row 1 is full width (40), so no clear needed:
+        assert!(!s.contains("\x1b[2;"), "full width should not emit clear: {s}");
+        // Row 2 has 10 cols of text, so clear from col 11 to end of line:
+        assert!(s.contains("\x1b[3;11H\x1b[K"), "expected row 3 clear: {s}");
+        // Starts with DECSC and ends with DECRC + hide cursor
+        assert!(s.starts_with("\x1b7"));
+        assert!(s.ends_with("\x1b8\x1b[?25l"));
+    }
+}

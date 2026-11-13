@@ -58,6 +58,25 @@ pub fn is_copy_header(line: &str) -> bool {
     line.starts_with(CODE_RAIL) && line.trim_end().ends_with(COPY_LABEL)
 }
 
+/// Finds the latest byte offset in `text` right after a completed blank-line separator
+/// outside any open code fence or markdown table. Splitting `text` at this offset produces
+/// an immutable prefix whose rendered lines never change as additional text streams in.
+pub fn safe_markdown_split_point(text: &str) -> usize {
+    let mut split = 0usize;
+    let mut offset = 0usize;
+    let mut in_code_block = false;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim();
+        if is_fence(line) {
+            in_code_block = !in_code_block;
+        } else if !in_code_block && trimmed.is_empty() && line.ends_with('\n') {
+            split = offset;
+        }
+    }
+    split
+}
+
 pub fn render_markdown_with_copy(
     text: &str,
     theme: &Theme,
@@ -1296,5 +1315,22 @@ mod code_block_tests {
         let out = rows(&format!("```\n{line}\n```"), 40);
         let body: String = out.iter().filter_map(|r| r.strip_prefix(CODE_RAIL).or_else(|| r.strip_prefix(CODE_RAIL_WRAPPED))).collect();
         assert_eq!(body.trim_end(), line, "{out:#?}");
+    }
+
+    #[test]
+    fn incremental_split_matches_full_render_across_every_streaming_prefix() {
+        let sample = "# Title\n\nIntro paragraph with **bold** and `code`.\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n## Next\n\n- item 1\n- item 2\n";
+        let theme = Theme::detect();
+        for end in 0..=sample.len() {
+            if !sample.is_char_boundary(end) {
+                continue;
+            }
+            let prefix = &sample[..end];
+            let split = safe_markdown_split_point(prefix);
+            let full = render_markdown(prefix, &theme, 60);
+            let mut incremental = render_markdown(&prefix[..split], &theme, 60);
+            incremental.extend(render_markdown(&prefix[split..], &theme, 60));
+            assert_eq!(incremental, full, "mismatch at prefix end={end}, split={split}");
+        }
     }
 }

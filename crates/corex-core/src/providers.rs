@@ -197,7 +197,9 @@ impl ProviderConfig {
 
     /// Local providers need no key; remote ones need a non-empty env value.
     pub fn is_ready(&self) -> bool {
-        self.is_local() || self.is_deepseek() || !self.api_key().trim().is_empty()
+        self.is_local()
+            || self.is_deepseek()
+            || !self.api_key().trim().is_empty()
     }
 }
 
@@ -343,6 +345,7 @@ pub fn locate_active(
     } else {
         active_provider
             .and_then(|n| providers.iter().position(|p| p.name == n))
+            .or_else(|| providers.iter().position(|p| p.models.iter().any(|m| m.id == model)))
             .or_else(|| {
                 let m = model.to_ascii_lowercase();
                 if m.starts_with("gpt-") || m.starts_with("o1") || m.starts_with("o3") {

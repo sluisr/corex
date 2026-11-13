@@ -129,70 +129,159 @@ const DANGEROUS_SHELL_PATTERNS: &[&str] = &[
     "$", "$(", "`", "<(", ">(", "${", "{", "}", "\n", "\r",
 ];
 
-/// Checks if a shell command is known to be safe/read-only and does not require user confirmation.
-/// Matches deepseek-cli / Google Gemini CLI commandSafety.ts logic.
-///
-/// A command is considered safe when every pipeline segment is a known read-only
-/// command (with subcommand/flag validation where relevant) and there is no
-/// redirection to a real file. Benign redirections (`> /dev/null`, `2>&1`,
-/// heredocs) are ignored; leading `VAR=value` prefixes are skipped.
-pub fn is_known_safe_command(cmd_str: &str) -> bool {
+fn cleaned_command(cmd_str: &str) -> Option<String> {
     let trimmed = cmd_str.trim();
-    if trimmed.is_empty() {
-        return false;
+    if trimmed.is_empty() || DANGEROUS_SHELL_PATTERNS.iter().any(|p| trimmed.contains(p)) {
+        return None;
     }
-
-    // Deny command substitutions, process substitutions, variable expansions ($VAR / ${VAR}),
-    // brace expansion, and multi-line or here-doc escapes.
-    if DANGEROUS_SHELL_PATTERNS.iter().any(|p| trimmed.contains(p)) {
-        return false;
-    }
-
-    // Strip benign redirections (to /dev/null, fd duplication, here-strings) before
-    // checking for any remaining redirection to a real file.
     let cleaned = strip_benign_redirects(trimmed);
-    if cleaned.contains('>') || cleaned.contains('<') {
-        return false;
-    }
-
-    let segments = split_segments(&cleaned);
-    if segments.is_empty() {
-        return false;
-    }
-
-    segments.iter().all(|seg| is_single_segment_safe(seg))
+    (!cleaned.contains('>') && !cleaned.contains('<')).then_some(cleaned)
 }
 
-/// Like [`is_known_safe_command`], but also accepts commands matching the
-/// user-configured `allowed_commands` list (from `~/.corex/settings.json`).
-/// Entries may be bare binary names or full `cmd subcommand` prefixes.
+pub fn is_known_safe_command(cmd_str: &str) -> bool {
+    cleaned_command(cmd_str).is_some_and(|cleaned| {
+        let segments = split_segments(&cleaned);
+        !segments.is_empty() && segments.iter().all(|seg| is_single_segment_safe(seg))
+    })
+}
+
 pub fn is_known_safe_command_with_allowed(cmd_str: &str, allowed: &HashSet<String>) -> bool {
-    if is_known_safe_command(cmd_str) {
+    cleaned_command(cmd_str).is_some_and(|cleaned| {
+        let segments = split_segments(&cleaned);
+        !segments.is_empty()
+            && segments
+                .iter()
+                .all(|seg| is_single_segment_safe(seg) || segment_matches_allowed(seg, allowed))
+    })
+}
+
+pub fn runs_without_asking(cmd_str: &str, allowed: &HashSet<String>, cwd: &Path, roots: &[&Path]) -> bool {
+    cleaned_command(cmd_str).is_some_and(|cleaned| {
+        let segments = split_segments(&cleaned);
+        !segments.is_empty()
+            && segments.iter().all(|seg| {
+                (is_single_segment_safe(seg) && segment_stays_in_scope(seg, cwd, roots))
+                    || segment_matches_allowed(seg, allowed)
+            })
+    })
+}
+
+fn command_words(segment: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = segment.split_whitespace().map(strip_outer_quotes).collect();
+    loop {
+        let assignments = parts.iter().take_while(|p| is_env_assignment(p)).count();
+        parts.drain(..assignments);
+        match parts.first() {
+            Some(cmd) if is_wrapper(cmd) => {
+                let options = parts[1..]
+                    .iter()
+                    .take_while(|p| p.starts_with('-') || p.chars().all(|c| c.is_ascii_digit()))
+                    .count();
+                parts.drain(..=options);
+            }
+            _ => return parts,
+        }
+    }
+}
+
+const PATHLESS_TOOLS: &[&str] = &["df", "findmnt", "mountpoint", "lsblk", "blkid", "echo", "printf", "expr", "test"];
+
+fn segment_stays_in_scope(segment: &str, cwd: &Path, roots: &[&Path]) -> bool {
+    let words = command_words(segment);
+    let Some((cmd, args)) = words.split_first() else {
         return true;
-    }
-    if allowed.is_empty() {
+    };
+    if runs_project_config(cmd, args, cwd) {
         return false;
     }
+    PATHLESS_TOOLS.contains(cmd)
+        || !args.iter().flat_map(|arg| path_operands(arg)).any(|operand| leaves_roots(operand, cwd, roots))
+}
 
-    let trimmed = cmd_str.trim();
-    if trimmed.is_empty() {
+fn path_operands(token: &str) -> Vec<&str> {
+    let value = token.split_once('=').map(|(_, value)| value);
+    match token.strip_prefix('-') {
+        Some(flag) if !flag.starts_with('-') && value.is_none() => {
+            flag.find(['/', '~', '.']).map(|i| &flag[i..]).into_iter().collect()
+        }
+        Some(_) => value.into_iter().collect(),
+        None => std::iter::once(token).chain(value).collect(),
+    }
+}
+
+const SYSTEM_READ_ROOTS: &[&str] =
+    &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/private/etc", "/proc", "/sys", "/boot", "/var/log"];
+
+fn leaves_roots(operand: &str, cwd: &Path, roots: &[&Path]) -> bool {
+    let value = operand.trim_matches(|c| c == '\'' || c == '"');
+    if value.is_empty() || value == "-" || value == "/dev/null" {
         return false;
     }
-
-    if DANGEROUS_SHELL_PATTERNS.iter().any(|p| trimmed.contains(p)) {
+    let literal = match value.find(['*', '?', '[']) {
+        Some(glob) => {
+            if value[glob..].split('/').any(|part| part == "..") {
+                return true;
+            }
+            &value[..value[..glob].rfind('/').map_or(0, |slash| slash + 1)]
+        }
+        None => value,
+    };
+    let path = if let Some(rest) = literal.strip_prefix('~') {
+        let Some(base) = BaseDirs::new() else { return true };
+        match rest.strip_prefix('/') {
+            Some(inside) => base.home_dir().join(inside),
+            None if rest.is_empty() => base.home_dir().to_path_buf(),
+            None => return true,
+        }
+    } else {
+        cwd.join(literal)
+    };
+    if fs::symlink_metadata(&path).is_err() {
         return false;
     }
+    let real = path.canonicalize().unwrap_or_else(|_| crate::fs_tools::clean_lexical_path(&path));
+    !SYSTEM_READ_ROOTS.iter().any(|root| real.starts_with(root))
+        && !roots.iter().any(|root| crate::fs_tools::is_within_workspace(&path, root))
+        && !corex_core::is_spill_path(&path)
+}
 
-    let cleaned = strip_benign_redirects(trimmed);
-    if cleaned.contains('>') || cleaned.contains('<') {
-        return false;
+fn project_dirs(cwd: &Path) -> impl Iterator<Item = &Path> {
+    let home = BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    cwd.ancestors().take_while(move |dir| dir.parent().is_some() && home.as_deref() != Some(*dir))
+}
+
+fn runs_project_config(cmd: &str, args: &[&str], cwd: &Path) -> bool {
+    let has_any = |names: &[&str]| project_dirs(cwd).any(|dir| names.iter().any(|name| dir.join(name).exists()));
+    match cmd {
+        "yarn" | "pnpm" => has_any(&[".yarnrc.yml", ".yarnrc", ".pnpmfile.cjs", ".pnpmfile.mjs"]),
+        "cargo" => {
+            !matches!(args.first().copied(), Some("--version" | "-V"))
+                && has_any(&[".cargo/config.toml", ".cargo/config"])
+        }
+        "git" => git_repo_is_untrusted(cwd),
+        _ => false,
     }
+}
 
-    let segments = split_segments(&cleaned);
-    !segments.is_empty()
-        && segments
-            .iter()
-            .all(|seg| is_single_segment_safe(seg) || segment_matches_allowed(seg, allowed))
+fn git_repo_is_untrusted(cwd: &Path) -> bool {
+    for dir in cwd.ancestors() {
+        let dot_git = dir.join(".git");
+        if dot_git.is_dir() {
+            return false;
+        }
+        if dot_git.is_file() {
+            let target = fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|text| text.trim().strip_prefix("gitdir:").map(|t| dir.join(t.trim())));
+            return !target.is_some_and(|t| {
+                crate::fs_tools::clean_lexical_path(&t).components().any(|c| c.as_os_str() == ".git")
+            });
+        }
+        if dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true if the given shell command requires sudo, doas, or pkexec privileges.
@@ -809,13 +898,13 @@ fn is_single_segment_safe(segment: &str) -> bool {
         [
             "cat", "ls", "dir", "grep", "egrep", "fgrep", "head", "tail",
             "wc", "cut", "tr", "tac", "nl", "echo", "printf", "stat",
-            "file", "strings", "column", "pwd", "which", "whereis", "whoami", "id",
+            "strings", "column", "pwd", "which", "whereis", "whoami", "id",
             "uname", "uptime", "lscpu", "free", "df", "du", "lsblk", "nproc", "arch",
             "top", "expr", "seq", "true", "false", "test", "numfmt", "sensors",
-            "lshw", "lspci", "lsusb", "dmidecode", "dmesg", "journalctl",
+            "lshw", "lspci", "lsusb", "dmidecode",
             "glxinfo", "vulkaninfo", "clinfo", "inxi",
             // Read-only inspection / text-processing additions
-            "ss", "netstat", "lsof", "diff", "cmp", "basename", "dirname",
+            "netstat", "lsof", "diff", "cmp", "basename", "dirname",
             "readlink", "realpath", "md5sum", "sha1sum", "sha224sum", "sha256sum",
             "sha384sum", "sha512sum", "cksum", "sum", "od", "hexdump",
             "vmstat", "iostat", "pgrep", "pidof", "pstree", "bc", "factor", "zipinfo",
@@ -829,6 +918,32 @@ fn is_single_segment_safe(segment: &str) -> bool {
 
     if safe_tools.contains(cmd) {
         return true;
+    }
+
+    if cmd == "file" {
+        return !parts[1..].iter().any(|&p| short_cluster_contains(p, 'C') || is_dangerous_long_abbrev(p, &["--compile"]));
+    }
+
+    if cmd == "ss" {
+        return !parts[1..].iter().any(|&p| {
+            short_cluster_contains(p, 'D') || short_cluster_contains(p, 'K') || is_dangerous_long_abbrev(p, &["--diag", "--kill"])
+        });
+    }
+
+    if cmd == "dmesg" {
+        return !parts[1..].iter().any(|&p| {
+            ['C', 'c', 'D', 'E', 'n'].iter().any(|flag| short_cluster_contains(p, *flag))
+                || is_dangerous_long_abbrev(p, &["--clear", "--read-clear", "--console-off", "--console-on", "--console-level"])
+        });
+    }
+
+    if cmd == "journalctl" {
+        return !parts[1..].iter().any(|&p| {
+            is_dangerous_long_abbrev(p, &[
+                "--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync",
+                "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog",
+            ])
+        });
     }
 
     if cmd == "tree" {
@@ -941,7 +1056,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
                 "describe", "config", "check-ignore", "ls-files",
                 "blame", "shortlog", "count-objects", "var", "version", "help",
                 "for-each-ref", "show-ref", "name-rev", "rev-list", "whatchanged",
-                "ls-remote", "branch", "tag",
+                "branch", "tag",
             ]
             .into_iter()
             .collect();
@@ -952,8 +1067,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
                     "tag" => is_safe_git_tag(&parts),
                     "remote" => is_safe_git_remote(&parts),
                     "config" => is_safe_git_config(&parts),
-                    // `git help -w/--web <topic>` launches a browser; plain help paginates.
-                    "help" => !parts[2..].iter().any(|&p| p == "-w" || p == "--web"),
+                    "help" => !parts[2..].iter().any(|&p| short_cluster_contains(p, 'w') || is_dangerous_long_abbrev(p, &["--web"])),
                     _ => true,
                 };
             }
@@ -1073,7 +1187,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
         if parts.len() > 1 {
             let subcommand = parts[1];
             let safe_docker_subcommands: HashSet<&str> = [
-                "ps", "images", "version", "info", "stats", "help", "inspect", "logs",
+                "ps", "images", "version", "info", "stats", "help", "logs",
                 "history", "top", "port", "diff", "events",
             ]
             .into_iter()
@@ -1096,7 +1210,7 @@ fn is_single_segment_safe(segment: &str) -> bool {
         if parts.len() > 1 {
             let subcommand = parts[1];
             let safe_docker_compose_subcommands: HashSet<&str> = [
-                "ps", "version", "config", "help"
+                "ps", "version", "help"
             ]
             .into_iter()
             .collect();
@@ -1126,10 +1240,6 @@ fn is_single_segment_safe(segment: &str) -> bool {
         return true;
     }
 
-    if cmd == "ping" && parts.iter().any(|&p| p == "-c" || p == "--help") {
-        return true;
-    }
-
     false
 }
 
@@ -1148,8 +1258,11 @@ fn is_safe_tar(parts: &[&str]) -> bool {
     let write_long = [
         "--create", "--extract", "--get", "--append", "--update", "--concatenate",
         "--delete", "--unlink-first", "--checkpoint-action", "--to-command",
-        "--use-compress-program", "--rsh-command", "--rmt-command", "--files-from",
+        "--use-compress-program", "--rsh-command", "--rmt-command", "--files-from", "--index-file",
     ];
+    if parts[1..].iter().any(|p| p.contains(':')) {
+        return false;
+    }
     let has_write = short_chars.iter().any(|c| matches!(c, 'x' | 'c' | 'r' | 'u' | 'A' | 'U' | 'I'))
         || long_flags.iter().any(|f| is_dangerous_long_abbrev(f, &write_long));
     let has_list = short_chars.contains(&'t') || long_flags.contains(&"--list");
@@ -1296,26 +1409,17 @@ fn is_safe_dpkg(parts: &[&str]) -> bool {
 }
 
 fn is_safe_git_branch(parts: &[&str]) -> bool {
-    // bare `git branch` lists; only listing flags are read-only.
-    // Every argument after `branch` must be a listing flag (no bare branch name to create).
-    if parts.len() == 2 {
-        return true;
-    }
-    for arg in &parts[2..] {
-        if !arg.starts_with('-') {
-            return false;
-        }
+    parts[2..].iter().all(|arg| {
         let name = arg.split('=').next().unwrap_or(arg);
-        if matches!(
+        matches!(
             name,
-            "-d" | "-D" | "-m" | "-M" | "-c" | "-C" | "-f" | "-u"
-                | "--delete" | "--move" | "--copy" | "--force"
-                | "--set-upstream-to" | "--unset-upstream" | "--edit-description"
-        ) {
-            return false;
-        }
-    }
-    true
+            "-a" | "-r" | "-l" | "-v" | "-vv" | "-av" | "-avv" | "-rv" | "-rvv" | "-va" | "-vva"
+                | "--all" | "--remotes" | "--list" | "--verbose" | "--show-current" | "--merged"
+                | "--no-merged" | "--contains" | "--no-contains" | "--points-at" | "--sort"
+                | "--format" | "--color" | "--no-color" | "--column" | "--no-column"
+                | "--ignore-case" | "--abbrev" | "--no-abbrev"
+        )
+    })
 }
 
 fn is_safe_git_tag(parts: &[&str]) -> bool {
@@ -1364,7 +1468,9 @@ fn is_safe_git_config(parts: &[&str]) -> bool {
         .copied()
         .filter(|p| !p.starts_with('-'))
         .collect();
-    !(non_opts.len() > 1 || non_opts.iter().any(|p| p.contains('=')))
+    !(non_opts.len() > 1
+        || non_opts.iter().any(|p| p.contains('='))
+        || matches!(non_opts.first().copied(), Some("edit" | "set" | "unset" | "rename-section" | "remove-section")))
 }
 
 fn segment_matches_allowed(segment: &str, allowed: &HashSet<String>) -> bool {
@@ -1465,7 +1571,8 @@ fn append_and_truncate_output(buf: &mut String, text: &str, max_len: usize) {
         if !marker.is_empty() && buf.starts_with(marker) {
             buf.drain(..marker.len());
         }
-        let mut cut = buf.len().saturating_sub(max_len - marker.len());
+        let keep = if marker.is_empty() { max_len } else { max_len / 4 * 3 };
+        let mut cut = buf.len().saturating_sub(keep - marker.len());
         while cut < buf.len() && !buf.is_char_boundary(cut) {
             cut += 1;
         }
@@ -1478,6 +1585,31 @@ fn append_and_truncate_output(buf: &mut String, text: &str, max_len: usize) {
         buf.drain(..cut);
         buf.insert_str(0, marker);
     }
+}
+
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    for back in 1..=bytes.len().min(3) {
+        let byte = bytes[bytes.len() - back];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let needed = match byte {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if needed > back { back } else { 0 };
+    }
+    0
+}
+
+fn decode_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+    pending.extend_from_slice(chunk);
+    let whole = pending.len() - incomplete_utf8_tail(pending);
+    let text = String::from_utf8_lossy(&pending[..whole]).into_owned();
+    pending.drain(..whole);
+    text
 }
 
 /// Put in front of a command's output once its beginning has been dropped to stay in budget.
@@ -1534,24 +1666,26 @@ impl Tool for ShellTool {
     }
 
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
-        // A `cwd` outside the workspace moves the safe-list's path reasoning onto unknown ground
-        // (`{"command":"cat id_ed25519","cwd":"/home/u/.ssh"}`), so it always needs confirmation.
-        if let Some(cwd) = args.get("cwd").or_else(|| args.get("Cwd")).and_then(|v| v.as_str()) {
-            let resolved = if Path::new(cwd).is_absolute() {
-                PathBuf::from(cwd)
-            } else {
-                context.workspace_dir.join(cwd)
-            };
-            if !crate::fs_tools::is_within_workspace(&resolved, &context.workspace_dir) {
-                return true;
+        let cwd = match args.get("cwd").or_else(|| args.get("Cwd")).and_then(|v| v.as_str()) {
+            Some(cwd) => {
+                let resolved = context.workspace_dir.join(cwd);
+                if !crate::fs_tools::is_within_workspace(&resolved, &context.workspace_dir) {
+                    return true;
+                }
+                resolved
             }
-        }
+            None => context.workspace_dir.clone(),
+        };
         let cmd = args.get("command")
             .or_else(|| args.get("CommandLine"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let allowed: HashSet<String> = context.allowed_commands.iter().cloned().collect();
-        !is_known_safe_command_with_allowed(cmd, &allowed)
+        let roots: Vec<&Path> = std::iter::once(&context.workspace_dir)
+            .chain(&context.extra_dirs)
+            .map(PathBuf::as_path)
+            .collect();
+        !runs_without_asking(cmd, &allowed, &cwd, &roots)
     }
 
     async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
@@ -1625,7 +1759,6 @@ impl Tool for ShellTool {
 
         if requires_sudo {
             cmd.env("SUDO_ASKPASS", &askpass_path);
-            cmd.env("SSH_ASKPASS", &askpass_path);
             // Stage the password in a 0600 file the askpass helper reads; never in an inheritable
             // environment variable the spawned command could read and exfiltrate.
             if let Some(ref pwd) = context.sudo_password {
@@ -1678,6 +1811,8 @@ impl Tool for ShellTool {
 
             let mut chunk_out = [0u8; 8192];
             let mut chunk_err = [0u8; 8192];
+            let mut pending_out: Vec<u8> = Vec::new();
+            let mut pending_err: Vec<u8> = Vec::new();
             let mut done_tx_opt = Some(done_tx);
             let mut stdin_closed = false;
 
@@ -1693,7 +1828,7 @@ impl Tool for ShellTool {
                         match res {
                             Ok(0) | Err(_) => reader_stdout = None,
                             Ok(n) => {
-                                let text = String::from_utf8_lossy(&chunk_out[..n]);
+                                let text = decode_chunk(&mut pending_out, &chunk_out[..n]);
                                 if let Ok(mut buf) = buf_clone.lock() {
                                     append_and_truncate_output(&mut buf, &text, 200_000);
                                 }
@@ -1710,7 +1845,7 @@ impl Tool for ShellTool {
                         match res {
                             Ok(0) | Err(_) => reader_stderr = None,
                             Ok(n) => {
-                                let text = String::from_utf8_lossy(&chunk_err[..n]);
+                                let text = decode_chunk(&mut pending_err, &chunk_err[..n]);
                                 if let Ok(mut buf) = buf_clone.lock() {
                                     append_and_truncate_output(&mut buf, &text, 200_000);
                                 }
@@ -1732,21 +1867,15 @@ impl Tool for ShellTool {
                     }
                     wait_res = child.wait() => {
                         if let Some(ref mut r) = reader_stdout {
-                            let mut rest_bytes = Vec::new();
                             // A child left in the background keeps the pipe open: never wait for EOF.
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut rest_bytes)).await;
-                            if !rest_bytes.is_empty() {
-                                let rest = String::from_utf8_lossy(&rest_bytes);
-                                if let Ok(mut buf) = buf_clone.lock() {
-                                    append_and_truncate_output(&mut buf, &rest, 200_000);
-                                }
-                            }
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut pending_out)).await;
                         }
                         if let Some(ref mut r) = reader_stderr {
-                            let mut rest_bytes = Vec::new();
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut rest_bytes)).await;
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut pending_err)).await;
+                        }
+                        for rest_bytes in [&pending_out, &pending_err] {
                             if !rest_bytes.is_empty() {
-                                let rest = String::from_utf8_lossy(&rest_bytes);
+                                let rest = String::from_utf8_lossy(rest_bytes);
                                 if let Ok(mut buf) = buf_clone.lock() {
                                     append_and_truncate_output(&mut buf, &rest, 200_000);
                                 }
@@ -1836,7 +1965,7 @@ impl Tool for ShellTool {
                 if status.success() {
                     Ok(ToolOutput::success(display_output))
                 } else {
-                    let code = status.code().unwrap_or(-1);
+                    let code = exit_code_of(Some(&status)).unwrap_or(-1);
                     Ok(ToolOutput::error(format!("Command exited with status code {}:\n{}", code, display_output)))
                 }
             }
@@ -2201,6 +2330,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::current_dir().unwrap(),
             yolo_mode: true,
+            yolo_all: false,
             allowed_commands: vec![],
             sudo_password: None,
             extra_dirs: Vec::new(),
@@ -2227,6 +2357,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::current_dir().unwrap(),
             yolo_mode: true,
+            yolo_all: false,
             allowed_commands: vec![],
             sudo_password: None,
             extra_dirs: Vec::new(),
@@ -2247,6 +2378,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::current_dir().unwrap(),
             yolo_mode: true,
+            yolo_all: false,
             allowed_commands: vec![],
             sudo_password: None,
             extra_dirs: Vec::new(),
@@ -2266,6 +2398,121 @@ mod tests {
         assert!(!res.is_error);
         assert!(res.output.contains("[COMMAND SENT TO BACKGROUND]"));
         assert!(res.display_summary.is_some());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corex-shell-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ws")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn runs(cmd: &str, cwd: &Path, workspace: &Path) -> bool {
+        runs_without_asking(cmd, &HashSet::new(), cwd, &[workspace])
+    }
+
+    #[test]
+    fn reads_outside_the_workspace_ask() {
+        let base = scratch("scope");
+        let ws = base.join("ws");
+        fs::create_dir_all(base.join("outside")).unwrap();
+        fs::write(base.join("outside/notes.txt"), "x").unwrap();
+        fs::write(ws.join("a.txt"), "x").unwrap();
+
+        for cmd in ["cat a.txt", "ls *.txt", "grep -rn /api/v1 .", "cat /etc/hosts", "df -h /", "wc -l a.txt | sort"] {
+            assert!(runs(cmd, &ws, &ws), "{cmd}");
+        }
+        let outside = base.join("outside/notes.txt");
+        for cmd in [
+            "cat ../outside/notes.txt".to_string(),
+            "cat ../outside/*".to_string(),
+            format!("cat {}", outside.display()),
+            format!("grep -r token {}", base.display()),
+            format!("grep --file={} a.txt", outside.display()),
+            "grep -r token /".to_string(),
+            "ls ~".to_string(),
+        ] {
+            assert!(!runs(&cmd, &ws, &ws), "{cmd}");
+        }
+        assert!(runs_without_asking("cat ../outside/notes.txt", &HashSet::new(), &ws, &[&ws, &base.join("outside")]));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn git_outside_a_plain_repository_asks() {
+        let base = scratch("git");
+        let ws = base.join("ws");
+        fs::create_dir_all(ws.join(".git/modules/sub")).unwrap();
+        fs::create_dir_all(ws.join("src")).unwrap();
+        let bare = ws.join("vendor/lib");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::create_dir_all(bare.join("refs")).unwrap();
+        fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        for (dir, target) in [("sub", "../.git/modules/sub"), ("rogue", "../vendor/lib")] {
+            fs::create_dir_all(ws.join(dir)).unwrap();
+            fs::write(ws.join(dir).join(".git"), format!("gitdir: {target}\n")).unwrap();
+        }
+
+        assert!(runs("git status", &ws, &ws));
+        assert!(runs("git log --oneline", &ws.join("src"), &ws));
+        assert!(runs("git status", &ws.join("sub"), &ws));
+        assert!(!runs("git status", &bare, &ws));
+        assert!(!runs("git status", &ws.join("rogue"), &ws));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn project_config_that_runs_programs_asks() {
+        let base = scratch("config");
+        let ws = base.join("ws");
+        assert!(runs("yarn --version", &ws, &ws));
+        assert!(runs("cargo tree", &ws, &ws));
+        fs::write(ws.join(".yarnrc.yml"), "yarnPath: ./x.js\n").unwrap();
+        fs::create_dir_all(ws.join(".cargo")).unwrap();
+        fs::write(ws.join(".cargo/config.toml"), "[build]\nrustc = \"./x\"\n").unwrap();
+        assert!(!runs("yarn --version", &ws, &ws));
+        assert!(!runs("pnpm list", &ws, &ws));
+        assert!(!runs("cargo tree", &ws, &ws));
+        assert!(runs("cargo --version", &ws, &ws));
+        assert!(runs("npm ls", &ws, &ws));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn commands_that_write_or_reach_the_network_are_not_safe() {
+        for cmd in [
+            "tar -tf a.tar --index-file=out.txt",
+            "tar -tf host.example:/x.tar",
+            "git branch -uorigin/main",
+            "git branch --set-up=origin/main",
+            "git help --we log",
+            "git config edit",
+            "git ls-remote origin",
+            "ss -D out.bin",
+            "file -C -m magic",
+            "dmesg -C",
+            "journalctl --user --vacuum-time=1s",
+            "docker inspect web",
+            "docker-compose config",
+            "ping -c 1 example.com",
+        ] {
+            assert!(!is_known_safe_command(cmd), "{cmd}");
+        }
+        for cmd in ["tar -tf a.tar", "git branch -vv", "git help log", "ss -tulpn", "file README.md", "dmesg -T", "journalctl -u nginx -n 50"] {
+            assert!(is_known_safe_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_character_split_between_two_reads_stays_whole() {
+        let bytes = "ñ€🙂".as_bytes();
+        for split in 1..bytes.len() {
+            let mut pending = Vec::new();
+            let mut text = decode_chunk(&mut pending, &bytes[..split]);
+            text.push_str(&decode_chunk(&mut pending, &bytes[split..]));
+            assert_eq!(text, "ñ€🙂", "split at {split}");
+            assert!(pending.is_empty());
+        }
     }
 
     #[test]

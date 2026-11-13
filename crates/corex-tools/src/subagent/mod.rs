@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
-use corex_core::subagent::{get_subagent_manager, SubagentRole, SubagentStatus, SubagentTask};
+use corex_core::subagent::{get_subagent_manager, SubagentRole, SubagentTask};
 use corex_core::client::LlmClient;
 use crate::types::{Tool, ToolContext, ToolOutput};
 
@@ -21,6 +21,10 @@ pub fn set_subagent_llm_client(client: Arc<LlmClient>) {
     if let Ok(mut g) = SUBAGENT_LLM_CLIENT.lock() {
         *g = Some(client);
     }
+}
+
+pub(crate) fn live_config() -> Option<corex_core::config::Config> {
+    SUBAGENT_LLM_CLIENT.lock().ok()?.as_ref().map(|client| client.get_config())
 }
 
 pub fn get_subagent_llm_client(workspace: &Path) -> Option<Arc<LlmClient>> {
@@ -186,7 +190,7 @@ impl Tool for DelegateSubagentTool {
         );
 
         let output = format!(
-            "Task ID: {}\nRole: {}\nStatus: RUNNING in background\nLog File: {}\nSubagent dispatched in background. Keep working, or call manage_subagents with action 'wait' to block until it reports (do not poll 'status' in a loop).",
+            "Task ID: {}\nRole: {}\nStatus: RUNNING in background\nLog File: {}\nSubagent dispatched in background. Keep working: its report arrives on its own as a SUBAGENT_DONE notification when it finishes, so never block or poll waiting for it.",
             task_id, role.as_str(), log_file.display()
         );
 
@@ -194,57 +198,72 @@ impl Tool for DelegateSubagentTool {
     }
 }
 
-/// Blocks until the watched subagents (`task_id`, or all of them) stop running, or `timeout`
-/// passes, and reports each one with its output, so the model never has to poll in a loop.
+/// How long `action='wait'` may hold the turn: 0 returns the snapshot straight away.
+const WAIT_MAX_BLOCK_SECS: u64 = 30;
+
+/// A snapshot of the watched subagents (`task_id`, or all of them when it is `None`).
+///
+/// It does not keep the turn waiting for work that runs on its own: finished reports are returned
+/// and acknowledged, so the very same output is not injected again as a `SUBAGENT_DONE`
+/// notification, and the ones still running are listed and deliver themselves when they finish.
 async fn wait_for_subagents(task_id: Option<&str>, timeout: std::time::Duration) -> ToolOutput {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let (running, report) = {
-            let mgr = match get_subagent_manager().lock() {
+            let mut mgr = match get_subagent_manager().lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
             };
-            let watched: Vec<&SubagentTask> = match task_id {
-                Some(id) => mgr.get_task(id).into_iter().collect(),
-                None => mgr.list(),
+            let watched: Vec<SubagentTask> = match task_id {
+                Some(id) => match mgr.get_task(id) {
+                    Some(t) => vec![t.clone()],
+                    None => return ToolOutput::error(format!("Subagent with ID '{}' not found", id)),
+                },
+                None => mgr.list().into_iter().cloned().collect(),
             };
             if watched.is_empty() {
-                return ToolOutput::error(match task_id {
-                    Some(id) => format!("Subagent with ID '{}' not found", id),
-                    None => "No subagents have been dispatched in this session.".to_string(),
-                });
+                return ToolOutput::error("No subagents have been dispatched in this session.".to_string());
             }
-            let running = watched
-                .iter()
-                .filter(|t| matches!(t.status, SubagentStatus::Pending | SubagentStatus::Running))
-                .count();
-            let report: Vec<String> = watched
-                .iter()
-                .map(|t| {
-                    let body = if t.output.is_empty() { "(no output yet)" } else { t.output.as_str() };
-                    format!(
-                        "## {} {} ({}) - {} after {}\n{}",
-                        t.role.icon(),
-                        t.role.as_str().to_uppercase(),
-                        t.id,
-                        t.status.display_label(),
-                        t.duration_str(),
-                        corex_core::truncate_ellipsis(body, 6000)
-                    )
-                })
-                .collect();
-            (running, report.join("\n\n"))
+
+            let mut running: Vec<String> = Vec::new();
+            let mut finished: Vec<String> = Vec::new();
+            let mut reports: Vec<String> = Vec::new();
+            for t in &watched {
+                let body = if t.output.is_empty() { "(no output yet)" } else { t.output.as_str() };
+                reports.push(format!(
+                    "## {} {} ({}) - {} after {}\n{}",
+                    t.role.icon(),
+                    t.role.as_str().to_uppercase(),
+                    t.id,
+                    t.status.display_label(),
+                    t.duration_str(),
+                    corex_core::truncate_ellipsis(body, 6000)
+                ));
+                if t.status.is_active() {
+                    running.push(format!("{} ({}, {})", t.id, t.role.as_str(), t.duration_str()));
+                } else {
+                    finished.push(t.id.clone());
+                }
+            }
+            // Returned here: the notification must not deliver these reports a second time.
+            for id in &finished {
+                mgr.acknowledge(id);
+            }
+            (running, reports.join("\n\n"))
         };
-        if running == 0 {
+
+        if running.is_empty() {
             return ToolOutput::success(format!("All watched subagents have finished.\n\n{report}"));
         }
         if std::time::Instant::now() >= deadline {
             return ToolOutput::success(format!(
-                "{running} subagent(s) still running after {}s. Call 'wait' again or continue with other work.\n\n{report}",
-                timeout.as_secs()
+                "{} subagent(s) still running: {}. Their reports arrive on their own as SUBAGENT_DONE \
+                 notifications when they finish, so keep working instead of calling 'wait' or 'status' again.\n\n{report}",
+                running.len(),
+                running.join(", ")
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -258,7 +277,7 @@ impl Tool for ManageSubagentsTool {
     }
 
     fn description(&self) -> &str {
-        "Manage delegated background subagents: list them, check status, view forensic logs, cancel, or wait until they finish (returns their reports)."
+        "Manage delegated background subagents: list them, check status, view forensic logs, cancel, or take a snapshot of their reports. It never blocks a turn: finished reports come back at once and the ones still running deliver themselves when they finish."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -268,7 +287,7 @@ impl Tool for ManageSubagentsTool {
                 "action": {
                     "type": "string",
                     "enum": ["list", "status", "log", "cancel", "wait"],
-                    "description": "Action to perform: 'list' (list subagents), 'status' (view output and details), 'log' (view step-by-step forensic log), 'cancel' (cancel subagent), 'wait' (block until the subagent, or every running one when task_id is omitted, finishes, and return the reports)."
+                    "description": "Action to perform: 'list' (list subagents), 'status' (view output and details), 'log' (view step-by-step forensic log), 'cancel' (cancel subagent), 'wait' (snapshot of the subagent, or of every one when task_id is omitted: finished reports come back now, the ones still running are listed and report themselves when they finish; it does not hold the turn)."
                 },
                 "task_id": {
                     "type": "string",
@@ -276,7 +295,7 @@ impl Tool for ManageSubagentsTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "For 'wait': give up after this many seconds (default 120, max 600)."
+                    "description": "For 'wait': how long to wait for a running subagent before returning the snapshot (default 0 = return immediately, max 30). Never needed: the report arrives as a SUBAGENT_DONE notification."
                 }
             },
             "required": ["action"]
@@ -288,7 +307,11 @@ impl Tool for ManageSubagentsTool {
         let task_id = args.get("task_id").and_then(|t| t.as_str()).map(str::trim);
 
         if action == "wait" {
-            let timeout = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(120).clamp(1, 600);
+            let timeout = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(WAIT_MAX_BLOCK_SECS);
             return Ok(wait_for_subagents(task_id, std::time::Duration::from_secs(timeout)).await);
         }
 

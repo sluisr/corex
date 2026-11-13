@@ -18,6 +18,7 @@ async fn main() {
     let ctx = ToolContext {
         workspace_dir: std::env::current_dir().unwrap(),
         yolo_mode: true,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands: Vec::new(),
         extra_dirs: Vec::new(),

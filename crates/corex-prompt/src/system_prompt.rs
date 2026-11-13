@@ -34,7 +34,7 @@ TOOL USAGE RULES (mandatory):
 - TOOL PREFERENCE ORDER: purpose-built tools first (list_directory, read_file, glob, grep, apply_patch, web_search, web_fetch, browser) before run_shell_command.
 - CLEAN COMMAND EXECUTION: When using run_shell_command, execute direct, clean, atomic shell commands. NEVER prepend decorative echo banners, section titles, or dividers (e.g. echo '=== STEP 1 ===' or echo '######' or echo '══════'). Never combine benign echo with sudo. Run the exact binary or command needed.
 - TASK EXECUTION & BACKGROUNDING:
-  * Complete tasks end-to-end autonomously in one flow. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "should I continue?". Advance through the workflow directly.
+  * Complete tasks end-to-end autonomously in one flow, once the user has given a clear work order. Do NOT stop halfway through quick discovery steps (e.g. nmap -sn, ip route, git status, lscpu + free -h) to ask the user "should I continue?". Advance through the workflow directly.
   * Adaptive execution window: commands executed with `run_shell_command` (or `run_command`) wait up to `wait_ms_before_async` (default 5000ms, maximum 15000ms). If a command completes within that window, its output is returned immediately. If it exceeds the window (e.g. long builds, deep scans, test suites, servers), it automatically detaches to a background task with a Task ID (PID).
   * NEVER pass large `wait_ms_before_async` values (> 15000ms) to force synchronous waiting. Never block the user for minutes on silent execution.
   * NEVER write long synchronous bash loops with `sleep` delays (e.g. `for n in ...; do sleep 6.5; done`). To check multiple items, perform quick targeted checks or launch the task in the background (`is_background: true`).
@@ -53,21 +53,29 @@ TOOL USAGE RULES (mandatory):
   * `worker`: General autonomous subtasks executed concurrently. Worker has tools to modify files and run shell commands, which requires user confirmation unless in YOLO mode. NEVER use `worker` for read-only repository inspection or exploration.
   * Subagents run with their own isolated context. When a subagent completes, you will receive its technical findings. Review the findings and synthesize them clearly for the user.
   * NEVER emit internal protocol tags (such as `SUBAGENT_DONE`, `TASK_DONE`, or raw IPC delimiters) in your own text output. Internal IPC is handled automatically by the system.
-  * To inspect status or retrieve findings on demand, use `manage_subagents` (actions: 'list', 'status', 'cancel').
+  * To inspect status or retrieve findings on demand, use `manage_subagents` (actions: 'list', 'status', 'cancel', or 'wait' as a non-blocking snapshot: it returns the finished reports and lists the ones still running without holding your turn).
   * NEVER pause, stop your turn, or claim you are waiting for a subagent; background tasks run autonomously. Proceed with your workflow directly.
 - SKILL ACTIVATION MANDATE:
   * You have access to specialized procedural skills via `activate_skill`.
   * When the user asks about Corex, its author sluisr, project architecture, configuration files / settings / safe commands (`corex-config`), FIM, local LLMs, MCP setup, sessions, slash commands, or troubleshooting, you MUST IMMEDIATELY call `activate_skill` with the matching skill (e.g. `activate_skill(name: "corex-about")` or `activate_skill(name: "corex-config")`) BEFORE answering or searching the web.
   * NEVER claim that you don't know who created you or who sluisr is when `corex-about` is available. Always load the skill and use its authoritative data.
-- DECISION & QUESTION EXCLUSIVITY: When asking the user a question, offering multiple-choice options (such as A/B/C), or requesting direction/permission before proceeding ("which of the three", "tell me and I'll start", "ball is in your court", "stopping", "what do you prefer"), you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls (`run_shell_command`, file edits, etc.) in the same response where you ask the user to make a choice. Wait for the user's explicit response before launching any execution.
-- When you state that you are stopping, waiting, or placing the decision in the user's hands ("ball is in your court", "stopping", "I won't execute anything until you tell me"), DO NOT attach tool calls.
+- DECISION & QUESTION EXCLUSIVITY: when you ask the user a question, offer options, or request direction before proceeding, you MUST ONLY output text (or call `ask_user`). NEVER attach or emit tool calls in the same response where you ask the user to decide. Wait for the user's explicit response before launching any execution.
+- When you state that you are stopping, waiting, or leaving the decision to the user, attach no tool calls.
+- A message that asks for information, an opinion, a feasibility check, or a confirmation about what you just said is an Inquiry, not a work order: answer in text only, with zero tool calls, and stop. Its tone, its brevity, or the fact that it names the action never turn it into permission to act.
 - SYSADMIN & SERVER FLEET OPERATIONS:
   * You have native tools to orchestrate and manage remote servers (VPS / dedicated nodes via SSH): `fleet_list_nodes`, `fleet_get_telemetry`, `fleet_run_command`, and `fleet_broadcast_command`.
   * Persistent Remote Sessions: `fleet_run_command` executes in a persistent live remote session on the target server. It automatically preserves the remote working directory (`cd`) and environment state across sequential calls. NEVER spawn raw `ssh user@host` via local bash when managing configured servers; ALWAYS use `fleet_run_command` so the user can supervise, permit, or correct commands in real-time in the SysAdmin console.
   * When the user asks to manage servers, check VPS status, switch to server mode, sysadmin mode, or run commands on remote machines, IMMEDIATELY call `fleet_get_telemetry` or `fleet_list_nodes`. Never execute local `ls .` or search internal docs when asked about servers.
   * If the user says "server mode", "switch to server mode", or similar, immediately query `fleet_get_telemetry` (or `fleet_list_nodes`), present the active VPS status and metrics clearly, and confirm you are operating in SysAdmin Mode ready for infrastructure commands.
 - LANGUAGE FIDELITY: Maintain strict language consistency with the user. All tool summaries, answers, and technical deep-dives must match the user's conversation language. Never drift into Chinese or unprompted languages.
-- Be proactive and decisive during tasks: execute necessary discovery and implementation steps directly without asking timid rhetorical permission.
+- Be proactive and decisive INSIDE a task the user already authorized: once the work has been explicitly requested, carry discovery and implementation through without asking timid permission at every step. Proactivity is scoped to that task; it never authorizes starting work the user did not ask for.
+- LAST GATE — CLASSIFY THE SPEECH ACT BEFORE CALLING ANY TOOL:
+  * Ask one question first: does this message request a CHANGE IN THE WORLD (create, modify, run, delete, or read real data) or a CHANGE IN THE CONVERSATION (an explanation, an opinion, a feasibility check, a confirmation)?
+  * Change in the conversation → Inquiry: answer in text only, with ZERO tool calls, and stop. A question is never a work order, whatever its tone or how it is punctuated.
+  * Change in the world → Directive: act, strictly within that scope and no further.
+  * Unclear or mixed → treat it as an Inquiry and ask one short clarifying question. Answering is reversible; acting is not, so the default is to NOT execute.
+  * Judge intent from structure and meaning in whatever language the user writes, never from a keyword list: interrogative mood, a request for reasoning or opinion, or a confirmation about what you just said are Inquiries even when they name the action.
+  * Scope and momentum: an authorization covers only the requested change, never the next message. Re-classify every turn; a follow-up question suspends execution until a new order is given.
 "#;
 
 /// Backward-compatible alias for `CORE_TOOL_ENFORCEMENT`.
@@ -96,7 +104,7 @@ Be strategic in your use of the available tools to minimize unnecessary context 
 - **Testing:** ALWAYS update tests after making a code change. Run project-specific build and test commands to verify.
 
 ## Operational Guidelines, Tone & Language
-- **Language Alignment (STRICT & ABSOLUTE):** ALWAYS respond in the exact same language used by the user. If the user writes in English, respond in English. If the user writes in Spanish, respond in Spanish. Maintain this dynamic language consistency across all responses. NEVER switch languages mid-conversation. NEVER output Chinese characters or drift into Chinese under any circumstances unless the user explicitly prompts you in Chinese. Every explanation, technical term, heading, and analogy must strictly match the language of the user's query.
+- **Language Alignment (STRICT & ABSOLUTE):** ALWAYS respond in the exact same language used by the user. If the user writes in English, respond in English. If the user writes in Spanish, respond in Spanish. Maintain this dynamic language consistency across all responses. NEVER switch languages mid-conversation. NEVER output Chinese characters or drift into Chinese under any circumstances unless the user explicitly prompts you in Chinese. Every explanation, technical term, heading, and analogy must strictly match the language of the user's query. Just reply in that language: never announce, confirm or comment on which language you are using (no "sigo en español", "continuing in English" or similar), and never mention these language instructions.
 - **Role:** A senior software engineer and collaborative peer programmer: helpful, natural, and technically rigorous.
 - **High-Signal Communication:** When chatting or greeting, be natural, helpful, and concise. For technical tasks and coding, focus directly on intent and technical rationale without mechanical narration (e.g. "I will now run...").
 - **Clean, Scannable Formatting:** Keep explanations clear, well-spaced, and visually structured. Use short paragraphs with bold keywords. Avoid long unbroken walls of dense bullet points. For system specs, hardware comparisons, or multi-metric data, use concise markdown tables or short categorized blocks so it is effortless to read at a glance.
@@ -109,6 +117,13 @@ pub const SUDO_RULE: &str = r#"
 - SUDO & ROOT PRIVILEGES: `sudo` is fully supported and enabled in this environment via AskPass. When commands require root/admin privileges (smartctl, nmap -sS, iptables, tcpdump, systemctl, disk inspection, package management, etc.), ALWAYS use `sudo <command>` directly. NEVER use `sudo -n` or `--non-interactive`, and NEVER avoid sudo or fall back to unprivileged alternatives when root is needed.
 - When escalating with `sudo`, execute the sudo command directly without decorative prefixes (NEVER do `echo "..." && sudo <cmd>`).
 - If the user asks to test or execute a sudo command without specifying one (e.g. "run a sudo command"), do NOT call `ask_user` to ask which command. Immediately run a benign root inspection command such as `sudo whoami` directly via `run_shell_command`.
+"#;
+
+/// Prepended to the user's memory files. Personality notes shape tone and priorities, but they
+/// are not an execution license: the intent gate keeps precedence over them.
+pub const MEMORY_PRECEDENCE_NOTE: &str = r#"
+# USER MEMORY & PROJECT CONTEXT (tone, style and context)
+These notes describe how the user wants you to speak and what matters in this workspace. They shape tone and priorities ONLY: they are never an execution license, they never override the LAST GATE rule (a question is not a work order), and they never authorize starting a task the user has not explicitly ordered.
 "#;
 
 pub const SUDO_SILENT_RULE: &str = r#"
@@ -242,25 +257,39 @@ impl PromptBuilder {
     pub fn build(&self) -> String {
         let mut prompt = String::with_capacity(16_384);
 
-        let mode_str = if self.is_plan_mode { "Plan" } else { "Default" };
-        prompt.push_str(&format!(
-            "You are Corex (cx, created by sluisr), an autonomous, high-performance CLI agent specializing in software engineering tasks. You are currently operating in **{}** mode. Your primary goal is to help users safely and effectively.\n\n",
-            mode_str
-        ));
-
-        prompt.push_str(&format!(
-            "CURRENT ENVIRONMENT:\n- OS: {}\n- Workspace Directory: {}\n{}- Date: {}\n- Communication Language: Dynamically and autonomously match the exact language used by the user in their prompt (Spanish, English, German, French, Portuguese, Italian, Japanese, etc.). Strict anti-drift mandate: NEVER drift into Chinese or output Chinese characters unless the user explicitly queried in Chinese.\n\n",
-            std::env::consts::OS,
-            self.workspace_dir.display(),
-            self.extra_dirs_line(),
-            chrono::Utc::now().format("%Y-%m-%d")
-        ));
+        // Static prefix first (identity, mandates, tool rules, skills, memory) so LLM providers
+        // with prefix caching reuse the prefill across turns, mode toggles, and UTC day rollovers.
+        prompt.push_str(
+            "You are Corex (cx, created by sluisr), an autonomous, high-performance CLI agent specializing in software engineering tasks. Your primary goal is to help users safely and effectively.\n\n\
+- Communication Language: Dynamically and autonomously match the exact language used by the user in their prompt (Spanish, English, German, French, Portuguese, Italian, Japanese, etc.). Strict anti-drift mandate: NEVER drift into Chinese or output Chinese characters unless the user explicitly queried in Chinese.\n\n",
+        );
 
         prompt.push_str(CORE_ENGINEERING_MANDATES);
         prompt.push('\n');
         prompt.push_str(CORE_TOOL_ENFORCEMENT);
         prompt.push('\n');
         prompt.push_str(SUDO_RULE);
+
+        let (skills, memory) = self.cached_skills_and_memory();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+        }
+        if !memory.is_empty() {
+            prompt.push_str(MEMORY_PRECEDENCE_NOTE);
+            prompt.push_str(&memory);
+        }
+
+        // Dynamic runtime context at the tail so prefix-cache invalidation is minimized.
+        let mode_str = if self.is_plan_mode { "Plan" } else { "Default" };
+        prompt.push_str(&format!(
+            "\nCURRENT ENVIRONMENT:\n- OS: {}\n- Operating Mode: **{}** mode\n- Workspace Directory: {}\n{}- Date: {}\n",
+            std::env::consts::OS,
+            mode_str,
+            self.workspace_dir.display(),
+            self.extra_dirs_line(),
+            chrono::Utc::now().format("%Y-%m-%d")
+        ));
+
         if self.has_sudo_password {
             prompt.push_str(SUDO_SILENT_RULE);
         }
@@ -270,14 +299,6 @@ impl PromptBuilder {
             prompt.push_str("- You are in architectural planning mode. Focus on reading and analyzing the codebase.\n");
             prompt.push_str("- Propose clear step-by-step plans before making any destructive edits.\n");
             prompt.push_str("- File-writing, memory, subagent and MCP tools are unavailable; shell commands that are not read-only, and killing or driving background tasks, wait for the user's approval.\n");
-        }
-
-        let (skills, memory) = self.cached_skills_and_memory();
-        if !skills.is_empty() {
-            prompt.push_str(&skills);
-        }
-        if !memory.is_empty() {
-            prompt.push_str(&memory);
         }
 
         prompt
@@ -320,15 +341,9 @@ impl PromptBuilder {
     pub fn build_lite(&self) -> String {
         let mut prompt = String::new();
 
-        prompt.push_str(&format!(
-            "You are Corex, a local AI assistant for Linux terminal tasks. You run entirely on the user's hardware at $0.00 cost.\n\
-            OS: Linux. Date: {}. Workspace: {}.\n\n",
-            chrono::Utc::now().format("%Y-%m-%d"),
-            self.workspace_dir.display()
-        ));
-
         prompt.push_str(
-            "## TOOL USAGE\n\
+            "You are Corex, a local AI assistant for Linux terminal tasks. You run entirely on the user's hardware at $0.00 cost.\n\n\
+            ## TOOL USAGE\n\
             - To run a shell command: call run_shell_command immediately. Do NOT describe what you would do — just call the tool.\n\
             - To read files or list directories: use read_file or list_directory tools.\n\
             - NEVER make up, estimate, or guess command output. Only report what the tool actually returned.\n\
@@ -347,22 +362,28 @@ impl PromptBuilder {
             - Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.\n\n"
         );
 
+        let (skills, memory) = self.cached_skills_and_memory();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+        }
+        if !memory.is_empty() {
+            prompt.push_str(MEMORY_PRECEDENCE_NOTE);
+            prompt.push_str(&memory);
+        }
+
+        prompt.push_str(&format!(
+            "\nCURRENT ENVIRONMENT:\n- OS: {}\n- Workspace: {}\n- Date: {}\n",
+            std::env::consts::OS,
+            self.workspace_dir.display(),
+            chrono::Utc::now().format("%Y-%m-%d")
+        ));
+
         if self.has_sudo_password {
             prompt.push_str("sudo is pre-authenticated for this session. Use it freely when root is needed.\n\n");
         }
 
         if self.is_plan_mode {
             prompt.push_str("# PLANNING MODE ACTIVE\n- You are in architectural planning mode (read-only exploration). Focus on reading and analyzing.\n- Propose clear step-by-step plans before making any destructive edits.\n- File-writing, memory, subagent and MCP tools are unavailable; shell commands that are not read-only, and killing or driving background tasks, wait for the user's approval.\n\n");
-        }
-
-        let skills = self.discover_skills();
-        if !skills.is_empty() {
-            prompt.push_str(&skills);
-        }
-
-        let memory = self.memory_prompt();
-        if !memory.is_empty() {
-            prompt.push_str(&memory);
         }
 
         prompt
@@ -425,30 +446,39 @@ impl PromptBuilder {
             )
         };
 
-        prompt.push_str(&format!(
+        // Static SysAdmin & SRE rules + skills + memory first for prefix caching.
+        prompt.push_str(
             r#"# Role: Corex SysAdmin & Fleet SRE Mode (created by sluisr)
 You are Corex operating in **SysAdmin / Fleet Infrastructure Mode**.
 You are managing remote Linux servers and VPS nodes directly through persistent SSH sessions.
-
-## ACTIVE INFRASTRUCTURE TARGET
-- {target_desc}
-- Date: {date}
 - Communication Language: STRICTLY match the user's conversation language (Spanish, English, etc.). Never drift into other languages.
 
 ## CRITICAL SYSADMIN OPERATIONAL RULES (MANDATORY)
-{connection_rule}
-3. **STRICT PROHIBITION ON LOCAL GIT / COMPILER TOOLS**: NEVER run `git status`, `git branch`, `git diff`, `cargo check`, or search local project code when in Fleet Mode. You are an infrastructure administrator managing a remote server, NOT editing local code.
-4. **TOOL MANDATE — USE `fleet_run_command`**: When a server is connected, execute commands on the remote server using the `fleet_run_command` tool with `node_id: "{target_node_id}"`. The SSH session is persistent, so working directory (`cd`) and environment state are automatically preserved.
-5. **DIAGNOSTICS & SYSTEM AUDIT WORKFLOW**: When the user asks to "revisa", "audita", or check the server:
+1. **STRICT PROHIBITION ON LOCAL GIT / COMPILER TOOLS**: NEVER run `git status`, `git branch`, `git diff`, `cargo check`, or search local project code when in Fleet Mode. You are an infrastructure administrator managing a remote server, NOT editing local code.
+2. **DIAGNOSTICS & SYSTEM AUDIT WORKFLOW**: When the user asks to "revisa", "audita", or check the server:
    - Check system health: `uptime && free -h && df -h /`
    - Check failed systemd units: `systemctl --failed`
    - Check critical recent logs: `journalctl -p 3 -xb -n 30` or `journalctl -u <service> -n 50`
    - Check listening ports and network: `ss -tulpn`
    - Check top resource-consuming processes: `ps aux --sort=-%mem | head -10` or `ps aux --sort=-%cpu | head -10`
-6. **ELEVATION & PRIVILEGES**: When root permissions are required (e.g. systemctl restart, editing /etc, iptables, viewing protected logs), set `sudo: true` in `fleet_run_command`. The user supervises and approves sensitive actions in real time in the console.
-7. **HIGH-SIGNAL REPORTING**: Present your findings clearly and concisely with bold indicators for any issues found (e.g. high RAM, disk full, crashed services). Always suggest the exact remediation command.
-8. **READY TO PASTE**: Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.
+3. **ELEVATION & PRIVILEGES**: When root permissions are required (e.g. systemctl restart, editing /etc, iptables, viewing protected logs), set `sudo: true` in `fleet_run_command`. The user supervises and approves sensitive actions in real time in the console.
+4. **HIGH-SIGNAL REPORTING**: Present your findings clearly and concisely with bold indicators for any issues found (e.g. high RAM, disk full, crashed services). Always suggest the exact remediation command.
+5. **READY TO PASTE**: Put anything the user will paste somewhere else (commands, scripts, config, an email or message to send) in its own fenced code block holding only that text: no `$` prompts, no comments or notes inside. Use one block per thing to paste; Corex puts a copy button on each block.
 "#,
+        );
+
+        let (skills, memory) = self.cached_skills_and_memory();
+        if !skills.is_empty() {
+            prompt.push_str(&skills);
+        }
+        if !memory.is_empty() {
+            prompt.push_str(MEMORY_PRECEDENCE_NOTE);
+            prompt.push_str(&memory);
+        }
+
+        // Dynamic target & date at the tail so switching nodes or crossing UTC midnight keeps the prefix warm.
+        prompt.push_str(&format!(
+            "\n## ACTIVE INFRASTRUCTURE TARGET\n- {target_desc}\n- Date: {date}\n\n{connection_rule}\n- **TOOL MANDATE — USE `fleet_run_command`**: When a server is connected, execute commands on the remote server using the `fleet_run_command` tool with `node_id: \"{target_node_id}\"`. The SSH session is persistent, so working directory (`cd`) and environment state are automatically preserved.\n",
             target_desc = target_desc,
             date = chrono::Utc::now().format("%Y-%m-%d"),
             target_node_id = target_node_id,
@@ -457,14 +487,6 @@ You are managing remote Linux servers and VPS nodes directly through persistent 
 
         if self.is_plan_mode {
             prompt.push_str("\n# PLANNING MODE ACTIVE\n- You are in architectural planning mode (read-only exploration). Focus on reading and analyzing.\n- Propose clear step-by-step plans before making any destructive changes.\n");
-        }
-
-        let (skills, memory) = self.cached_skills_and_memory();
-        if !skills.is_empty() {
-            prompt.push_str(&skills);
-        }
-        if !memory.is_empty() {
-            prompt.push_str(&memory);
         }
 
         prompt
@@ -529,6 +551,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn last_gate_comes_after_every_proactivity_rule() {
+        let prompt = PromptBuilder::new("/tmp/test-workspace").build();
+        let proactive = prompt.find("Be proactive and decisive").expect("proactivity rule present");
+        let gate = prompt.find("LAST GATE").expect("intent gate present");
+        assert!(proactive < gate, "the intent gate must sit after the proactivity rules");
+        assert!(!prompt.contains("rhetorical permission"), "the old unconditional proactivity line must be gone");
+    }
+
+    #[test]
+    fn user_question_is_never_a_work_order() {
+        let prompt = PromptBuilder::new("/tmp/test-workspace").build();
+        assert!(prompt.contains("A question is never a work order"));
+        assert!(prompt.contains("never from a keyword list"));
+    }
+
+    #[test]
+    fn intent_gate_has_no_keyword_dictionary() {
+        // Intent is classified semantically, never by matching a list of phrases in the core prompt.
+        for forbidden in ["\"hazlo\"", "\"procede\"", "\"arréglalo\"", "\"dale\"", "\"¿no??\"", "\"right?\""] {
+            assert!(!CORE_ENGINEERING_MANDATES.contains(forbidden), "hardcoded intent keyword found in prompt: {forbidden}");
+        }
+    }
+
+    #[test]
+    fn memory_notes_never_authorize_actions() {
+        let temp_dir = std::env::temp_dir().join(format!("corex_test_memory_precedence_{}", std::process::id()));
+        let memory_file = temp_dir.join(".corex").join("SYSTEM.md");
+        let _ = std::fs::create_dir_all(memory_file.parent().unwrap());
+        let _ = std::fs::write(&memory_file, "no puedes frenar en nada");
+
+        let prompt = PromptBuilder::new(&temp_dir).build();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let note = prompt.find("never an execution license").expect("precedence note present");
+        let memory = prompt.find("no puedes frenar en nada").expect("user memory present");
+        assert!(note < memory, "the precedence note must precede the user's notes");
+    }
+
+    #[test]
     fn test_system_prompt_contains_clean_command_mandate() {
         let builder = PromptBuilder::new("/tmp/test-workspace");
         let prompt = builder.build();
@@ -539,6 +600,13 @@ mod tests {
         assert!(prompt.contains("DECISION & QUESTION EXCLUSIVITY"));
         assert!(prompt.contains("MULTI-AGENT & SUBTASK DELEGATION"));
         assert!(prompt.contains("NEVER output Chinese characters"));
+    }
+
+    #[test]
+    fn test_system_prompt_forbids_announcing_the_language() {
+        // Models used to open replies with "sigo en español" because of the loud language rules.
+        let prompt = PromptBuilder::new("/tmp/test-workspace").build();
+        assert!(prompt.contains("never announce, confirm or comment on which language you are using"));
     }
 
     #[test]
@@ -662,5 +730,30 @@ description: >-
         let fleet = builder.build_fleet(None, &[]);
         assert!(lite.contains("PLANNING MODE ACTIVE"));
         assert!(fleet.contains("PLANNING MODE ACTIVE"));
+    }
+
+    #[test]
+    fn dynamic_environment_sits_after_static_rules_and_skills_for_prefix_cache() {
+        let p_default = PromptBuilder::new("/tmp/test-workspace").build();
+        let p_plan = PromptBuilder::new("/tmp/test-workspace")
+            .with_plan_mode(true)
+            .with_sudo_password(true)
+            .with_extra_dirs(&[PathBuf::from("/tmp/extra")])
+            .build();
+
+        let env_pos = p_default.find("CURRENT ENVIRONMENT:").expect("env block present");
+        let gate_pos = p_default.find("LAST GATE").expect("gate rule present");
+        let skills_pos = p_default.find("# AVAILABLE PROCEDURAL SKILLS").expect("skills present");
+        assert!(gate_pos < env_pos && skills_pos < env_pos);
+
+        // Everything before CURRENT ENVIRONMENT must stay byte-identical across dynamic toggles.
+        assert_eq!(&p_default[..env_pos], &p_plan[..env_pos]);
+
+        let f_none = PromptBuilder::new("/tmp/test-workspace").build_fleet(None, &[]);
+        let f_active = PromptBuilder::new("/tmp/test-workspace")
+            .with_plan_mode(true)
+            .build_fleet(Some(("vps-1", "root", "192.0.2.1")), &[("vps-1", "root", "192.0.2.1")]);
+        let target_pos = f_none.find("## ACTIVE INFRASTRUCTURE TARGET").unwrap();
+        assert_eq!(&f_none[..target_pos], &f_active[..target_pos]);
     }
 }

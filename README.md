@@ -50,7 +50,7 @@ Unlike traditional terminal assistants built on Node.js or Python runtimes, Core
 - **Real-Time Prompt Queuing:** Type or paste follow-up prompts while the model is streaming responses. Queued items run sequentially without interrupting generation.
 - **Fuzzy Diff Patch Engine (`apply_patch`):** Precise unified diff patching with whitespace tolerance, accurate line offset calculation, and CRLF/LF line ending preservation.
 - **File Locks & Protected Paths:** File-level advisory concurrency locks (`file_lock.rs`) across parallel background tasks and processes, plus protection of sensitive files (SSH keys, GPG credentials, git configs) even in YOLO mode.
-- **Session Audit Log:** A plain-text log of every tool call, shell command and LLM exchange, with millisecond timestamps, in `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`, kept for 7 days. It is not signed or encrypted.
+- **Session Audit Log:** A plain-text log of every tool call, shell command and LLM exchange, with millisecond timestamps, in `~/.corex/logs/corex-forensic-YYYY-MM-DD.log`, kept for 7 days. It is not signed or encrypted; pasted text is never written to it, and `COREX_FORENSIC_LOG=0` turns it off.
 - **Global & Workspace Personality (`SYSTEM.md`):** Loads every instruction file it finds (`~/.corex/SYSTEM.md`, `COREX.md`, `AGENTS.md`, `DEEPSEEK.md`, global first, then the workspace); `/memory list` shows which ones are in use.
 - **Clipboard Integration:** Copies text through `wl-copy`, `xclip`/`xsel` or OSC 52, and pastes images, or copied image files, with `Ctrl+V` (as `[Image #N]`) for models that can see them. `Alt+V` pastes the text only. Code blocks copy with one click on `⧉ copy`, without the rail or the line breaks added to fit the screen.
 - **KV Cache Preservation:** Context management and tool compression keep the prompt prefix stable so provider prompt caching applies. The hit rate depends on the provider and the conversation; `/stats` and the summary printed on exit report it.
@@ -374,7 +374,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/export [md\|txt\|html] [full]` | Save the chat to `~/.corex/exports/<project>/` (or `exports_dir`) as Markdown, text or an HTML page to print to PDF. |
 | `/model` | Master-detail catalog: select provider/model (DeepSeek, Gemini, Claude, OpenAI, Groq, Local) & tune CoT sliders. |
 | `/key [api_key]` (alias `/auth`) | Set or replace the API key of the active provider; without an argument it opens the credentials dialog. |
-| `/balance` | Check current account credits and token balance asynchronously (`/wallet`). |
+| `/balance` | Check current account credits asynchronously, plus what the current session has spent (`/wallet`). |
 | `/fim <file>` | Fill-in-the-Middle code completion at cursor location. |
 | `/local <prompt>` | Query local offline LLM directly ($0.00 cost) or check status (`/local status`). |
 | `/web <query>` | Query the live internet via autonomous web search engine (`/search`). |
@@ -391,7 +391,7 @@ Within the interactive TUI, type `/` to access built-in commands:
 | `/directory [add\|show]` | Let the agent read directories outside the workspace without confirmation, for this session (alias `/dir`). |
 | `/mcp` | Interactive Model Context Protocol server catalog (`/mcp status`, `/mcp catalog`, `/mcp add`, `/mcp remove`, `/mcp reload`). |
 | `/tasks` | Manage background tasks (`list`, `status`, `kill`, `send`). |
-| `/stats` (alias `/context`) | View session metrics, KV Cache hit rates, financial cost, and the context in use against the compaction limit. |
+| `/stats` (alias `/context`) | View session token metrics, KV Cache hit rate and the context in use. `/stats full` (or `/context`) adds the window source, history cap and where to change them. |
 | `/info` | Display system telemetry, version, and links. |
 | `/update` | Check for updates or apply in-place atomically (`/update apply` / `/update force`). |
 | `/mouse` | Toggle mouse reporting: wheel and drag, or the terminal's native touch. |
@@ -450,7 +450,7 @@ Corex sizes its limits from the active model's context window instead of a fixed
 
 When you pick a model, Corex asks its provider for the window in the background (DeepSeek, Anthropic, Google, OpenRouter, Groq, Mistral and OpenAI-compatible servers that list it; OpenAI and GitHub Models do not report one). Order of precedence: `context_window_tokens`, then a `context_window` on the model in your `providers` list, then what the provider reported, then the default above. Anthropic's answer is capped at 200,000, since the 1M window needs a beta header Corex does not send.
 
-The status bar shows the share of the window in use (`~13%`) and turns yellow once the prompt passes the auto-compact limit. The size is the prompt size the API reported for the last request plus an estimate of what was added since. `/stats` (or `/context`) lists the limits in force and where the window comes from, and the compaction notice says at how many tokens it ran.
+The status bar shows the share of the window in use (`~13%`) and turns yellow once the prompt passes the auto-compact limit. The size is the prompt size the API reported for the last request plus an estimate of what was added since. `/stats full` (or `/context`) lists the limits in force and where the window comes from, and the compaction notice says at how many tokens it ran.
 
 Earlier versions saved `"compact_threshold_tokens": 95000` to `settings.json`; that exact value is treated as unset. Use `95001` to keep a threshold that low.
 
@@ -471,6 +471,7 @@ Earlier versions saved `"compact_threshold_tokens": 95000` to `settings.json`; t
 | `--completions <shell>` | Print the shell completion script. |
 | `--fleet` (or `cxs`) | Open the Fleet console. |
 | `COREX_KEYRING=0` | Keep API keys in `~/.corex/credentials.json` instead of the system keyring. |
+| `COREX_FORENSIC_LOG=0` | Do not write the session audit log in `~/.corex/logs/`. |
 
 ---
 

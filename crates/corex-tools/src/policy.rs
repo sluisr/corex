@@ -14,9 +14,13 @@ pub enum Verdict {
     Ask,
 }
 
-/// The verdict for a call made by the main agent. `ctx.yolo_mode` is auto-approve; `plan` is
+/// The verdict for a call made by the main agent. `ctx.yolo_mode` is auto-approve (YOLO Normal);
+/// `ctx.yolo_all` is full auto-approve without asking permission for anything (YOLO All); `plan` is
 /// plan mode, which holds anything that changes things even when auto-approve is on.
 pub fn verdict(registry: &ToolRegistry, name: &str, args: &serde_json::Value, ctx: &ToolContext, plan: bool) -> Verdict {
+    if ctx.yolo_all {
+        return Verdict::Run;
+    }
     let tool_asks = || registry.get(name).is_some_and(|t| t.needs_confirmation(args, ctx));
     let ask = (plan && (plan_mode_requires_approval(name, args) || tool_asks()))
         || needs_approval_even_in_yolo(name, args)
@@ -36,7 +40,8 @@ pub fn needs_sudo(name: &str, args: &serde_json::Value) -> bool {
 
 /// Calls that wait for the user even with auto-approve (YOLO) on: shell commands aimed at
 /// credentials or at files that run code by themselves (git hooks, shell startup files, cron),
-/// and notes for the global memory that every future session loads.
+/// notes for the global memory that every future session loads, and local files handed to a
+/// website.
 pub fn needs_approval_even_in_yolo(name: &str, args: &serde_json::Value) -> bool {
     match name {
         "run_shell_command" => args
@@ -44,6 +49,7 @@ pub fn needs_approval_even_in_yolo(name: &str, args: &serde_json::Value) -> bool
             .and_then(|v| v.as_str())
             .is_some_and(crate::shell::command_references_sensitive_or_protected_path),
         "save_memory" => args.get("scope").and_then(|v| v.as_str()).unwrap_or("global") != "project",
+        "browser" => args.get("action").and_then(|v| v.as_str()) == Some("upload"),
         _ => false,
     }
 }
@@ -153,6 +159,18 @@ mod tests {
         ToolContext {
             workspace_dir: std::env::temp_dir(),
             yolo_mode: yolo,
+            yolo_all: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        }
+    }
+
+    fn ctx_all() -> ToolContext {
+        ToolContext {
+            workspace_dir: std::env::temp_dir(),
+            yolo_mode: true,
+            yolo_all: true,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -184,6 +202,8 @@ mod tests {
             assert_eq!(verdict(&reg, name, args, &ctx(false), false), normal, "{name} {args} normal");
             assert_eq!(verdict(&reg, name, args, &ctx(true), false), yolo, "{name} {args} yolo");
             assert_eq!(verdict(&reg, name, args, &ctx(true), true), plan, "{name} {args} plan");
+            assert_eq!(verdict(&reg, name, args, &ctx_all(), false), Verdict::Run, "{name} {args} yolo_all");
+            assert_eq!(verdict(&reg, name, args, &ctx_all(), true), Verdict::Run, "{name} {args} yolo_all plan");
         }
     }
 

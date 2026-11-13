@@ -814,6 +814,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::current_dir().unwrap(),
             yolo_mode: false,
+            yolo_all: false,
             allowed_commands: vec![],
             sudo_password: None,
             extra_dirs: Vec::new(),
@@ -828,6 +829,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::current_dir().unwrap(),
             yolo_mode: false,
+            yolo_all: false,
             allowed_commands: vec![],
             sudo_password: None,
             extra_dirs: Vec::new(),

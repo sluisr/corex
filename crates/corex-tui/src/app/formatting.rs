@@ -343,19 +343,138 @@ pub fn clean_tool_args(name: &str, raw_args: &str) -> String {
 }
 
 /// Target file of an `apply_patch` call.
+///
+/// Two spellings reach us: a unified diff names the file on its `---`/`+++` pair, while the
+/// `*** Begin Patch` envelope models write names it on its first `*** Update/Add/Delete File:` line.
 pub fn patch_target(patch: &str) -> Option<String> {
-    patch
-        .lines()
-        .filter(|line| line.starts_with("+++ ") || line.starts_with("--- "))
-        .filter_map(|line| {
-            let path = line[4..].split('\t').next().unwrap_or("").trim();
-            if path.is_empty() || path == "/dev/null" {
-                return None;
+    patch.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        for prefix in ["*** Update File:", "*** Add File:", "*** Delete File:"] {
+            if let Some(path) = trimmed.strip_prefix(prefix) {
+                let path = path.trim();
+                if !path.is_empty() {
+                    return Some(path.to_string());
+                }
             }
-            let path = path.strip_prefix("b/").or_else(|| path.strip_prefix("a/")).unwrap_or(path);
-            Some(path.to_string())
-        })
-        .next()
+        }
+        let rest = trimmed.strip_prefix("+++ ").or_else(|| trimmed.strip_prefix("--- "))?;
+        let path = rest.split('\t').next().unwrap_or("").trim();
+        if path.is_empty() || path == "/dev/null" {
+            return None;
+        }
+        let path = path.strip_prefix("b/").or_else(|| path.strip_prefix("a/")).unwrap_or(path);
+        Some(path.to_string())
+    })
+}
+
+/// One row of an edit's diff as the conversation draws it.
+pub enum DiffRow {
+    /// The file the following hunks belong to: drawn once, with its own marker, so the patch's
+    /// real `@@` right below it never reads as a duplicate.
+    File(String),
+    /// A hunk marker: `@@ -1,2 +1,3 @@`, or the bare `@@` of a `*** Begin Patch` envelope.
+    Hunk(String),
+    Added(String),
+    Removed(String),
+    Context(String),
+}
+
+/// The changed lines a file-editing call carries, as the conversation draws them once the edit
+/// lands: the patch body for `apply_patch`, the old/new pair for `edit`.
+pub fn edit_diff_rows(tool_name: &str, raw_args: &str) -> Vec<DiffRow> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+        return Vec::new();
+    };
+    match tool_name {
+        "apply_patch" => args
+            .get("patch")
+            .or_else(|| args.get("input"))
+            .or_else(|| args.get("diff"))
+            .and_then(|p| p.as_str())
+            .map(patch_rows)
+            .unwrap_or_default(),
+        "edit" | "replace" => {
+            let old = args.get("old_string").or_else(|| args.get("old")).and_then(|s| s.as_str());
+            let new = args.get("new_string").or_else(|| args.get("new")).and_then(|s| s.as_str());
+            match (old, new) {
+                (Some(old), Some(new)) => old
+                    .lines()
+                    .map(|l| DiffRow::Removed(l.to_string()))
+                    .chain(new.lines().map(|l| DiffRow::Added(l.to_string())))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A patch body, with the `*** Begin Patch` envelope reduced to the file header it names.
+///
+/// `---`/`+++` are only file headers while no hunk has started: an added line whose own text
+/// begins with `++ ` reaches us as `+++ `, and reading that as a header would swallow the change.
+/// A `diff --git` line starts the next file, so it reopens the header section.
+fn patch_rows(patch: &str) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    let mut pre_image: Option<String> = None;
+    let mut in_hunks = false;
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("*** Begin Patch") || trimmed.starts_with("*** End Patch") {
+            continue;
+        }
+        if trimmed.starts_with("diff --git") {
+            in_hunks = false;
+            continue;
+        }
+        if let Some(path) = ["*** Update File:", "*** Add File:", "*** Delete File:"]
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))
+        {
+            let path = path.trim();
+            if !path.is_empty() {
+                rows.push(DiffRow::File(path.to_string()));
+            }
+            pre_image = None;
+            in_hunks = false;
+            continue;
+        }
+        if !in_hunks {
+            if let Some(rest) = line.strip_prefix("--- ") {
+                pre_image = patch_path(rest);
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                if let Some(path) = patch_path(rest).or_else(|| pre_image.take()) {
+                    rows.push(DiffRow::File(path));
+                }
+                pre_image = None;
+                continue;
+            }
+        }
+        if line.starts_with("@@") {
+            rows.push(DiffRow::Hunk(line.to_string()));
+            in_hunks = true;
+        } else if let Some(body) = line.strip_prefix('+') {
+            rows.push(DiffRow::Added(body.to_string()));
+        } else if let Some(body) = line.strip_prefix('-') {
+            rows.push(DiffRow::Removed(body.to_string()));
+        } else if let Some(body) = line.strip_prefix(' ') {
+            rows.push(DiffRow::Context(body.to_string()));
+        }
+    }
+    rows
+}
+
+/// The target a diff header names, without the `a/`/`b/` prefix or the `/dev/null` sentinel.
+fn patch_path(raw: &str) -> Option<String> {
+    let path = raw.split('\t').next().unwrap_or("").trim();
+    let path = path.strip_prefix("b/").or_else(|| path.strip_prefix("a/")).unwrap_or(path);
+    if path.is_empty() || path == "/dev/null" {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 /// Helper to trim current working directory or home directory prefix from a path

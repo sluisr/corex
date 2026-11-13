@@ -221,6 +221,18 @@ impl SubagentManager {
         false
     }
 
+    /// Marks a finished task as already delivered.
+    ///
+    /// A tool that returns a report itself (see `manage_subagents` with `action='wait'`) calls
+    /// this so the same output is not injected again as a `SUBAGENT_DONE` notification.
+    pub fn acknowledge(&mut self, id: &str) {
+        if let Some(task) = self.tasks.get_mut(id) {
+            if !task.status.is_active() {
+                task.acknowledged = true;
+            }
+        }
+    }
+
     pub fn get_cancel_token(&self, id: &str) -> Option<tokio_util::sync::CancellationToken> {
         self.tasks.get(id).map(|t| t.cancel_token.clone())
     }

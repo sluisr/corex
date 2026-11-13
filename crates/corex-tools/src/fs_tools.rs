@@ -21,61 +21,32 @@ pub(crate) use corex_core::lock_path;
 /// truth for "this path holds credentials". Callers should pass a canonicalized path when the
 /// file may be reached through a symlink.
 fn is_sensitive_system_path_raw(path: &Path) -> bool {
-    let p_str = path.to_string_lossy();
+    const SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".corex", ".deepseek"];
+    const SECRET_FILES: &[&str] = &[".askpass_cred", ".git-credentials", ".netrc", ".npmrc"];
+    const SECRET_PAIRS: &[(&str, &str)] = &[(".aws", "credentials"), (".docker", "config.json"), (".kube", "config")];
+    const SECRET_SYSTEM_FILES: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
-    // A bare credential directory (e.g. `~/.ssh`, `/home/x/.gnupg`, `~/.corex`, `~/.deepseek`).
-    if p_str.ends_with("/.ssh")
-        || p_str.ends_with(".ssh")
-        || p_str.ends_with("/.gnupg")
-        || p_str.ends_with(".gnupg")
-        || p_str.ends_with("/.corex")
-        || p_str == ".corex"
-        || p_str.ends_with("/.deepseek")
-        || p_str == ".deepseek"
+    let lower = path.to_string_lossy().to_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|p| !p.is_empty()).collect();
+    let is_secret_file = |part: &str| {
+        SECRET_FILES.iter().any(|f| part == *f || part.strip_prefix(f).is_some_and(|rest| rest.starts_with('.')))
+    };
+    if parts.iter().any(|part| SECRET_DIRS.contains(part) || is_secret_file(part))
+        || parts.windows(2).any(|pair| SECRET_PAIRS.contains(&(pair[0], pair[1])))
+        || SECRET_SYSTEM_FILES.iter().any(|file| lower.contains(file))
     {
         return true;
     }
 
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        let lower_name = name.to_ascii_lowercase();
-        if (lower_name == ".env" || lower_name.starts_with(".env."))
-            && !matches!(
-                lower_name.as_str(),
-                ".env.example" | ".env.sample" | ".env.template"
-            )
+    if let Some(name) = parts.last() {
+        if (*name == ".env" || name.starts_with(".env."))
+            && !matches!(*name, ".env.example" | ".env.sample" | ".env.template")
         {
             return true;
         }
     }
 
-    const SENSITIVE_FRAGMENTS: &[&str] = &[
-        ".ssh/",
-        ".gnupg/",
-        ".corex/",
-        ".deepseek/",
-        ".askpass_cred",
-        ".aws/credentials",
-        ".docker/config.json",
-        ".git-credentials",
-        ".kube/config",
-        ".netrc",
-        ".npmrc",
-        "/etc/shadow",
-        "/etc/gshadow",
-        "/etc/sudoers",
-    ];
-    if SENSITIVE_FRAGMENTS.iter().any(|frag| p_str.contains(frag)) {
-        return true;
-    }
-
-    // `/proc/<pid>/{environ,mem}` expose inherited environment and process memory.
-    if (p_str.starts_with("/proc/") || p_str.starts_with("/proc/self/"))
-        && (p_str.ends_with("/environ") || p_str.ends_with("/mem"))
-    {
-        return true;
-    }
-
-    false
+    lower.starts_with("/proc/") && (lower.ends_with("/environ") || lower.ends_with("/mem"))
 }
 
 pub fn is_sensitive_system_path(path: &Path) -> bool {
@@ -91,52 +62,49 @@ pub fn is_sensitive_system_path(path: &Path) -> bool {
 }
 
 fn is_protected_write_path_raw(path: &Path) -> bool {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        const PROTECTED_NAMES: &[&str] = &[
-            ".bashrc",
-            ".bash_profile",
-            ".bash_login",
-            ".profile",
-            ".zshrc",
-            ".zprofile",
-            ".zshenv",
-            ".gitconfig",
-            ".git-credentials",
-            ".gitmodules",
-        ];
-        if PROTECTED_NAMES.contains(&name) {
-            return true;
-        }
+    const PROTECTED_NAMES: &[&str] = &[
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".profile",
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".gitconfig",
+        ".git-credentials",
+        ".gitmodules",
+    ];
+
+    let lower = path.to_string_lossy().to_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return false;
+    };
+    if PROTECTED_NAMES.contains(name) || (*name == ".git" && !path.is_dir()) {
+        return true;
+    }
+    // A repository's own config can name programs git runs implicitly (`core.fsmonitor`,
+    // `diff.external`, filter drivers), even for read-only commands such as `git status`.
+    if dirs.contains(&".git") && (name.starts_with("config") || *name == "commondir") {
+        return true;
     }
 
-    let p_str = path.to_string_lossy();
-    // A repository's own config can name programs git runs implicitly (`core.fsmonitor`,
-    // `core.hooksPath`, `diff.external`, textconv/filter drivers), even for read-only commands
-    // such as `git status` or `git diff`.
-    p_str.ends_with("/.git/config")
-        || p_str == ".git/config"
-        || p_str.contains("/.git/info/attributes")
-        || p_str.starts_with(".git/info/attributes")
-        || p_str.contains("/.git/hooks/")
-        || p_str.starts_with(".git/hooks/")
-        || p_str.contains("/.corex/")
-        || p_str.starts_with(".corex/")
-        || p_str.ends_with("/.corex")
-        || p_str == ".corex"
-        || p_str.contains("/.deepseek/")
-        || p_str.starts_with(".deepseek/")
-        || p_str.ends_with("/.deepseek")
-        || p_str == ".deepseek"
-        || p_str.ends_with("/.ssh/authorized_keys")
-        || p_str.ends_with("/.ssh/config")
-        || p_str.contains("/authorized_keys")
-        || p_str.contains("/.cargo/config.toml")
-        || p_str.ends_with("/.cargo/config")
-        || p_str.contains("/.config/systemd/user/")
-        || p_str.contains("/.config/fish/config.fish")
-        || p_str.contains("/etc/profile.d/")
-        || p_str.contains("/etc/cron.d/")
-        || p_str.contains("/etc/crontab")
+    let anchored = format!("/{}", parts.join("/"));
+    anchored.contains("/.git/info/attributes")
+        || anchored.contains("/.git/hooks/")
+        || anchored.contains("/.corex/")
+        || anchored.ends_with("/.corex")
+        || anchored.contains("/.deepseek/")
+        || anchored.ends_with("/.deepseek")
+        || anchored.contains("/authorized_keys")
+        || anchored.ends_with("/.ssh/config")
+        || anchored.contains("/.cargo/config.toml")
+        || anchored.ends_with("/.cargo/config")
+        || anchored.contains("/.config/systemd/user/")
+        || anchored.contains("/.config/fish/config.fish")
+        || anchored.contains("/etc/profile.d/")
+        || anchored.contains("/etc/cron.d/")
+        || anchored.contains("/etc/crontab")
 }
 
 /// Paths whose modification would grant code execution or credential persistence to the user's
@@ -237,7 +205,8 @@ pub fn read_path_needs_confirmation(
     let readable = std::iter::once(&context.workspace_dir)
         .chain(&context.extra_dirs)
         .any(|root| is_within_workspace(&path, root));
-    if readable && !is_sensitive_system_path(&path) {
+    // The read tools refuse a credential path themselves, so asking first would be pointless.
+    if readable || is_sensitive_system_path(&path) {
         return false;
     }
     // Output the harness itself spilled to disk is meant to be read back without a prompt.
@@ -773,10 +742,11 @@ impl Tool for WriteFileTool {
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
         if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = resolve_path(&context.workspace_dir, rel);
-            if !is_within_workspace(&path, &context.workspace_dir)
-                || is_sensitive_system_path(&path)
-                || is_protected_write_path(&path)
-            {
+            // Refused when it runs, so asking first would be pointless.
+            if is_sensitive_system_path(&path) || is_protected_write_path(&path) {
+                return false;
+            }
+            if !is_within_workspace(&path, &context.workspace_dir) {
                 return true;
             }
         }
@@ -1010,10 +980,11 @@ impl Tool for EditTool {
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
         if let Some(rel) = args.get("file_path").and_then(|v| v.as_str()) {
             let path = resolve_path(&context.workspace_dir, rel);
-            if !is_within_workspace(&path, &context.workspace_dir)
-                || is_sensitive_system_path(&path)
-                || is_protected_write_path(&path)
-            {
+            // Refused when it runs, so asking first would be pointless.
+            if is_sensitive_system_path(&path) || is_protected_write_path(&path) {
+                return false;
+            }
+            if !is_within_workspace(&path, &context.workspace_dir) {
                 return true;
             }
         }
@@ -1587,6 +1558,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn credential_paths_match_whole_names_in_any_case() {
+        for path in ["/home/u/.ssh/id_rsa", "/home/u/.SSH/id_rsa", "/home/u/.npmrc", "/home/u/.netrc.bak", "/srv/app/.env.local", "/home/u/.aws/credentials"] {
+            assert!(is_sensitive_system_path(Path::new(path)), "{path}");
+        }
+        for path in ["/srv/docs/notes.ssh", "/srv/docs/guide.netrc.md", "/srv/app/.env.example", "/home/u/.aws/config"] {
+            assert!(!is_sensitive_system_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn git_internals_that_run_programs_are_protected() {
+        for path in ["/w/.git/config", "/w/.git/modules/sub/config", "/w/.git/config.worktree", "/w/.git/commondir", "/w/sub/.git", ".git/hooks/pre-commit", "/home/u/.Bashrc"] {
+            assert!(is_protected_write_path(Path::new(path)), "{path}");
+        }
+        for path in ["/w/.git/HEAD", "/w/src/config", "/w/.github/workflows/ci.yml"] {
+            assert!(!is_protected_write_path(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
     fn sensitive_and_protected_paths_are_classified() {
         // Credential/auth paths must be flagged as sensitive.
         assert!(is_sensitive_system_path(Path::new("/home/x/.ssh/id_rsa")));
@@ -1629,6 +1620,7 @@ mod tests {
         let mut ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1654,6 +1646,7 @@ mod tests {
         let mut ctx = ToolContext {
             workspace_dir: ws,
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1679,6 +1672,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: vec![],
@@ -1732,6 +1726,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1757,6 +1752,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1828,6 +1824,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1871,6 +1868,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1932,6 +1930,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -2006,6 +2005,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -2053,6 +2053,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -2119,6 +2120,7 @@ mod tests {
         let mut context = ToolContext {
             workspace_dir: temp_dir.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec!["apply_patch".to_string()],
             extra_dirs: Vec::new(),
@@ -2143,6 +2145,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),

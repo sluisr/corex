@@ -61,7 +61,8 @@ pub fn format_call_preview(call: &ToolCall, registry: &corex_tools::ToolRegistry
 pub(super) fn tool_context(app: &App) -> ToolContext {
     ToolContext {
         workspace_dir: app.workspace_dir.clone(),
-        yolo_mode: app.always_allow_tools,
+        yolo_mode: app.yolo_mode.is_active(),
+        yolo_all: app.yolo_mode.is_all(),
         sudo_password: get_sudo_password(),
         allowed_commands: app.get_effective_allowed_commands(),
         extra_dirs: app.extra_dirs.clone(),
@@ -175,6 +176,17 @@ pub(super) fn run_single_tool(app: &mut App, call: ToolCall, event_tx: EventTx) 
     });
 }
 
+/// The text a tool output contributes to the conversation, carrying the `Error` marker that both
+/// the renderer and the model read as a failure. `ToolOutput::error` does not always write one,
+/// and without it a refusal such as "Refusing to modify ..." is drawn as a success.
+fn tool_result_payload(output: corex_tools::types::ToolOutput) -> (String, bool) {
+    if output.is_error && !output.output.starts_with("Error") {
+        (format!("Error: {}", output.output), false)
+    } else {
+        (output.output, !output.is_error)
+    }
+}
+
 /// Executes `call`, logs it to the forensic trail and reports its start and its output.
 async fn run_one_tool(registry: &corex_tools::ToolRegistry, call: ToolCall, ctx: &ToolContext, gen: u64, tx: &EventTx) {
     let call_id = call.id;
@@ -189,7 +201,7 @@ async fn run_one_tool(registry: &corex_tools::ToolRegistry, call: ToolCall, ctx:
     let start_tool = Instant::now();
     let (output, success) = match corex_core::parse_lenient_json(&args_str) {
         Ok(args_json) => match registry.execute(&tool_name, args_json, ctx).await {
-            Ok(o) => (o.output, true),
+            Ok(o) => tool_result_payload(o),
             Err(e) => (format!("Error executing {}: {}", tool_name, e), false),
         },
         Err(e) => (format!("Error executing {}: invalid tool arguments JSON: {}", tool_name, e), false),
@@ -307,6 +319,7 @@ pub(super) fn finish_ask_user(app: &mut App, event_tx: EventTx) {
     app.is_streaming = true;
 
     tokio::spawn(async move {
+        let mut handles = Vec::new();
         for call in calls {
             if call.id == ask_call_id {
                 let _ = tx
@@ -324,26 +337,16 @@ pub(super) fn finish_ask_user(app: &mut App, event_tx: EventTx) {
                     }))
                     .await;
             } else {
-                let summary = format_tool_call_summary(&call.function.name, &call.function.arguments);
-                let _ = tx
-                    .send((gen, StreamEvent::ToolExecutionStarting {
-                        call_id: call.id.clone(),
-                        name: call.function.name.clone(),
-                        summary,
-                    }))
-                    .await;
-
-                let out = match corex_core::parse_lenient_json(&call.function.arguments) {
-                    Ok(args_json) => match registry.execute(&call.function.name, args_json, &context).await {
-                        Ok(o) => o.output,
-                        Err(e) => format!("Error executing {}: {}", call.function.name, e),
-                    },
-                    Err(e) => format!("Error executing {}: invalid tool arguments JSON: {}", call.function.name, e),
-                };
-                let _ = tx
-                    .send((gen, StreamEvent::ToolExecutionDone { call_id: call.id, output: out }))
-                    .await;
+                let reg = registry.clone();
+                let ctx = context.clone();
+                let tx_call = tx.clone();
+                handles.push(tokio::spawn(async move {
+                    run_one_tool(&reg, call, &ctx, gen, &tx_call).await;
+                }));
             }
+        }
+        for h in handles {
+            let _ = h.await;
         }
         let _ = tx.send((gen, StreamEvent::AllToolsDone)).await;
     });
@@ -365,6 +368,7 @@ mod tests {
         let mut context = ToolContext {
             workspace_dir: PathBuf::from("/tmp"),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -402,6 +406,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: PathBuf::from("/tmp"),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -420,6 +425,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yolo_all_bypasses_credentials_hooks_and_global_memory() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.set_yolo_mode(corex_core::YoloMode::All);
+        let context = ToolContext {
+            workspace_dir: PathBuf::from("/tmp"),
+            yolo_mode: true,
+            yolo_all: true,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let wipe = ToolCall::new("wipe", "run_shell_command", r#"{"command":"rm -rf target"}"#);
+        let key = ToolCall::new("key", "run_shell_command", r#"{"command":"cat ~/.ssh/id_rsa"}"#);
+        let hook = ToolCall::new("hook", "run_shell_command", r#"{"command":"echo x >.git/hooks/pre-commit"}"#);
+        let global = ToolCall::new("global", "save_memory", r#"{"fact":"x"}"#);
+        let project = ToolCall::new("project", "save_memory", r#"{"fact":"x","scope":"project"}"#);
+
+        assert!(!needs_approval(&app, &[wipe.clone(), key.clone(), hook.clone(), global.clone(), project.clone()], &context));
+        let (gated, free) = split_by_approval(&app, vec![wipe, key, hook, global, project], &context);
+        assert!(gated.is_empty(), "YOLO ALL does not gate any calls");
+        assert_eq!(free.len(), 5);
+    }
+
+    #[tokio::test]
     async fn shift_tab_cycles_modes_and_accept_edits_lets_only_edits_through() {
         let ws = std::env::temp_dir().join(format!("corex-accept-edits-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
@@ -434,14 +463,17 @@ mod tests {
         app.cycle_permission_mode();
         assert!(app.accept_edits && !app.plan_mode);
         let (gated, free) = split_by_approval(&app, vec![edit.clone(), env, outside, shell], &tool_context(&app));
-        assert_eq!(ids(&free), ["edit"], "only the workspace edit runs on its own");
-        assert_eq!(ids(&gated), ["env", "outside", "shell"], "protected files, outside paths and shell still ask");
+        assert_eq!(ids(&free), ["edit", "env"], "the workspace edit runs; the credential file is refused without asking");
+        assert_eq!(ids(&gated), ["outside", "shell"], "outside paths and shell still ask");
 
         app.cycle_permission_mode();
         assert!(!app.accept_edits && app.plan_mode, "then plan mode");
         app.cycle_permission_mode();
-        assert!(!app.accept_edits && !app.plan_mode, "then back to normal");
-        assert!(!app.always_allow_tools, "YOLO is never part of the cycle");
+        assert!(!app.accept_edits && !app.plan_mode && app.yolo_mode == corex_core::YoloMode::Normal && app.always_allow_tools, "then yolo normal");
+        app.cycle_permission_mode();
+        assert!(!app.accept_edits && !app.plan_mode && app.yolo_mode == corex_core::YoloMode::All && app.always_allow_tools, "then yolo all");
+        app.cycle_permission_mode();
+        assert!(!app.accept_edits && !app.plan_mode && app.yolo_mode == corex_core::YoloMode::Off && !app.always_allow_tools, "then back to normal");
         assert!(needs_approval(&app, &[edit], &tool_context(&app)));
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -453,6 +485,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: PathBuf::from("/tmp"),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec!["write_file".to_string(), "edit".to_string()],
             extra_dirs: Vec::new(),
@@ -480,4 +513,42 @@ mod tests {
         assert_eq!(ids(&free), ["status", "list"]);
         assert!(app.active_tool_definitions().iter().any(|d| d.function.name == "run_shell_command"));
     }
+
+    #[test]
+    fn a_refusal_reaches_the_renderer_as_a_failure() {
+        let out = corex_tools::types::ToolOutput::error(
+            "Refusing to modify a.rs: the file has not been read in this session.",
+        );
+        let (text, success) = tool_result_payload(out);
+        assert!(!success, "a refused write is not a success");
+        assert!(text.starts_with("Error: Refusing to modify"), "{text}");
+
+        // The marker is what draws the ✕ instead of a green ✓.
+        let lines = crate::app::render_single_message_with_pending(
+            0,
+            &Message::tool_response("call_1", text),
+            None,
+            &crate::theme::Theme::default(),
+            80,
+            None,
+            false,
+        );
+        let shown: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
+        assert!(shown.contains('✕'), "a refused write is drawn as an error: {shown}");
+    }
+
+    #[test]
+    fn an_error_that_already_carries_the_marker_is_left_alone() {
+        let (text, success) = tool_result_payload(corex_tools::types::ToolOutput::error("Error: boom"));
+        assert!(!success);
+        assert_eq!(text, "Error: boom", "the marker is never doubled");
+    }
+
+    #[test]
+    fn a_successful_output_is_untouched() {
+        let (text, success) = tool_result_payload(corex_tools::types::ToolOutput::success("Patched a.rs"));
+        assert!(success);
+        assert_eq!(text, "Patched a.rs");
+    }
 }
+

@@ -25,7 +25,7 @@ case "$OS" in
         TARGET="x86_64-unknown-linux-gnu"
         ;;
       aarch64|arm64)
-        if [ -n "$PREFIX" ] || [ -d "/data/data/com.termux" ]; then
+        if [ -d "/data/data/com.termux" ] || [ "${PREFIX#*com.termux}" != "$PREFIX" ]; then
           TARGET="aarch64-linux-android"
         else
           TARGET="aarch64-unknown-linux-gnu"
@@ -63,7 +63,14 @@ case "$LATEST_TAG" in
   v[0-9]*) ;;
   *) LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4) ;;
 esac
-VERSION="${LATEST_TAG:-v0.8.5}"
+VERSION="$LATEST_TAG"
+case "$VERSION" in
+  v[0-9]*) ;;
+  *)
+    echo "Error: Could not detect the latest Corex release. Check your connection and try again."
+    exit 1
+    ;;
+esac
 
 ARCHIVE_NAME="corex-${VERSION}-${TARGET}.tar.gz"
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/${VERSION}/${ARCHIVE_NAME}"

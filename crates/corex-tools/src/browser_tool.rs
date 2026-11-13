@@ -106,10 +106,13 @@ impl Tool for BrowserTool {
         changes_the_page(args)
     }
 
-    async fn execute(&self, args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
         let Some(action) = arg(&args, "action") else {
             return Ok(ToolOutput::error("Missing 'action' argument."));
         };
+        if let Some(reason) = refusal(action, &args, context) {
+            return Ok(ToolOutput::error(reason));
+        }
 
         let mut guard = BROWSER.lock().await;
         if action == "close" {
@@ -152,6 +155,39 @@ impl Tool for BrowserTool {
     }
 }
 
+fn upload_paths(args: &Value) -> Vec<String> {
+    args.get("paths")
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+fn refusal(action: &str, args: &Value, context: &ToolContext) -> Option<String> {
+    let is_secret = |path: &str| {
+        crate::fs_tools::is_sensitive_system_path(&crate::fs_tools::resolve_path(&context.workspace_dir, path))
+    };
+    match action {
+        "upload" => upload_paths(args)
+            .into_iter()
+            .find(|path| is_secret(path))
+            .map(|path| format!("Access denied: uploading the credential file '{path}' is forbidden.")),
+        "navigate" => {
+            let url = arg(args, "url")?;
+            let scheme = url.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+            match scheme.as_deref() {
+                None | Some("http" | "https") => None,
+                Some("file") => reqwest::Url::parse(url)
+                    .ok()
+                    .and_then(|parsed| parsed.to_file_path().ok())
+                    .is_none_or(|path| is_secret(&path.to_string_lossy()))
+                    .then(|| format!("Access denied: '{url}' cannot be opened in the browser.")),
+                Some(_) => Some(format!("'{url}' cannot be opened: only http, https and file addresses are.")),
+            }
+        }
+        _ => None,
+    }
+}
+
 fn target<'a>(args: &'a Value, action: &str) -> Result<&'a str> {
     arg(args, "ref").ok_or_else(|| anyhow!("'{action}' needs the 'ref' argument"))
 }
@@ -190,11 +226,7 @@ async fn perform(browser: &mut Browser, action: &str, args: &Value) -> Result<St
             Ok(format!("Chose '{value}' from {key}"))
         }
         "upload" => {
-            let paths: Vec<String> = args
-                .get("paths")
-                .and_then(|v| v.as_array())
-                .map(|list| list.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
+            let paths = upload_paths(args);
             if paths.is_empty() {
                 return Err(anyhow!("'upload' needs the 'paths' argument"));
             }

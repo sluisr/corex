@@ -11,14 +11,23 @@ use crate::user_dialog::parse_questions;
 pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event_tx: &EventTx) {
     match event {
         StreamEvent::ReasoningDelta(delta) => {
+            if let Some(t) = app.last_turn_start {
+                app.latency.record_first_token(t.elapsed().as_millis() as u64);
+            }
             app.thinking_state.content.push_str(&delta);
             app.set_status("Thinking...");
         }
         StreamEvent::ContentDelta(delta) => {
+            if let Some(t) = app.last_turn_start {
+                app.latency.record_first_token(t.elapsed().as_millis() as u64);
+            }
             app.streaming_text.push_str(&delta);
             app.set_status("Generating response...");
         }
         StreamEvent::ToolCallDelta { index, id, name, arguments, extra_content } => {
+            if let Some(t) = app.last_turn_start {
+                app.latency.record_first_token(t.elapsed().as_millis() as u64);
+            }
             if index > 64 {
                 return;
             }
@@ -54,6 +63,9 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
         }
         StreamEvent::ToolExecutionStarting { summary, name, call_id } => {
             app.set_status(&summary);
+            if call_id != "batch" {
+                app.tool_starts.insert(call_id.clone(), std::time::Instant::now());
+            }
             if app.fleet_dialog.is_open {
                 app.fleet_dialog.status_msg = Some(summary.clone());
                 if name == "fleet_run_command" {
@@ -115,6 +127,9 @@ pub(super) fn waiting_for_user(app: &App) -> bool {
 
 async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: &EventTx) {
     app.in_flight_tool_calls = app.in_flight_tool_calls.saturating_sub(1);
+    if let Some(started) = app.tool_starts.remove(&call_id) {
+        app.latency.record_tool_duration(started.elapsed().as_millis() as u64);
+    }
     let turn = app.session.user_turns().len().max(1);
     app.session.file_edits.extend(corex_core::file_history::drain(turn));
     if output.contains("incorrect password attempt")
@@ -134,9 +149,18 @@ async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: 
         Some(reminder) => format!("{}\n\n{}", output, reminder),
         None => output,
     };
-    let mut tool_msg = Message::tool_response(call_id, output.clone());
+    let mut tool_msg = Message::tool_response(call_id.clone(), output.clone());
     tool_msg.name = tool_name.clone();
     app.session.add_message(tool_msg);
+    // The response is drawn under the call that produced it, so that block has to be rebuilt.
+    let owner = app.session.display_messages().iter().rposition(|m| {
+        m.tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|c| c.id == call_id))
+    });
+    if let Some(idx) = owner {
+        app.invalidate_message_cache_from(idx);
+    }
 
     if app.fleet_dialog.is_open {
         super::fleet::show_tool_output(app, tool_name.as_deref(), &output).await;
@@ -160,6 +184,9 @@ async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: 
 /// The model finished its answer: run its tool calls (asking first where needed) or, when
 /// there are none, record the answer and move on to whatever the user queued.
 fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) {
+    if let Some(t) = app.last_turn_start {
+        app.latency.record_turn_completed(t.elapsed().as_millis() as u64);
+    }
     let truncated = corex_core::is_truncated_finish(finish_reason);
     let assistant_text = (!app.streaming_text.is_empty()).then(|| app.streaming_text.clone());
     let reasoning = (!app.thinking_state.content.is_empty()).then(|| app.thinking_state.content.clone());

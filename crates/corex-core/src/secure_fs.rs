@@ -121,7 +121,11 @@ pub fn write_private_atomic(path: &Path, content: impl AsRef<[u8]>) -> io::Resul
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
     let tmp = path.with_file_name(format!(".{}.tmp.{}.{}", file_name, std::process::id(), ts));
-    if let Err(e) = write_private(&tmp, content) {
+    let written = open_private(&tmp, false).and_then(|mut file| {
+        file.write_all(content.as_ref())?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }

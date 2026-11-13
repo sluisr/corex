@@ -64,10 +64,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -77,7 +77,7 @@ jobs:
 
       - name: Set up Python (for cargo-zigbuild)
         if: matrix.use_zigbuild
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
@@ -135,7 +135,7 @@ jobs:
       # a release is created only for a pushed tag.
       - name: Keep build as workflow artifact
         if: "!startsWith(github.ref, 'refs/tags/')"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
@@ -144,7 +144,7 @@ jobs:
 
       - name: Upload Release Asset
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
@@ -160,9 +160,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Aggregate checksums and update release notes
         env:
@@ -202,10 +203,10 @@ jobs:
           gh release edit "$TAG" --notes-file /tmp/release_notes.md
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
@@ -215,18 +216,27 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          echo "Publishing workspace crates to Crates.io in topological order..."
-          cargo publish -p corex-core --locked || true
-          cargo publish -p corex-browser --locked || true
+          publish() {
+            if out=$(cargo publish -p "$1" --locked 2>&1); then
+              echo "$out"
+            elif echo "$out" | grep -qiE "already (exists|uploaded)"; then
+              echo "$1 is already published, skipping."
+            else
+              echo "$out"
+              return 1
+            fi
+          }
+          publish corex-core
+          publish corex-browser
           sleep 15
-          cargo publish -p corex-tools --locked || true
-          cargo publish -p corex-prompt --locked || true
+          publish corex-tools
+          publish corex-prompt
           sleep 15
-          cargo publish -p corex-fleet --locked || true
+          publish corex-fleet
           sleep 15
-          cargo publish -p corex-tui --locked || true
+          publish corex-tui
           sleep 15
-          cargo publish -p corex-cli --locked || true
+          publish corex-cli
 
       - name: Sync npm version and publish to npm registry
         if: env.NODE_AUTH_TOKEN != ''
@@ -238,4 +248,4 @@ jobs:
           cd npm
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           sed -i "s/const VERSION = '.*';/const VERSION = '${GITHUB_REF_NAME}';/" scripts/install.js
-          npm publish --access public
+          npm publish --access public --provenance

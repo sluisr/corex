@@ -63,7 +63,7 @@ pub use client::{
     get_sudo_password, is_truncated_finish, parse_openai_sse_data, set_sudo_password, LlmClient,
     StreamEvent, TRUNCATED_TOOL_CALL_ERROR,
 };
-pub use config::{Config, McpServerConfig, WindowSource};
+pub use config::{Config, McpServerConfig, WindowSource, YoloMode};
 pub use file_lock::lock_path;
 pub use forensic::ForensicLogger;
 pub use history::HistoryStore;

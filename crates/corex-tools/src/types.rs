@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use corex_core::types::ToolDefinition;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     pub workspace_dir: PathBuf,
     pub yolo_mode: bool,
+    pub yolo_all: bool,
     pub sudo_password: Option<String>,
     pub allowed_commands: Vec<String>,
     /// Directories added with `/directory add`: read like the workspace, without confirmation.

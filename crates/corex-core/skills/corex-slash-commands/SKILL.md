@@ -142,7 +142,9 @@ cx fetch "https://news.ycombinator.com"
 |`/mcp add <id>` | Add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
 |`/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
 |`/mcp remove <name>` | Remove an MCP server and reload configuration |
-|`/mcp reload` | Reconnect and rediscover tools across all configured MCP servers |
+|`/mcp reload` | Re-read `mcp_servers` from `~/.corex/settings.json`, reconnect and rediscover tools |
+
+`/mcp reload` takes the file as the source of truth: a key refreshed or a server added by hand applies without restarting `cx`.
 
 ---
 
@@ -150,8 +152,9 @@ cx fetch "https://news.ycombinator.com"
 
 |Command | Description |
 |:--- | :--- |
-|`/yolo` | Toggle YOLO mode — auto-approves ALL tool executions |
-|`/yolo on` | Enable YOLO mode |
+|`/yolo` | Toggle YOLO mode — auto-approves tool executions |
+|`/yolo normal` / `/yolo on` | Enable YOLO Normal mode (except sensitive paths/memory) |
+|`/yolo all` | Enable YOLO All mode (auto-approves EVERYTHING, zero prompts) |
 |`/yolo off` | Disable YOLO mode |
 |`/sudo [clear]` | Configure or clear ephemeral in-memory sudo password for privileged commands |
 |`/tasks` | List all running background tasks (alias: `/background`) |
@@ -162,10 +165,11 @@ cx fetch "https://news.ycombinator.com"
 Enable YOLO from CLI:
 ```bash
 cx -y -p "Run all tests and fix any failures"
-cx --yolo
+cx --yolo        # YOLO Normal
+cx --yolo-all    # YOLO All
 ```
 
->  YOLO mode skips all confirmation prompts. Use carefully — commands run instantly without asking.
+>  YOLO mode skips confirmation prompts (YOLO Normal asks on sensitive paths; YOLO All asks nothing). Use carefully — commands run instantly without asking.
 
 ---
 

@@ -228,7 +228,7 @@ pub fn install_native_host() -> Result<()> {
     let launcher = root.join("corex-browser-host");
     write_if_changed(
         &launcher,
-        &format!("#!/bin/sh\nexec \"{}\" browser-host \"$@\"\n", exe.display()),
+        &format!("#!/bin/sh\nexec '{}' browser-host \"$@\"\n", exe.to_string_lossy().replace('\'', "'\\''")),
         0o755,
     )?;
     let manifest = serde_json::to_string_pretty(&serde_json::json!({

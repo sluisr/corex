@@ -10,6 +10,7 @@ fn delegating_a_worker_or_tester_needs_approval() {
     let mut ctx = ToolContext {
         workspace_dir: PathBuf::from("/tmp"),
         yolo_mode: false,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands: Vec::new(),
         extra_dirs: Vec::new(),
@@ -37,6 +38,7 @@ async fn test_delegate_and_manage_subagents() {
     let ctx = ToolContext {
         workspace_dir: PathBuf::from("/tmp"),
         yolo_mode: false,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands: Vec::new(),
         extra_dirs: Vec::new(),
@@ -82,6 +84,7 @@ async fn test_delegate_subagent_sync_execution() {
     let ctx = ToolContext {
         workspace_dir: PathBuf::from("/tmp"),
         yolo_mode: false,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands: Vec::new(),
         extra_dirs: Vec::new(),
@@ -413,6 +416,7 @@ fn test_subagent_policy_denies_unapproved_actions() {
         ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: allowed,
             extra_dirs: Vec::new(),
@@ -509,6 +513,7 @@ async fn test_subagent_forensic_log_generation_and_query() {
     let ctx = ToolContext {
         workspace_dir: temp_dir.clone(),
         yolo_mode: false,
+        yolo_all: false,
         sudo_password: None,
         allowed_commands: Vec::new(),
         extra_dirs: Vec::new(),
@@ -550,4 +555,70 @@ async fn test_subagent_forensic_log_generation_and_query() {
     assert!(log_res.output.contains("Testing forensic trace audit"));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn wait_returns_a_snapshot_instead_of_holding_the_turn() {
+    let ctx = ToolContext {
+        workspace_dir: PathBuf::from("/tmp"),
+        yolo_mode: false,
+        yolo_all: false,
+        sudo_password: None,
+        allowed_commands: Vec::new(),
+        extra_dirs: Vec::new(),
+    };
+    let task_id = {
+        let mut mgr = get_subagent_manager().lock().unwrap_or_else(|e| e.into_inner());
+        mgr.register(SubagentRole::Scout, "still working".to_string())
+    };
+
+    let started = std::time::Instant::now();
+    let res = ManageSubagentsTool
+        .execute(json!({ "action": "wait", "task_id": task_id }), &ctx)
+        .await
+        .expect("wait should succeed");
+    let elapsed = started.elapsed();
+
+    assert!(!res.is_error, "{}", res.output);
+    assert!(elapsed < std::time::Duration::from_secs(2), "wait held the turn for {elapsed:?}");
+    assert!(res.output.contains("still running"), "a running subagent is reported, never awaited: {}", res.output);
+    assert!(res.output.contains(&task_id), "the running subagent is named: {}", res.output);
+    assert!(
+        res.output.contains("SUBAGENT_DONE"),
+        "the model is told the report arrives on its own: {}",
+        res.output
+    );
+}
+
+#[tokio::test]
+async fn a_report_returned_by_wait_is_not_delivered_a_second_time() {
+    let ctx = ToolContext {
+        workspace_dir: PathBuf::from("/tmp"),
+        yolo_mode: false,
+        yolo_all: false,
+        sudo_password: None,
+        allowed_commands: Vec::new(),
+        extra_dirs: Vec::new(),
+    };
+    let task_id = {
+        let mut mgr = get_subagent_manager().lock().unwrap_or_else(|e| e.into_inner());
+        let id = mgr.register(SubagentRole::Scout, "already done".to_string());
+        mgr.complete(&id, "hallazgo final".to_string());
+        id
+    };
+
+    let res = ManageSubagentsTool
+        .execute(json!({ "action": "wait", "task_id": task_id }), &ctx)
+        .await
+        .expect("wait should succeed");
+
+    assert!(res.output.contains("have finished"), "{}", res.output);
+    assert!(res.output.contains("hallazgo final"), "{}", res.output);
+
+    let mut mgr = get_subagent_manager().lock().unwrap_or_else(|e| e.into_inner());
+    let drained = mgr.drain_unacknowledged();
+    assert!(
+        !drained.iter().any(|(id, ..)| id == &task_id),
+        "the same output must not reach the model twice"
+    );
 }

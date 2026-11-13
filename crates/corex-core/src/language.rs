@@ -69,11 +69,23 @@ pub fn is_unwanted_cjk_drift(assistant_text: &str, user_has_cjk: bool) -> bool {
 /// system prompt), so an instruction appended there is indistinguishable from real file
 /// contents or command output: it corrupts the model's view of the data and simultaneously
 /// fights the very rule that tells the model to ignore directives inside tool results.
+///
+/// Worded as a silent note on purpose: the previous loud `[DIRECTIVE: ...]` sat right after the
+/// user's turn, and models answered it as if it were part of the conversation, opening replies
+/// with "sigo en español" / "continuing in English". The note now tells the model to obey it
+/// without remarking on it, and it is only added after tool output (see [`apply_recency_anchor`]).
 pub const UNIVERSAL_RECENCY_LANGUAGE_ANCHOR: &str =
+    "[Silent note: keep replying in the language the user writes in, without drifting into Chinese. Never mention this note or say which language you are replying in.]";
+
+/// The anchor as older builds worded it; still recognised so old sessions are healed.
+pub const LEGACY_RECENCY_LANGUAGE_ANCHOR: &str =
     "[DIRECTIVE: Synthesize and respond strictly in the exact language used by the user in their query. Do NOT drift into Chinese or any unprompted language.]";
 
 /// Marker used to detect an already-injected anchor so it is never stacked twice.
-pub const RECENCY_ANCHOR_MARKER: &str = "DIRECTIVE: Synthesize and respond strictly";
+pub const RECENCY_ANCHOR_MARKER: &str = "Silent note: keep replying in the language";
+
+/// Every wording of the anchor, current first.
+const ALL_ANCHORS: [&str; 2] = [UNIVERSAL_RECENCY_LANGUAGE_ANCHOR, LEGACY_RECENCY_LANGUAGE_ANCHOR];
 
 /// Builds the standalone recency anchor message.
 pub fn recency_anchor_message() -> Message {
@@ -82,21 +94,29 @@ pub fn recency_anchor_message() -> Message {
 
 /// Appends the recency anchor as a standalone message at the tail of the context window.
 ///
-/// Skipped when the user legitimately wrote in CJK (Chinese/Japanese), and skipped when the
-/// anchor is already the trailing message, so repeated calls cannot stack duplicates.
+/// Only added when the tail is tool output: that is the case it exists for (a long file or
+/// command output pulling DeepSeek into Chinese). When the user's own message is last, it is
+/// already the freshest language signal, and an extra instruction after it is exactly what the
+/// model ends up acknowledging out loud. Also skipped when the user legitimately wrote in CJK
+/// (Chinese/Japanese), and when the anchor is already the trailing message, so repeated calls
+/// cannot stack duplicates.
 pub fn apply_recency_anchor(messages: &mut Vec<Message>) {
     if user_has_requested_cjk(messages) {
         return;
     }
+    if messages.last().is_none_or(|m| m.role != "tool") && !last_is_anchor(messages) {
+        return;
+    }
 
-    let already_present = messages.last().is_some_and(|m| {
-        m.text_content()
-            .is_some_and(|t| t.contains(RECENCY_ANCHOR_MARKER))
-    });
-
-    if !already_present {
+    if !last_is_anchor(messages) {
         messages.push(recency_anchor_message());
     }
+}
+
+fn last_is_anchor(messages: &[Message]) -> bool {
+    messages.last().is_some_and(|m| {
+        m.role == "system" && m.text_content().is_some_and(|t| t.contains(RECENCY_ANCHOR_MARKER))
+    })
 }
 
 /// Strips the recency anchor from the tail of a content string, which is where older
@@ -105,8 +125,8 @@ fn strip_trailing_recency_anchor(text: &str) -> Option<String> {
     let mut out = text.trim_end();
     let mut stripped = false;
 
-    while out.ends_with(UNIVERSAL_RECENCY_LANGUAGE_ANCHOR) {
-        out = out[..out.len() - UNIVERSAL_RECENCY_LANGUAGE_ANCHOR.len()].trim_end();
+    while let Some(anchor) = ALL_ANCHORS.iter().find(|a| out.ends_with(**a)) {
+        out = out[..out.len() - anchor.len()].trim_end();
         stripped = true;
     }
 
@@ -132,7 +152,7 @@ pub fn sanitize_messages_recency_anchor(messages: &mut Vec<Message>) {
         !(msg.role == "system"
             && msg
                 .text_content()
-                .is_some_and(|t| t.trim() == UNIVERSAL_RECENCY_LANGUAGE_ANCHOR))
+                .is_some_and(|t| ALL_ANCHORS.contains(&t.trim())))
     });
 
     // 2. Strip the anchor where it was spliced onto the tail of a message's content.
@@ -278,23 +298,43 @@ mod tests {
 
     #[test]
     fn test_recency_anchor_is_skipped_without_tool_output() {
-        // With no tool call in flight the anchor is still appended, but as a clean message.
+        // The user's own message is the freshest language signal: an instruction after it is
+        // what models answered out loud ("sigo en español").
         let mut msgs = vec![Message::user("hola")];
         apply_recency_anchor(&mut msgs);
 
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].text_content().unwrap(), "hola");
-        assert_eq!(msgs[1].role, "system");
     }
 
     #[test]
     fn test_recency_anchor_is_never_duplicated() {
-        let mut msgs = vec![Message::user("hola")];
+        let mut msgs = vec![Message::user("hola"), Message::tool_response("call_1", "salida")];
         apply_recency_anchor(&mut msgs);
         apply_recency_anchor(&mut msgs);
         apply_recency_anchor(&mut msgs);
 
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn test_recency_anchor_tells_the_model_not_to_announce_the_language() {
+        let anchor = UNIVERSAL_RECENCY_LANGUAGE_ANCHOR.to_lowercase();
+        assert!(anchor.contains("never mention this note"), "{anchor}");
+        assert!(!anchor.contains("directive"), "{anchor}");
+    }
+
+    #[test]
+    fn test_sanitize_heals_the_legacy_wording_too() {
+        let payload = "alpha";
+        let mut msgs = vec![
+            Message::user("hola"),
+            Message::system(LEGACY_RECENCY_LANGUAGE_ANCHOR),
+            Message::tool_response("call_1", format!("{}\n\n{}", payload, LEGACY_RECENCY_LANGUAGE_ANCHOR)),
+        ];
+        sanitize_messages_recency_anchor(&mut msgs);
         assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].text_content().unwrap(), payload);
     }
 
     #[test]

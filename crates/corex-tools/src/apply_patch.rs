@@ -859,6 +859,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -908,6 +909,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -935,6 +937,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1053,6 +1056,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1124,6 +1128,7 @@ mod tests {
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1218,6 +1223,7 @@ Hope this helps!
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1250,6 +1256,7 @@ Hope this helps!
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1300,6 +1307,7 @@ Hope this helps!
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1325,6 +1333,7 @@ Hope this helps!
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1366,6 +1375,7 @@ Hope this helps!
         let context = ToolContext {
             workspace_dir: dir.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1388,6 +1398,7 @@ Hope this helps!
         let mut context = ToolContext {
             workspace_dir: std::path::PathBuf::from("/tmp"),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec!["edit".to_string()],
             extra_dirs: Vec::new(),

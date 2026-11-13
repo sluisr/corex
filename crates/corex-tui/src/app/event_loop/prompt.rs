@@ -338,9 +338,10 @@ fn strip_prompt_prefixes(prompt: String) -> String {
         let rest = &after[end..];
         prompt = format!("{} {}", before.trim(), rest.trim()).trim().to_string();
     }
-    if prompt.starts_with("$auto") || prompt.starts_with("$yolo") {
+    if prompt.starts_with("$auto") || prompt.starts_with("$yolo-all") || prompt.starts_with("$yolo") {
         prompt = prompt
             .trim_start_matches("$auto")
+            .trim_start_matches("$yolo-all")
             .trim_start_matches("$yolo")
             .trim()
             .to_string();
@@ -534,12 +535,12 @@ mod tests {
             assert!(app.input_buffer.is_empty(), "? on an empty prompt is not typed");
             assert!(last_text(&app).starts_with("Shortcuts:") && last_text(&app).contains("!command"), "{}", last_text(&app));
             assert!(last_text(&app).contains("Shift+Tab"), "the shortcuts list the mode cycle");
-            for expected in ["[ACCEPT EDITS]", "[PLAN MODE]", ""] {
+            for expected in ["[ACCEPT EDITS]", "[PLAN MODE]", "[YOLO]", "[YOLO ALL]", ""] {
                 prompt_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &tx).await;
                 let (_, rows) = screen(&mut app);
                 let all = rows.join("\n");
                 if expected.is_empty() {
-                    assert!(!all.contains("[ACCEPT EDITS]") && !all.contains("[PLAN MODE]"), "back to normal:\n{all}");
+                    assert!(!all.contains("[ACCEPT EDITS]") && !all.contains("[PLAN MODE]") && !all.contains("[YOLO]"), "back to normal:\n{all}");
                 } else {
                     let bar = rows.iter().find(|r| r.contains(expected)).unwrap_or_else(|| panic!("Shift+Tab shows {expected}:\n{all}"));
                     let path = ws.file_name().unwrap().to_str().unwrap();

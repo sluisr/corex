@@ -242,6 +242,43 @@ impl Selection {
     }
 }
 
+/// Lightweight per-session latency metrics surfaced in `/stats`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionLatency {
+    pub current_turn_first_token_ms: Option<u64>,
+    pub last_ttft_ms: Option<u64>,
+    pub ttft_sum_ms: u64,
+    pub ttft_count: u64,
+    pub last_turn_ms: Option<u64>,
+    pub turn_sum_ms: u64,
+    pub turn_count: u64,
+    pub tool_calls_count: u64,
+    pub tool_total_ms: u64,
+}
+
+impl SessionLatency {
+    pub fn record_first_token(&mut self, elapsed_ms: u64) {
+        if self.current_turn_first_token_ms.is_none() {
+            self.current_turn_first_token_ms = Some(elapsed_ms);
+            self.last_ttft_ms = Some(elapsed_ms);
+            self.ttft_sum_ms += elapsed_ms;
+            self.ttft_count += 1;
+        }
+    }
+
+    pub fn record_turn_completed(&mut self, elapsed_ms: u64) {
+        self.last_turn_ms = Some(elapsed_ms);
+        self.turn_sum_ms += elapsed_ms;
+        self.turn_count += 1;
+        self.current_turn_first_token_ms = None;
+    }
+
+    pub fn record_tool_duration(&mut self, elapsed_ms: u64) {
+        self.tool_calls_count += 1;
+        self.tool_total_ms += elapsed_ms;
+    }
+}
+
 pub struct App {
     pub session: Session,
     pub llm_client: LlmClient,
@@ -288,6 +325,7 @@ pub struct App {
     pub total_rendered_items: usize,
     pub plan_mode: bool,
     pub always_allow_tools: bool,
+    pub yolo_mode: corex_core::YoloMode,
     pub mouse_capture: bool,
     /// Pauses mouse reporting around a tap so Termux raises the soft keyboard.
     pub tap_keyboard: TapKeyboardGate,
@@ -312,6 +350,8 @@ pub struct App {
     pub logs_expanded: bool,
     pub git_branch: String,
     pub last_turn_start: Option<Instant>,
+    pub latency: SessionLatency,
+    pub tool_starts: HashMap<String, Instant>,
     pub last_esc_press: Option<Instant>,
     pub launched_at: Instant,
     pub prompts_this_run: usize,
@@ -354,8 +394,11 @@ pub struct App {
     pub(crate) message_clock: super::browser_run::MessageClock,
     /// Parsed markdown of `streaming_text`, reused across frames until the text grows.
     pub streaming_md_cache: Vec<Line<'static>>,
+    pub streaming_md_committed_lines: Vec<Line<'static>>,
+    pub streaming_md_committed_len: usize,
     pub streaming_md_cache_len: usize,
     pub streaming_md_cache_width: usize,
+    pub footer_model: Option<FooterModel>,
     pub active_background_pids: HashSet<u32>,
     pub pending_task_wakeup: bool,
     pub current_generation_id: u64,
@@ -363,6 +406,7 @@ pub struct App {
     pub active_status: Option<String>,
     pub status_transition: StatusTransition,
     pub last_chat_rect: Option<Rect>,
+    pub visible_line_widths: Vec<u16>,
     pub balance_tx: mpsc::Sender<Result<corex_core::types::BalanceResponse, String>>,
     pub balance_rx: mpsc::Receiver<Result<corex_core::types::BalanceResponse, String>>,
     pub is_checking_balance: bool,
@@ -373,4 +417,19 @@ pub struct App {
     pub steer_messages: Vec<String>,
     pub start_time: Instant,
     pub last_interaction: Instant,
+}
+
+/// What the status footer shows about the active model, worked out from the provider catalog.
+/// Kept between frames: only a change of the settings below, or a second, makes it stale.
+#[derive(Clone)]
+pub struct FooterModel {
+    pub computed_at: std::time::Instant,
+    pub model: String,
+    pub active_provider: Option<String>,
+    pub base_url: String,
+    pub limits: (Option<usize>, Option<usize>),
+    pub is_deepseek: bool,
+    pub display_name: Option<String>,
+    pub window: usize,
+    pub compact_threshold: usize,
 }

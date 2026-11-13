@@ -197,6 +197,72 @@ fn push_log_tail(
     }
 }
 
+/// Diff rows of an edit that stay visible while logs are collapsed.
+const COLLAPSED_DIFF_ROWS: usize = 12;
+
+/// True when a file-editing tool reports that the change landed; a failure draws no diff.
+fn edit_result_landed(content: &str) -> bool {
+    ["Patched ", "Created ", "Deleted ", "Edited ", "Successfully edited "]
+        .iter()
+        .any(|prefix| content.starts_with(prefix))
+}
+
+/// Draws the change behind an edit, so the code that moved stays in the conversation instead of
+/// collapsing to its one-line result. All of it with Ctrl+O (`expanded`).
+fn push_edit_diff(
+    lines: &mut Vec<Line<'static>>,
+    tool_name: &str,
+    raw_args: &str,
+    expanded: bool,
+    theme: &Theme,
+) {
+    let rows = edit_diff_rows(tool_name, raw_args);
+    if rows.is_empty() {
+        return;
+    }
+    let shown = if expanded { rows.len() } else { rows.len().min(COLLAPSED_DIFF_ROWS) };
+    for row in &rows[..shown] {
+        // The marker decides the colour, so what the edit dropped is painted as prominently as
+        // what it added instead of blending into the context: the same language as the legacy
+        // `Successfully edited` preview right above.
+        let line = match row {
+            DiffRow::File(path) => Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(
+                    format!("▸ {}", format_relative_path(path)),
+                    Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            DiffRow::Hunk(text) => Line::from(vec![
+                Span::styled("      ", Style::default()),
+                Span::styled(text.clone(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+            ]),
+            DiffRow::Added(body) => Line::from(vec![
+                Span::styled("      + ", Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)),
+                Span::styled(body.clone(), Style::default().fg(theme.diff_added_fg)),
+            ]),
+            DiffRow::Removed(body) => Line::from(vec![
+                Span::styled("      - ", Style::default().fg(theme.diff_removed_fg).add_modifier(Modifier::BOLD)),
+                Span::styled(body.clone(), Style::default().fg(theme.diff_removed_fg)),
+            ]),
+            DiffRow::Context(body) => Line::from(vec![
+                Span::styled("        ", Style::default().fg(theme.dark_gray)),
+                Span::styled(body.clone(), Style::default().fg(theme.gray)),
+            ]),
+        };
+        lines.push(line);
+    }
+    if shown < rows.len() {
+        lines.push(Line::from(vec![
+            Span::styled("      ", Style::default()),
+            Span::styled(
+                format!("… (+{} lines, Ctrl+O for the full patch)", rows.len() - shown),
+                Style::default().fg(theme.dark_gray),
+            ),
+        ]));
+    }
+}
+
 /// Finds the `(name, arguments)` of the call a tool message answers by matching its
 /// `tool_call_id` against the assistant turns before it.
 fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> {
@@ -217,6 +283,20 @@ fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> 
                 .find(|c| c.id == id)
                 .map(|c| (c.function.name.as_str(), c.function.arguments.as_str()))
         })
+}
+
+/// Indexes the tool responses of `messages` by the call they answer.
+fn tool_answers(messages: &[Message]) -> ToolAnswers<'_> {
+    let mut answers = ToolAnswers::new();
+    for msg in messages {
+        if msg.role != "tool" {
+            continue;
+        }
+        if let Some(id) = msg.tool_call_id.as_deref() {
+            answers.insert(id, msg);
+        }
+    }
+    answers
 }
 
 /// The `… (+N lines above)` row a collapsed log leaves behind.
@@ -549,7 +629,7 @@ pub fn render_single_message_with_pending(
     pending_conf: Option<&PendingToolBatch>,
     logs_expanded: bool,
 ) -> Vec<Line<'static>> {
-    render_single_message_with_pending_and_thinking(
+    render_message_lines(
         msg_idx,
         msg,
         next_msg,
@@ -560,11 +640,46 @@ pub fn render_single_message_with_pending(
         logs_expanded,
         None,
         false,
+        None,
+    )
+}
+
+/// Tool responses already in the history, keyed by the `tool_call_id` they answer.
+///
+/// It is what lets a call be drawn with its own output underneath instead of leaving every header
+/// in one block and every output in another.
+pub type ToolAnswers<'a> = std::collections::HashMap<&'a str, &'a Message>;
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_single_message_with_pending_and_thinking(
+    msg_idx: usize,
+    msg: &Message,
+    next_msg: Option<&Message>,
+    theme: &Theme,
+    content_max_width: usize,
+    pending_conf: Option<&PendingToolBatch>,
+    logs_expanded: bool,
+    thinking_expanded: bool,
+    tool_call: Option<(&str, &str)>,
+    copy_buttons: bool,
+) -> Vec<Line<'static>> {
+    render_message_lines(
+        msg_idx,
+        msg,
+        next_msg,
+        theme,
+        content_max_width,
+        pending_conf,
+        logs_expanded,
+        thinking_expanded,
+        tool_call,
+        copy_buttons,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render_single_message_with_pending_and_thinking(
+pub fn render_message_lines(
     _msg_idx: usize,
     msg: &Message,
     next_msg: Option<&Message>,
@@ -577,6 +692,7 @@ pub fn render_single_message_with_pending_and_thinking(
     // their own, so without it the renderer would have to guess the tool from the output text.
     tool_call: Option<(&str, &str)>,
     copy_buttons: bool,
+    answers: Option<&ToolAnswers>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match msg.role.as_str() {
@@ -657,10 +773,32 @@ pub fn render_single_message_with_pending_and_thinking(
                     for group in split_spans_at_newlines(spans) {
                         lines.extend(crate::markdown::wrap_spans_with_indent(group, content_max_width, "  ", &hang));
                     }
+
+                    // Its output rides right under the call: a batch of reads then reads in the
+                    // order the model asked for them, not in the order they happened to finish.
+                    if let Some(answer) = answers.and_then(|a| a.get(call.id.as_str())) {
+                        lines.extend(render_message_lines(
+                            _msg_idx,
+                            answer,
+                            None,
+                            theme,
+                            content_max_width,
+                            None,
+                            logs_expanded,
+                            thinking_expanded,
+                            Some((call.function.name.as_str(), call.function.arguments.as_str())),
+                            copy_buttons,
+                            None,
+                        ));
+                    }
                 }
             }
         }
         "tool" => {
+            // Already drawn under the call that produced it.
+            if answers.is_some_and(|a| msg.tool_call_id.as_deref().is_some_and(|id| a.contains_key(id))) {
+                return lines;
+            }
             let content = msg.text_content().unwrap_or("");
             let is_last_tool = next_msg.map(|m| m.role.as_str() != "tool").unwrap_or(true);
 
@@ -688,6 +826,7 @@ pub fn render_single_message_with_pending_and_thinking(
                 return lines;
             }
 
+            let legacy_diff = content.starts_with("Successfully edited") && content.contains('\n');
             let denial = content
                 .strip_prefix("Tool execution denied by user")
                 .or_else(|| content.strip_prefix("Execution denied by user"));
@@ -701,7 +840,7 @@ pub fn render_single_message_with_pending_and_thinking(
                 }
                 let wrapped = crate::markdown::wrap_spans_with_indent(line_spans, content_max_width, "", "      ");
                 lines.extend(wrapped);
-            } else if content.starts_with("Successfully edited") && content.contains('\n') {
+            } else if legacy_diff {
                 let mut content_lines = content.lines();
                 let header = content_lines.next().unwrap_or("Successfully edited");
                 let header_spans = vec![
@@ -844,6 +983,14 @@ pub fn render_single_message_with_pending_and_thinking(
                     ]));
 
                     push_log_tail(&mut lines, &raw_output_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray);
+                }
+            }
+
+            // An edit's result is a one-line summary; the change itself rides on the call's
+            // arguments, so without this the conversation would never show the code that moved.
+            if denial.is_none() && !legacy_diff && edit_result_landed(content) {
+                if let Some((name, args)) = tool_call {
+                    push_edit_diff(&mut lines, name, args, logs_expanded, theme);
                 }
             }
 
@@ -1130,12 +1277,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             let first_block = next_block;
             next_block += super::copy::block_count(msg);
             let next_msg = messages[..target_cache_count].get(msg_idx + 1);
+            let answers = (msg.role == "assistant" && msg.tool_calls.is_some())
+                .then(|| tool_answers(&messages[..target_cache_count]));
             let run = if app.logs_expanded { None } else { browser_run::run_start(messages, msg_idx) };
             let rendered = match run {
                 Some(start) if start < msg_idx => Vec::new(),
                 Some(start) => {
                     let end = browser_run::run_end(messages, start, target_cache_count);
-                    let mut lines = render_single_message_with_pending_and_thinking(
+                    let mut lines = render_message_lines(
                         msg_idx,
                         &browser_run::without_calls(msg),
                         next_msg,
@@ -1146,6 +1295,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                         app.thinking_state.is_expanded,
                         None,
                         true,
+                        None,
                     );
                     lines.extend(browser_run::summary_lines(
                         &messages[start..end],
@@ -1157,7 +1307,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     ));
                     lines
                 }
-                None => render_single_message_with_pending_and_thinking(
+                None => render_message_lines(
                     msg_idx,
                     msg,
                     next_msg,
@@ -1168,6 +1318,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     app.thinking_state.is_expanded,
                     answered_tool_call(messages, msg_idx),
                     true,
+                    answers.as_ref(),
                 ),
             };
             if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
@@ -1201,7 +1352,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     if let Some(start) = live_run {
         let messages = app.session.display_messages();
         let first_block = super::copy::blocks_before(messages, start) + 1;
-        let rendered = render_single_message_with_pending_and_thinking(
+        let rendered = render_message_lines(
             start,
             &browser_run::without_calls(&messages[start]),
             None,
@@ -1212,6 +1363,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.thinking_state.is_expanded,
             None,
             true,
+            None,
         );
         app.copy_headers.tail.extend(super::copy::number_headers(&rendered, 0, first_block));
         tail_lines.extend(rendered);
@@ -1225,9 +1377,11 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         ));
     } else if target_cache_count < app.session.display_messages().len() {
         let msg_idx = target_cache_count;
-        let msg = &app.session.display_messages()[msg_idx];
-        let next_msg = app.session.display_messages().get(msg_idx + 1);
-        let rendered = render_single_message_with_pending_and_thinking(
+        let messages = app.session.display_messages();
+        let msg = &messages[msg_idx];
+        let next_msg = messages.get(msg_idx + 1);
+        let answers = (msg.role == "assistant" && msg.tool_calls.is_some()).then(|| tool_answers(messages));
+        let rendered = render_message_lines(
             msg_idx,
             msg,
             next_msg,
@@ -1236,8 +1390,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             app.pending_confirmation.as_ref(),
             app.logs_expanded,
             app.thinking_state.is_expanded,
-            answered_tool_call(&app.session.display_messages(), msg_idx),
+            answered_tool_call(messages, msg_idx),
             true,
+            answers.as_ref(),
         );
         let first_block = super::copy::blocks_before(app.session.display_messages(), msg_idx) + 1;
         app.copy_headers.tail.extend(super::copy::number_headers(&rendered, 0, first_block));
@@ -1293,19 +1448,38 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         }
 
         if !app.streaming_text.is_empty() {
-            // Re-parse markdown only when the streamed text or width actually changed.
+            // Re-parse only the active trailing block when streamed text grows past committed
+            // block boundaries, avoiding O(N^2) full-buffer markdown re-parsing on long replies.
             let cache_valid = app.streaming_md_cache_len == app.streaming_text.len()
                 && app.streaming_md_cache_width == content_max_width
-                && !app.streaming_md_cache.is_empty();
+                && (!app.streaming_md_cache.is_empty() || !app.streaming_md_committed_lines.is_empty());
             if !cache_valid {
-                app.streaming_md_cache = crate::markdown::render_markdown(&app.streaming_text, &app.theme, content_max_width);
+                if app.streaming_md_cache_width != content_max_width
+                    || app.streaming_text.len() < app.streaming_md_committed_len
+                {
+                    app.streaming_md_committed_lines.clear();
+                    app.streaming_md_committed_len = 0;
+                }
+                let split = crate::markdown::safe_markdown_split_point(&app.streaming_text);
+                if split > app.streaming_md_committed_len {
+                    let delta = &app.streaming_text[app.streaming_md_committed_len..split];
+                    app.streaming_md_committed_lines.extend(
+                        crate::markdown::render_markdown(delta, &app.theme, content_max_width),
+                    );
+                    app.streaming_md_committed_len = split;
+                }
+                let tail = &app.streaming_text[app.streaming_md_committed_len..];
+                app.streaming_md_cache = crate::markdown::render_markdown(tail, &app.theme, content_max_width);
                 app.streaming_md_cache_len = app.streaming_text.len();
                 app.streaming_md_cache_width = content_max_width;
             }
+            tail_lines.extend(app.streaming_md_committed_lines.iter().cloned());
             tail_lines.extend(app.streaming_md_cache.iter().cloned());
             tail_lines.push(Line::from(""));
-        } else if !app.streaming_md_cache.is_empty() {
+        } else if !app.streaming_md_cache.is_empty() || !app.streaming_md_committed_lines.is_empty() {
             app.streaming_md_cache = Vec::new();
+            app.streaming_md_committed_lines.clear();
+            app.streaming_md_committed_len = 0;
             app.streaming_md_cache_len = 0;
         }
 
@@ -1318,8 +1492,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             );
             tail_lines.extend(preview_lines);
         }
-    } else if !app.streaming_md_cache.is_empty() {
+    } else if !app.streaming_md_cache.is_empty() || !app.streaming_md_committed_lines.is_empty() {
         app.streaming_md_cache = Vec::new();
+        app.streaming_md_committed_lines.clear();
+        app.streaming_md_committed_len = 0;
         app.streaming_md_cache_len = 0;
     }
 
@@ -1383,6 +1559,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         .take(visible_height)
         .cloned()
         .collect();
+
+    app.visible_line_widths = visible_lines.iter().map(|l| l.width() as u16).collect();
 
     let message_paragraph = Paragraph::new(visible_lines)
         .block(Block::default().borders(Borders::NONE));
@@ -1621,19 +1799,12 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     // Right spans: Model info, temperature, reasoning
     let mut right_spans = Vec::new();
-    let is_deepseek = cfg.is_deepseek_endpoint();
+    let footer = footer_model(app, &cfg);
+    let is_deepseek = footer.is_deepseek;
     let is_flash = is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat" || cfg.model == "DeepSeek-V4.1-Flash" || cfg.model == "DeepSeek-V4.1-Flash-1017" || cfg.model == "DeepSeek-V4-Flash");
     let is_pro = is_deepseek && (cfg.model == "deepseek-pro" || cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner" || cfg.model == "DeepSeek-V4-Pro");
 
-    // The provider table holds the exact label of every variant (e.g. Flash vs Flash-1017).
-    let display_name = {
-        let all = cfg.all_providers();
-        let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
-        prov.into_iter()
-            .chain(all.iter())
-            .find_map(|p| p.models.iter().find(|m| m.id == cfg.model))
-            .map(|m| m.display_name().to_string())
-    };
+    let display_name = footer.display_name;
     // DeepSeek models always show their short name ("DeepSeek Flash", as in the header). A phone
     // has ~48 columns: there every model name is shortened and the temperature is dropped, so the
     // model and the reasoning effort fit next to the path instead of being cut off.
@@ -1730,9 +1901,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     // nothing worth the room; yellow once the prompt is past the auto-compact limit.
     if !is_mobile_portrait(size.width, size.height) && !app.session.messages.is_empty() {
         let used = app.session.context_tokens();
-        let window = if cfg.model.starts_with("local") { 24_000 } else { cfg.context_window() };
+        let window = if cfg.model.starts_with("local") { 24_000 } else { footer.window };
         let percent = (used * 100 / window.max(1)).min(100);
-        let past_compact = cfg.auto_compact && used >= cfg.effective_compact_threshold();
+        let past_compact = cfg.auto_compact && used >= footer.compact_threshold;
         if percent >= 50 || past_compact {
             let color = if past_compact { app.theme.accent_yellow } else { app.theme.muted };
             right_spans.insert(0, Span::styled(format!("~{percent}% · "), Style::default().fg(color)));
@@ -1938,12 +2109,52 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
 
 
-/// Footer badges for the modes that change how tools run. Auto-approve is the riskiest one, so it
-/// is spelled out instead of being left to the `*` prompt prefix alone.
+fn footer_model(app: &mut App, cfg: &corex_core::config::Config) -> super::state::FooterModel {
+    let limits = (cfg.context_window_tokens, cfg.compact_threshold_tokens);
+    let fresh = app.footer_model.as_ref().filter(|cached| {
+        cached.computed_at.elapsed() < Duration::from_secs(1)
+            && cached.model == cfg.model
+            && cached.active_provider == cfg.active_provider
+            && cached.base_url == cfg.base_url
+            && cached.limits == limits
+    });
+    if let Some(cached) = fresh {
+        return cached.clone();
+    }
+    // The provider table holds the exact label of every variant (e.g. Flash vs Flash-1017).
+    let all = cfg.all_providers();
+    let active = cfg.active_provider.as_deref().and_then(|name| all.iter().find(|p| p.name == name));
+    let display_name = active
+        .into_iter()
+        .chain(all.iter())
+        .find_map(|p| p.models.iter().find(|m| m.id == cfg.model))
+        .map(|m| m.display_name().to_string());
+    let model = super::state::FooterModel {
+        computed_at: std::time::Instant::now(),
+        model: cfg.model.clone(),
+        active_provider: cfg.active_provider.clone(),
+        base_url: cfg.base_url.clone(),
+        limits,
+        is_deepseek: cfg.is_deepseek_endpoint(),
+        display_name,
+        window: cfg.context_window(),
+        compact_threshold: cfg.effective_compact_threshold(),
+    };
+    app.footer_model = Some(model.clone());
+    model
+}
+
+// YOLO is the riskiest mode: spelled out here, the `*` prompt prefix alone is easy to miss.
 fn mode_badges(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if app.always_allow_tools {
-        spans.push(Span::styled(" [AUTO-APPROVE]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+    match app.yolo_mode {
+        corex_core::YoloMode::All => {
+            spans.push(Span::styled(" [YOLO ALL]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        }
+        corex_core::YoloMode::Normal => {
+            spans.push(Span::styled(" [YOLO]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
+        }
+        corex_core::YoloMode::Off => {}
     }
     if app.accept_edits {
         spans.push(Span::styled(" [ACCEPT EDITS]", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));

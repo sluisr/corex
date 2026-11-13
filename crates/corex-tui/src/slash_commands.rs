@@ -128,7 +128,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "/balance",
         args: "",
-        description: "Show API account balance and token credits",
+        description: "Show API account balance and what this session has spent",
         aliases: &["/wallet"],
         group: MODEL,
         subcommands: &[],
@@ -136,10 +136,10 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     CommandItem {
         name: "/stats",
         args: "",
-        description: "Session token metrics, context in use and limits",
+        description: "Session token metrics and context in use",
         aliases: &["/context"],
         group: MODEL,
-        subcommands: &[],
+        subcommands: &[sub("full", "", "Also show the window source, history cap and where to change them")],
     },
     // --- Context ---
     CommandItem {
@@ -244,12 +244,14 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
     CommandItem {
         name: "/yolo",
-        args: "[on|off]",
-        description: "Toggle auto-approval of all tool executions",
+        args: "[on|normal|all|off]",
+        description: "Toggle auto-approval of tool executions (normal or all)",
         aliases: &[],
         group: TOOLS,
         subcommands: &[
-            sub("on", "", "Auto-approve every tool execution"),
+            sub("on", "", "Auto-approve tools (except sensitive paths/memory)"),
+            sub("normal", "", "Auto-approve tools (except sensitive paths/memory)"),
+            sub("all", "", "Auto-approve EVERYTHING without asking permission"),
             sub("off", "", "Ask before mutating or dangerous tools"),
         ],
     },

@@ -24,6 +24,7 @@ pub mod user_dialog;
 
 pub use app::{restore_terminal, run_tui, App, TerminalGuard};
 pub use auth_dialog::AuthDialogState;
+pub use corex_core::YoloMode;
 pub use fleet_dialog::{render_fleet_dialog, FleetDialogState};
 pub use markdown::{render_markdown, render_markdown_to_ansi};
 pub use model_dialog::ModelDialogState;

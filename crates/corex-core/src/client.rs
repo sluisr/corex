@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use crate::config::Config;
+use crate::config::{Config, McpServerConfig};
 use crate::reasoning_cache::ReasoningCache;
 use crate::types::*;
 
@@ -176,6 +176,8 @@ impl LlmClient {
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(30)))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -228,6 +230,14 @@ impl LlmClient {
         self.look_up_context_window(&new_config);
         if let Ok(mut g) = self.config.lock() {
             *g = new_config;
+        }
+    }
+
+    /// Replaces the MCP server map and nothing else: no local client is rebuilt and no context
+    /// window is looked up again. `/mcp reload` uses it to adopt what `settings.json` now holds.
+    pub fn set_mcp_servers(&self, servers: std::collections::HashMap<String, McpServerConfig>) {
+        if let Ok(mut g) = self.config.lock() {
+            g.mcp_servers = servers;
         }
     }
 
@@ -548,6 +558,13 @@ impl LlmClient {
     /// for DeepSeek's KV cache pricing discount.
     pub fn sort_tools(tools: &mut [ToolDefinition]) {
         tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+    }
+
+    /// Sorts tool definitions deterministically and removes exact name duplicates so
+    /// no redundant schemas waste tokens or destabilize KV prefix caching.
+    pub fn dedup_and_sort_tools(tools: &mut Vec<ToolDefinition>) {
+        Self::sort_tools(tools);
+        tools.dedup_by(|a, b| a.function.name == b.function.name);
     }
 
     /// Truncates tool response messages and background task / subagent dumps that exceed the
@@ -1141,6 +1158,10 @@ impl LlmClient {
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
         let cfg = self.get_config();
+        if let Some(ref mut t_list) = tools {
+            Self::dedup_and_sort_tools(t_list);
+        }
+
         let is_local_model = cfg.model.starts_with("local");
 
         if is_local_model {
@@ -1202,6 +1223,7 @@ impl LlmClient {
         let (endpoint_url, api_key_owned) = cfg.endpoint();
         let api_key = &api_key_owned;
         let is_deepseek = cfg.is_deepseek_endpoint();
+        // API key check
         if api_key.is_empty() {
             crate::forensic::ForensicLogger::log_error("stream_chat", "Missing API key in Config");
             if is_deepseek {
@@ -1244,10 +1266,6 @@ impl LlmClient {
         // outputs do not cause DeepSeek to drift into Chinese.
         if is_deepseek {
             crate::language::apply_recency_anchor(&mut messages);
-        }
-
-        if let Some(ref mut t_list) = tools {
-            Self::sort_tools(t_list);
         }
 
         let provider_kind = cfg.provider_kind();
@@ -2313,5 +2331,21 @@ mod image_fallback_tests {
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0].contains("image_url") && bodies[0].contains("AAAA"));
         assert!(!bodies[1].contains("AAAA") && bodies[1].contains("do not search the disk"));
+    }
+
+    #[test]
+    fn dedup_and_sort_tools_sorts_and_drops_duplicates() {
+        let mk = |name: &str| ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        };
+        let mut tools = vec![mk("zeta"), mk("alpha"), mk("zeta"), mk("beta"), mk("alpha")];
+        LlmClient::dedup_and_sort_tools(&mut tools);
+        let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
     }
 }

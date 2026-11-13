@@ -192,6 +192,7 @@ async function handle(msg) {
     }
 
     if (method === "Corex.activateTab") {
+      if (!tabs.has(params?.tabId)) throw new Error("Tab is not controlled by Corex");
       const tab = await chrome.tabs.update(params.tabId, { active: true });
       await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
       return reply(id, {});

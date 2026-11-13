@@ -37,6 +37,9 @@ fn get_http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(4)
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -60,20 +63,9 @@ fn urlencoding(input: &str) -> String {
 }
 
 fn resolve_api_key(context: &ToolContext) -> Option<String> {
-    // Only resolve keys designated for DeepSeek / Corex API.
-    // OPENAI_API_KEY is deliberately excluded to prevent credential leakage to DeepSeek's endpoint.
-    std::env::var("COREX_API_KEY")
-        .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .or_else(|| {
-            let cfg = corex_core::config::Config::load_with_workspace(Some(&context.workspace_dir));
-            if !cfg.api_key.trim().is_empty() {
-                Some(cfg.api_key)
-            } else {
-                None
-            }
-        })
+    crate::subagent::live_config()
+        .unwrap_or_else(|| corex_core::config::Config::load_with_workspace(Some(&context.workspace_dir)))
+        .deepseek_api_key()
 }
 
 pub fn format_search_results(query: &str, results: &[serde_json::Value]) -> String {
@@ -865,6 +857,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::temp_dir(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -1022,6 +1015,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: std::env::temp_dir(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),

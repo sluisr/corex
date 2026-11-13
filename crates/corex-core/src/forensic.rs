@@ -8,7 +8,16 @@ use directories::BaseDirs;
 static LOGGER: Mutex<Option<ForensicLogger>> = Mutex::new(None);
 
 pub struct ForensicLogger {
-    log_file_path: PathBuf,
+    file: Option<fs::File>,
+    written: u64,
+}
+
+const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
+
+/// True when `COREX_FORENSIC_LOG` is `0`, `false` or `off`: nothing is written to `~/.corex/logs`.
+fn disabled_by_env() -> bool {
+    std::env::var("COREX_FORENSIC_LOG")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
 }
 
 impl ForensicLogger {
@@ -21,8 +30,11 @@ impl ForensicLogger {
             PathBuf::from(".corex").join("logs")
         };
 
-        let _ = crate::secure_fs::ensure_private_dir(&log_dir);
         let log_file_path = log_dir.join(format!("corex-forensic-{}.log", date_str));
+        if disabled_by_env() {
+            return log_file_path;
+        }
+        let _ = crate::secure_fs::ensure_private_dir(&log_dir);
 
         // Purge logs older than 7 days.
         if let Ok(entries) = fs::read_dir(&log_dir) {
@@ -48,33 +60,35 @@ impl ForensicLogger {
             Err(e) => e.into_inner(),
         };
         *global = Some(ForensicLogger {
-            log_file_path: log_file_path.clone(),
+            written: fs::metadata(&log_file_path).map(|m| m.len()).unwrap_or(0),
+            file: crate::secure_fs::open_private(&log_file_path, true).ok(),
         });
+        drop(global);
 
-        Self::raw_append(
-            &log_file_path,
-            &format!(
-                "\n--- SESSION START {} | workspace={} ---\n",
-                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                workspace_dir
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "N/A".to_string())
-            ),
-        );
+        Self::raw_append(&format!(
+            "\n--- SESSION START {} | workspace={} ---\n",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            workspace_dir
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "N/A".to_string())
+        ));
 
         log_file_path
     }
 
-    fn raw_append(path: &Path, content: &str) {
-        // Cap single-day log files at 20 MiB.
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.len() > 20 * 1024 * 1024 {
-                return;
-            }
+    fn raw_append(content: &str) {
+        let mut global = match LOGGER.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let Some(logger) = global.as_mut() else { return };
+        if logger.written > MAX_LOG_BYTES {
+            return;
         }
-        if let Ok(mut file) = crate::secure_fs::open_private(path, true) {
-            let _ = file.write_all(content.as_bytes());
-            let _ = file.flush();
+        if let Some(file) = logger.file.as_mut() {
+            if file.write_all(content.as_bytes()).is_ok() {
+                logger.written += content.len() as u64;
+            }
         }
     }
 
@@ -83,13 +97,9 @@ impl ForensicLogger {
     }
 
     pub fn log_event(category: &str, title: &str, details: &str) {
-        let log_path = match LOGGER.lock() {
-            Ok(guard) => guard.as_ref().map(|l| l.log_file_path.clone()),
-            Err(_) => None,
-        };
-        let Some(path) = log_path else {
+        if !Self::is_enabled() {
             return;
-        };
+        }
 
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let redacted_details = Self::redact_secrets(details.trim());
@@ -102,7 +112,7 @@ impl ForensicLogger {
             "-".repeat(80)
         );
 
-        Self::raw_append(&path, &formatted);
+        Self::raw_append(&formatted);
     }
 
     pub fn log_llm_request(engine: &str, model: &str, endpoint: &str, messages_count: usize, tools_count: usize, body: &str) {
@@ -340,12 +350,25 @@ impl ForensicLogger {
     pub fn redact_secrets(input: &str) -> String {
         const PREFIXES: &[&str] = &[
             "sk-",
+            "sk_live_",
             "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
             "github_pat_",
+            "gsk_",
             "AIza",
+            "AKIA",
+            "ASIA",
             "glpat-",
+            "xoxa-",
             "xoxb-",
             "xoxp-",
+            "xoxr-",
+            "xoxs-",
+            "eyJ",
+            "Bearer ",
         ];
         let mut out = String::with_capacity(input.len());
         let bytes = input.as_bytes();
@@ -366,8 +389,7 @@ impl ForensicLogger {
                     let mut token_end = after;
                     while token_end < bytes.len()
                         && (bytes[token_end].is_ascii_alphanumeric()
-                            || bytes[token_end] == b'_'
-                            || bytes[token_end] == b'-')
+                            || matches!(bytes[token_end], b'_' | b'-' | b'.'))
                     {
                         token_end += 1;
                     }

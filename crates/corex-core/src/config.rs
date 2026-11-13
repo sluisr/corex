@@ -46,13 +46,54 @@ impl Default for ProSettings {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Local servers are spawned as a subprocess and talked to over stdio.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Remote servers (Streamable HTTP transport) are reached at this URL instead of a command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Headers sent with every request to a remote server. Values may reference
+    /// environment variables as `${NAME}` so keys never have to be written to disk.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// A local server launched as a subprocess and spoken to over stdio.
+    pub fn stdio(command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            command: command.into(),
+            args,
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        }
+    }
+
+    /// A remote server spoken to over Streamable HTTP.
+    pub fn remote(url: impl Into<String>, headers: HashMap<String, String>) -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(url.into()),
+            headers,
+        }
+    }
+
+    /// How the server is shown in `/mcp status`: its URL, or the command line it runs.
+    pub fn display_target(&self) -> String {
+        match &self.url {
+            Some(url) if !url.is_empty() => url.clone(),
+            _ => format!("{} {}", self.command, self.args.join(" ")).trim_end().to_string(),
+        }
+    }
 }
 
 /// Subset of settings a workspace (`<repo>/.corex/settings.json`) may override.
@@ -68,7 +109,7 @@ struct LocalOverrides {
     history_token_limit: Option<usize>,
     context_window_tokens: Option<usize>,
     local_prompt_lite: Option<bool>,
-    yolo_mode: Option<bool>,
+    yolo_mode: Option<serde_json::Value>,
     local_llm_enabled: Option<bool>,
 }
 
@@ -99,6 +140,9 @@ const SETTINGS_ORDER: &[&str] = &[
 
 /// Keys `settings.json` no longer carries; they are still read from files that have them.
 const NOT_IN_SETTINGS: &[&str] = &["api_key", "provider_api_keys", "flash_settings", "pro_settings", "target_dir"];
+
+/// Smallest token limit a workspace file may set: lower ones compact on every turn, at the user's cost.
+const MIN_WORKSPACE_TOKEN_LIMIT: usize = 8_000;
 
 /// The fixed auto-compact threshold of earlier versions, which counts as unset.
 const LEGACY_COMPACT_THRESHOLD: u64 = 95_000;
@@ -140,6 +184,80 @@ impl WindowSource {
     }
 }
 
+/// Execution permission mode for tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum YoloMode {
+    /// Normal: asks before mutating or dangerous actions.
+    #[default]
+    Off,
+    /// YOLO Normal: auto-approves mutating actions, but asks for sensitive paths (credentials,
+    /// shell startup files, git hooks), global memory, and browser uploads.
+    Normal,
+    /// YOLO All: auto-approves ALL tool executions without asking for any confirmation.
+    All,
+}
+
+impl YoloMode {
+    pub fn is_active(self) -> bool {
+        matches!(self, YoloMode::Normal | YoloMode::All)
+    }
+
+    pub fn is_all(self) -> bool {
+        matches!(self, YoloMode::All)
+    }
+}
+
+impl Serialize for YoloMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            YoloMode::Off => serializer.serialize_bool(false),
+            YoloMode::Normal => serializer.serialize_str("normal"),
+            YoloMode::All => serializer.serialize_str("all"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for YoloMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct YoloModeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for YoloModeVisitor {
+            type Value = YoloMode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a boolean or string (\"normal\", \"all\", \"off\")")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(if v { YoloMode::Normal } else { YoloMode::Off })
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "all" | "yolo-all" | "yolo_all" => Ok(YoloMode::All),
+                    "normal" | "true" | "on" | "yolo" | "yolo-normal" => Ok(YoloMode::Normal),
+                    "off" | "false" => Ok(YoloMode::Off),
+                    _ => Ok(YoloMode::Off),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(YoloModeVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_api_key")]
@@ -161,7 +279,7 @@ pub struct Config {
     #[serde(default, skip)]
     pub sudo_password: Option<String>,
     #[serde(default)]
-    pub yolo_mode: bool,
+    pub yolo_mode: YoloMode,
     #[serde(default)]
     pub target_dir: PathBuf,
     #[serde(default = "default_local_llm_enabled")]
@@ -353,7 +471,7 @@ impl Default for Config {
             pro_settings: ProSettings::default(),
             mcp_servers: HashMap::new(),
             sudo_password: None,
-            yolo_mode: false,
+            yolo_mode: YoloMode::Off,
             target_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             local_llm_enabled: default_local_llm_enabled(),
             local_llm_url: default_local_llm_url(),
@@ -425,6 +543,21 @@ impl Config {
     /// All providers: built-ins merged with user-defined ones.
     pub fn all_providers(&self) -> Vec<crate::providers::ProviderConfig> {
         crate::providers::merge_providers(&self.providers)
+    }
+
+    /// Routes the session to the built-in provider that owns `model` when the model is chosen by
+    /// name (`-m`, `/model`, a resumed session) instead of through the picker. Unknown models keep
+    /// the legacy behavior of inferring the endpoint from `base_url`.
+    pub fn adopt_provider_for_model(&mut self) {
+        if self.model.starts_with("local") {
+            return;
+        }
+        self.local_llm_enabled = false;
+        self.active_provider = self
+            .all_providers()
+            .into_iter()
+            .find(|p| !p.is_local() && p.models.iter().any(|m| m.id == self.model))
+            .map(|p| p.name);
     }
 
     /// The remote (non-DeepSeek, non-local) provider currently selected, if any.
@@ -511,6 +644,19 @@ impl Config {
                 }
             }
         }
+    }
+
+    /// A key that belongs to DeepSeek, for its search and fetch endpoints. The key of any other
+    /// provider is never returned: it would be sent to `api.deepseek.com`.
+    pub fn deepseek_api_key(&self) -> Option<String> {
+        let stored = self.provider_api_keys.get(crate::providers::DEEPSEEK_ID).cloned();
+        let default = is_deepseek_base_url(&self.base_url).then(|| self.api_key.clone());
+        std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .into_iter()
+            .chain(stored)
+            .chain(default)
+            .find(|key| !key.trim().is_empty())
     }
 
     /// False for the models known to read only text, which reject image parts: DeepSeek Pro.
@@ -851,7 +997,13 @@ impl Config {
                             let t = m.trim();
                             !t.is_empty() && !t.to_ascii_lowercase().starts_with("local")
                         }) {
-                            config.model = m;
+                            // A workspace may pick a model, never the provider (and key) that serves it.
+                            let provider = config.external_provider().map(|p| p.name);
+                            let previous = std::mem::replace(&mut config.model, m);
+                            if config.external_provider().map(|p| p.name) != provider {
+                                tracing::warn!("Ignoring `model` in {}: it belongs to another provider", local_path.display());
+                                config.model = previous;
+                            }
                         }
                         if let Some(t) = o.temperature {
                             config.temperature = t;
@@ -862,19 +1014,20 @@ impl Config {
                         if let Some(a) = o.auto_compact {
                             config.auto_compact = a;
                         }
-                        if let Some(t) = o.compact_threshold_tokens {
+                        let roomy = |tokens: &usize| *tokens >= MIN_WORKSPACE_TOKEN_LIMIT;
+                        if let Some(t) = o.compact_threshold_tokens.filter(roomy) {
                             config.compact_threshold_tokens = Some(t);
                         }
-                        if let Some(t) = o.history_token_limit {
+                        if let Some(t) = o.history_token_limit.filter(roomy) {
                             config.history_token_limit = Some(t);
                         }
-                        if let Some(t) = o.context_window_tokens {
+                        if let Some(t) = o.context_window_tokens.filter(roomy) {
                             config.context_window_tokens = Some(t);
                         }
                         if let Some(l) = o.local_prompt_lite {
                             config.local_prompt_lite = l;
                         }
-                        if o.yolo_mode == Some(true) || o.local_llm_enabled.is_some() {
+                        if o.yolo_mode.is_some() || o.local_llm_enabled.is_some() {
                             tracing::warn!(
                                 "Ignoring security-sensitive keys (yolo_mode/local_llm_enabled) in {}",
                                 local_path.display()
@@ -985,6 +1138,33 @@ impl Config {
             .map(str::to_string)
     }
 
+    /// The `mcp_servers` map `settings.json` holds right now. Only the global file carries MCP
+    /// servers (a workspace copy is stripped of them), so this is what a reload and a save must
+    /// use instead of the copy that was loaded at start-up.
+    pub fn mcp_servers_from_disk() -> Option<HashMap<String, McpServerConfig>> {
+        let path = Self::resolve_settings_path(None, "settings.json")?;
+        let content = fs::read_to_string(path).ok()?;
+        Self::mcp_servers_in(&content)
+    }
+
+    /// The `mcp_servers` map of a settings document: `Some` empty when the key is absent (the
+    /// user removed every server), `None` when the document is not JSON.
+    fn mcp_servers_in(content: &str) -> Option<HashMap<String, McpServerConfig>> {
+        let value: serde_json::Value = serde_json::from_str(content).ok()?;
+        match value.get("mcp_servers") {
+            Some(servers) => serde_json::from_value(servers.clone()).ok(),
+            None => Some(HashMap::new()),
+        }
+    }
+
+    /// Replaces the map in memory with the one the file holds, when there is a file: a save must
+    /// never bring back a server, or an old key, the user removed or fixed by hand meanwhile.
+    fn keep_mcp_servers_from(&mut self, on_disk: Option<HashMap<String, McpServerConfig>>) {
+        if let Some(servers) = on_disk {
+            self.mcp_servers = servers;
+        }
+    }
+
     /// True when `key` is the value of a provider API-key environment variable. Such keys are
     /// injected at load time (env > file) and must never be written into `settings.json`.
     fn is_env_supplied_key(key: &str) -> bool {
@@ -1007,7 +1187,18 @@ impl Config {
     }
 
     pub fn save_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
+        self.save_settings(workspace, false)
+    }
+
+    /// `write_mcp_servers` is true only from `/mcp add` and `/mcp remove`, the two edits made to
+    /// the map in memory that must reach the file. Every other save keeps the map the file holds,
+    /// so a process that started before `settings.json` was edited cannot write the old copy
+    /// — an outdated key included — back over it.
+    fn save_settings(&self, workspace: Option<&Path>, write_mcp_servers: bool) -> anyhow::Result<()> {
         let mut to_save = self.clone();
+        if !write_mcp_servers {
+            to_save.keep_mcp_servers_from(Self::mcp_servers_from_disk());
+        }
         if to_save.api_key.trim().is_empty() || Self::is_env_supplied_key(&to_save.api_key) {
             // Keep whatever key the file already had; an environment key stays in the environment.
             to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
@@ -1030,8 +1221,12 @@ impl Config {
         server: McpServerConfig,
         workspace: Option<&Path>,
     ) -> anyhow::Result<()> {
-        self.mcp_servers.insert(name, server);
-        self.save_with_workspace(workspace)
+        // The file is the truth here too: another Corex, or a hand edit, may have changed a
+        // server since this one loaded it, and only the added server must be new.
+        let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
+        servers.insert(name, server);
+        self.mcp_servers = servers;
+        self.save_settings(workspace, true)
     }
 
     pub fn remove_mcp_server(
@@ -1039,9 +1234,11 @@ impl Config {
         name: &str,
         workspace: Option<&Path>,
     ) -> anyhow::Result<bool> {
-        let existed = self.mcp_servers.remove(name).is_some();
+        let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
+        let existed = servers.remove(name).is_some();
         if existed {
-            self.save_with_workspace(workspace)?;
+            self.mcp_servers = servers;
+            self.save_settings(workspace, true)?;
         }
         Ok(existed)
     }
@@ -1215,6 +1412,65 @@ mod tests {
         assert_eq!(Config::strip_secrets(r#"{"api_key":"sk-1", broken"#), None);
     }
 
+    #[test]
+    fn mcp_servers_read_as_local_or_remote() {
+        let local: McpServerConfig =
+            serde_json::from_str(r#"{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}"#)
+                .expect("a local server needs only a command");
+        assert_eq!(local.url, None);
+        assert_eq!(local.display_target(), "npx -y @modelcontextprotocol/server-github");
+
+        let remote: McpServerConfig = serde_json::from_str(
+            r#"{"url":"https://stitch.googleapis.com/mcp","headers":{"X-Goog-Api-Key":"${STITCH_API_KEY}"}}"#,
+        )
+        .expect("a remote server needs no command");
+        assert_eq!(remote.command, "");
+        assert_eq!(remote.display_target(), "https://stitch.googleapis.com/mcp");
+        assert_eq!(remote.headers["X-Goog-Api-Key"], "${STITCH_API_KEY}");
+
+        // An empty command is not written back, and neither are empty headers.
+        let written = serde_json::to_string(&remote).expect("serializes");
+        assert!(!written.contains("command"), "{written}");
+        assert!(!written.contains("headers") || written.contains("X-Goog-Api-Key"), "{written}");
+    }
+
+    #[test]
+    fn the_mcp_map_is_read_from_the_file_not_only_at_startup() {
+        let doc = r#"{"model":"m","mcp_servers":{"stitch":{"url":"https://stitch.googleapis.com/mcp","headers":{"X-Goog-Api-Key":"fresh"}}}}"#;
+        let servers = Config::mcp_servers_in(doc).expect("a settings document has a map");
+        assert_eq!(servers["stitch"].headers["X-Goog-Api-Key"], "fresh");
+
+        // No key at all: every server was removed, which is an empty map, not a failure.
+        assert_eq!(Config::mcp_servers_in(r#"{"model":"m"}"#), Some(HashMap::new()));
+        // Content that is not JSON has no map to offer, so the caller keeps what it has.
+        assert_eq!(Config::mcp_servers_in("{not json"), None);
+    }
+
+    #[test]
+    fn a_save_keeps_the_mcp_map_the_file_holds() {
+        // What the process loaded at start-up: the placeholder the catalog wrote.
+        let mut memory = Config::default();
+        memory.mcp_servers.insert(
+            "stitch".to_string(),
+            McpServerConfig::remote(
+                "https://stitch.googleapis.com/mcp",
+                HashMap::from([("X-Goog-Api-Key".to_string(), "${STITCH_API_KEY}".to_string())]),
+            ),
+        );
+        // What the user pasted by hand afterwards.
+        let mut on_disk = memory.mcp_servers.clone();
+        on_disk.get_mut("stitch").unwrap().headers.insert("X-Goog-Api-Key".to_string(), "a-key-pasted-by-hand".to_string());
+
+        let mut saved = memory.clone();
+        saved.keep_mcp_servers_from(Some(on_disk.clone()));
+        assert_eq!(saved.mcp_servers["stitch"].headers["X-Goog-Api-Key"], "a-key-pasted-by-hand");
+
+        // With no file to read (first run), the map in memory is all there is.
+        let mut first_run = memory.clone();
+        first_run.keep_mcp_servers_from(None);
+        assert_eq!(first_run.mcp_servers["stitch"].headers["X-Goog-Api-Key"], "${STITCH_API_KEY}");
+    }
+
 
     #[test]
     fn test_workspace_config_override() {
@@ -1257,6 +1513,25 @@ mod tests {
             url.starts_with("https://") || key.is_empty(),
             "API key must never be paired with a remote plaintext http:// base_url"
         );
+    }
+
+    #[test]
+    fn test_yolo_mode_serialization_and_deserialization() {
+        assert_eq!(serde_json::from_str::<YoloMode>("true").unwrap(), YoloMode::Normal);
+        assert_eq!(serde_json::from_str::<YoloMode>("false").unwrap(), YoloMode::Off);
+        assert_eq!(serde_json::from_str::<YoloMode>(r#""normal""#).unwrap(), YoloMode::Normal);
+        assert_eq!(serde_json::from_str::<YoloMode>(r#""all""#).unwrap(), YoloMode::All);
+        assert_eq!(serde_json::from_str::<YoloMode>(r#""off""#).unwrap(), YoloMode::Off);
+
+        assert_eq!(serde_json::to_string(&YoloMode::Off).unwrap(), "false");
+        assert_eq!(serde_json::to_string(&YoloMode::Normal).unwrap(), r#""normal""#);
+        assert_eq!(serde_json::to_string(&YoloMode::All).unwrap(), r#""all""#);
+
+        assert!(YoloMode::Normal.is_active());
+        assert!(YoloMode::All.is_active());
+        assert!(!YoloMode::Off.is_active());
+        assert!(YoloMode::All.is_all());
+        assert!(!YoloMode::Normal.is_all());
     }
 }
 

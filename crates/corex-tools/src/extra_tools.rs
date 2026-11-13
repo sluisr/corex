@@ -966,6 +966,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: PathBuf::from("/tmp/nonexistent-skill-workspace-xyz"),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: Vec::new(),
@@ -995,6 +996,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: Vec::new(),
@@ -1024,6 +1026,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: vec![],
@@ -1054,6 +1057,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: vec![data.clone()],
@@ -1082,6 +1086,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: false,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: vec![],
             extra_dirs: Vec::new(),

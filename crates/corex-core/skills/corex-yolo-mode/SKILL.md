@@ -12,12 +12,15 @@ description: >-
 
 # Corex YOLO Mode & Tool Execution Control
 
-By default, Corex asks for confirmation before executing any **mutating or potentially dangerous** action (writing files, running shell commands, applying patches). YOLO mode skips those prompts, with a few exceptions that always ask:
+Corex provides two YOLO modes for autonomous execution:
 
-- shell commands that read or write credentials (`~/.ssh`, `~/.aws`, `~/.corex/settings.json`…) or files that run code by themselves (`.git/hooks/`, `~/.bashrc` and other shell startup files, `crontab`);
-- notes saved to the global memory (`~/.corex/COREX.md`), which every future session loads.
+1. **YOLO Normal** (`/yolo`, `/yolo normal`, `/yolo on`, `cx -y`, `cx --yolo`): Skips confirmation prompts for mutating tools (writing files, running commands, applying patches), with safety exceptions that always ask:
+   - shell commands that read or write credentials (`~/.ssh`, `~/.aws`, `~/.corex/settings.json`…) or files that run code by themselves (`.git/hooks/`, `~/.bashrc` and other shell startup files, `crontab`);
+   - notes saved to global memory (`~/.corex/COREX.md`), which every future session loads;
+   - browser file uploads.
+2. **YOLO All** (`/yolo all`, `cx --yolo-all`): Complete autonomy with **zero permission prompts**. Auto-approves all tool executions, bypassing even the sensitive path and memory confirmations.
 
-Editing a sensitive file with the file tools is refused outright, YOLO or not.
+Editing a sensitive file with the file tools is refused outright.
 
 ---
 
@@ -25,25 +28,31 @@ Editing a sensitive file with the file tools is refused outright, YOLO or not.
 
 ### Option 1 — From inside the TUI
 ```
-/yolo
-/yolo on
-/yolo off
+/yolo            # Toggle YOLO mode (cycles between Normal and Off)
+/yolo normal     # Enable YOLO Normal mode
+/yolo all        # Enable YOLO All mode (no confirmations for anything)
+/yolo off        # Disable YOLO mode
 ```
 
-Toggling `/yolo` without arguments switches the current state. Status is shown in the TUI status bar.
+Toggling `/yolo` without arguments switches between Normal and Off. Status is shown in the TUI status bar as `[YOLO]` or `[YOLO ALL]`.
 
-### Option 2 — From the CLI flag
+### Option 2 — With Shift+Tab
+In the TUI, press `Shift+Tab` to cycle between execution modes:
+`Normal` → `[ACCEPT EDITS]` → `[PLAN MODE]` → `[YOLO]` → `[YOLO ALL]` → `Normal`
+
+### Option 3 — From the CLI flags
 ```bash
-cx -y
-cx --yolo
-cx --yolo -p "Refactor all files in src/ and run tests"
+cx -y                    # YOLO Normal
+cx --yolo                # YOLO Normal
+cx --yolo-all            # YOLO All (no permissions asked)
+cx --yolo-all -p "Build and test"
 ```
 
-### Option 3 — Persist via `settings.json`
+### Option 4 — Persist via `settings.json`
 ```json
 // ~/.corex/settings.json
 {
-  "yolo_mode": true
+  "yolo_mode": "normal"  // or "all", true, false
 }
 ```
 

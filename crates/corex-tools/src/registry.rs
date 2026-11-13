@@ -229,6 +229,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),
@@ -263,6 +264,7 @@ mod tests {
         let ctx = ToolContext {
             workspace_dir: ws.clone(),
             yolo_mode: true,
+            yolo_all: false,
             sudo_password: None,
             allowed_commands: Vec::new(),
             extra_dirs: Vec::new(),

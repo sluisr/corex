@@ -1,12 +1,39 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{atomic::{AtomicBool, Ordering}, OnceLock};
 use std::time::Duration;
 use chrono::Utc;
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+fn shared_update_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
+
+fn shared_no_redir_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCache {
@@ -71,7 +98,7 @@ pub fn current_target_triple() -> Option<&'static str> {
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        if std::env::var("PREFIX").is_ok() || Path::new("/data/data/com.termux").exists() {
+        if std::env::var("PREFIX").is_ok_and(|p| p.contains("com.termux")) || Path::new("/data/data/com.termux").exists() {
             Some("aarch64-linux-android")
         } else {
             Some("aarch64-unknown-linux-gnu")
@@ -120,12 +147,16 @@ pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Returns true if candidate is strictly newer than current.
+fn is_prerelease(v: &str) -> bool {
+    v.trim().trim_start_matches('v').split('+').next().is_some_and(|core| core.contains('-'))
+}
+
+/// Returns true if candidate is strictly newer than current. A release is newer than its own
+/// pre-releases (`1.0.0` after `1.0.0-rc1`).
 pub fn is_newer_version(current: &str, candidate: &str) -> bool {
-    if let (Some(cur), Some(cand)) = (parse_semver(current), parse_semver(candidate)) {
-        cand > cur
-    } else {
-        false
+    match (parse_semver(current), parse_semver(candidate)) {
+        (Some(cur), Some(cand)) => cand > cur || (cand == cur && is_prerelease(current) && !is_prerelease(candidate)),
+        _ => false,
     }
 }
 
@@ -238,13 +269,16 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
     if update_check_disabled() {
         return None;
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .user_agent(format!("corex/{}", current_version))
-        .build()
-        .ok()?;
+    let client = shared_update_client()?;
+    let ua = format!("corex/{}", current_version);
 
-    if let Ok(resp) = client.get("https://corex.sluisr.com/release.json").send().await {
+    if let Ok(resp) = client
+        .get("https://corex.sluisr.com/release.json")
+        .timeout(Duration::from_secs(3))
+        .header(reqwest::header::USER_AGENT, &ua)
+        .send()
+        .await
+    {
         if resp.status().is_success() {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
                 if let Some(tag) = val.get("tag").or_else(|| val.get("version")).and_then(|t| t.as_str()) {
@@ -258,7 +292,10 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         }
     }
 
-    let mut req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
+    let mut req = client
+        .get("https://api.github.com/repos/sluisr/corex/releases/latest")
+        .timeout(Duration::from_secs(3))
+        .header(reqwest::header::USER_AGENT, &ua);
     if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
         let token = token.trim();
         if !token.is_empty() {
@@ -279,13 +316,14 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
         }
     }
 
-    let no_redir_client = reqwest::Client::builder()
+    let no_redir_client = shared_no_redir_client()?;
+    if let Ok(resp) = no_redir_client
+        .get("https://github.com/sluisr/corex/releases/latest")
         .timeout(Duration::from_secs(3))
-        .user_agent(format!("corex/{}", current_version))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()?;
-    if let Ok(resp) = no_redir_client.get("https://github.com/sluisr/corex/releases/latest").send().await {
+        .header(reqwest::header::USER_AGENT, &ua)
+        .send()
+        .await
+    {
         if resp.status().is_redirection() {
             if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
                 if let Ok(loc_str) = loc.to_str() {
@@ -308,25 +346,22 @@ pub async fn check_for_update_online(current_version: &str) -> Option<String> {
 struct CdnReleasePayload {
     tag: Option<String>,
     version: Option<String>,
-    #[serde(default)]
-    binaries: Vec<CdnBinaryEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CdnBinaryEntry {
-    archive: String,
-    url: String,
+fn is_plain_tag(tag: &str) -> bool {
+    !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
 }
 
 /// Fetches latest release metadata (GitHub REST API -> CDN -> GitHub web redirect).
 pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseInfo, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(format!("corex/{}", current_version))
-        .build()
-        .map_err(|e| format!("Failed to initialize HTTP client: {}", e))?;
+    let client = shared_update_client()
+        .ok_or_else(|| "Failed to initialize HTTP client".to_string())?;
+    let ua = format!("corex/{}", current_version);
 
-    let mut api_req = client.get("https://api.github.com/repos/sluisr/corex/releases/latest");
+    let mut api_req = client
+        .get("https://api.github.com/repos/sluisr/corex/releases/latest")
+        .timeout(Duration::from_secs(10))
+        .header(reqwest::header::USER_AGENT, &ua);
     if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
         let token = token.trim();
         if !token.is_empty() {
@@ -352,9 +387,9 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
 
     // Neither fallback is trusted alone. The CDN file is refreshed by hand after a release, so it can
     // still name the previous version (the API being rate limited then made `cx update` report
-    // "already on the latest version"), and the web redirect names the newest tag but lists no
-    // assets. The newest of the two wins; the download URL is rebuilt from the tag when needed.
-    let cdn = fetch_release_from_cdn(&client).await;
+    // "already on the latest version"). Both only name a tag: the download always comes from the
+    // GitHub release of that tag, so the CDN can never point the updater at a binary of its own.
+    let cdn = fetch_release_from_cdn(client, &ua).await;
     let redirect = fetch_release_from_web_redirect(current_version).await;
 
     newest_release(cdn, redirect).ok_or_else(|| {
@@ -364,46 +399,47 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
     })
 }
 
-/// The release described by the CDN's `release.json`, with its asset list.
-async fn fetch_release_from_cdn(client: &reqwest::Client) -> Option<ReleaseInfo> {
-    let resp = client.get("https://corex.sluisr.com/release.json").send().await.ok()?;
+/// The release tag named by the CDN's `release.json`.
+async fn fetch_release_from_cdn(client: &reqwest::Client, ua: &str) -> Option<ReleaseInfo> {
+    let resp = client
+        .get("https://corex.sluisr.com/release.json")
+        .timeout(Duration::from_secs(10))
+        .header(reqwest::header::USER_AGENT, ua)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let payload = resp.json::<CdnReleasePayload>().await.ok()?;
-    let tag_name = payload.tag.or(payload.version)?;
-    let assets = payload
-        .binaries
-        .into_iter()
-        .map(|b| ReleaseAsset {
-            name: b.archive,
-            browser_download_url: b.url,
-            size: None,
-        })
-        .collect();
+    let tag_name = payload.tag.or(payload.version).filter(|tag| is_plain_tag(tag))?;
     Some(ReleaseInfo {
         tag_name,
         html_url: Some("https://corex.sluisr.com".to_string()),
         body: None,
-        assets,
+        assets: vec![],
     })
 }
 
 /// The newest release tag, read from where GitHub's `releases/latest` page redirects. It uses no
 /// API quota, and carries no asset list.
 async fn fetch_release_from_web_redirect(current_version: &str) -> Option<ReleaseInfo> {
-    let client = reqwest::Client::builder()
+    let client = shared_no_redir_client()?;
+    let resp = client
+        .get("https://github.com/sluisr/corex/releases/latest")
         .timeout(Duration::from_secs(10))
-        .user_agent(format!("corex/{}", current_version))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .header(reqwest::header::USER_AGENT, format!("corex/{}", current_version))
+        .send()
+        .await
         .ok()?;
-    let resp = client.get("https://github.com/sluisr/corex/releases/latest").send().await.ok()?;
     if !resp.status().is_redirection() {
         return None;
     }
     let location = resp.headers().get(reqwest::header::LOCATION)?.to_str().ok()?.to_string();
     let tag_name = location.split("/tag/").nth(1)?.trim_matches('/').to_string();
+    if !is_plain_tag(&tag_name) {
+        return None;
+    }
     Some(ReleaseInfo {
         tag_name,
         html_url: Some(location),
@@ -412,7 +448,7 @@ async fn fetch_release_from_web_redirect(current_version: &str) -> Option<Releas
     })
 }
 
-/// The newer of two releases. On a tie the first is kept, since it is the one with the asset list.
+/// The newer of two releases. On a tie the first is kept.
 fn newest_release(first: Option<ReleaseInfo>, second: Option<ReleaseInfo>) -> Option<ReleaseInfo> {
     match (first, second) {
         (Some(a), Some(b)) => Some(if is_newer_version(&a.tag_name, &b.tag_name) { b } else { a }),
@@ -438,9 +474,20 @@ pub fn is_trusted_release_url(url: &str) -> bool {
     match host.to_ascii_lowercase().as_str() {
         "github.com" => path.starts_with("/sluisr/corex/releases/"),
         "api.github.com" => path.starts_with("/repos/sluisr/corex/releases/"),
-        "objects.githubusercontent.com" | "release-assets.githubusercontent.com" | "corex.sluisr.com" => true,
+        "objects.githubusercontent.com" | "release-assets.githubusercontent.com" => true,
         _ => false,
     }
+}
+
+async fn read_capped(mut resp: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Failed to read archive payload: {}", e))? {
+        if (bytes.len() + chunk.len()) as u64 > limit {
+            return Err("Release archive exceeds maximum allowed size (200 MB)".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Extracts the target binary bytes from a tar.gz or zip archive in memory.
@@ -629,15 +676,14 @@ where
         return Err(format!("Untrusted release download URL: {}", download_url));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(format!("corex/{}", current_version))
-        .build()
-        .map_err(|e| format!("HTTP client init failed: {}", e))?;
+    let client = shared_update_client()
+        .ok_or_else(|| "HTTP client init failed".to_string())?;
 
     progress(&format!("Downloading binary archive from {}...", download_url));
     let resp = client
         .get(&download_url)
+        .timeout(Duration::from_secs(60))
+        .header(reqwest::header::USER_AGENT, format!("corex/{}", current_version))
         .send()
         .await
         .map_err(|e| format!("Failed to download release archive: {}", e))?;
@@ -657,14 +703,7 @@ where
         return Err("Release archive exceeds maximum allowed size (200 MB)".to_string());
     }
 
-    let archive_bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read archive payload: {}", e))?
-        .to_vec();
-    if archive_bytes.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
-        return Err("Release archive exceeds maximum allowed size (200 MB)".to_string());
-    }
+    let archive_bytes = read_capped(resp, MAX_EXTRACTED_BINARY_BYTES).await?;
 
     progress(&format!(
         "Downloaded {} KB. Verifying SHA-256 signature...",
@@ -772,6 +811,9 @@ mod tests {
         assert!(!is_newer_version("0.2.0", "0.2.0"));
         assert!(!is_newer_version("0.2.0", "0.1.9"));
         assert!(!is_newer_version("0.2.1", "0.2.0"));
+        assert!(is_newer_version("1.0.0-rc1", "1.0.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.0-rc1"));
+        assert!(!is_newer_version("1.0.0-rc1", "1.0.0-rc2"));
     }
 
     #[test]
@@ -823,6 +865,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs the network"]
     async fn test_fetch_latest_release_info_fallback() {
         let release = fetch_latest_release_info("0.6.3").await;
         assert!(release.is_ok(), "fetch_latest_release_info should succeed via CDN/fallback: {:?}", release.err());
@@ -893,7 +936,7 @@ mod tests {
     fn only_corex_release_urls_are_trusted() {
         assert!(is_trusted_release_url("https://github.com/sluisr/corex/releases/download/v0.9.0/corex.tar.gz"));
         assert!(is_trusted_release_url("https://objects.githubusercontent.com/github-production-release-asset/123"));
-        assert!(is_trusted_release_url("https://corex.sluisr.com/releases/corex.tar.gz"));
+        assert!(!is_trusted_release_url("https://corex.sluisr.com/releases/corex.tar.gz"));
         assert!(!is_trusted_release_url("http://github.com/sluisr/corex/releases/download/v0.9.0/corex.tar.gz"));
         assert!(!is_trusted_release_url("https://evil.example.com/corex.tar.gz"));
         assert!(!is_trusted_release_url("https://github.com/attacker/corex/releases/download/v9/corex.tar.gz"));

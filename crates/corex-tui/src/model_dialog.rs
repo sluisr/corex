@@ -260,6 +260,7 @@ impl ModelDialogState {
         } else {
             cfg.reasoning_effort.clone()
         };
+        self.normalize_generic_reasoning();
     }
 
     pub fn selected_provider(&self) -> Option<&ProviderConfig> {
@@ -308,6 +309,27 @@ impl ModelDialogState {
             Some(ModelFamily::Pro) => self.pro_reasoning.clone(),
             _ => self.generic_reasoning.clone(),
         }
+    }
+
+    /// Keeps the generic Reasoning row on a level the highlighted model actually supports, so it
+    /// never displays "default" for a model that exposes a level.
+    fn normalize_generic_reasoning(&mut self) {
+        let Some(model) = self.selected_model() else { return };
+        if model.family != ModelFamily::Generic || model.reasoning.is_empty() {
+            return;
+        }
+        if model.reasoning.iter().any(|level| level == &self.generic_reasoning) {
+            return;
+        }
+        let preferred = match self.generic_reasoning.trim().to_ascii_lowercase().as_str() {
+            "max" | "xhigh" => "high",
+            _ => "medium",
+        };
+        self.generic_reasoning = if model.reasoning.iter().any(|level| level.as_str() == preferred) {
+            preferred.to_string()
+        } else {
+            model.reasoning.first().cloned().unwrap_or_default()
+        };
     }
 
     pub fn adjust_row(&mut self, forward: bool) {
@@ -360,6 +382,7 @@ impl ModelDialogState {
         self.prov_idx = idx;
         self.model_idx = if idx == self.active_provider { self.active_model } else { 0 };
         self.row_idx = 0;
+        self.normalize_generic_reasoning();
     }
 
     /// Provider indices in the order the list shows them: the active one, then the ones ready to
@@ -436,6 +459,7 @@ impl ModelDialogState {
                 Pane::Models => {
                     self.model_idx = self.model_idx.saturating_sub(1);
                     self.row_idx = 0;
+                    self.normalize_generic_reasoning();
                 }
                 Pane::Settings => self.row_idx = self.row_idx.saturating_sub(1),
             },
@@ -446,6 +470,7 @@ impl ModelDialogState {
                     if self.model_idx + 1 < n {
                         self.model_idx += 1;
                         self.row_idx = 0;
+                        self.normalize_generic_reasoning();
                     }
                 }
                 Pane::Settings => {
