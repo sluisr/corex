@@ -70,7 +70,8 @@ impl App {
         let is_online = Arc::new(AtomicBool::new(false));
         let (balance_tx, balance_rx) = mpsc::channel(10);
         let mut app = Self {
-            session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir)),
+            session: Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&workspace_dir))
+                .with_provider(cfg.active_provider.clone()),
             llm_client: llm_client.clone(),
             tool_registry: ToolRegistry::new(),
             theme: Theme::detect(),
@@ -1529,6 +1530,7 @@ impl App {
         }
         self.llm_client.update_config(cfg.clone());
         self.session.model = cfg.model.clone();
+        self.session.provider = cfg.active_provider.clone();
         self.session.temperature = Some(cfg.temperature);
         self.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
         let _ = self.session.save();

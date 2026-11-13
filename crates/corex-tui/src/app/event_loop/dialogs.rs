@@ -200,13 +200,14 @@ fn resume_session(app: &mut App, session_id: &str) {
     match Session::load_by_id_or_tag(session_id) {
         Ok(mut loaded) => {
             let mut cfg = app.llm_client.get_config();
-            cfg.model = loaded.model.clone();
+            cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
             if let Some(t) = loaded.temperature {
                 cfg.temperature = t;
             }
             if let Some(ref r) = loaded.reasoning_effort {
                 cfg.reasoning_effort = r.clone();
             }
+            loaded.provider = cfg.active_provider.clone();
             app.llm_client.update_config(cfg);
             corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(app.llm_client.clone()));
             let is_fleet = app.session_dialog.is_fleet;

@@ -279,9 +279,10 @@ pub async fn run() -> Result<()> {
     let mut resumed_session: Option<Session> = None;
     if let Some(ref session_id) = cli.resume {
         match Session::load_by_id_or_tag(session_id) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
                 if !explicit_model {
-                    config.model = loaded.model.clone();
+                    config.adopt_session_model(&loaded.model, loaded.provider.as_deref());
+                    loaded.provider = config.active_provider.clone();
                 }
                 if let Some(t) = loaded.temperature {
                     config.temperature = t;
@@ -311,6 +312,7 @@ pub async fn run() -> Result<()> {
                 &config.reasoning_effort,
                 Some(&workspace_dir),
             )
+            .with_provider(config.active_provider.clone())
         })
     };
 

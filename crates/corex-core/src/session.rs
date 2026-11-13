@@ -2,7 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,6 +15,10 @@ pub struct Session {
     pub tag: Option<String>,
     #[serde(default = "default_session_model")]
     pub model: String,
+    /// Provider the session was last using (e.g. "deepseek", "openai"). Sessions saved
+    /// before this field existed have `None`; resuming infers the provider from `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -107,6 +110,7 @@ impl Session {
             title: "New Session".to_string(),
             tag: None,
             model: model.to_string(),
+            provider: None,
             temperature: Some(temperature),
             reasoning_effort: Some(reasoning_effort.to_string()),
             workspace_dir: workspace.map(|p| p.display().to_string()),
@@ -118,6 +122,12 @@ impl Session {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// Sets the provider the session is using, so resuming it later restores the right endpoint.
+    pub fn with_provider(mut self, provider: Option<String>) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// The messages the chat should draw: the full history once a compaction has trimmed
@@ -207,15 +217,11 @@ impl Session {
     }
 
     pub fn sessions_dir() -> PathBuf {
-        BaseDirs::new()
-            .map(|dirs| dirs.home_dir().join(".corex").join("sessions"))
-            .unwrap_or_else(|| PathBuf::from(".corex/sessions"))
+        crate::config::corex_home().join("sessions")
     }
 
     pub fn fleet_sessions_dir() -> PathBuf {
-        BaseDirs::new()
-            .map(|dirs| dirs.home_dir().join(".corex").join("fleet_sessions"))
-            .unwrap_or_else(|| PathBuf::from(".corex/fleet_sessions"))
+        crate::config::corex_home().join("fleet_sessions")
     }
 
     pub fn is_fleet(&self) -> bool {
@@ -716,5 +722,19 @@ mod history_tests {
             .filter_map(|m| m.text_content())
             .collect();
         assert_eq!(remaining, vec!["first real turn", "ok 1"]);
+    }
+
+    #[test]
+    fn provider_round_trips_and_old_sessions_default_to_none() {
+        let session = Session::new().with_provider(Some("openai".to_string()));
+        let json = serde_json::to_string(&session).expect("serializes");
+        assert!(json.contains("\"provider\":\"openai\""), "{json}");
+        let back: Session = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.provider.as_deref(), Some("openai"));
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        value.as_object_mut().expect("session object").remove("provider");
+        let old: Session = serde_json::from_value(value).expect("old session without provider");
+        assert_eq!(old.provider, None);
     }
 }

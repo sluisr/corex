@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 fn default_flash_temperature() -> f32 { 1.0 }
 fn default_flash_reasoning() -> String { "dynamic".to_string() }
 
+/// Per-user state directory. `COREX_HOME` lets a session or installation keep its settings
+/// and sessions isolated from the default `~/.corex` directory.
+pub fn corex_home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("COREX_HOME").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".corex"))
+        .unwrap_or_else(|| PathBuf::from(".corex"))
+}
+
+/// Whether `COREX_HOME` keeps this process's state isolated from the shared `~/.corex` directory.
+pub fn isolated_home() -> bool {
+    std::env::var_os("COREX_HOME")
+        .map(|dir| !dir.is_empty())
+        .unwrap_or(false)
+}
+
 /// Depth used by the `dynamic` reasoning mode on turns that only answer a tool result (~200ms).
 pub const DYNAMIC_TOOL_TURN_EFFORT: &str = "low";
 /// Depth used by the `dynamic` reasoning mode on every other turn.
@@ -560,6 +578,31 @@ impl Config {
             .map(|p| p.name);
     }
 
+    /// Restores the model and provider a session was using. The provider saved with the session
+    /// wins when it still owns the model; sessions saved before that field existed infer it from
+    /// the model, and a stale provider never sends a model to the wrong API.
+    pub fn adopt_session_model(&mut self, model: &str, provider: Option<&str>) {
+        self.model = model.to_string();
+        if model.starts_with("local") {
+            self.local_llm_enabled = true;
+            self.active_provider = Some(crate::providers::LOCAL_ID.to_string());
+            return;
+        }
+        if let Some(name) = provider.filter(|name| !name.trim().is_empty()) {
+            let known = self.all_providers().into_iter().find(|p| p.name == name);
+            let matches_model = known
+                .as_ref()
+                .map(|p| p.is_local() || p.models.is_empty() || p.models.iter().any(|m| m.id == self.model))
+                .unwrap_or(false);
+            if matches_model {
+                self.local_llm_enabled = known.as_ref().map(|p| p.is_local()).unwrap_or(false);
+                self.active_provider = Some(name.to_string());
+                return;
+            }
+        }
+        self.adopt_provider_for_model();
+    }
+
     /// The remote (non-DeepSeek, non-local) provider currently selected, if any.
     pub fn external_provider(&self) -> Option<crate::providers::ProviderConfig> {
         let all = self.all_providers();
@@ -725,50 +768,51 @@ impl Config {
 
 impl Config {
     fn resolve_settings_path(workspace: Option<&Path>, filename: &str) -> Option<PathBuf> {
+        let corex_global = corex_home().join(filename);
+        if isolated_home() && corex_global.exists() {
+            return Some(corex_global);
+        }
         if let Some(ws) = workspace {
             let corex_local = ws.join(".corex").join(filename);
             if corex_local.exists() {
                 return Some(corex_local);
             }
         }
-        if let Some(dirs) = BaseDirs::new() {
-            let corex_global = dirs.home_dir().join(".corex").join(filename);
-            if corex_global.exists() {
-                return Some(corex_global);
-            }
+        if corex_global.exists() {
+            return Some(corex_global);
         }
         None
     }
 
     fn save_to_destinations(content: &str, filename: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
         let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
-        if let Some(ws) = workspace {
-            let dir = ws.join(".corex");
-            if dir.exists() {
-                // Workspace copies must never carry credentials: they live inside a repository
-                // that may be committed or shared.
-                match Self::strip_secrets(content) {
-                    Some(sanitized) => {
-                        if let Err(e) = crate::secure_fs::write_private_atomic(&dir.join(filename), sanitized) {
-                            tracing::warn!("Failed to save workspace settings {}: {}", dir.join(filename).display(), e);
-                            if is_temp {
-                                return Err(e.into());
+        if !isolated_home() {
+            if let Some(ws) = workspace {
+                let dir = ws.join(".corex");
+                if dir.exists() {
+                    // Workspace copies must never carry credentials: they live inside a repository
+                    // that may be committed or shared.
+                    match Self::strip_secrets(content) {
+                        Some(sanitized) => {
+                            if let Err(e) = crate::secure_fs::write_private_atomic(&dir.join(filename), sanitized) {
+                                tracing::warn!("Failed to save workspace settings {}: {}", dir.join(filename).display(), e);
+                                if is_temp {
+                                    return Err(e.into());
+                                }
                             }
                         }
+                        None => tracing::warn!(
+                            "Not writing workspace settings {}: content could not be sanitized",
+                            dir.join(filename).display()
+                        ),
                     }
-                    None => tracing::warn!(
-                        "Not writing workspace settings {}: content could not be sanitized",
-                        dir.join(filename).display()
-                    ),
                 }
             }
         }
         if !is_temp {
-            if let Some(dirs) = BaseDirs::new() {
-                let dir = dirs.home_dir().join(".corex");
-                crate::secure_fs::ensure_private_dir(&dir)?;
-                crate::secure_fs::write_private_atomic(&dir.join(filename), content)?;
-            }
+            let dir = corex_home();
+            crate::secure_fs::ensure_private_dir(&dir)?;
+            crate::secure_fs::write_private_atomic(&dir.join(filename), content)?;
         }
         Ok(())
     }
@@ -826,7 +870,7 @@ impl Config {
     }
 
     fn credentials_path() -> Option<PathBuf> {
-        BaseDirs::new().map(|d| d.home_dir().join(".corex").join("credentials.json"))
+        Some(corex_home().join("credentials.json"))
     }
 
     /// The system keyring entry holding the keys (Secret Service, Keychain or Credential
@@ -985,7 +1029,7 @@ impl Config {
         // Workspace overrides (`.corex/settings.json`) are restricted to non-privileged fields.
         // Credentials, endpoints, `yolo_mode`, `local_llm_enabled`, `allowed_commands`, and
         // `mcp_servers` are ignored from workspace files.
-        if let Some(ws) = workspace {
+        if let Some(ws) = workspace.filter(|_| !isolated_home()) {
             let local_path = ws.join(".corex").join("settings.json");
             if local_path.exists() {
                 match fs::read_to_string(&local_path)
@@ -998,11 +1042,20 @@ impl Config {
                             !t.is_empty() && !t.to_ascii_lowercase().starts_with("local")
                         }) {
                             // A workspace may pick a model, never the provider (and key) that serves it.
-                            let provider = config.external_provider().map(|p| p.name);
-                            let previous = std::mem::replace(&mut config.model, m);
-                            if config.external_provider().map(|p| p.name) != provider {
+                            let candidate = m;
+                            let owner = config
+                                .all_providers()
+                                .into_iter()
+                                .find(|p| p.models.iter().any(|model| model.id == candidate))
+                                .map(|p| p.name);
+                            let belongs = match (config.active_provider.as_deref(), owner) {
+                                (Some(active), Some(owner)) => active == owner,
+                                _ => true,
+                            };
+                            if belongs {
+                                config.model = candidate;
+                            } else {
                                 tracing::warn!("Ignoring `model` in {}: it belongs to another provider", local_path.display());
-                                config.model = previous;
                             }
                         }
                         if let Some(t) = o.temperature {
@@ -1491,6 +1544,25 @@ mod tests {
         assert!(!loaded.local_llm_enabled);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn session_model_restores_its_provider() {
+        let mut cfg = Config::default();
+
+        cfg.adopt_session_model("gpt-4o", None);
+        assert_eq!(cfg.model, "gpt-4o");
+        assert_eq!(cfg.active_provider.as_deref(), Some("openai"));
+        assert!(!cfg.local_llm_enabled);
+
+        cfg.local_llm_enabled = true;
+        cfg.adopt_session_model("deepseek-flash", Some("deepseek"));
+        assert_eq!(cfg.active_provider.as_deref(), Some("deepseek"));
+        assert!(!cfg.local_llm_enabled);
+
+        // A stale provider must not send a model to the wrong API.
+        cfg.adopt_session_model("gpt-4o", Some("deepseek"));
+        assert_eq!(cfg.active_provider.as_deref(), Some("openai"));
     }
 
     #[test]

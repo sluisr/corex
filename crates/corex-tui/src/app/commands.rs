@@ -215,15 +215,16 @@ impl App {
                         if parts.len() > 2 {
                             let target = parts[2..].join(" ");
                             match Session::load_by_id_or_tag(&target) {
-                                Ok(loaded) => {
+                                Ok(mut loaded) => {
                                     let mut cfg = self.llm_client.get_config();
-                                    cfg.model = loaded.model.clone();
+                                    cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
                                     if let Some(t) = loaded.temperature {
                                         cfg.temperature = t;
                                     }
                                     if let Some(ref r) = loaded.reasoning_effort {
                                         cfg.reasoning_effort = r.clone();
                                     }
+                                    loaded.provider = cfg.active_provider.clone();
                                     self.llm_client.update_config(cfg);
                                     corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                                     let title = loaded.title.clone();
@@ -261,7 +262,8 @@ impl App {
                     "new" => {
                         let _ = self.session.save();
                         let cfg = self.llm_client.get_config();
-                        self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir));
+                        self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir))
+                            .with_provider(cfg.active_provider.clone());
                         self.streaming_text.clear();
                         self.thinking_state.reset();
                         self.cached_session_id.clear();
@@ -284,13 +286,14 @@ impl App {
                     match Session::load_by_id_or_tag(&target) {
                         Ok(mut loaded) => {
                             let mut cfg = self.llm_client.get_config();
-                            cfg.model = loaded.model.clone();
+                            cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
                             if let Some(t) = loaded.temperature {
                                 cfg.temperature = t;
                             }
                             if let Some(ref r) = loaded.reasoning_effort {
                                 cfg.reasoning_effort = r.clone();
                             }
+                            loaded.provider = cfg.active_provider.clone();
                             self.llm_client.update_config(cfg);
                             corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                             let title = loaded.title.clone();
@@ -340,7 +343,8 @@ impl App {
             "/new" => {
                 let _ = self.session.save();
                 let cfg = self.llm_client.get_config();
-                self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir));
+                self.session = Session::new_with_params(&cfg.model, cfg.temperature, &cfg.reasoning_effort, Some(&self.workspace_dir))
+                    .with_provider(cfg.active_provider.clone());
                 self.streaming_text.clear();
                 self.thinking_state.reset();
                 self.cached_session_id.clear();
@@ -356,7 +360,10 @@ impl App {
                     let new_model = parts[1];
                     let mut cfg = self.llm_client.get_config();
                     cfg.model = new_model.to_string();
-                    if !new_model.contains("local") {
+                    if new_model.contains("local") {
+                        cfg.local_llm_enabled = true;
+                        cfg.active_provider = Some(corex_core::providers::LOCAL_ID.to_string());
+                    } else {
                         cfg.local_llm_enabled = false;
                         // A model outside the catalog leaves the provider to be inferred from its name.
                         cfg.active_provider = cfg
@@ -369,6 +376,7 @@ impl App {
                     self.llm_client.update_config(cfg.clone());
                     corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
                     self.session.model = new_model.to_string();
+                    self.session.provider = cfg.active_provider.clone();
                     self.session.temperature = Some(cfg.temperature);
                     self.session.reasoning_effort = Some(cfg.reasoning_effort);
                     let _ = self.session.save();
