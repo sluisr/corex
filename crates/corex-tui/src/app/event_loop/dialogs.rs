@@ -1,6 +1,7 @@
 //! Keys for the modal dialogs: sudo password, API key, session picker, tool approval and the
 //! ask_user questions. Each handler returns `Flow::Pass` when its dialog is closed.
 
+use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use corex_core::client::set_sudo_password;
@@ -9,13 +10,27 @@ use corex_core::types::Message;
 use corex_tools::types::ToolContext;
 
 use super::tools::{finish_ask_user, first_sudo_command, run_single_tool, run_tools_in_parallel, show_next_call, tool_context};
-use super::{EventTx, Flow};
+use super::{is_ctrl_c, EventTx, Flow};
 use crate::app::formatting::extract_tool_allow_rules;
 use crate::app::state::App;
 
 pub(super) fn sudo_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Flow {
     if !app.sudo_dialog.is_open {
         return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        for call in take_sudo_calls(app) {
+            app.session.add_message(Message::tool_response(
+                call.id,
+                "Sudo authentication cancelled by user.",
+            ));
+        }
+        app.sudo_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        if app.pending_confirmation.is_none() && app.in_flight_tool_calls == 0 {
+            app.start_stream_turn(event_tx.clone());
+        }
+        return Flow::Handled;
     }
     match key.code {
         KeyCode::Esc => {
@@ -69,6 +84,14 @@ fn take_sudo_calls(app: &mut App) -> Vec<corex_core::types::ToolCall> {
 pub(super) fn auth_key(app: &mut App, key: KeyEvent) -> Flow {
     if !app.auth_dialog.is_open {
         return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.auth_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        app.session.add_message(Message::system(
+            "Auth dialog cancelled. You can set keys anytime via /model, /key, or run offline via /local."
+        ));
+        return Flow::Handled;
     }
     match key.code {
         KeyCode::Esc => {
@@ -133,6 +156,13 @@ fn save_api_key(app: &mut App, key_str: String) {
 pub(super) fn session_key(app: &mut App, key: KeyEvent) -> Flow {
     if !app.session_dialog.is_open {
         return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.session_dialog.pending_delete = None;
+        app.session_dialog.search_query.clear();
+        app.session_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        return Flow::Handled;
     }
     let filtered_count = app.session_dialog.filtered_sessions().len();
 
@@ -510,6 +540,12 @@ pub(super) fn rewind_key(app: &mut App, key: KeyEvent) -> Flow {
     if !app.rewind_dialog.is_open {
         return Flow::Pass;
     }
+    if is_ctrl_c(&key) {
+        app.rewind_dialog.confirming = None;
+        app.rewind_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        return Flow::Handled;
+    }
     match key.code {
         KeyCode::Esc => {
             if app.rewind_dialog.back() {
@@ -540,6 +576,12 @@ pub(super) fn rewind_key(app: &mut App, key: KeyEvent) -> Flow {
 pub(super) fn ask_user_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Flow {
     if !app.user_dialog.is_open {
         return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.user_dialog.cancelled = true;
+        app.last_ctrl_c_press = Some(Instant::now());
+        finish_ask_user(app, event_tx.clone());
+        return Flow::Handled;
     }
     let cur = app.user_dialog.current;
     match key.code {

@@ -273,6 +273,11 @@ fn is_ctrl_z(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a'))
 }
 
+pub(super) fn is_ctrl_c(key: &KeyEvent) -> bool {
+    (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')))
+        || key.code == KeyCode::Char('\x03')
+}
+
 async fn dispatch_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, terminal: &mut Tui) -> Result<Flow> {
     match ev {
         Event::Paste(pasted) => handle_paste(app, pasted),
@@ -329,6 +334,15 @@ async fn handle_mouse(app: &mut App, mouse: MouseEvent, terminal: &mut Tui) {
 
 /// Offers `key` to each handler in priority order until one uses it.
 async fn handle_key(app: &mut App, key: KeyEvent, event_tx: &EventTx, terminal: &mut Tui) -> Result<Flow> {
+    handle_key_inner(app, key, event_tx, Some(terminal)).await
+}
+
+async fn handle_key_inner(
+    app: &mut App,
+    key: KeyEvent,
+    event_tx: &EventTx,
+    terminal: Option<&mut Tui>,
+) -> Result<Flow> {
     macro_rules! offer {
         ($flow:expr) => {
             match $flow {
@@ -353,6 +367,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, event_tx: &EventTx, terminal: 
 fn model_key(app: &mut App, key: KeyEvent) -> Flow {
     if !app.model_dialog.is_open {
         return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.model_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        return Flow::Handled;
     }
     let action = app.model_dialog.handle_key(key.code);
     app.apply_model_dialog_action(action);
@@ -438,7 +457,7 @@ fn early_key(app: &mut App, key: KeyEvent) -> Flow {
 }
 
 /// Ctrl+O (expand logs), Ctrl+C twice (quit), Ctrl+T (thinking box), Ctrl+L (repaint).
-fn global_hotkey(app: &mut App, key: KeyEvent, terminal: &mut Tui) -> Result<Flow> {
+fn global_hotkey(app: &mut App, key: KeyEvent, terminal: Option<&mut Tui>) -> Result<Flow> {
     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let is_ctrl_o = (is_ctrl && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O')))
         || key.code == KeyCode::Char('\x0f');
@@ -453,26 +472,62 @@ fn global_hotkey(app: &mut App, key: KeyEvent, terminal: &mut Tui) -> Result<Flo
         return Ok(Flow::Handled);
     }
 
+    if is_ctrl_c(&key) {
+        let is_recent = app.last_ctrl_c_press.is_some_and(|i| i.elapsed() <= Duration::from_secs(2));
+        if is_recent {
+            return Ok(Flow::Quit);
+        }
+        app.last_ctrl_c_press = Some(Instant::now());
+        app.last_ctrl_z_press = None;
+        return Ok(Flow::Handled);
+    }
+
     if !is_ctrl {
         return Ok(Flow::Pass);
     }
     match key.code {
-        KeyCode::Char('c') | KeyCode::Char('\x03') => {
-            let is_recent = app.last_ctrl_c_press.is_some_and(|i| i.elapsed() <= Duration::from_secs(2));
-            if is_recent {
-                return Ok(Flow::Quit);
-            }
-            app.last_ctrl_c_press = Some(Instant::now());
-            app.last_ctrl_z_press = None;
-        }
         KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('\x14') => {
             app.thinking_state.is_expanded = !app.thinking_state.is_expanded;
             app.invalidate_message_cache();
         }
         KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Char('\x0c') => {
-            terminal.clear()?;
+            if let Some(term) = terminal {
+                term.clear()?;
+            }
         }
         _ => return Ok(Flow::Pass),
     }
     Ok(Flow::Handled)
+}
+
+#[cfg(test)]
+mod ctrl_c_tests {
+    use super::*;
+    use corex_core::client::LlmClient;
+    use corex_core::config::Config;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn first_ctrl_c_closes_model_or_session_dialog_and_second_quits() {
+        let mut app = App::new(LlmClient::new(Config::default()), PathBuf::from("/tmp"), false);
+        let (tx, _rx) = mpsc::channel(4);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.model_dialog.open(&Config::default());
+        assert!(app.model_dialog.is_open);
+        let flow1 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
+        assert!(matches!(flow1, Flow::Handled));
+        assert!(!app.model_dialog.is_open, "first Ctrl+C closes /model");
+
+        let flow2 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
+        assert!(matches!(flow2, Flow::Quit), "second Ctrl+C within 2s quits");
+
+        app.last_ctrl_c_press = None;
+        app.session_dialog.is_open = true;
+        let flow3 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
+        assert!(matches!(flow3, Flow::Handled));
+        assert!(!app.session_dialog.is_open, "first Ctrl+C closes /resume");
+        let flow4 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
+        assert!(matches!(flow4, Flow::Quit), "second Ctrl+C after /resume quits");
+    }
 }
