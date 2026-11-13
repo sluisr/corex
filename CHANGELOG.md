@@ -7,10 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.12.0-beta.1] - 2026-11-13
 
 ### Added
 - **Remote MCP servers (Streamable HTTP)**: The MCP client only knew stdio, so a cloud server such as Google Stitch could not be added at all. A server entry now takes a `url` and `headers` instead of a `command`: Corex posts one JSON-RPC message per request, accepts a JSON body or a `text/event-stream` reply (read until the matching response arrives, then the stream is dropped), echoes the `Mcp-Session-Id` the server returns and sends the negotiated `mcp-protocol-version`. A `401`/`403` reports expired credentials instead of a generic failure. Header values may be written as `${ENV_VAR}`, resolved when connecting, so an API key never has to reach `settings.json`. `/mcp add <name> <url> [Header=value ...]` adds one, `/mcp catalog` lists the new remote `stitch` template, and `/mcp status` marks each server as local or remote.
+- **Per-session provider isolation & `COREX_HOME`**: Sessions record their active provider alongside the model and restore it on resume (`-r`, `/resume`, `/chat resume`, session picker). `COREX_HOME` isolates settings, credentials, and sessions when running side-by-side instances.
+- **Latency metrics in `/stats`**: Tracks and displays TTFT (last and average), turn duration, and cumulative tool execution time.
+- **Prefix caching, pooling & parallel tool execution**: Static system prompt instructions, skills, and memory are ordered ahead of dynamic runtime context; UI-only notices are filtered from outbound LLM payloads; tool schemas are sorted and deduplicated across all providers including local LLMs; HTTP clients share keep-alive pools; subagents, headless CLI, and post-`ask_user` batches execute independent tools concurrently; and streaming Markdown uses incremental block caching.
+- **Modal `Ctrl+C` & full header wrapping**: First `Ctrl+C` cleanly closes open modal dialogs (`/model`, `/resume`, `/rewind`, `/key`, `sudo`, `ask_user`) while a second `Ctrl+C` quits; `/model` header metadata wraps instead of truncating with `…`, and fixed-level reasoning models hide misleading `‹ ›` arrows.
 
 ### Security
 - **Commands that read outside the project ask first**: Read-only commands such as `cat`, `grep` and `ls` ran without asking wherever they pointed, so `grep -r token /home` or `cat ~/.config/gh/hosts.yml` could hand credentials to the model unseen. They now ask when a file or folder is outside the project and the folders added with `/directory add`, as `read_file` already did. System folders (`/usr`, `/etc`, `/proc`, `/sys`, `/boot`, `/var/log`) are still read freely.
