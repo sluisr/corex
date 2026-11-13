@@ -171,7 +171,7 @@ pub fn render_rewind_dialog(frame: &mut Frame, area: Rect, dialog: &RewindDialog
                 let selected = i == dialog.option;
                 let style = if selected { strong } else { Style::default().fg(theme.foreground) };
                 lines.push(Line::from(vec![
-                    Span::styled(if selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue)),
+                    Span::styled(if selected { "› " } else { "  " }, Style::default().fg(theme.accent_blue)),
                     Span::styled(format!("{}. {}", i + 1, label), style),
                 ]));
             }
@@ -190,7 +190,7 @@ pub fn render_rewind_dialog(frame: &mut Frame, area: Rect, dialog: &RewindDialog
                 let selected = i == dialog.selected;
                 let style = if selected { strong } else { Style::default().fg(theme.foreground) };
                 lines.push(Line::from(vec![
-                    Span::styled(if selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue)),
+                    Span::styled(if selected { "› " } else { "  " }, Style::default().fg(theme.accent_blue)),
                     Span::styled(fit_text(text, width.saturating_sub(3)), style),
                 ]));
                 lines.push(Line::from(Span::styled(format!("   {}", fit_text(detail, width.saturating_sub(3))), dim)));

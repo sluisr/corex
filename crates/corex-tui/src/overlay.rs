@@ -108,8 +108,8 @@ impl Row {
 
 pub fn rail(row: Row, theme: &crate::theme::Theme) -> Span<'static> {
     match row {
-        Row::Cursor => Span::styled(" ▎ ", Style::default().fg(theme.accent_blue)),
-        Row::Current => Span::styled(" ▎ ", Style::default().fg(theme.border_dim)),
+        Row::Cursor => Span::styled(" › ", Style::default().fg(theme.accent_blue)),
+        Row::Current => Span::styled(" › ", Style::default().fg(theme.border_dim)),
         Row::Idle => Span::raw("   "),
     }
 }

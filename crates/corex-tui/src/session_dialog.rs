@@ -486,7 +486,7 @@ mod tests {
         let rows = screen(&mut s, 120);
         let row = rows.iter().find(|r| r.contains("first session")).expect("row");
         assert!(!row.contains("deepseek-flash"), "one model only: the column adds nothing: {row}");
-        let cursor = row.find('▎').unwrap();
+        let cursor = row.find('›').unwrap();
         let title = row.find("first").unwrap();
         assert!(title - cursor <= 8, "title sits next to the cursor, no reserved tag column: {row}");
 

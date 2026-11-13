@@ -468,7 +468,7 @@ pub fn render_file_popup(
                     Style::default().fg(theme.foreground)
                 };
                 Line::from(vec![
-                    Span::styled(if i == selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue)),
+                    Span::styled(if i == selected { "› " } else { "  " }, Style::default().fg(theme.accent_blue)),
                     Span::styled(pad_right(&fit_path(&printable(path), inner_w), inner_w + 1), style),
                 ])
             })

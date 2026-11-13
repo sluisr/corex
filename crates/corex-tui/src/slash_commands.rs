@@ -481,7 +481,7 @@ pub fn render_command_popup(
             .find(|a| !query.is_empty() && a.trim_start_matches('/').to_lowercase().contains(&query))
             .filter(|_| !cmd.name.trim_start_matches('/').to_lowercase().contains(&query));
 
-        let mut spans = vec![Span::styled(if is_selected { "▎ " } else { "  " }, Style::default().fg(theme.accent_blue))];
+        let mut spans = vec![Span::styled(if is_selected { "› " } else { "  " }, Style::default().fg(theme.accent_blue))];
         let name_text = format!("{:<w$}", cmd.name, w = name_w);
         spans.extend(highlighted(&name_text, &needle, style, hit));
         spans.push(Span::styled(
