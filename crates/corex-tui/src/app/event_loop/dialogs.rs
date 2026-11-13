@@ -557,7 +557,7 @@ pub(super) fn ask_user_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> 
         KeyCode::Down => {
             if let Some(q) = app.user_dialog.current_question() {
                 if q.has_options {
-                    let max = q.options.len().saturating_sub(1);
+                    let max = q.options.len();
                     if app.user_dialog.selected[cur] < max {
                         app.user_dialog.selected[cur] += 1;
                     }
@@ -565,27 +565,31 @@ pub(super) fn ask_user_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> 
             }
         }
         KeyCode::Backspace => {
-            if !app.user_dialog.questions[cur].has_options {
+            if app.user_dialog.current_needs_text() {
                 app.user_dialog.text_input[cur].pop();
             }
         }
         KeyCode::PageUp => app.scroll_chat(-10),
         KeyCode::PageDown => app.scroll_chat(10),
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
-            if let Some(q) = app.user_dialog.current_question() {
-                if q.has_options {
-                    // 1-9 pick an option.
-                    if let Some(idx) = c.to_digit(10).filter(|d| *d >= 1).map(|d| (d - 1) as usize) {
-                        if idx < q.options.len() {
-                            app.user_dialog.selected[cur] = idx;
-                        }
+            if app.user_dialog.current_needs_text() {
+                app.user_dialog.text_input[cur].push(c);
+            } else if let Some(q) = app.user_dialog.current_question() {
+                let digit = c.to_digit(10).filter(|d| *d >= 1).map(|d| (d - 1) as usize);
+                match digit {
+                    Some(idx) if idx <= q.options.len() => app.user_dialog.selected[cur] = idx,
+                    Some(_) => {}
+                    None => {
+                        app.user_dialog.selected[cur] = q.options.len();
+                        app.user_dialog.text_input[cur].push(c);
                     }
-                } else {
-                    app.user_dialog.text_input[cur].push(c);
                 }
             }
         }
         KeyCode::Enter => {
+            if app.user_dialog.on_custom_row(cur) && app.user_dialog.text_input[cur].trim().is_empty() {
+                return Flow::Handled;
+            }
             if cur + 1 < app.user_dialog.questions.len() {
                 app.user_dialog.current += 1;
             } else {

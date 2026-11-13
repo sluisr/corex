@@ -91,7 +91,7 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
             app.session.keep_history_before_compaction(&before);
             app.session.add_message(Message::system(notice));
             app.invalidate_message_cache();
-            let _ = app.session.save();
+            app.session.save_async();
             corex_core::trim_memory();
         }
         StreamEvent::Notice(notice) => {
@@ -235,7 +235,7 @@ fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) 
         app.streaming_text.clear();
         app.streaming_extra_content = None;
         app.invalidate_message_cache();
-        let _ = app.session.save();
+        app.session.save_async();
         if already_retried {
             app.is_streaming = false;
             app.thinking_state.reset();
@@ -250,7 +250,7 @@ fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) 
     app.session.add_message(Message::assistant_with_tools(assistant_text, reasoning, calls.clone()));
     app.streaming_text.clear();
     app.streaming_extra_content = None;
-    let _ = app.session.save();
+    app.session.save_async();
     dispatch_tool_calls(app, calls, event_tx);
 }
 
@@ -316,7 +316,7 @@ fn finish_answer(app: &mut App, assistant_text: Option<String>, reasoning: Optio
     app.streaming_text.clear();
     app.streaming_tool_calls.clear();
     app.streaming_extra_content = None;
-    let _ = app.session.save();
+    app.session.save_async();
     corex_core::trim_memory();
 
     // Automatically dequeue and run the next queued prompt.

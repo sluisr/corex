@@ -36,8 +36,35 @@ impl ForensicLogger {
         }
         let _ = crate::secure_fs::ensure_private_dir(&log_dir);
 
+        let mut global = match LOGGER.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *global = Some(ForensicLogger {
+            written: fs::metadata(&log_file_path).map(|m| m.len()).unwrap_or(0),
+            file: crate::secure_fs::open_private(&log_file_path, true).ok(),
+        });
+        drop(global);
+
+        let purge_dir = log_dir.clone();
+        std::thread::spawn(move || {
+            Self::purge_old_logs(&purge_dir);
+        });
+
+        Self::raw_append(&format!(
+            "\n--- SESSION START {} | workspace={} ---\n",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            workspace_dir
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "N/A".to_string())
+        ));
+
+        log_file_path
+    }
+
+    fn purge_old_logs(log_dir: &Path) {
         // Purge logs older than 7 days.
-        if let Ok(entries) = fs::read_dir(&log_dir) {
+        if let Ok(entries) = fs::read_dir(log_dir) {
             let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400);
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -54,26 +81,6 @@ impl ForensicLogger {
                 }
             }
         }
-
-        let mut global = match LOGGER.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        *global = Some(ForensicLogger {
-            written: fs::metadata(&log_file_path).map(|m| m.len()).unwrap_or(0),
-            file: crate::secure_fs::open_private(&log_file_path, true).ok(),
-        });
-        drop(global);
-
-        Self::raw_append(&format!(
-            "\n--- SESSION START {} | workspace={} ---\n",
-            Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            workspace_dir
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "N/A".to_string())
-        ));
-
-        log_file_path
     }
 
     fn raw_append(content: &str) {
@@ -116,17 +123,23 @@ impl ForensicLogger {
     }
 
     pub fn log_llm_request(engine: &str, model: &str, endpoint: &str, messages_count: usize, tools_count: usize, body: &str) {
+        Self::log_llm_request_bytes(engine, model, endpoint, messages_count, tools_count, body.as_bytes());
+    }
+
+    pub fn log_llm_request_bytes(engine: &str, model: &str, endpoint: &str, messages_count: usize, tools_count: usize, body: &[u8]) {
         if !Self::is_enabled() {
             return;
         }
         let body_preview = if body.len() > 8_192 {
+            let prefix = std::str::from_utf8(&body[..8_192])
+                .unwrap_or_else(|e| std::str::from_utf8(&body[..e.valid_up_to()]).unwrap_or(""));
             format!(
                 "{}\n... [{} bytes truncated]",
-                crate::types::safe_truncate_str(body, 8_192),
-                body.len() - 8_192
+                prefix,
+                body.len() - prefix.len()
             )
         } else {
-            body.to_string()
+            String::from_utf8_lossy(body).into_owned()
         };
         let details = format!(
             "Engine:     {}\nModel:      {}\nEndpoint:   {}\nMessages:   {}\nTools:      {}\nPayload (Preview):\n{}",
@@ -428,5 +441,14 @@ mod tests {
         assert!(!redacted.contains("ghp_1234567890abcdefghijklmnop"));
         assert!(!redacted.contains("my_secret_pw"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn log_llm_request_bytes_handles_multibyte_utf8_at_truncation_boundary() {
+        let mut payload = "a".repeat(8_191);
+        payload.push('ñ'); // 2-byte UTF-8 straddling index 8_191..8_193
+        payload.push_str(&"b".repeat(500));
+        // Must not panic when slicing at 8_192 bytes across a multibyte UTF-8 sequence.
+        ForensicLogger::log_llm_request_bytes("TestEngine", "test-model", "https://api.test", 1, 0, payload.as_bytes());
     }
 }

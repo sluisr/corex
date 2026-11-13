@@ -786,7 +786,7 @@ impl Config {
 
     fn save_to_destinations(content: &str, filename: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
         let is_temp = workspace.map(|w| w.starts_with(std::env::temp_dir())).unwrap_or(false);
-        if !isolated_home() {
+        if !isolated_home() || (cfg!(test) && is_temp) {
             if let Some(ws) = workspace {
                 let dir = ws.join(".corex");
                 if dir.exists() {
@@ -886,15 +886,24 @@ impl Config {
         keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
     }
 
-    /// The keys from the system keyring, else from `credentials.json`.
+    /// The keys from `credentials.json` (when present on disk) or the system keyring.
+    /// Checking the file first avoids a blocking D-Bus IPC round-trip on every startup when
+    /// credentials are stored on disk (`save_credentials` removes `credentials.json` whenever
+    /// the system keyring is active).
     fn load_credentials() -> Option<Credentials> {
+        if let Some(path) = Self::credentials_path().filter(|p| p.exists()) {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(credentials) = serde_json::from_str::<Credentials>(&content) {
+                    return Some(credentials);
+                }
+            }
+        }
         if let Some(stored) = Self::keyring_entry().and_then(|e| e.get_password().ok()) {
             if let Ok(credentials) = serde_json::from_str(&stored) {
                 return Some(credentials);
             }
         }
-        let content = fs::read_to_string(Self::credentials_path()?).ok()?;
-        serde_json::from_str(&content).ok()
+        None
     }
 
     /// Stores the keys in the system keyring and removes `credentials.json`; where no keyring
@@ -1029,7 +1038,9 @@ impl Config {
         // Workspace overrides (`.corex/settings.json`) are restricted to non-privileged fields.
         // Credentials, endpoints, `yolo_mode`, `local_llm_enabled`, `allowed_commands`, and
         // `mcp_servers` are ignored from workspace files.
-        if let Some(ws) = workspace.filter(|_| !isolated_home()) {
+        if let Some(ws) = workspace.filter(|w| {
+            !isolated_home() || (cfg!(test) && w.starts_with(std::env::temp_dir()))
+        }) {
             let local_path = ws.join(".corex").join("settings.json");
             if local_path.exists() {
                 match fs::read_to_string(&local_path)

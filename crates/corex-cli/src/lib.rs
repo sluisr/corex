@@ -108,7 +108,9 @@ pub async fn run() -> Result<()> {
     if cli.message.is_none() && cli.query.first().is_some_and(|word| word == "browser-host") {
         return corex_browser::run_native_host().await;
     }
-    let _ = corex_browser::install_native_host();
+    std::thread::spawn(|| {
+        let _ = corex_browser::install_native_host();
+    });
     if let Some(arg0) = std::env::args().next() {
         if (arg0.ends_with("cxs") || arg0.ends_with("cx-fleet")) && !cli.fleet {
             cli.fleet = true;
@@ -376,7 +378,7 @@ pub async fn run() -> Result<()> {
 
     let mut app = App::new(llm_client, workspace_dir.clone(), config.yolo_mode.is_active());
     app.set_yolo_mode(config.yolo_mode);
-    let _ = app.reload_mcp_servers().await;
+    app.start_mcp_background_load();
     if cli.fleet {
         app.enter_fleet_mode();
         app.fleet_dialog.open_async(&workspace_dir).await;

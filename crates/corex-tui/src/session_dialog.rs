@@ -3,12 +3,12 @@ use corex_core::session::{Session, SessionSummary};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlay::{begin_modal, key_hints, panel_rules};
-use crate::text::{fit_text, group_thousands, pad_right, strip_inline_markdown};
+use crate::overlay::{docked_height, docked_panel, highlight_cursor, key_hints, rail, row_text, Row};
+use crate::text::{fit_path, fit_text, group_thousands, pad_right, strip_inline_markdown};
 use crate::theme::Theme;
 
 #[derive(Debug, Default)]
@@ -116,29 +116,6 @@ impl SessionDialogState {
     }
 }
 
-/// Short label and colour of the model family a session was run with.
-fn model_badge(model: &str) -> (&'static str, Color) {
-    if model.starts_with("local") {
-        ("[Local]", Color::Rgb(255, 215, 130))
-    } else if model.contains("claude") || model.contains("anthropic") {
-        ("[Claude]", Color::Rgb(255, 167, 38))
-    } else if model.contains("gemini") {
-        ("[Gemini]", Color::Rgb(79, 195, 247))
-    } else if model.contains("gpt") || model.contains("openai") || model.starts_with("o1") || model.starts_with("o3") {
-        ("[GPT]", Color::Rgb(105, 240, 174))
-    } else if model.contains("llama") {
-        ("[Llama]", Color::Rgb(179, 136, 255))
-    } else if model.contains("codestral") || model.contains("mistral") {
-        ("[Mistral]", Color::Rgb(255, 112, 67))
-    } else if model.contains("pro") || model.contains("reasoner") {
-        ("[Pro]", Color::Rgb(215, 175, 255))
-    } else if model.contains("flash") {
-        ("[Flash]", Color::Rgb(135, 215, 235))
-    } else {
-        ("[Cloud]", Color::Rgb(129, 199, 245))
-    }
-}
-
 /// "5m ago" for recent sessions; from a week on a date ("Oct 17"), which tells two old sessions
 /// apart where "7d ago" would not.
 fn list_time(dt: DateTime<Utc>) -> String {
@@ -147,6 +124,15 @@ fn list_time(dt: DateTime<Utc>) -> String {
     } else {
         dt.with_timezone(&Local).format("%b %-d").to_string()
     }
+}
+
+const BODY_ROWS: usize = 12;
+const CONTENT_MAX_WIDTH: u16 = 120;
+const PREVIEW_FROM_WIDTH: u16 = 80;
+const COLUMN_GAP: u16 = 2;
+
+pub fn dialog_height(screen_height: u16) -> u16 {
+    docked_height(BODY_ROWS, screen_height)
 }
 
 pub fn render_session_dialog(
@@ -159,42 +145,16 @@ pub fn render_session_dialog(
         return;
     }
 
-    // Update the selected element's preview if it changed
     state.update_preview();
 
-    let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
+    let panel = docked_panel(frame, area, theme);
+    let inner = Rect::new(panel.x, panel.y, panel.width.min(CONTENT_MAX_WIDTH), panel.height);
+    let with_preview = inner.width >= PREVIEW_FROM_WIDTH && !crate::app::is_mobile_portrait(inner.width, 0);
 
-    let dialog_width = if is_mobile {
-        area.width.saturating_sub(2).max(20)
-    } else {
-        104.min(area.width.saturating_sub(4)).max(56.min(area.width))
-    };
-    let dialog_height = if is_mobile {
-        area.height.saturating_sub(2).min(28)
-    } else {
-        (area.height * 4 / 5)
-            .clamp(16, 26)
-            .min(area.height.saturating_sub(2))
-    };
-
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-    let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
-
-    // Soft dimmed background + perimeter breathing
-    begin_modal(frame, area, dialog_area, 2, 1);
-
-    // No fill, so a transparent terminal shows through; thin rules mark the top and bottom.
-    let panel = Block::default().padding(Padding::new(1, 1, 1, 1));
-    let inner = panel.inner(dialog_area);
-    frame.render_widget(panel, dialog_area);
-    panel_rules(frame, dialog_area, theme);
-
-    // Title and filter, a gap, the list beside its preview, a gap, the shortcuts.
     let vert_chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Min(8),
+        Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -202,94 +162,71 @@ pub fn render_session_dialog(
 
     let title = if state.is_fleet { "Fleet sessions" } else { "Sessions" };
     let mut search_spans = vec![
-        Span::styled(format!("   {title}   "), Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            if state.search_query.is_empty() {
-                "type to search by topic, #tag or model...".to_string()
-            } else {
-                state.search_query.clone()
-            },
-            if state.search_query.is_empty() {
-                Style::default().fg(theme.dark_gray)
-            } else {
-                Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)
-            },
-        ),
+        Span::styled(format!(" {title}  "), Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)),
+        if state.search_query.is_empty() {
+            Span::styled("type to filter by title, #tag or model", Style::default().fg(theme.dark_gray))
+        } else {
+            Span::styled(state.search_query.clone(), Style::default().fg(theme.foreground))
+        },
     ];
     if !state.search_query.is_empty() {
-        search_spans.push(Span::styled(format!(" {}", crate::cursor::underscore()), Style::default().fg(theme.accent_cyan)));
+        search_spans.push(Span::styled(crate::cursor::underscore(), Style::default().fg(theme.accent_blue)));
     }
     frame.render_widget(Paragraph::new(Line::from(search_spans)), vert_chunks[0]);
 
     let filtered = state.filtered_sessions();
     if filtered.is_empty() {
+        let dim = Style::default().fg(theme.dark_gray);
         let empty_msg = if state.sessions.is_empty() {
             vec![
-                Line::from(""),
+                Line::from(Span::styled("   No sessions in this workspace yet.", Style::default().fg(theme.gray))),
                 Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("No conversation sessions found for this workspace.", Style::default().fg(theme.gray)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("Sessions are automatically saved as you chat or via ", Style::default().fg(theme.dark_gray)),
-                    Span::styled("/save <tag>", Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD)),
-                    Span::styled(".", Style::default().fg(theme.dark_gray)),
+                    Span::styled("   They are saved as you chat, or with ", dim),
+                    Span::styled("/save <tag>", Style::default().fg(theme.foreground)),
+                    Span::styled(".", dim),
                 ]),
             ]
         } else {
             vec![
-                Line::from(""),
                 Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("No sessions matching: ", Style::default().fg(theme.gray)),
-                    Span::styled(&state.search_query, Style::default().fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled("   Nothing matches ", Style::default().fg(theme.gray)),
+                    Span::styled(state.search_query.clone(), Style::default().fg(theme.foreground)),
                 ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("Press Backspace to clear filter.", Style::default().fg(theme.dark_gray)),
-                ]),
+                Line::from(Span::styled("   Backspace clears the filter.", dim)),
             ]
         };
         frame.render_widget(Paragraph::new(empty_msg), vert_chunks[2]);
     } else {
-        // Columns that carry no information are not drawn: the tag chip only exists when some
-        // session has a tag, and the model badge only when sessions were run with different models.
         let tag_col = state
             .sessions
             .iter()
             .filter_map(|s| s.tag.as_ref())
             .map(|t| UnicodeWidthStr::width(t.as_str()).min(8))
             .max();
-        let mixed_models = state
-            .sessions
-            .iter()
-            .map(|s| model_badge(&s.model).0)
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            > 1;
-        let columns = ListColumns { tag_col, badges: mixed_models };
+        let models: std::collections::HashSet<&str> = state.sessions.iter().map(|s| s.model.as_str()).collect();
+        // Beside the preview the model is already named there, and the title needs the room.
+        let model_col = (models.len() > 1 && !with_preview)
+            .then(|| models.iter().map(|m| UnicodeWidthStr::width(*m)).max().unwrap_or(0).min(MODEL_COL_MAX));
+        let columns = ListColumns { tag_col, model_col };
 
-        if is_mobile {
-            render_session_list(frame, vert_chunks[2], &filtered, state.selected_idx, &columns, theme);
-        } else {
+        if with_preview {
             let split_h = Layout::horizontal([
-                Constraint::Percentage(58),
-                Constraint::Length(1), // Separador vertical
-                Constraint::Percentage(42),
+                Constraint::Percentage(56),
+                Constraint::Length(COLUMN_GAP),
+                Constraint::Min(0),
             ])
             .split(vert_chunks[2]);
 
             render_session_list(frame, split_h[0], &filtered, state.selected_idx, &columns, theme);
             render_session_preview(frame, split_h[2], state.cached_preview_session.as_ref(), theme);
+        } else {
+            render_session_list(frame, vert_chunks[2], &filtered, state.selected_idx, &columns, theme);
         }
     }
     let total = state.filtered_sessions().len();
     let position = (total > 0).then(|| state.selected_idx.min(total - 1) + 1);
 
-    let mut footer = vec![Span::raw("  ")];
+    let mut footer = vec![Span::raw(" ")];
     if let Some(pending) = state.pending_delete.as_ref() {
         let title = state
             .sessions
@@ -303,13 +240,15 @@ pub fn render_session_dialog(
             Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
         ));
         footer.extend(key_hints(&[("y", "yes"), ("n", "no")], theme));
-    } else if is_mobile {
-        footer.extend(key_hints(&[("Enter", "open"), ("^X", "delete"), ("Esc", "close")], theme));
     } else {
         let esc = if state.search_query.is_empty() { ("Esc", "close") } else { ("Esc", "clear filter") };
-        footer.extend(key_hints(&[("Enter", "resume"), ("Del", "delete"), ("↑↓", "navigate"), esc], theme));
+        let pairs = match (total, with_preview) {
+            (0, _) => vec![esc],
+            (_, true) => vec![("Enter", "resume"), ("Del", "delete"), ("↑↓", "navigate"), esc],
+            (_, false) => vec![("Enter", "open"), ("^X", "delete"), esc],
+        };
+        footer.extend(key_hints(&pairs, theme));
     }
-    // Where the cursor is in the list: only a screenful of sessions is ever visible.
     if let Some(pos) = position {
         let counter = format!("{}/{} ", pos, total);
         let used: usize = footer.iter().map(|s| s.width()).sum();
@@ -322,16 +261,14 @@ pub fn render_session_dialog(
     frame.render_widget(Paragraph::new(Line::from(footer)), vert_chunks[4]);
 }
 
-/// Which optional columns the session list draws.
 struct ListColumns {
-    /// Width of the longest `#tag` (capped), or `None` when no session has one.
     tag_col: Option<usize>,
-    /// Whether the model badge is shown (only useful when models are mixed).
-    badges: bool,
+    model_col: Option<usize>,
 }
 
-const BADGE_WIDTH: usize = 9; // "[Mistral]"
-const TIME_WIDTH: usize = 7;
+const MODEL_COL_MAX: usize = 20;
+const MIN_TITLE_WIDTH: usize = 28;
+const TIME_WIDTH: usize = 8;
 
 fn render_session_list(
     frame: &mut Frame,
@@ -345,62 +282,36 @@ fn render_session_list(
     let max_visible = area.height as usize;
 
     let selected = selected_idx.min(sessions.len().saturating_sub(1));
-    let start_idx = if selected >= max_visible {
-        selected + 1 - max_visible
-    } else {
-        0
-    };
+    let start_idx = (selected + 1).saturating_sub(max_visible);
     let end_idx = (start_idx + max_visible).min(sessions.len());
 
-    // cursor (3) + tag chip ("#" + tag + space) + badge + space, then the title, then the time.
     let tag_w = columns.tag_col.map_or(0, |w| w + 2);
-    let badge_w = if columns.badges { BADGE_WIDTH + 1 } else { 0 };
-    let right_w = TIME_WIDTH + 2;
-    let title_w = inner_w.saturating_sub(3 + tag_w + badge_w + right_w).max(10);
+    let fixed_w = 3 + tag_w + 2 + TIME_WIDTH + 1;
+    let model_col = columns.model_col.filter(|w| inner_w >= fixed_w + w + 2 + MIN_TITLE_WIDTH);
+    let title_w = inner_w.saturating_sub(fixed_w + model_col.map_or(0, |w| w + 2)).max(10);
+    let dim = Style::default().fg(theme.dark_gray);
 
     let mut lines = Vec::new();
     for (i, &s) in sessions.iter().enumerate().take(end_idx).skip(start_idx) {
-        let is_selected = i == selected;
-
-        let cursor = if is_selected { " ▎ " } else { "   " };
-        let cursor_style = Style::default().fg(theme.accent_blue);
-
-        let mut row = vec![Span::styled(cursor, cursor_style)];
+        let row = Row::of(i == selected, true);
+        let mut spans = vec![rail(row, theme)];
 
         if let Some(tag_col) = columns.tag_col {
             let chip = match s.tag.as_ref() {
                 Some(t) => format!("#{} ", pad_right(t, tag_col)),
                 None => " ".repeat(tag_col + 2),
             };
-            row.push(Span::styled(
-                chip,
-                Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD),
-            ));
-        }
-
-        if columns.badges {
-            let (label, fg) = model_badge(&s.model);
-            row.push(Span::styled(
-                format!("{} ", pad_right(label, BADGE_WIDTH)),
-                Style::default().fg(fg).add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled(chip, Style::default().fg(theme.muted)));
         }
 
         // A session without messages has nothing to resume: it stays listed but recedes.
-        let title_style = if s.message_count == 0 {
-            Style::default().fg(theme.dark_gray)
-        } else if is_selected {
-            Style::default().fg(theme.text_on_selected).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.foreground)
-        };
-        row.push(Span::styled(pad_right(&s.title, title_w), title_style));
-        row.push(Span::styled(
-            format!("{:>w$} ", list_time(s.updated_at), w = TIME_WIDTH),
-            Style::default().fg(theme.dark_gray),
-        ));
-        row.push(Span::styled(" ", Style::default()));
-        lines.push(Line::from(row));
+        let idle = if s.message_count == 0 { theme.dark_gray } else { theme.foreground };
+        spans.push(Span::styled(pad_right(&s.title, title_w), row_text(row, idle, theme)));
+        if let Some(model_col) = model_col {
+            spans.push(Span::styled(format!("  {}", pad_right(&s.model, model_col)), dim));
+        }
+        spans.push(Span::styled(format!("  {:>w$} ", list_time(s.updated_at), w = TIME_WIDTH), dim));
+        lines.push(highlight_cursor(row, Line::from(spans), inner_w, theme));
     }
 
     frame.render_widget(Paragraph::new(lines), area);
@@ -444,57 +355,43 @@ fn render_session_preview(
     theme: &Theme,
 ) {
     let w = area.width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let dim = Style::default().fg(theme.dark_gray);
 
     let Some(s) = session else {
-        lines.push(Line::from(Span::styled(" No preview available", Style::default().fg(theme.dark_gray))));
-        frame.render_widget(Paragraph::new(lines), area);
+        frame.render_widget(Paragraph::new(Span::styled("no preview", dim)), area);
         return;
     };
 
-    let label = Style::default().fg(theme.dark_gray);
-    let meta = |name: &'static str, value: String, style: Style| {
-        Line::from(vec![Span::styled(format!("  {:<11}", name), label), Span::styled(value, style)])
-    };
-    let value_w = w.saturating_sub(13).max(8);
+    let counts = format!(
+        " · {} messages · {} tokens",
+        s.messages.len(),
+        group_thousands(s.total_usage.total_tokens as u64)
+    );
+    let mut lines: Vec<Line<'static>> = vec![Line::from(vec![
+        Span::styled(fit_text(&s.model, w.saturating_sub(counts.chars().count()).max(8)), Style::default().fg(theme.foreground)),
+        Span::styled(counts, dim),
+    ])];
 
-    lines.push(Line::from(vec![
-        Span::styled(" Preview", Style::default().fg(theme.dark_gray).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" · ID: {}", corex_core::types::safe_truncate_str(&s.id, 8)),
-            Style::default().fg(theme.dark_gray),
-        ),
-    ]));
-    lines.push(Line::from(""));
-
-    lines.push(meta("Model:", fit_text(&s.model, value_w), Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)));
-    lines.push(Line::from(vec![
-        Span::styled(format!("  {:<11}", "Messages:"), label),
-        Span::styled(s.messages.len().to_string(), Style::default().fg(theme.accent_cyan)),
-        Span::styled(
-            format!("  ({} tokens)", group_thousands(s.total_usage.total_tokens as u64)),
-            Style::default().fg(theme.dark_gray),
-        ),
-    ]));
-    let fmt_time = |dt: DateTime<Utc>| dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string();
-    lines.push(meta("Updated:", fmt_time(s.updated_at), Style::default().fg(theme.gray)));
-    lines.push(meta("Created:", fmt_time(s.created_at), Style::default().fg(theme.gray)));
+    let mut origin = vec![
+        s.updated_at.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string(),
+        corex_core::types::safe_truncate_str(&s.id, 8).to_string(),
+    ];
+    if let Some(tag) = s.tag.as_ref() {
+        origin.push(format!("#{tag}"));
+    }
+    let mut origin = origin.join(" · ");
     if let Some(dir) = s.workspace_dir.as_deref().filter(|d| !d.is_empty()) {
-        lines.push(meta("Workspace:", fit_text(&with_home_as_tilde(dir), value_w), Style::default().fg(theme.gray)));
+        let room = w.saturating_sub(origin.chars().count() + 3);
+        if room >= 8 {
+            origin = format!("{origin} · {}", fit_path(&with_home_as_tilde(dir), room));
+        }
     }
-    if let Some(ref tag) = s.tag {
-        lines.push(meta("Tag:", format!("#{}", tag), Style::default().fg(theme.accent_green).add_modifier(Modifier::BOLD)));
-    }
-    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(fit_text(&origin, w), dim)));
+    lines.push(Line::default());
 
-    // A role-labelled excerpt: the label on the first row, the text wrapped under it.
-    let max_text_w = w.saturating_sub(2).max(10);
-    let excerpt = |tag: &'static str, tag_color: Color, text: String, text_color: Color, rows: usize| {
-        let spans = vec![
-            Span::styled(format!("{:<7}", tag), Style::default().fg(tag_color).add_modifier(Modifier::BOLD)),
-            Span::styled(text, Style::default().fg(text_color)),
-        ];
-        limit_lines(crate::markdown::wrap_spans_with_indent(spans, max_text_w, "  ", "         "), rows)
+    let excerpt = |who: &'static str, text: String, text_color: Color, rows: usize| {
+        let spans = vec![Span::styled(format!("{who:<7}"), dim), Span::styled(text, Style::default().fg(text_color))];
+        limit_lines(crate::markdown::wrap_spans_with_indent(spans, w.max(10), "", "       "), rows)
     };
 
     let turns = || s.messages.iter().filter(|m| matches!(m.role.as_str(), "user" | "assistant"));
@@ -502,22 +399,20 @@ fn render_session_preview(
     let last_assistant = turns().filter(|m| m.role == "assistant").last();
     let first_user = turns().find(|m| m.role == "user");
 
-    if last_user.is_some() || last_assistant.is_some() {
-        lines.push(Line::from(Span::styled("  Latest exchange", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD))));
-        if let Some(u) = last_user {
-            lines.extend(excerpt("You:", theme.accent_blue, message_snippet(u), theme.foreground, 3));
-        }
-        if let Some(a) = last_assistant {
-            lines.extend(excerpt("AI:", theme.accent_green, message_snippet(a), theme.gray, 4));
-        }
+    if let Some(u) = last_user {
+        lines.extend(excerpt("you", message_snippet(u), theme.foreground, 3));
+    }
+    if let Some(a) = last_assistant {
+        lines.extend(excerpt("corex", message_snippet(a), theme.gray, 4));
     }
 
     // Only when it differs from the latest one: otherwise it is the same text twice.
-    if let Some(first) = first_user {
+    let rows_left = (area.height as usize).saturating_sub(lines.len());
+    if let Some(first) = first_user.filter(|_| rows_left >= 3) {
         if !last_user.is_some_and(|last| std::ptr::eq(last, first)) {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  Started with", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD))));
-            lines.extend(excerpt("You:", theme.accent_blue, message_snippet(first), theme.gray, 2));
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("started with", dim)));
+            lines.extend(excerpt("you", message_snippet(first), theme.gray, (rows_left - 2).min(2)));
         }
     }
 
@@ -547,9 +442,10 @@ mod tests {
     fn screen(state: &mut SessionDialogState, width: u16) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
+        let height = dialog_height(30);
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
         terminal
-            .draw(|f| render_session_dialog(f, f.area(), state, &Theme::default()))
+            .draw(|f| render_session_dialog(f, Rect::new(0, 30 - height, width, height), state, &Theme::default()))
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height)
@@ -582,23 +478,24 @@ mod tests {
     }
 
     #[test]
-    fn list_draws_no_empty_tag_gap_and_hides_redundant_badges() {
+    fn list_draws_no_empty_tag_gap_and_names_the_model_only_when_they_differ() {
         let mut s = state_with(vec![
             summary("aaaa1111", "first session", None, "deepseek-flash", 3),
             summary("bbbb2222", "second session", None, "deepseek-flash", 5),
         ]);
         let rows = screen(&mut s, 120);
         let row = rows.iter().find(|r| r.contains("first session")).expect("row");
-        assert!(!row.contains("[Flash]"), "one model only: the badge adds nothing: {row}");
+        assert!(!row.contains("deepseek-flash"), "one model only: the column adds nothing: {row}");
         let cursor = row.find('▎').unwrap();
         let title = row.find("first").unwrap();
         assert!(title - cursor <= 8, "title sits next to the cursor, no reserved tag column: {row}");
 
-        // With mixed models and a tag, both columns come back.
         s.sessions.push(summary("cccc3333", "tagged session", Some("work"), "gpt-4o", 2));
-        let rows = screen(&mut s, 120);
-        let all = rows.join("\n");
-        assert!(all.contains("[Flash]") && all.contains("[GPT]") && all.contains("#work"));
+        let wide = screen(&mut s, 120).join("\n");
+        assert!(wide.contains("#work") && !wide.contains("gpt-4o"), "the preview names the model: {wide}");
+        let narrow = screen(&mut s, 76).join("\n");
+        assert!(narrow.contains("deepseek-flash") && narrow.contains("gpt-4o"), "{narrow}");
+        assert!(!narrow.contains('['), "the model is named, not guessed into a badge: {narrow}");
     }
 
     #[test]
@@ -628,8 +525,9 @@ mod tests {
         assert!(text.contains("195,373 tokens"), "{text}");
         assert!(text.contains("I don't know"), "markdown markers are gone: {text}");
         assert!(!text.contains("**") && !text.contains('`'), "{text}");
-        assert!(text.contains("Started with") && text.contains("research which cpu"), "{text}");
-        assert!(text.contains("Updated:") && text.contains("Created:") && text.contains("Workspace:"), "{text}");
+        assert!(text.contains("started with") && text.contains("research which cpu"), "{text}");
+        assert!(text.contains("4 messages") && text.contains("Juegos"), "{text}");
+        assert!(!text.contains("Preview") && !text.contains("AI:"), "{text}");
         assert!(text.contains('…'), "a clipped message is marked: {text}");
     }
 

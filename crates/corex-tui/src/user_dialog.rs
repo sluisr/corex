@@ -76,6 +76,14 @@ impl UserDialogState {
         self.questions.get(self.current)
     }
 
+    pub fn on_custom_row(&self, i: usize) -> bool {
+        self.questions.get(i).is_some_and(|q| q.has_options && self.selected[i] == q.options.len())
+    }
+
+    pub fn current_needs_text(&self) -> bool {
+        self.questions.get(self.current).is_some_and(|q| !q.has_options) || self.on_custom_row(self.current)
+    }
+
     /// Formats the user's answers as the `ask_user` tool output.
     pub fn format_output(&self) -> String {
         if self.cancelled {
@@ -83,7 +91,7 @@ impl UserDialogState {
         }
         let mut out = String::from("User's responses:\n");
         for (i, q) in self.questions.iter().enumerate() {
-            let answer = if q.has_options {
+            let answer = if q.has_options && !self.on_custom_row(i) {
                 let idx = self.selected[i].min(q.options.len().saturating_sub(1));
                 q.options.get(idx).cloned().unwrap_or_default()
             } else {
@@ -103,11 +111,14 @@ pub fn parse_questions(raw_args: &str) -> Option<Vec<UserQuestion>> {
     for q in arr {
         let question = q.get("question")?.as_str()?.to_string();
         let header = q.get("header").and_then(|h| h.as_str()).map(str::to_string);
-        let options: Vec<String> = q
+        let mut options: Vec<String> = q
             .get("options")
             .and_then(|o| o.as_array())
             .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
+        if options.len() > 1 && options.last().is_some_and(|o| is_catch_all(o)) {
+            options.pop();
+        }
         out.push(UserQuestion {
             header,
             question,
@@ -120,6 +131,16 @@ pub fn parse_questions(raw_args: &str) -> Option<Vec<UserQuestion>> {
     } else {
         Some(out)
     }
+}
+
+fn is_catch_all(option: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "other", "something else", "none of", "otra", "otro", "algo más", "algo mas", "ninguna", "ninguno",
+    ];
+    let lower = option.trim().to_lowercase();
+    PREFIXES.iter().any(|p| {
+        lower.strip_prefix(p).is_some_and(|rest| rest.chars().next().is_none_or(|c| !c.is_alphanumeric()))
+    })
 }
 
 /// `text` broken into rows of at most `width` columns, at spaces when it can. A word wider than a
@@ -169,6 +190,8 @@ fn wrap_rows(text: &str, width: usize) -> Vec<String> {
 /// Most options listed at once; the rest scroll with the selection.
 const MAX_VISIBLE_OPTIONS: usize = 8;
 
+const CUSTOM_PLACEHOLDER: &str = "Type something else…";
+
 /// Every row of the dialog body for `width` columns, plus the rows the selected option spans so
 /// the renderer can keep it on screen when the terminal is too short for everything.
 /// Long questions and options wrap with a hanging indent instead of being clipped at the edge,
@@ -189,21 +212,34 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
 
     // 2. Options or text input.
     if q.has_options {
-        let max_opts = q.options.len().min(MAX_VISIBLE_OPTIONS);
+        let total = q.options.len() + 1;
+        let max_opts = total.min(MAX_VISIBLE_OPTIONS);
         let cur_sel = state.selected[state.current];
         let window_start = if cur_sel >= max_opts { cur_sel + 1 - max_opts } else { 0 };
-        let num_w = (q.options.len()).to_string().len() + 2; // "10. "
+        let num_w = total.to_string().len() + 2;
+        let typed = &state.text_input[state.current];
 
-        for (idx, opt) in q.options.iter().enumerate().skip(window_start).take(max_opts) {
+        for idx in (window_start..total).take(max_opts) {
             let is_sel = idx == cur_sel;
-            let (marker_style, num_style, text_style) = if is_sel {
+            let is_custom = idx == q.options.len();
+            let (marker_style, num_style, mut text_style) = if is_sel {
                 (bullet, bullet, Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD))
             } else {
                 (Style::default(), Style::default().fg(theme.dark_gray), Style::default().fg(theme.gray))
             };
+            let text = if !is_custom {
+                q.options[idx].clone()
+            } else if typed.is_empty() {
+                text_style = Style::default().fg(theme.dark_gray).add_modifier(Modifier::ITALIC);
+                CUSTOM_PLACEHOLDER.to_string()
+            } else {
+                typed.clone()
+            };
             let first = lines.len();
             let text_w = width.saturating_sub(4 + num_w + 1).max(10);
-            for (i, row) in wrap_rows(opt, text_w).into_iter().enumerate() {
+            let rows = wrap_rows(&text, text_w);
+            let last = rows.len() - 1;
+            for (i, row) in rows.into_iter().enumerate() {
                 let lead = if i == 0 {
                     vec![
                         Span::styled(if is_sel { "  › " } else { "    " }, marker_style),
@@ -214,6 +250,9 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
                 };
                 let mut spans = lead;
                 spans.push(Span::styled(row, text_style));
+                if is_custom && is_sel && i == last {
+                    spans.push(Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)));
+                }
                 lines.push(Line::from(spans));
             }
             if is_sel {
@@ -221,7 +260,7 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
             }
         }
 
-        let remaining = q.options.len().saturating_sub(window_start + max_opts);
+        let remaining = total.saturating_sub(window_start + max_opts);
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
                 format!("     ... ({} more below)", remaining),
@@ -250,9 +289,11 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
     }
 
     // 3. Hint footer.
-    let hint = if q.has_options {
-        if q.options.len() <= 9 {
-            format!("  ↑↓ or 1-{} · enter confirm · esc cancel", q.options.len())
+    let hint = if state.on_custom_row(state.current) {
+        "  ↑↓ options · enter confirm · esc cancel".to_string()
+    } else if q.has_options {
+        if q.options.len() < 9 {
+            format!("  ↑↓ or 1-{} · enter confirm · esc cancel", q.options.len() + 1)
         } else {
             "  ↑↓ navigate · enter confirm · esc cancel".to_string()
         }
@@ -310,6 +351,14 @@ mod tests {
     }
 
     #[test]
+    fn trailing_catch_all_option_is_dropped() {
+        let raw = r#"{"questions":[{"question":"Q?","options":["Lanzar la TUI","Otra cosa (te la digo)"]},{"question":"Q2?","options":["Otros ajustes","Other"]}]}"#;
+        let qs = parse_questions(raw).unwrap();
+        assert_eq!(qs[0].options, vec!["Lanzar la TUI"]);
+        assert_eq!(qs[1].options, vec!["Otros ajustes"]);
+    }
+
+    #[test]
     fn test_parse_questions_rejects_empty() {
         assert!(parse_questions(r#"{"questions":[]}"#).is_none());
         assert!(parse_questions(r#"{"foo":1}"#).is_none());
@@ -325,6 +374,18 @@ mod tests {
         state.selected[0] = 1;
         let out = state.format_output();
         assert!(out.contains("B"), "output should contain selected option: {}", out);
+    }
+
+    #[test]
+    fn custom_row_answer_replaces_options() {
+        let mut state = open_with(r#"{"questions":[{"question":"What?","options":["A","B"]}]}"#);
+        state.selected[0] = 2;
+        state.text_input[0] = "something else".to_string();
+        assert!(state.on_custom_row(0));
+        let out = state.format_output();
+        assert!(out.contains("-> something else"), "{out}");
+        let (lines, sel) = dialog_lines(state.current_question().unwrap(), &state, 80, &Theme::default());
+        assert!(plain(&lines[sel.start]).contains("3. something else"));
     }
 
     #[test]

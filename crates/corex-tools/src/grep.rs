@@ -5,7 +5,7 @@ use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::json;
 
-use crate::fs_tools::{is_binary_file, resolve_path};
+use crate::fs_tools::{is_valid_walk_file, resolve_path};
 use crate::types::{Tool, ToolContext, ToolOutput};
 use corex_core::safe_truncate_str;
 
@@ -107,86 +107,140 @@ impl Tool for GrepTool {
             Err(e) => return Ok(ToolOutput::error(format!("Invalid regex pattern: {}", e))),
         };
 
-        let mut output = Vec::new();
-        let mut total_matches = 0;
+        let pattern_owned = pattern.to_string();
+        let workspace_dir = context.workspace_dir.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            let mut total_matches = 0;
 
-        let walker = WalkBuilder::new(&root_dir)
-            .hidden(false)
-            .git_ignore(true)
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                name != ".git"
-            })
-            .build();
+            let walker = WalkBuilder::new(&root_dir)
+                .hidden(false)
+                .git_ignore(true)
+                .filter_entry(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    name != ".git"
+                })
+                .build();
 
-        for entry in walker.flatten() {
-            let path = entry.path();
-            if !path.is_file()
-                || !crate::fs_tools::is_within_workspace(path, &root_dir)
-                || crate::fs_tools::is_sensitive_system_path(path)
-                || is_binary_file(path)
-            {
-                continue;
-            }
-
-            let rel_display = path
-                .strip_prefix(&context.workspace_dir)
-                .unwrap_or(path)
-                .to_string_lossy();
-
-            if let Some(ref filter) = include_filter {
-                if !filter.matches(&rel_display) {
+            for entry in walker.flatten() {
+                if !is_valid_walk_file(&entry, &root_dir) {
                     continue;
                 }
-            }
+                let path = entry.path();
+                let rel_display = path
+                    .strip_prefix(&workspace_dir)
+                    .unwrap_or(path)
+                    .to_string_lossy();
 
-            // Skip files larger than 10 MB to prevent memory exhaustion / OOM crashes
-            let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-            if file_size > 10 * 1024 * 1024 {
-                continue;
-            }
-
-            let content = match fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let lines: Vec<&str> = content.lines().collect();
-            for (idx, line) in lines.iter().enumerate() {
-                if regex.is_match(line) {
-                    total_matches += 1;
-                    let start = idx.saturating_sub(context_lines);
-                    let end = (idx + context_lines + 1).min(lines.len());
-
-                    output.push(format!("--- {} ---", rel_display));
-                    for (i, l) in lines[start..end].iter().enumerate() {
-                        let line_num = start + i + 1;
-                        let marker = if line_num == idx + 1 { ">" } else { " " };
-                        let display_line = if l.len() > 350 {
-                            format!("{}... [truncated]", safe_truncate_str(l, 350))
-                        } else {
-                            l.to_string()
-                        };
-                        output.push(format!("{}{:4} | {}", marker, line_num, display_line));
-                    }
-                    output.push(String::new());
-
-                    if total_matches >= max_matches {
-                        output.push(format!("(Max matches limit {} reached)", max_matches));
-                        break;
+                if let Some(ref filter) = include_filter {
+                    if !filter.matches(&rel_display) {
+                        continue;
                     }
                 }
-            }
 
-            if total_matches >= max_matches {
-                break;
+                // Skip files larger than 10 MB to prevent memory exhaustion / OOM crashes
+                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if file_size > 10 * 1024 * 1024 {
+                    continue;
+                }
+
+                let bytes = match fs::read(path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if bytes[..bytes.len().min(1024)].contains(&0) {
+                    continue;
+                }
+                let content = match String::from_utf8(bytes) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                if !regex.is_match(&content) {
+                    continue;
+                }
+
+                let lines: Vec<&str> = content.lines().collect();
+                for (idx, line) in lines.iter().enumerate() {
+                    if regex.is_match(line) {
+                        total_matches += 1;
+                        let start = idx.saturating_sub(context_lines);
+                        let end = (idx + context_lines + 1).min(lines.len());
+
+                        output.push(format!("--- {} ---", rel_display));
+                        for (i, l) in lines[start..end].iter().enumerate() {
+                            let line_num = start + i + 1;
+                            let marker = if line_num == idx + 1 { ">" } else { " " };
+                            let display_line = if l.len() > 350 {
+                                format!("{}... [truncated]", safe_truncate_str(l, 350))
+                            } else {
+                                l.to_string()
+                            };
+                            output.push(format!("{}{:4} | {}", marker, line_num, display_line));
+                        }
+                        output.push(String::new());
+
+                        if total_matches >= max_matches {
+                            output.push(format!("(Max matches limit {} reached)", max_matches));
+                            break;
+                        }
+                    }
+                }
+
+                if total_matches >= max_matches {
+                    break;
+                }
             }
-        }
+            output
+        })
+        .await?;
 
         if output.is_empty() {
-            Ok(ToolOutput::success(format!("No matches found for '{}'.", pattern)))
+            Ok(ToolOutput::success(format!("No matches found for '{}'.", pattern_owned)))
         } else {
             Ok(ToolOutput::success(output.join("\n")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grep_searches_directory_and_single_file_and_skips_binaries() {
+        let ws = std::env::temp_dir().join(format!("corex_grep_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(ws.join("src")).unwrap();
+        fs::write(ws.join("src/main.rs"), "fn alpha() {}\nfn needle_here() {}\n").unwrap();
+        fs::write(ws.join("src/ignore.txt"), "nothing\n").unwrap();
+        fs::write(ws.join("src/bin.dat"), b"\x00\x01needle_here\x00").unwrap();
+
+        let ctx = ToolContext {
+            workspace_dir: ws.clone(),
+            yolo_mode: true,
+            yolo_all: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+
+        let res = GrepTool
+            .execute(json!({ "pattern": "needle_here", "include_pattern": "*.rs" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        assert!(res.output.contains("src/main.rs"), "{}", res.output);
+        assert!(res.output.contains(">   2 | fn needle_here() {}"), "{}", res.output);
+        assert!(!res.output.contains("bin.dat"), "{}", res.output);
+
+        // Searching a single file directly via dir_path (depth == 0) must also work.
+        let single = GrepTool
+            .execute(json!({ "pattern": "needle_here", "dir_path": "src/main.rs" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!single.is_error);
+        assert!(single.output.contains("fn needle_here()"), "{}", single.output);
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

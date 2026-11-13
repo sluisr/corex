@@ -263,9 +263,8 @@ fn push_edit_diff(
     }
 }
 
-/// Finds the `(name, arguments)` of the call a tool message answers by matching its
-/// `tool_call_id` against the assistant turns before it.
-fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> {
+/// Index of the assistant turn the tool message at `idx` answers.
+fn answer_owner(messages: &[Message], idx: usize) -> Option<usize> {
     let msg = messages.get(idx)?;
     if msg.role != "tool" {
         return None;
@@ -273,16 +272,20 @@ fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> 
     let id = msg.tool_call_id.as_deref()?;
     messages[..idx]
         .iter()
-        .rev()
-        .filter(|m| m.role == "assistant")
-        .take(16)
-        .find_map(|m| {
-            m.tool_calls
-                .as_ref()?
-                .iter()
-                .find(|c| c.id == id)
-                .map(|c| (c.function.name.as_str(), c.function.arguments.as_str()))
-        })
+        .rposition(|m| m.tool_calls.as_ref().is_some_and(|calls| calls.iter().any(|c| c.id == id)))
+}
+
+/// Finds the `(name, arguments)` of the call a tool message answers by matching its
+/// `tool_call_id` against the assistant turns before it.
+fn answered_tool_call(messages: &[Message], idx: usize) -> Option<(&str, &str)> {
+    let owner = answer_owner(messages, idx)?;
+    let id = messages.get(idx)?.tool_call_id.as_deref()?;
+    messages[owner]
+        .tool_calls
+        .as_ref()?
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| (c.function.name.as_str(), c.function.arguments.as_str()))
 }
 
 /// Indexes the tool responses of `messages` by the call they answer.
@@ -297,6 +300,20 @@ fn tool_answers(messages: &[Message]) -> ToolAnswers<'_> {
         }
     }
     answers
+}
+
+/// Whether `msg` needs the answers map: an assistant turn draws the output of each call right
+/// under it, and a bare tool response asks the map whether it was already drawn that way.
+fn needs_answers(msg: &Message) -> bool {
+    msg.role == "tool" || (msg.role == "assistant" && msg.tool_calls.is_some())
+}
+
+fn pending_owner(messages: &[Message], pending: &PendingToolBatch) -> Option<usize> {
+    messages.iter().rposition(|m| {
+        m.tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|c| pending.calls.iter().any(|p| p.id == c.id)))
+    })
 }
 
 /// The `… (+N lines above)` row a collapsed log leaves behind.
@@ -795,8 +812,10 @@ pub fn render_message_lines(
             }
         }
         "tool" => {
-            // Already drawn under the call that produced it.
-            if answers.is_some_and(|a| msg.tool_call_id.as_deref().is_some_and(|id| a.contains_key(id))) {
+            // Drawn under its call already; the owner check keeps an orphaned response visible.
+            let drawn_under_call = tool_call.is_some()
+                && answers.is_some_and(|a| msg.tool_call_id.as_deref().is_some_and(|id| a.contains_key(id)));
+            if drawn_under_call {
                 return lines;
             }
             let content = msg.text_content().unwrap_or("");
@@ -1145,7 +1164,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 .clamp(1, MAX_COMPOSER_LINES)
         }
     };
-    let composer_height = if app.rewind_dialog.is_open {
+    let composer_height = if app.auth_dialog.is_open {
+        crate::auth_dialog::dialog_height(size.height)
+    } else if app.session_dialog.is_open {
+        crate::session_dialog::dialog_height(size.height)
+    } else if app.model_dialog.is_open {
+        app.model_dialog.height(size.width, size.height)
+    } else if app.rewind_dialog.is_open {
         app.rewind_dialog.height(size.height)
     } else if app.user_dialog.is_open {
         crate::user_dialog::calculate_dialog_height(&app.user_dialog, size.width, size.height)
@@ -1228,10 +1253,24 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let message_total = app.session.display_messages().len();
     app.message_clock.observe(&app.session.id, message_total);
 
-    let mut target_cache_count = if app.pending_confirmation.is_some() {
-        message_total.saturating_sub(1)
-    } else {
-        message_total
+    // A response that landed after its call was cached leaves that block stale: rebuild from the call.
+    if app.cached_message_count > 0 && app.cached_message_count < message_total {
+        let stale_owner = {
+            let messages = app.session.display_messages();
+            let cached = app.cached_message_count;
+            (cached..message_total)
+                .filter_map(|idx| answer_owner(messages, idx))
+                .filter(|owner| *owner < cached)
+                .min()
+        };
+        if let Some(owner) = stale_owner {
+            app.invalidate_message_cache_from(owner);
+        }
+    }
+
+    let mut target_cache_count = match app.pending_confirmation.as_ref() {
+        Some(pending) => pending_owner(app.session.display_messages(), pending).unwrap_or(message_total.saturating_sub(1)),
+        None => message_total,
     };
 
     let live_run = if !app.logs_expanded && (app.is_streaming || app.pending_confirmation.is_some()) {
@@ -1242,7 +1281,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         None
     };
     if let Some(start) = live_run {
-        target_cache_count = target_cache_count.min(start);
+        target_cache_count = start;
     }
 
     let mut keep_messages = target_cache_count;
@@ -1271,14 +1310,21 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         }
         let start_idx = app.cached_message_count;
         let mut next_block = super::copy::blocks_before(app.session.display_messages(), start_idx) + 1;
+        let shared_answers = {
+            let messages = app.session.display_messages();
+            messages[start_idx..target_cache_count]
+                .iter()
+                .any(needs_answers)
+                .then(|| tool_answers(&messages[..target_cache_count]))
+        };
+        let mut rendered_batch = Vec::with_capacity(target_cache_count - start_idx);
         for msg_idx in start_idx..target_cache_count {
             let messages = app.session.display_messages();
             let msg = &messages[msg_idx];
             let first_block = next_block;
             next_block += super::copy::block_count(msg);
             let next_msg = messages[..target_cache_count].get(msg_idx + 1);
-            let answers = (msg.role == "assistant" && msg.tool_calls.is_some())
-                .then(|| tool_answers(&messages[..target_cache_count]));
+            let answers = needs_answers(msg).then_some(shared_answers.as_ref()).flatten();
             let run = if app.logs_expanded { None } else { browser_run::run_start(messages, msg_idx) };
             let rendered = match run {
                 Some(start) if start < msg_idx => Vec::new(),
@@ -1318,9 +1364,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     app.thinking_state.is_expanded,
                     answered_tool_call(messages, msg_idx),
                     true,
-                    answers.as_ref(),
+                    answers,
                 ),
             };
+            rendered_batch.push((first_block, rendered));
+        }
+        drop(shared_answers);
+        for (first_block, rendered) in rendered_batch {
             if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
                 app.cached_has_collapsed_logs = true;
             }
@@ -1375,28 +1425,28 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             &app.theme,
             content_max_width,
         ));
-    } else if target_cache_count < app.session.display_messages().len() {
-        let msg_idx = target_cache_count;
+    } else {
         let messages = app.session.display_messages();
-        let msg = &messages[msg_idx];
-        let next_msg = messages.get(msg_idx + 1);
-        let answers = (msg.role == "assistant" && msg.tool_calls.is_some()).then(|| tool_answers(messages));
-        let rendered = render_message_lines(
-            msg_idx,
-            msg,
-            next_msg,
-            &app.theme,
-            content_max_width,
-            app.pending_confirmation.as_ref(),
-            app.logs_expanded,
-            app.thinking_state.is_expanded,
-            answered_tool_call(messages, msg_idx),
-            true,
-            answers.as_ref(),
-        );
-        let first_block = super::copy::blocks_before(app.session.display_messages(), msg_idx) + 1;
-        app.copy_headers.tail.extend(super::copy::number_headers(&rendered, 0, first_block));
-        tail_lines.extend(rendered);
+        let held_from = target_cache_count.min(messages.len());
+        let answers = messages[held_from..].iter().any(needs_answers).then(|| tool_answers(messages));
+        for msg_idx in held_from..messages.len() {
+            let rendered = render_message_lines(
+                msg_idx,
+                &messages[msg_idx],
+                messages.get(msg_idx + 1),
+                &app.theme,
+                content_max_width,
+                app.pending_confirmation.as_ref(),
+                app.logs_expanded,
+                app.thinking_state.is_expanded,
+                answered_tool_call(messages, msg_idx),
+                true,
+                answers.as_ref(),
+            );
+            let first_block = super::copy::blocks_before(messages, msg_idx) + 1;
+            app.copy_headers.tail.extend(super::copy::number_headers(&rendered, tail_lines.len(), first_block));
+            tail_lines.extend(rendered);
+        }
     }
 
     // Render Tool Confirmation Dialog inline directly in the chat stream!
@@ -1430,11 +1480,21 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     Span::styled(format!(" · {:.1}s ", elapsed), Style::default().fg(app.theme.gray)),
                     Span::styled("(Ctrl+T to collapse)", Style::default().fg(app.theme.dark_gray)),
                 ]));
-                for cot_line in app.thinking_state.content.trim().lines() {
-                    let clean = cot_line.replace('\t', "    ");
-                    let spans = vec![Span::styled(clean, Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC))];
-                    tail_lines.extend(crate::markdown::wrap_spans(spans, content_max_width, "    │ "));
+                if app.thinking_state.cached_len != app.thinking_state.content.len()
+                    || app.thinking_state.cached_width != content_max_width
+                {
+                    app.thinking_state.cached_lines.clear();
+                    for cot_line in app.thinking_state.content.trim().lines() {
+                        let clean = cot_line.replace('\t', "    ");
+                        let spans = vec![Span::styled(clean, Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC))];
+                        app.thinking_state.cached_lines.extend(
+                            crate::markdown::wrap_spans(spans, content_max_width, "    │ "),
+                        );
+                    }
+                    app.thinking_state.cached_len = app.thinking_state.content.len();
+                    app.thinking_state.cached_width = content_max_width;
                 }
+                tail_lines.extend(app.thinking_state.cached_lines.iter().cloned());
                 tail_lines.push(Line::from(""));
             } else {
                 tail_lines.push(Line::from(vec![
@@ -1758,7 +1818,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         );
     }
 
-    if app.rewind_dialog.is_open {
+    if app.auth_dialog.is_open {
+        render_auth_dialog(frame, composer_chunk, &app.auth_dialog, &app.theme);
+    } else if app.session_dialog.is_open {
+        render_session_dialog(frame, composer_chunk, &mut app.session_dialog, &app.theme);
+    } else if app.model_dialog.is_open {
+        render_model_dialog(frame, composer_chunk, &app.model_dialog, &app.theme);
+    } else if app.rewind_dialog.is_open {
         crate::rewind_dialog::render_rewind_dialog(frame, composer_chunk, &app.rewind_dialog, &app.theme);
     } else if app.user_dialog.is_open {
         render_user_dialog(frame, composer_chunk, &app.user_dialog, &app.theme);
@@ -2092,18 +2158,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     if app.sudo_dialog.is_open {
         render_sudo_dialog(frame, size, &app.sudo_dialog, &app.theme);
-    }
-
-    if app.model_dialog.is_open {
-        render_model_dialog(frame, size, &app.model_dialog, &app.theme);
-    }
-
-    if app.auth_dialog.is_open {
-        render_auth_dialog(frame, size, &app.auth_dialog, &app.theme);
-    }
-
-    if app.session_dialog.is_open {
-        render_session_dialog(frame, size, &mut app.session_dialog, &app.theme);
     }
 }
 

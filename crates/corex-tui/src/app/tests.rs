@@ -1703,6 +1703,43 @@ use corex_core::types::ToolCall;
             .join("\n")
     }
 
+    fn screen_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render_ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dialogs_dock_where_the_composer_is() {
+        let mut app = idle_app().await;
+        app.auth_dialog.close();
+        let placeholder = "for shortcuts";
+        assert!(screen_rows(&mut app, 120, 40).join("\n").contains(placeholder));
+
+        app.model_dialog.open(&corex_core::config::Config::default());
+        let rows = screen_rows(&mut app, 120, 40);
+        let rules: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.starts_with("────")).map(|(y, _)| y).collect();
+        assert_eq!(rules.len(), 2, "{}", rows.join("\n"));
+        assert_eq!(rules[1], rows.len() - 2, "the panel ends right above the status line");
+        assert!(rows[rules[0] + 1].starts_with(" Model"), "{}", rows.join("\n"));
+        assert!(!rows.join("\n").contains(placeholder), "the panel takes the composer's place");
+
+        app.model_dialog.close();
+        app.session_dialog.is_open = true;
+        let rows = screen_rows(&mut app, 120, 40);
+        assert!(rows[rows.len() - 2].starts_with("────") && rows.iter().any(|r| r.starts_with(" Sessions")));
+
+        app.session_dialog.close();
+        app.auth_dialog.open();
+        let rows = screen_rows(&mut app, 120, 40);
+        assert!(rows[rows.len() - 2].starts_with("────") && rows.iter().any(|r| r.starts_with(" DeepSeek API key")));
+    }
+
     #[tokio::test]
     async fn test_busy_agent_tells_what_enter_and_alt_enter_do() {
         let mut app = idle_app().await;
@@ -2113,6 +2150,76 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
             1, &answer_a, None, &theme, 100, None, false, false, Some(("read_file", "{}")), true, Some(&answers),
         );
         assert!(bare.is_empty(), "a tool message must not be drawn twice: {bare:#?}");
+    }
+
+    fn tall_screen(app: &mut App) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|f| render_ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_result_that_lands_late_is_drawn_once_under_its_call() {
+        let mut app = idle_app().await;
+        app.session.add_message(Message::user("create the probe".to_string()));
+        app.session.add_message(Message::assistant_with_tools(
+            None,
+            None,
+            vec![ToolCall::new("call_w", "write", r#"{"file_path":"tests/harness_probe_tmp.rs"}"#)],
+        ));
+
+        // The call is drawn and cached before its output exists.
+        let pending = tall_screen(&mut app);
+        assert_eq!(pending.matches("harness_probe_tmp.rs").count(), 1, "{pending}");
+        assert!(!pending.contains("Successfully created"), "{pending}");
+
+        // The output lands afterwards, without anyone invalidating the cache by hand.
+        app.session.add_message(Message::tool_response(
+            "call_w",
+            "Successfully created tests/harness_probe_tmp.rs (201 lines, 7.2 KB).".to_string(),
+        ));
+
+        let drawn = tall_screen(&mut app);
+        assert_eq!(drawn.matches("Successfully created").count(), 1, "the output is drawn once: {drawn}");
+        assert_eq!(drawn.matches("harness_probe_tmp.rs").count(), 2, "header + one output: {drawn}");
+    }
+
+    #[tokio::test]
+    async fn a_result_that_lands_while_approval_is_open_stays_visible() {
+        let mut app = idle_app().await;
+        app.session.add_message(Message::user("go".to_string()));
+        let free = ToolCall::new("free", "read_file", r#"{"file_path":"x.rs"}"#);
+        let gated = ToolCall::new("gated", "run_shell_command", r#"{"command":"rm -rf target"}"#);
+        app.session.add_message(Message::assistant_with_tools(None, None, vec![free, gated.clone()]));
+        app.pending_confirmation = Some(crate::app::state::PendingToolBatch {
+            total_count: 1,
+            calls: vec![gated],
+            current_idx: 1,
+            diff_preview: Some("$ rm -rf target".to_string()),
+            selected_option: 0,
+            diff_expanded: false,
+            input_mode: false,
+            feedback_text: String::new(),
+        });
+        tall_screen(&mut app);
+        app.session.add_message(Message::tool_response("free", "OUT_FREE".to_string()));
+
+        for _ in 0..2 {
+            let waiting = tall_screen(&mut app);
+            assert_eq!(waiting.matches("OUT_FREE").count(), 1, "{waiting}");
+            assert_eq!(waiting.matches("rm -rf target").count(), 1, "{waiting}");
+            assert_eq!(app.cached_message_count, 1);
+        }
+
+        app.pending_confirmation = None;
+        let approved = tall_screen(&mut app);
+        assert_eq!(approved.matches("OUT_FREE").count(), 1, "{approved}");
     }
 
     #[test]

@@ -187,6 +187,7 @@ impl App {
             steer_messages: Vec::new(),
             start_time: Instant::now(),
             last_interaction: Instant::now(),
+            mcp_startup_rx: None,
         };
         corex_fleet::register_fleet_tools(&mut app.tool_registry);
         crate::app::render::set_user_label(cfg.user_name.as_deref());
@@ -203,7 +204,9 @@ impl App {
                 app.session.add_message(Message::system(format!("{why}; /export saves to ~/.corex/exports until it is fixed.")));
             }
         }
-        app.trigger_local_health_check();
+        if cfg.local_llm_enabled || cfg.model.starts_with("local") {
+            app.trigger_local_health_check();
+        }
         app.trigger_update_check();
         if cfg.api_key.trim().is_empty() && cfg.endpoint().1.trim().is_empty() && !cfg.local_llm_enabled {
             app.set_status("No API key configured · Type /model to choose AI or /local");
@@ -1046,7 +1049,55 @@ impl App {
         });
     }
 
+    /// Spawns initial MCP server connections in the background so `run_tui` can paint the first
+    /// frame immediately without blocking on remote HTTP or stdio handshakes.
+    pub fn start_mcp_background_load(&mut self) {
+        let servers = self.llm_client.get_config().mcp_servers;
+        if servers.is_empty() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tools, _) = corex_tools::load_mcp_servers(&servers).await;
+            let _ = tx.send(tools);
+        });
+        self.mcp_startup_rx = Some(rx);
+    }
+
+    /// Non-blocking poll for background startup MCP tools.
+    pub fn poll_mcp_tools(&mut self) -> bool {
+        let Some(rx) = &mut self.mcp_startup_rx else { return false };
+        match rx.try_recv() {
+            Ok(tools) => {
+                self.mcp_startup_rx = None;
+                self.tool_registry.unregister_prefix("mcp_");
+                for t in tools {
+                    self.tool_registry.register(t);
+                }
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.mcp_startup_rx = None;
+                false
+            }
+        }
+    }
+
+    /// Waits for any in-flight startup MCP load to finish before the first prompt or `/mcp` command.
+    pub async fn finish_mcp_startup_load(&mut self) {
+        if let Some(rx) = self.mcp_startup_rx.take() {
+            if let Ok(tools) = rx.await {
+                self.tool_registry.unregister_prefix("mcp_");
+                for t in tools {
+                    self.tool_registry.register(t);
+                }
+            }
+        }
+    }
+
     pub async fn reload_mcp_servers(&mut self) -> Vec<corex_tools::McpServerStatus> {
+        self.mcp_startup_rx = None;
         // The file is the truth: a key refreshed by hand, a server added or removed since
         // start-up, applies here. `settings.json` is the only source of `mcp_servers` (a
         // workspace copy never carries them), so this cannot leak a workspace value.

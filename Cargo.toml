@@ -60,7 +60,7 @@ corex-tui = { path = "crates/corex-tui", version = "0.11.0" }
 corex-fleet = { path = "crates/corex-fleet", version = "0.11.0" }
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true

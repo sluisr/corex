@@ -153,41 +153,67 @@ impl FileIndex {
 }
 
 /// The entries of `root` down to the deepest level that fits in [`MAX_ENTRIES`], and whether a
-/// deeper level was left out. Walking one level at a time keeps every shallow folder in the index
-/// however large the tree below it is, which one depth-first walk cut at the limit does not.
+/// deeper level was left out. Bucketing by depth in a single walk keeps every shallow folder in
+/// the index without walking the directory tree up to `MAX_DEPTH` times.
 fn walk_by_level(root: &Path, prefix: &str, limit: usize) -> (Vec<String>, bool) {
+    let max_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(MAX_DEPTH));
+    let max_depth_filter = max_depth.clone();
+    let mut buckets: Vec<Vec<String>> = (0..=MAX_DEPTH).map(|_| Vec::new()).collect();
+    let mut overflowed_from = MAX_DEPTH + 1;
+
+    let walker = ignore::WalkBuilder::new(root)
+        .max_depth(Some(MAX_DEPTH))
+        .filter_entry(move |entry| {
+            let depth = entry.depth();
+            if depth == 0 {
+                return true;
+            }
+            if depth > max_depth_filter.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            !(entry.file_type().is_some_and(|t| t.is_dir())
+                && entry.file_name().to_str().is_some_and(|name| SKIPPED_DIRS.contains(&name)))
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        let depth = entry.depth();
+        if depth == 0 || depth > max_depth.load(std::sync::atomic::Ordering::Relaxed) {
+            continue;
+        }
+        let Some(rel) = entry.path().strip_prefix(root).ok().and_then(|p| p.to_str()) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        let slash = if ft.is_dir() { "/" } else { "" };
+        buckets[depth].push(format!("{prefix}{rel}{slash}"));
+
+        let cumulative: usize = buckets[1..=depth].iter().map(Vec::len).sum();
+        if cumulative > limit {
+            overflowed_from = overflowed_from.min(depth);
+            let new_max = depth.saturating_sub(1);
+            max_depth.store(new_max, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     let mut kept: Vec<String> = Vec::new();
     for depth in 1..=MAX_DEPTH {
-        let mut level: Vec<String> = ignore::WalkBuilder::new(root)
-            .max_depth(Some(depth))
-            .filter_entry(|entry| {
-                entry.depth() == 0
-                    || !(entry.file_type().is_some_and(|t| t.is_dir())
-                        && entry.file_name().to_str().is_some_and(|name| SKIPPED_DIRS.contains(&name)))
-            })
-            .build()
-            .flatten()
-            .filter_map(|entry| {
-                let rel = entry.path().strip_prefix(root).ok()?.to_str()?;
-                if rel.is_empty() {
-                    return None;
-                }
-                let slash = if entry.file_type()?.is_dir() { "/" } else { "" };
-                Some(format!("{prefix}{rel}{slash}"))
-            })
-            .take(limit + 1)
-            .collect();
-        if level.len() > limit {
+        if depth >= overflowed_from || kept.len() + buckets[depth].len() > limit {
             if depth == 1 {
-                level.truncate(limit);
-                kept = level;
+                buckets[1].truncate(limit);
+                kept = std::mem::take(&mut buckets[1]);
             }
             return (kept, true);
         }
-        if level.len() == kept.len() {
+        if buckets[depth].is_empty() {
             break;
         }
-        kept = level;
+        kept.append(&mut buckets[depth]);
     }
     (kept, false)
 }

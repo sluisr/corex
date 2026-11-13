@@ -205,7 +205,9 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &'static str {
-        "Requests clarification or missing information from the user via an interactive dialog."
+        "Requests clarification or missing information from the user via an interactive dialog. \
+         The dialog always adds a row where the user can type their own answer, so never include a \
+         catch-all option such as \"Other\" or \"Something else\"."
     }
 
     fn parameters(&self) -> serde_json::Value {

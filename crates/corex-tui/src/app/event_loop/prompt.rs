@@ -275,6 +275,7 @@ async fn submit(app: &mut App, cmd_to_run: String, send_now: bool, event_tx: &Ev
         app.cancel_generation("Generation cancelled to run the command.");
     }
 
+    app.finish_mcp_startup_load().await;
     if user_prompt_clean.starts_with('/') && app.handle_slash_command(&user_prompt_clean).await {
         // Slash commands never expand paste tags; release the buffers.
         app.pastes.clear();

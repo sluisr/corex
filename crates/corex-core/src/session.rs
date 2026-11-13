@@ -313,6 +313,19 @@ impl Session {
         Ok(())
     }
 
+    /// Offloads session JSON serialization and `fsync` disk writes to the blocking pool so
+    /// turn completions never stall the interactive TUI event loop.
+    pub fn save_async(&self) {
+        let snapshot = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                let _ = snapshot.save();
+            });
+        } else {
+            let _ = snapshot.save();
+        }
+    }
+
     fn summary_path(session_file: &Path) -> Option<PathBuf> {
         Some(session_file.parent()?.join("index").join(session_file.file_name()?))
     }

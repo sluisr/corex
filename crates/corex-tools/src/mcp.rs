@@ -662,67 +662,97 @@ impl Tool for McpTool {
     }
 }
 
+async fn load_single_mcp_server(
+    name: String,
+    cfg: McpServerConfig,
+) -> (Vec<Arc<dyn Tool>>, McpServerStatus) {
+    let cmd_display = cfg.display_target();
+    match McpClient::connect(&name, &cfg).await {
+        Ok(client) => {
+            let client_arc = Arc::new(client);
+            match client_arc.list_tools().await {
+                Ok(tool_list) => {
+                    let count = tool_list.len();
+                    let mut tool_names = Vec::with_capacity(count);
+                    let mut tools: Vec<Arc<dyn Tool>> = Vec::with_capacity(count);
+
+                    for (orig_name, desc, schema) in tool_list {
+                        let qualified_name = provider_tool_name(&name, &orig_name);
+                        tool_names.push(orig_name.clone());
+
+                        let mcp_tool = Arc::new(McpTool {
+                            display_name: qualified_name,
+                            original_name: orig_name,
+                            description_str: format!("[MCP: {}] {}", name, desc),
+                            parameters_schema: schema,
+                            client: client_arc.clone(),
+                        });
+                        tools.push(mcp_tool);
+                    }
+
+                    let status = McpServerStatus {
+                        name,
+                        command: cmd_display,
+                        is_connected: true,
+                        tools_count: count,
+                        tools: tool_names,
+                        error: None,
+                    };
+                    (tools, status)
+                }
+                Err(e) => (
+                    Vec::new(),
+                    McpServerStatus {
+                        name,
+                        command: cmd_display,
+                        is_connected: false,
+                        tools_count: 0,
+                        tools: Vec::new(),
+                        error: Some(format!("Failed to list tools: {}", e)),
+                    },
+                ),
+            }
+        }
+        Err(e) => (
+            Vec::new(),
+            McpServerStatus {
+                name,
+                command: cmd_display,
+                is_connected: false,
+                tools_count: 0,
+                tools: Vec::new(),
+                error: Some(e.to_string()),
+            },
+        ),
+    }
+}
+
 pub async fn load_mcp_servers(
     configs: &HashMap<String, McpServerConfig>,
 ) -> (Vec<Arc<dyn Tool>>, Vec<McpServerStatus>) {
+    if configs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut entries: Vec<(String, McpServerConfig)> = configs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut handles = Vec::with_capacity(entries.len());
+    for (name, cfg) in entries {
+        handles.push(tokio::spawn(async move {
+            load_single_mcp_server(name, cfg).await
+        }));
+    }
+
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let mut statuses: Vec<McpServerStatus> = Vec::new();
-
-    for (name, cfg) in configs {
-        let cmd_display = cfg.display_target();
-        match McpClient::connect(name, cfg).await {
-            Ok(client) => {
-                let client_arc = Arc::new(client);
-                match client_arc.list_tools().await {
-                    Ok(tool_list) => {
-                        let count = tool_list.len();
-                        let mut tool_names = Vec::new();
-
-                        for (orig_name, desc, schema) in tool_list {
-                            let qualified_name = provider_tool_name(name, &orig_name);
-                            tool_names.push(orig_name.clone());
-
-                            let mcp_tool = Arc::new(McpTool {
-                                display_name: qualified_name,
-                                original_name: orig_name,
-                                description_str: format!("[MCP: {}] {}", name, desc),
-                                parameters_schema: schema,
-                                client: client_arc.clone(),
-                            });
-                            tools.push(mcp_tool);
-                        }
-
-                        statuses.push(McpServerStatus {
-                            name: name.clone(),
-                            command: cmd_display,
-                            is_connected: true,
-                            tools_count: count,
-                            tools: tool_names,
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        statuses.push(McpServerStatus {
-                            name: name.clone(),
-                            command: cmd_display,
-                            is_connected: false,
-                            tools_count: 0,
-                            tools: Vec::new(),
-                            error: Some(format!("Failed to list tools: {}", e)),
-                        });
-                    }
-                }
-            }
-            Err(e) => {
-                statuses.push(McpServerStatus {
-                    name: name.clone(),
-                    command: cmd_display,
-                    is_connected: false,
-                    tools_count: 0,
-                    tools: Vec::new(),
-                    error: Some(e.to_string()),
-                });
-            }
+    let mut statuses: Vec<McpServerStatus> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok((server_tools, status)) = handle.await {
+            tools.extend(server_tools);
+            statuses.push(status);
         }
     }
 

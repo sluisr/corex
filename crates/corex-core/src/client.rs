@@ -1021,28 +1021,6 @@ impl LlmClient {
         tools: Option<Vec<ToolDefinition>>,
         cancel_token: CancellationToken,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let mut inner = self.stream_chat_retrying(messages, tools, cancel_token).await?;
-        let (tx, out) = mpsc::channel::<StreamEvent>(100);
-        let client = self.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = inner.recv().await {
-                if let StreamEvent::UsageUpdate(ref usage) = ev {
-                    client.record_usage(&client.get_config().model, usage);
-                }
-                if tx.send(ev).await.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(out)
-    }
-
-    async fn stream_chat_retrying(
-        &self,
-        messages: Vec<Message>,
-        tools: Option<Vec<ToolDefinition>>,
-        cancel_token: CancellationToken,
-    ) -> Result<mpsc::Receiver<StreamEvent>> {
         // Look at the first real event. Rejections (context overflow, rate limits, overloaded
         // servers) arrive before any content, so this is the one moment where retrying is
         // invisible to the consumer: nothing has been shown or run yet.
@@ -1099,11 +1077,15 @@ impl LlmClient {
                     .stream_chat_once(retry_messages, tools, cancel_token)
                     .await?;
                 let notice = format!("The request exceeded the model's context window. {} Retrying.", notice);
+                let client = self.clone();
                 tokio::spawn(async move {
                     let _ = tx
                         .send(StreamEvent::ContextCompacted { compacted_messages: compacted_session, notice })
                         .await;
                     while let Some(ev) = retry_rx.recv().await {
+                        if let StreamEvent::UsageUpdate(ref usage) = ev {
+                            client.record_usage(&client.get_config().model, usage);
+                        }
                         if tx.send(ev).await.is_err() {
                             break;
                         }
@@ -1120,9 +1102,13 @@ impl LlmClient {
             let notice = "The active model rejected the image, so it was sent as a note. \
                           Switch with /model to one that can see images."
                 .to_string();
+            let client = self.clone();
             tokio::spawn(async move {
                 let _ = tx.send(StreamEvent::Notice(notice)).await;
                 while let Some(ev) = retry_rx.recv().await {
+                    if let StreamEvent::UsageUpdate(ref usage) = ev {
+                        client.record_usage(&client.get_config().model, usage);
+                    }
                     if tx.send(ev).await.is_err() {
                         break;
                     }
@@ -1131,6 +1117,7 @@ impl LlmClient {
             return Ok(out);
         }
 
+        let client = self.clone();
         tokio::spawn(async move {
             for ev in prefix {
                 if tx.send(ev).await.is_err() {
@@ -1138,11 +1125,17 @@ impl LlmClient {
                 }
             }
             if let Some(ev) = first {
+                if let StreamEvent::UsageUpdate(ref usage) = ev {
+                    client.record_usage(&client.get_config().model, usage);
+                }
                 if tx.send(ev).await.is_err() {
                     return;
                 }
             }
             while let Some(ev) = rx.recv().await {
+                if let StreamEvent::UsageUpdate(ref usage) = ev {
+                    client.record_usage(&client.get_config().model, usage);
+                }
                 if tx.send(ev).await.is_err() {
                     break;
                 }
@@ -1466,15 +1459,15 @@ impl LlmClient {
             crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
         };
 
+        let body_bytes = serde_json::to_vec(&request_body)?;
         if crate::forensic::ForensicLogger::is_enabled() {
-            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
-            crate::forensic::ForensicLogger::log_llm_request(
+            crate::forensic::ForensicLogger::log_llm_request_bytes(
                 provider_label,
                 &api_model,
                 &url,
                 messages_count,
                 tools_count,
-                &body_serialized,
+                &body_bytes,
             );
         }
 
@@ -1485,7 +1478,7 @@ impl LlmClient {
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
-            .json(&request_body);
+            .body(body_bytes);
 
         let mut event_source = req_builder.eventsource()?;
         let (tx, rx) = mpsc::channel::<StreamEvent>(100);
@@ -1731,15 +1724,15 @@ impl LlmClient {
             cache_control: Some(serde_json::json!({ "type": "ephemeral" })),
         };
 
+        let body_bytes = serde_json::to_vec(&request_body)?;
         if crate::forensic::ForensicLogger::is_enabled() {
-            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
-            crate::forensic::ForensicLogger::log_llm_request(
+            crate::forensic::ForensicLogger::log_llm_request_bytes(
                 "Anthropic Claude",
                 model,
                 &url,
                 messages.len(),
                 tools.as_ref().map(|t| t.len()).unwrap_or(0),
-                &body_serialized,
+                &body_bytes,
             );
         }
 
@@ -1749,7 +1742,7 @@ impl LlmClient {
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&request_body);
+            .body(body_bytes);
 
         let mut event_source = req_builder.eventsource()?;
         let (tx, rx) = mpsc::channel::<StreamEvent>(100);

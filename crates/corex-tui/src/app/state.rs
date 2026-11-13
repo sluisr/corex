@@ -417,6 +417,8 @@ pub struct App {
     pub steer_messages: Vec<String>,
     pub start_time: Instant,
     pub last_interaction: Instant,
+    /// Background startup MCP tool loader so the TUI opens immediately without waiting on MCP handshakes.
+    pub mcp_startup_rx: Option<tokio::sync::oneshot::Receiver<Vec<Arc<dyn corex_tools::Tool>>>>,
 }
 
 /// What the status footer shows about the active model, worked out from the provider catalog.

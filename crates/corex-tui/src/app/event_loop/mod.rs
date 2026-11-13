@@ -103,6 +103,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         app.poll_local_health_check();
+        let _ = app.poll_mcp_tools();
         if app.poll_file_index() | app.refresh_context_files() | app.poll_user_shell() {
             needs_redraw = true;
         }

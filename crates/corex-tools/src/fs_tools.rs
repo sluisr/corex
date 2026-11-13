@@ -61,6 +61,18 @@ pub fn is_sensitive_system_path(path: &Path) -> bool {
     false
 }
 
+/// Fast validation for entries yielded by `ignore::WalkBuilder` (which has `follow_links(false)`
+/// on a `root_dir` already verified against [`is_sensitive_system_path`]). Non-symlink entries
+/// avoid redundant `stat` and `realpath` (`canonicalize`) syscalls per file.
+pub(crate) fn is_valid_walk_file(entry: &ignore::DirEntry, root_dir: &Path) -> bool {
+    let path = entry.path();
+    if entry.path_is_symlink() {
+        path.is_file() && is_within_workspace(path, root_dir) && !is_sensitive_system_path(path)
+    } else {
+        entry.file_type().is_some_and(|ft| ft.is_file()) && !is_sensitive_system_path_raw(path)
+    }
+}
+
 fn is_protected_write_path_raw(path: &Path) -> bool {
     const PROTECTED_NAMES: &[&str] = &[
         ".bashrc",
@@ -1346,47 +1358,48 @@ impl Tool for GlobTool {
             Err(e) => return Ok(ToolOutput::error(format!("Invalid glob pattern '{}': {}", pattern_str, e))),
         };
 
-        let mut matches: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
-        let walker = WalkBuilder::new(&root_dir)
-            .hidden(false)
-            .git_ignore(true)
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                name != ".git"
-            })
-            .build();
+        let workspace_dir = context.workspace_dir.clone();
+        let matches = tokio::task::spawn_blocking(move || {
+            let mut matches: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
+            let walker = WalkBuilder::new(&root_dir)
+                .hidden(false)
+                .git_ignore(true)
+                .filter_entry(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    name != ".git"
+                })
+                .build();
 
-        for entry in walker.flatten() {
-            let path = entry.path();
-            if path == root_dir
-                || !path.is_file()
-                || !is_within_workspace(path, &root_dir)
-                || is_sensitive_system_path(path)
-            {
-                continue;
-            }
-            let rel_to_root = path.strip_prefix(&root_dir).unwrap_or(path);
-            let rel_root_str = rel_to_root.to_string_lossy();
-            let display_rel = path
-                .strip_prefix(&context.workspace_dir)
-                .unwrap_or(path)
-                .to_string_lossy();
-            let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-            if glob_pattern.matches(&rel_root_str)
-                || glob_pattern.matches(&display_rel)
-                || glob_pattern.matches(path.to_str().unwrap_or(""))
-                || glob_pattern.matches(&file_name)
-            {
-                let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
-                matches.push((display_rel.to_string(), mtime));
-                if matches.len() >= GLOB_COLLECT_LIMIT {
-                    break;
+            for entry in walker.flatten() {
+                if entry.depth() == 0 || !is_valid_walk_file(&entry, &root_dir) {
+                    continue;
+                }
+                let path = entry.path();
+                let rel_to_root = path.strip_prefix(&root_dir).unwrap_or(path);
+                let rel_root_str = rel_to_root.to_string_lossy();
+                let display_rel = path
+                    .strip_prefix(&workspace_dir)
+                    .unwrap_or(path)
+                    .to_string_lossy();
+                let file_name = entry.file_name().to_string_lossy();
+                if glob_pattern.matches(&rel_root_str)
+                    || glob_pattern.matches(&display_rel)
+                    || glob_pattern.matches(path.to_str().unwrap_or(""))
+                    || glob_pattern.matches(&file_name)
+                {
+                    let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+                    matches.push((display_rel.into_owned(), mtime));
+                    if matches.len() >= GLOB_COLLECT_LIMIT {
+                        break;
+                    }
                 }
             }
-        }
+            // Most recently modified first: that is the part of a big result worth seeing.
+            matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            matches
+        })
+        .await?;
 
-        // Most recently modified first: that is the part of a big result worth seeing.
-        matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         if matches.is_empty() {
             return Ok(ToolOutput::success("No matching files found."));
         }

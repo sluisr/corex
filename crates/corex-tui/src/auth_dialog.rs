@@ -1,10 +1,10 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::overlay::{begin_modal, key_hints, panel_rules};
+use crate::overlay::{docked_height, docked_panel, key_hints, rail, Row};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -85,6 +85,12 @@ pub fn env_override_note(provider: &str, new_key: &str) -> Option<String> {
     })
 }
 
+const BODY_ROWS: usize = 4;
+
+pub fn dialog_height(screen_height: u16) -> u16 {
+    docked_height(BODY_ROWS, screen_height)
+}
+
 pub fn render_auth_dialog(
     frame: &mut Frame,
     area: Rect,
@@ -95,80 +101,55 @@ pub fn render_auth_dialog(
         return;
     }
 
-    let is_mobile = crate::app::is_mobile_portrait(area.width, area.height);
-    let dialog_width = if is_mobile {
-        area.width.saturating_sub(2).max(20)
+    let inner = docked_panel(frame, area, theme);
+    let dim = Style::default().fg(theme.dark_gray);
+
+    // Fully masked: no character of the key is ever drawn.
+    let input = if state.input_buffer.is_empty() {
+        Span::styled("paste or type the key", dim)
     } else {
-        72.min(area.width.saturating_sub(4)).max(44).min(area.width)
+        Span::styled("*".repeat(state.input_buffer.chars().count()), Style::default().fg(theme.foreground))
     };
-    let dialog_height = 11.min(area.height.saturating_sub(2));
+    let note = match &state.error_msg {
+        Some(err) => Line::from(Span::styled(format!(" {err}"), Style::default().fg(theme.error))),
+        None => Line::from(vec![
+            Span::styled(" Get one at ", dim),
+            Span::styled(state.portal_url.clone(), Style::default().fg(theme.link).add_modifier(Modifier::UNDERLINED)),
+        ]),
+    };
+    let mut hints = vec![Span::raw(" ")];
+    hints.extend(key_hints(&[("Enter", "save & activate"), ("Esc", "cancel")], theme));
 
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-    let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
 
-    // Dim the chat behind the modal so it does not visually collide.
-    begin_modal(frame, area, dialog_area, 2, 1);
-
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {} API key", state.provider_label),
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {} API key", state.provider_label),
             Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD),
         )),
-        Line::from(vec![
-            Span::styled("  Saved for ", Style::default().fg(theme.dark_gray)),
-            Span::styled(format!("${}", state.api_key_env), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" and the system keyring", Style::default().fg(theme.dark_gray)),
-        ]),
-        Line::from(""),
-    ];
-
-    // Fully masked input box to prevent leaking any characters of the secret API key
-    let (input_span, cursor) = if state.input_buffer.is_empty() {
-        (
-            Span::styled(format!("Paste or type key ({})", state.api_key_env), Style::default().fg(theme.dark_gray)),
-            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
-        )
+        rows[0],
+    );
+    let caret = Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue));
+    let field = if state.input_buffer.is_empty() {
+        vec![rail(Row::Cursor, theme), caret, Span::raw(" "), input]
     } else {
-        let total_chars = state.input_buffer.chars().count();
-        let masked = "*".repeat(total_chars);
-        (
-            Span::styled(masked, Style::default().fg(theme.foreground).add_modifier(Modifier::BOLD)),
-            Span::styled(crate::cursor::block(), Style::default().fg(theme.accent_blue)),
-        )
+        vec![rail(Row::Cursor, theme), input, caret]
     };
-
-    lines.push(Line::from(vec![
-        Span::styled("  ▎ ", Style::default().fg(theme.accent_blue)),
-        input_span,
-        cursor,
-    ]));
-    lines.push(Line::from(""));
-
-    if let Some(ref err) = state.error_msg {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", err),
-            Style::default().fg(theme.error),
-        )));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  Get one at ", Style::default().fg(theme.dark_gray)),
-            Span::styled(
-                &state.portal_url,
-                Style::default().fg(theme.accent_blue).add_modifier(Modifier::UNDERLINED),
-            ),
-        ]));
-    }
-    lines.push(Line::from(""));
-
-    let mut hints = vec![Span::raw("  ")];
-    hints.extend(key_hints(&[("Enter", "save & activate"), ("Esc", "cancel")], theme));
-    lines.push(Line::from(hints));
-
-    // Transparent like the other dialogs, with a thin rule above and below.
-    frame.render_widget(Paragraph::new(lines), Rect::new(dialog_area.x, dialog_area.y + 1, dialog_area.width, dialog_area.height.saturating_sub(2)));
-    panel_rules(frame, dialog_area, theme);
+    let body = vec![
+        Line::from(field),
+        Line::default(),
+        Line::from(Span::styled(format!(" Saved for ${} and the system keyring", state.api_key_env), dim)),
+        note,
+    ];
+    frame.render_widget(Paragraph::new(body), rows[2]);
+    frame.render_widget(Paragraph::new(Line::from(hints)), rows[4]);
 }
 
 #[cfg(test)]

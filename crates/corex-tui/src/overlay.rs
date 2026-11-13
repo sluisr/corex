@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Clear;
 use ratatui::Frame;
 
@@ -68,13 +68,69 @@ pub fn key_hints(pairs: &[(&'static str, &'static str)], theme: &crate::theme::T
     spans
 }
 
-/// A thin rule above and below a panel: enough edge to read it as one surface over a
-/// transparent terminal, without boxing it in.
 pub fn panel_rules(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) {
     if area.height < 2 {
         return;
     }
-    let rule = || ratatui::widgets::Paragraph::new(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.rule)));
+    let rule = || ratatui::widgets::Paragraph::new(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.border_dim)));
     frame.render_widget(rule(), Rect::new(area.x, area.y, area.width, 1));
     frame.render_widget(rule(), Rect::new(area.x, area.bottom() - 1, area.width, 1));
+}
+
+pub fn docked_panel(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) -> Rect {
+    frame.render_widget(Clear, area);
+    panel_rules(frame, area, theme);
+    Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(2))
+}
+
+pub fn docked_height(body_rows: usize, screen_height: u16) -> u16 {
+    (body_rows as u16 + DOCKED_CHROME_ROWS).min(screen_height.saturating_sub(6)).max(3)
+}
+
+pub const DOCKED_CHROME_ROWS: u16 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Cursor,
+    Current,
+    Idle,
+}
+
+impl Row {
+    pub fn of(selected: bool, focused: bool) -> Self {
+        match (selected, focused) {
+            (true, true) => Self::Cursor,
+            (true, false) => Self::Current,
+            _ => Self::Idle,
+        }
+    }
+}
+
+pub fn rail(row: Row, theme: &crate::theme::Theme) -> Span<'static> {
+    match row {
+        Row::Cursor => Span::styled(" ▎ ", Style::default().fg(theme.accent_blue)),
+        Row::Current => Span::styled(" ▎ ", Style::default().fg(theme.border_dim)),
+        Row::Idle => Span::raw("   "),
+    }
+}
+
+pub fn row_text(row: Row, idle: Color, theme: &crate::theme::Theme) -> Style {
+    match row {
+        Row::Cursor => Style::default().fg(theme.text_on_selected).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(idle),
+    }
+}
+
+pub fn highlight_cursor(row: Row, mut line: Line<'static>, width: usize, theme: &crate::theme::Theme) -> Line<'static> {
+    if row != Row::Cursor {
+        return line;
+    }
+    let used: usize = line.spans.iter().map(|s| s.width()).sum();
+    if used < width {
+        line.spans.push(Span::raw(" ".repeat(width - used)));
+    }
+    for span in &mut line.spans {
+        span.style = span.style.bg(theme.selected_bg);
+    }
+    line
 }

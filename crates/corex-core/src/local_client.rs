@@ -93,15 +93,15 @@ impl LocalLlmClient {
         };
 
         let msg_count = request_body.messages.len();
+        let body_bytes = serde_json::to_vec(&request_body)?;
         if crate::forensic::ForensicLogger::is_enabled() {
-            let body_serialized = serde_json::to_string(&request_body).unwrap_or_default();
-            crate::forensic::ForensicLogger::log_llm_request(
+            crate::forensic::ForensicLogger::log_llm_request_bytes(
                 "Local LLM (llama-server)",
                 &self.model_name,
                 &url,
                 msg_count,
                 0,
-                &body_serialized,
+                &body_bytes,
             );
         }
 
@@ -111,7 +111,7 @@ impl LocalLlmClient {
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .json(&request_body);
+            .body(body_bytes);
 
         let mut event_source = req_builder.eventsource()?;
         let (tx, rx) = mpsc::channel::<StreamEvent>(100);
