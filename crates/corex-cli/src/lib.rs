@@ -94,6 +94,10 @@ struct Cli {
     #[arg(long = "force", short = 'f')]
     force: bool,
 
+    /// Include beta / pre-release versions when updating (only used if newer than stable)
+    #[arg(long = "beta", alias = "pre")]
+    beta: bool,
+
     /// Generate shell autocompletion script (bash, zsh, fish, powershell, elvish)
     #[arg(long = "completions", value_enum)]
     completions: Option<clap_complete::Shell>,
@@ -207,9 +211,10 @@ pub async fn run() -> Result<()> {
 
     if is_update_cmd {
         let current = env!("CARGO_PKG_VERSION");
-        let force = cli.force || cli.query.iter().any(|q| q == "--force" || q == "-f");
+        let force = cli.force || cli.query.iter().any(|q| q == "--force" || q == "-f" || q == "force");
+        let include_beta = cli.beta || cli.query.iter().any(|q| q == "--beta" || q == "--pre" || q == "beta" || q == "pre");
         println!("Corex In-Place Self-Updater (v{})", current);
-        match corex_core::update::perform_self_update(current, force, |msg| {
+        match corex_core::update::perform_self_update_with_channel(current, force, include_beta, |msg| {
             println!("  › {}", msg);
         }).await {
             Ok(summary) => {
@@ -224,7 +229,11 @@ pub async fn run() -> Result<()> {
             Err(e) => {
                 eprintln!("\nNotice: {}", e);
                 if !force && e.contains("already on the latest version") {
-                    println!("To force re-download the latest release, run:\n  cx update --force\n");
+                    if include_beta {
+                        println!("To force re-download the latest beta/stable release, run:\n  cx update --beta --force\n");
+                    } else {
+                        println!("To force re-download the latest release, run:\n  cx update --force\n");
+                    }
                 }
             }
         }

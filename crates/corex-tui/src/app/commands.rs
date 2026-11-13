@@ -484,12 +484,21 @@ impl App {
             }
             "/update" => {
                 let current = env!("CARGO_PKG_VERSION");
-                let apply_update = parts.get(1).map(|s| *s == "apply" || *s == "--apply" || *s == "force" || *s == "--force").unwrap_or(false);
-                let force = parts.get(1).map(|s| *s == "force" || *s == "--force").unwrap_or(false);
+                let args: Vec<&str> = parts.iter().skip(1).copied().collect();
+                let include_beta = args.iter().any(|s| matches!(*s, "beta" | "--beta" | "pre" | "--pre"));
+                let force = args.iter().any(|s| matches!(*s, "force" | "--force"));
+                let apply_update = include_beta
+                    || force
+                    || args.iter().any(|s| matches!(*s, "apply" | "--apply"));
 
                 if apply_update {
-                    self.session.add_message(Message::system("Checking release and applying in-place update..."));
-                    match corex_core::update::perform_self_update(current, force, |_| {}).await {
+                    let check_msg = if include_beta {
+                        "Checking release (including beta pre-releases) and applying in-place update..."
+                    } else {
+                        "Checking release and applying in-place update..."
+                    };
+                    self.session.add_message(Message::system(check_msg));
+                    match corex_core::update::perform_self_update_with_channel(current, force, include_beta, |_| {}).await {
                         Ok(summary) => {
                             self.session.add_message(Message::system(format!(
                                 "✓ Corex successfully updated to v{} (previous: v{})!\nBinary: {}\n\nPlease restart Corex to run the updated version.",
@@ -498,7 +507,7 @@ impl App {
                         }
                         Err(e) => {
                             self.session.add_message(Message::system(format!(
-                                "✕ In-place update: {}\n\nManual update alternatives:\n• cx update (in terminal)\n• npm install -g @sluisr/corex\n• cargo install --git https://github.com/sluisr/corex.git --force",
+                                "✕ In-place update: {}\n\nManual update alternatives:\n• cx update (or cx update --beta)\n• curl -fsSL https://raw.githubusercontent.com/sluisr/corex/main/install.sh | bash\n• npm install -g @sluisr/corex\n• cargo install --git https://github.com/sluisr/corex.git --force",
                                 e
                             )));
                         }
@@ -511,7 +520,8 @@ impl App {
                     format!(
                         "A new version of Corex is available: v{} → v{}\n\n\
                         To update automatically in-place, run:\n\
-                        • /update apply (or cx update in your terminal)\n\n\
+                        • /update apply (or cx update in your terminal)\n\
+                        • /update beta  (or cx update --beta for pre-releases)\n\n\
                         Manual alternatives:\n\
                         • Via npm:       npm install -g @sluisr/corex\n\
                         • From source:   cargo install --git https://github.com/sluisr/corex.git --force\n\
@@ -521,8 +531,9 @@ impl App {
                 } else {
                     format!(
                         "Corex is up to date (v{}).\n\n\
-                        To force re-download the latest release in-place:\n\
-                        • /update force\n\n\
+                        Options:\n\
+                        • /update beta   (check and install newer beta pre-releases)\n\
+                        • /update force  (re-download the latest stable release in-place)\n\n\
                         Manual update alternatives:\n\
                         • npm install -g @sluisr/corex\n\
                         • cargo install --git https://github.com/sluisr/corex.git --force\n\

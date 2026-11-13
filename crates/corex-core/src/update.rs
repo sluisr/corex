@@ -147,15 +147,77 @@ pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-fn is_prerelease(v: &str) -> bool {
-    v.trim().trim_start_matches('v').split('+').next().is_some_and(|core| core.contains('-'))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreReleaseId {
+    Numeric(u64),
+    Alpha(String),
 }
 
-/// Returns true if candidate is strictly newer than current. A release is newer than its own
-/// pre-releases (`1.0.0` after `1.0.0-rc1`).
+impl Ord for PreReleaseId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (PreReleaseId::Numeric(a), PreReleaseId::Numeric(b)) => a.cmp(b),
+            (PreReleaseId::Alpha(a), PreReleaseId::Alpha(b)) => a.cmp(b),
+            // SemVer 2.0.0: numeric identifiers always have lower precedence than non-numeric.
+            (PreReleaseId::Numeric(_), PreReleaseId::Alpha(_)) => Ordering::Less,
+            (PreReleaseId::Alpha(_), PreReleaseId::Numeric(_)) => Ordering::Greater,
+        }
+    }
+}
+
+impl PartialOrd for PreReleaseId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_prerelease_ids(v: &str) -> Option<Vec<PreReleaseId>> {
+    let without_build = v.trim().trim_start_matches('v').split('+').next()?;
+    let (_, pre) = without_build.split_once('-')?;
+    if pre.is_empty() {
+        return None;
+    }
+    Some(
+        pre.split('.')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| match seg.parse::<u64>() {
+                Ok(n) => PreReleaseId::Numeric(n),
+                Err(_) => PreReleaseId::Alpha(seg.to_ascii_lowercase()),
+            })
+            .collect(),
+    )
+}
+
+fn compare_prerelease(cur: Option<Vec<PreReleaseId>>, cand: Option<Vec<PreReleaseId>>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (cur, cand) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(a), Some(b)) => {
+            for (ia, ib) in a.iter().zip(b.iter()) {
+                let ord = ia.cmp(ib);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+    }
+}
+
+/// Returns true if candidate is strictly newer than current (SemVer 2.0.0 precedence,
+/// including pre-releases such as `0.12.0-beta.2` > `0.12.0-beta.1` and `1.0.0` > `1.0.0-rc1`).
 pub fn is_newer_version(current: &str, candidate: &str) -> bool {
     match (parse_semver(current), parse_semver(candidate)) {
-        (Some(cur), Some(cand)) => cand > cur || (cand == cur && is_prerelease(current) && !is_prerelease(candidate)),
+        (Some(cur), Some(cand)) => {
+            if cand != cur {
+                return cand > cur;
+            }
+            compare_prerelease(parse_prerelease_ids(current), parse_prerelease_ids(candidate))
+                == std::cmp::Ordering::Less
+        }
         _ => false,
     }
 }
@@ -352,8 +414,28 @@ fn is_plain_tag(tag: &str) -> bool {
     !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
 }
 
-/// Fetches latest release metadata (GitHub REST API -> CDN -> GitHub web redirect).
+#[derive(Debug, Deserialize)]
+struct ReleaseListItem {
+    tag_name: String,
+    html_url: Option<String>,
+    body: Option<String>,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    draft: bool,
+}
+
+/// Fetches latest release metadata on the stable channel (GitHub REST API -> CDN -> GitHub web redirect).
 pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseInfo, String> {
+    fetch_latest_release_info_with_channel(current_version, false).await
+}
+
+/// Fetches latest release metadata. When `include_beta` is true, also considers non-draft
+/// pre-releases, but only chooses one if it is strictly newer than the latest stable release.
+pub async fn fetch_latest_release_info_with_channel(
+    current_version: &str,
+    include_beta: bool,
+) -> Result<ReleaseInfo, String> {
     let client = shared_update_client()
         .ok_or_else(|| "Failed to initialize HTTP client".to_string())?;
     let ua = format!("corex/{}", current_version);
@@ -370,11 +452,12 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
     }
 
     let mut last_api_err = None;
+    let mut stable_release: Option<ReleaseInfo> = None;
     match api_req.send().await {
         Ok(resp) => {
             if resp.status().is_success() {
                 if let Ok(release) = resp.json::<ReleaseInfo>().await {
-                    return Ok(release);
+                    stable_release = Some(release);
                 }
             } else {
                 last_api_err = Some(format!("GitHub API responded with status {}", resp.status()));
@@ -385,14 +468,61 @@ pub async fn fetch_latest_release_info(current_version: &str) -> Result<ReleaseI
         }
     }
 
-    // Neither fallback is trusted alone. The CDN file is refreshed by hand after a release, so it can
-    // still name the previous version (the API being rate limited then made `cx update` report
-    // "already on the latest version"). Both only name a tag: the download always comes from the
-    // GitHub release of that tag, so the CDN can never point the updater at a binary of its own.
-    let cdn = fetch_release_from_cdn(client, &ua).await;
-    let redirect = fetch_release_from_web_redirect(current_version).await;
+    if stable_release.is_none() {
+        // Neither fallback is trusted alone. The CDN file is refreshed by hand after a release, so it can
+        // still name the previous version (the API being rate limited then made `cx update` report
+        // "already on the latest version"). Both only name a tag: the download always comes from the
+        // GitHub release of that tag, so the CDN can never point the updater at a binary of its own.
+        let cdn = fetch_release_from_cdn(client, &ua).await;
+        let redirect = fetch_release_from_web_redirect(current_version).await;
+        stable_release = newest_release(cdn, redirect);
+    }
 
-    newest_release(cdn, redirect).ok_or_else(|| {
+    if include_beta {
+        let mut list_req = client
+            .get("https://api.github.com/repos/sluisr/corex/releases?per_page=15")
+            .timeout(Duration::from_secs(10))
+            .header(reqwest::header::USER_AGENT, &ua);
+        if let Ok(token) = std::env::var("GITHUB_TOKEN").or_else(|_| std::env::var("GH_TOKEN")) {
+            let token = token.trim();
+            if !token.is_empty() {
+                list_req = list_req.bearer_auth(token);
+            }
+        }
+        match list_req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(items) = resp.json::<Vec<ReleaseListItem>>().await {
+                    let mut best_from_list: Option<ReleaseInfo> = None;
+                    for item in items {
+                        if item.draft || !is_plain_tag(&item.tag_name) {
+                            continue;
+                        }
+                        let candidate = ReleaseInfo {
+                            tag_name: item.tag_name,
+                            html_url: item.html_url,
+                            body: item.body,
+                            assets: item.assets,
+                        };
+                        best_from_list = newest_release(best_from_list, Some(candidate));
+                    }
+                    // Only pick a beta/pre-release when it is strictly newer than the latest stable release.
+                    let chosen = newest_release(stable_release.clone(), best_from_list);
+                    if let Some(rel) = chosen {
+                        return Ok(rel);
+                    }
+                }
+            }
+            Ok(resp) if stable_release.is_none() => {
+                last_api_err = Some(format!("GitHub API responded with status {}", resp.status()));
+            }
+            Err(e) if stable_release.is_none() => {
+                last_api_err = Some(format!("Failed to reach GitHub Releases API: {}", e));
+            }
+            _ => {}
+        }
+    }
+
+    stable_release.ok_or_else(|| {
         last_api_err.unwrap_or_else(|| {
             "Could not retrieve latest release information across GitHub API, CDN, and web mirrors. Check internet connectivity.".to_string()
         })
@@ -630,13 +760,29 @@ pub async fn perform_self_update<F>(
 where
     F: Fn(&str) + Send + Sync,
 {
+    perform_self_update_with_channel(current_version, force, false, progress).await
+}
+
+pub async fn perform_self_update_with_channel<F>(
+    current_version: &str,
+    force: bool,
+    include_beta: bool,
+    progress: F,
+) -> Result<UpdateSummary, String>
+where
+    F: Fn(&str) + Send + Sync,
+{
     let target_triple = current_target_triple().ok_or_else(|| {
         "Auto-update is not supported on this platform architecture. Please update via cargo install or build from source."
             .to_string()
     })?;
 
-    progress("Checking for latest release on GitHub...");
-    let release = fetch_latest_release_info(current_version).await?;
+    if include_beta {
+        progress("Checking for latest release (including beta pre-releases) on GitHub...");
+    } else {
+        progress("Checking for latest release on GitHub...");
+    }
+    let release = fetch_latest_release_info_with_channel(current_version, include_beta).await?;
     let latest_clean = release.tag_name.trim_start_matches('v');
 
     if !force && !is_newer_version(current_version, latest_clean) {
@@ -813,7 +959,25 @@ mod tests {
         assert!(!is_newer_version("0.2.1", "0.2.0"));
         assert!(is_newer_version("1.0.0-rc1", "1.0.0"));
         assert!(!is_newer_version("1.0.0", "1.0.0-rc1"));
-        assert!(!is_newer_version("1.0.0-rc1", "1.0.0-rc2"));
+        assert!(is_newer_version("1.0.0-rc1", "1.0.0-rc2"));
+        assert!(is_newer_version("0.11.0", "0.12.0-beta.1"));
+        assert!(is_newer_version("0.12.0-beta.1", "0.12.0-beta.2"));
+        assert!(is_newer_version("0.12.0-beta.2", "0.12.0"));
+        assert!(!is_newer_version("0.12.0", "0.12.0-beta.2"));
+        assert!(!is_newer_version("0.11.0", "0.11.0-beta.9"));
+        assert!(!is_newer_version("0.12.0-beta.1", "0.11.0"));
+    }
+
+    #[test]
+    fn beta_only_wins_when_strictly_newer_than_stable() {
+        let stable_wins = newest_release(Some(release("v0.12.0", 6)), Some(release("v0.12.0-beta.2", 6))).unwrap();
+        assert_eq!(stable_wins.tag_name, "v0.12.0");
+
+        let older_beta_ignored = newest_release(Some(release("v0.11.0", 6)), Some(release("v0.11.0-beta.5", 6))).unwrap();
+        assert_eq!(older_beta_ignored.tag_name, "v0.11.0");
+
+        let newer_beta_wins = newest_release(Some(release("v0.11.0", 6)), Some(release("v0.12.0-beta.1", 6))).unwrap();
+        assert_eq!(newer_beta_wins.tag_name, "v0.12.0-beta.1");
     }
 
     #[test]

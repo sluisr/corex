@@ -2,6 +2,25 @@
 set -e
 
 REPO="sluisr/corex"
+BETA="${COREX_BETA:-0}"
+REQUESTED_VERSION="${COREX_VERSION:-}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --beta|--pre)
+      BETA=1
+      ;;
+    --version)
+      shift
+      REQUESTED_VERSION="${1:-}"
+      ;;
+    --version=*)
+      REQUESTED_VERSION="${1#*=}"
+      ;;
+  esac
+  shift
+done
+
 # Determine installation target directory
 ACTIVE_CX="$(command -v cx 2>/dev/null || true)"
 if [ -n "$PREFIX" ] && [ -d "$PREFIX/bin" ]; then
@@ -57,13 +76,94 @@ case "$OS" in
     ;;
 esac
 
-echo "[corex] Detecting latest version..."
-LATEST_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null | sed 's|.*/tag/||' | tr -d '\r\n')
-case "$LATEST_TAG" in
-  v[0-9]*) ;;
-  *) LATEST_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4) ;;
-esac
-VERSION="$LATEST_TAG"
+semver_gt() {
+  awk -v a="$1" -v b="$2" '
+    function parse(v, arr,    core, pre, n, i, p) {
+      sub(/^v/, "", v)
+      sub(/\+.*$/, "", v)
+      i = index(v, "-")
+      if (i > 0) {
+        core = substr(v, 1, i - 1)
+        pre = substr(v, i + 1)
+      } else {
+        core = v
+        pre = ""
+      }
+      split(core, arr, ".")
+      arr["maj"] = arr[1] + 0
+      arr["min"] = arr[2] + 0
+      arr["pat"] = arr[3] + 0
+      arr["stable"] = (pre == "" ? 1 : 0)
+      arr["pre"] = pre
+    }
+    BEGIN {
+      parse(a, A)
+      parse(b, B)
+      if (A["maj"] != B["maj"]) exit (A["maj"] > B["maj"] ? 0 : 1)
+      if (A["min"] != B["min"]) exit (A["min"] > B["min"] ? 0 : 1)
+      if (A["pat"] != B["pat"]) exit (A["pat"] > B["pat"] ? 0 : 1)
+      if (A["stable"] != B["stable"]) exit (A["stable"] > B["stable"] ? 0 : 1)
+      if (A["stable"] == 1) exit 1
+      na = split(A["pre"], pa, ".")
+      nb = split(B["pre"], pb, ".")
+      n = (na > nb ? na : nb)
+      for (k = 1; k <= n; k++) {
+        if (k > na) exit 1
+        if (k > nb) exit 0
+        ia = pa[k]; ib = pb[k]
+        da = (ia ~ /^[0-9]+$/); db = (ib ~ /^[0-9]+$/)
+        if (da && db) {
+          if ((ia + 0) != (ib + 0)) exit ((ia + 0) > (ib + 0) ? 0 : 1)
+        } else if (da != db) {
+          exit (db ? 0 : 1)
+        } else if (ia != ib) {
+          exit (ia > ib ? 0 : 1)
+        }
+      }
+      exit 1
+    }
+  '
+}
+
+if [ -n "$REQUESTED_VERSION" ]; then
+  case "$REQUESTED_VERSION" in
+    v*) VERSION="$REQUESTED_VERSION" ;;
+    *) VERSION="v$REQUESTED_VERSION" ;;
+  esac
+  echo "[corex] Installing requested version ${VERSION}..."
+else
+  echo "[corex] Detecting latest version..."
+  STABLE_TAG=$(curl -fsSLI -o /dev/null -w "%{url_effective}" "https://github.com/$REPO/releases/latest" 2>/dev/null | sed 's|.*/tag/||' | tr -d '\r\n')
+  case "$STABLE_TAG" in
+    v[0-9]*) ;;
+    *) STABLE_TAG=$(curl -sSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d '"' -f 4) ;;
+  esac
+  VERSION="$STABLE_TAG"
+
+  if [ "$BETA" = "1" ] || [ "$BETA" = "true" ]; then
+    RELEASES_JSON=$(curl -sSL "https://api.github.com/repos/$REPO/releases?per_page=15" 2>/dev/null || true)
+    CANDIDATES=$(printf '%s' "$RELEASES_JSON" | awk '
+      /"tag_name":/ {
+        if (match($0, /"tag_name": *"[^"]*"/)) {
+          tag = substr($0, RSTART, RLENGTH)
+          gsub(/.*"tag_name": *"|"$/, "", tag)
+          draft = 0
+        }
+      }
+      /"draft": *true/ { draft = 1 }
+      /"prerelease":/ {
+        if (!draft && tag ~ /^v[0-9]/) print tag
+        tag = ""
+      }
+    ')
+    for cand in $CANDIDATES; do
+      if [ -z "$VERSION" ] || semver_gt "$cand" "$VERSION"; then
+        VERSION="$cand"
+      fi
+    done
+  fi
+fi
+
 case "$VERSION" in
   v[0-9]*) ;;
   *)
