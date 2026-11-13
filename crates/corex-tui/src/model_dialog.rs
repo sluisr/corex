@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::overlay::{docked_height, docked_panel, highlight_cursor, key_hints, rail, row_text, Row};
-use crate::text::{fit_text, pad_right};
+use crate::text::{fit_text, pad_right, wrap_words};
 use crate::theme::Theme;
 
 pub const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0];
@@ -441,7 +441,13 @@ impl ModelDialogState {
                     self.row_idx = 0;
                     self.normalize_generic_reasoning();
                 }
-                Pane::Settings => self.row_idx = self.row_idx.saturating_sub(1),
+                Pane::Settings => {
+                    if self.row_idx == 0 {
+                        self.pane = Pane::Models;
+                    } else {
+                        self.row_idx -= 1;
+                    }
+                }
             },
             KeyCode::Down | KeyCode::Char('j') => match self.pane {
                 Pane::Providers => self.step_provider(true),
@@ -523,11 +529,19 @@ fn provider_row_count(state: &ModelDialogState) -> usize {
 }
 
 impl ModelDialogState {
+    fn meta_lines(&self, width: u16) -> Vec<String> {
+        let compact = is_compact(width);
+        let lead = if compact { " Model".len() + 2 } else { (PROVIDERS_COL_WIDTH + COLUMN_GAP) as usize + 3 };
+        let meta_w = (width as usize).saturating_sub(lead + 1).max(12);
+        wrap_words(&provider_meta(self), meta_w)
+    }
+
     pub fn height(&self, width: u16, screen_height: u16) -> u16 {
+        let extra_meta = self.meta_lines(width).len().saturating_sub(2);
         let body = if is_compact(width) {
-            2 + detail_row_count(self)
+            2 + detail_row_count(self) + extra_meta
         } else {
-            detail_row_count(self).max(provider_row_count(self))
+            detail_row_count(self).max(provider_row_count(self)) + extra_meta
         };
         docked_height(body, screen_height)
     }
@@ -542,26 +556,37 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     state.compact.set(compact);
 
     let inner = docked_panel(frame, area, theme);
+    let title = " Model";
+    let lead = if compact { title.len() + 2 } else { (PROVIDERS_COL_WIDTH + COLUMN_GAP) as usize + 3 };
+    let meta_w = (inner.width as usize).saturating_sub(lead + 1).max(12);
+    let meta_lines = wrap_words(&provider_meta(state), meta_w);
+    let meta_cont_rows = meta_lines.len().saturating_sub(1).max(1) as u16;
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(meta_cont_rows),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
-    let (title_area, body, footer_area) = (rows[0], rows[2], rows[4]);
+    let (title_area, meta_area, body, footer_area) = (rows[0], rows[1], rows[2], rows[4]);
 
-    let title = " Model";
-    let lead = if compact { title.len() + 2 } else { (PROVIDERS_COL_WIDTH + COLUMN_GAP) as usize + 3 };
-    let meta_w = (title_area.width as usize).saturating_sub(lead + 1);
+    let first_meta = meta_lines.first().map(String::as_str).unwrap_or("");
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(pad_right(title, lead), Style::default().fg(theme.text_strong).add_modifier(Modifier::BOLD)),
-            Span::styled(fit_text(&provider_meta(state), meta_w), Style::default().fg(theme.dark_gray)),
+            Span::styled(first_meta.to_string(), Style::default().fg(theme.dark_gray)),
         ])),
         title_area,
     );
+    if meta_lines.len() > 1 {
+        let pad = " ".repeat(lead);
+        let cont: Vec<Line<'static>> = meta_lines[1..]
+            .iter()
+            .map(|l| Line::from(Span::styled(format!("{pad}{l}"), Style::default().fg(theme.dark_gray))))
+            .collect();
+        frame.render_widget(Paragraph::new(cont), meta_area);
+    }
 
     if compact {
         let w = body.width as usize;
@@ -569,7 +594,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         lines.extend(detail_lines(state, w, theme));
         frame.render_widget(Paragraph::new(lines), body);
     } else {
-        let detail_w = body.width.saturating_sub(PROVIDERS_COL_WIDTH + COLUMN_GAP).min(DETAIL_MAX_WIDTH);
+        let detail_w = body.width.saturating_sub(PROVIDERS_COL_WIDTH + COLUMN_GAP);
         let columns = Layout::horizontal([
             Constraint::Length(PROVIDERS_COL_WIDTH),
             Constraint::Length(COLUMN_GAP),
@@ -600,8 +625,6 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     footer.extend(key_hints(&pairs, theme));
     frame.render_widget(Paragraph::new(Line::from(footer)), footer_area);
 }
-
-const DETAIL_MAX_WIDTH: u16 = 84;
 
 fn provider_meta(state: &ModelDialogState) -> String {
     let Some(provider) = state.selected_provider() else { return String::new() };
@@ -716,7 +739,8 @@ fn detail_lines(state: &ModelDialogState, w: usize, theme: &Theme) -> Vec<Line<'
     for (i, setting) in state.settings_rows().iter().enumerate() {
         let row = Row::of(settings_focused && i == state.row_idx, true);
         let (label, value, note) = setting_display(*setting, family, state);
-        let (left, right) = if row == Row::Cursor { ("‹ ", " ›") } else { ("  ", "  ") };
+        let adjustable = can_cycle_setting(*setting, family, state);
+        let (left, right) = if row == Row::Cursor && adjustable { ("‹ ", " ›") } else { ("  ", "  ") };
         let value_pad = SETTING_VALUE_WIDTH.saturating_sub(value.chars().count());
         let note_w = w.saturating_sub(3 + SETTING_LABEL_WIDTH + 2 + value.chars().count() + 2 + value_pad + 2 + 1);
         let line = Line::from(vec![
@@ -732,6 +756,15 @@ fn detail_lines(state: &ModelDialogState, w: usize, theme: &Theme) -> Vec<Line<'
     lines
 }
 
+fn can_cycle_setting(row: SettingRow, family: ModelFamily, state: &ModelDialogState) -> bool {
+    match row {
+        SettingRow::Reasoning if family == ModelFamily::Generic => {
+            state.selected_model().is_some_and(|m| m.reasoning.len() > 1)
+        }
+        _ => true,
+    }
+}
+
 fn setting_display(row: SettingRow, family: ModelFamily, state: &ModelDialogState) -> (&'static str, String, &'static str) {
     match row {
         SettingRow::Temperature => {
@@ -744,7 +777,11 @@ fn setting_display(row: SettingRow, family: ModelFamily, state: &ModelDialogStat
                 ModelFamily::Pro => &state.pro_reasoning,
                 ModelFamily::Generic => &state.generic_reasoning,
             };
-            let note = if family == ModelFamily::Flash && level == "dynamic" {
+            let fixed_generic = family == ModelFamily::Generic
+                && state.selected_model().is_some_and(|m| m.reasoning.len() <= 1);
+            let note = if fixed_generic {
+                "fixed for this model"
+            } else if family == ModelFamily::Flash && level == "dynamic" {
                 "low on tool-result turns, high otherwise"
             } else {
                 ""
