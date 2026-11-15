@@ -41,6 +41,9 @@ Each entry under `mcp_servers` is a named server with:
 - **`env`** — optional environment variables for the server process
 - **`url`** — for a **remote** server instead of `command` (e.g. `https://stitch.googleapis.com/mcp`)
 - **`headers`** — HTTP headers sent to a remote server, where its API key or token goes
+- **`timeout_secs`** — optional, how long Corex waits for each answer from this server (default 60). Raise it for servers whose tools run for minutes, e.g. a reverse-engineering server that starts Ghidra: `"timeout_secs": 450`
+
+Servers that split their tool list into pages (`nextCursor`) are read to the last page. Every tool a server lists is sent to the model on each request, so for servers with hundreds of tools use the server's own options (usually `env` variables) to load only the families you need.
 
 Corex spawns a local server as a subprocess and communicates via **JSON-RPC over stdio** (protocol version `2024-11-05`); a remote one is reached over **Streamable HTTP**. The two forms are mixed freely in the same `mcp_servers` map.
 

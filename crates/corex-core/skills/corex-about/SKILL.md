@@ -47,7 +47,6 @@ It is a **ground-up rewrite** of previous TypeScript/Node.js CLIs — a standalo
 - **Multi-Provider Support** — DeepSeek V4.1, Gemini 3.x/2.5, Claude 3.7/3.5, OpenAI, Groq, Mistral, OpenRouter
 - **100% Offline Local LLM** — llama.cpp / Ollama on :8080 at $0.00 cost
 - **DeepSeek V4.1 & Multi-Model CoT** — Flash + Pro with reasoning depth tuning
-- **Adaptive CoT** — automatic reasoning depth per task complexity
 - **96%+ KV cache hit rate** — up to 90% API cost reduction
 - **`apply_patch`** — atomic unified-diff patching with fuzzy whitespace tolerance
 - **Forensic telemetry** — TTFT, tokens/sec, USD cost per turn
@@ -124,7 +123,7 @@ Corex stores all its configuration and data in **`~/.corex/`** (in your home dir
 |File / Path | Purpose |
 |:--- | :--- |
 |`~/.corex/settings.json` | API key, base URL, default model |
-|`~/.corex/flash_settings.json` | CoT reasoning depth (`none` / `low` / `high` / `xhigh` / `max`) |
+|`~/.corex/flash_settings.json` | DeepSeek Flash reasoning (`off` / `low` / `high` / `max`, default `high`) and temperature, which DeepSeek only applies with reasoning `off` |
 |`~/.corex/pro_settings.json` | Deep reasoning configuration for DeepSeek-V4-Pro |
 |`~/.corex/logs/` | Forensic audit logs (`corex-forensic-YYYY-MM-DD.log`) |
 |`~/.corex/SYSTEM.md`, `~/.corex/COREX.md` | Global instructions (applies to all projects) |

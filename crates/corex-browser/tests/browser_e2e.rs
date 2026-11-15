@@ -11,10 +11,11 @@ use tokio::process::{Child, Command};
 
 const EXTENSION_ID: &str = "pgbencaoenigjeekljfindfeaolenaip";
 const LOGO_PNG: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
-    0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41,
-    0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
-    0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
 type Saved = Arc<Mutex<HashMap<String, String>>>;
@@ -30,7 +31,13 @@ impl Site {
     }
 
     fn saved(&self, page: &str) -> Value {
-        let body = self.saved.lock().unwrap().get(page).cloned().unwrap_or_default();
+        let body = self
+            .saved
+            .lock()
+            .unwrap()
+            .get(page)
+            .cloned()
+            .unwrap_or_default();
         serde_json::from_str(&body).unwrap_or(Value::Null)
     }
 }
@@ -64,7 +71,11 @@ async fn answer(mut stream: TcpStream, root: PathBuf, saved: Saved, port: u16) {
     let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let length = head
         .lines()
-        .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse().ok()))
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .and_then(|v| v.trim().parse().ok())
+        })
         .unwrap_or(0usize);
     while buffer.len() < header_end + length {
         let read = stream.read(&mut chunk).await.unwrap_or(0);
@@ -78,7 +89,10 @@ async fn answer(mut stream: TcpStream, root: PathBuf, saved: Saved, port: u16) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
 
     let (status, body) = if method == "POST" {
-        let page = query.split('&').find_map(|pair| pair.strip_prefix("page=")).unwrap_or("unnamed");
+        let page = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("page="))
+            .unwrap_or("unnamed");
         let body = String::from_utf8_lossy(&buffer[header_end..]).to_string();
         saved.lock().unwrap().insert(page.to_string(), body);
         ("200 OK", "ok".to_string())
@@ -100,9 +114,20 @@ fn find_browser() -> Option<PathBuf> {
         return Some(PathBuf::from(custom));
     }
     let path = std::env::var_os("PATH")?;
-    ["brave", "brave-browser", "google-chrome-stable", "google-chrome", "chromium", "chromium-browser"]
-        .iter()
-        .find_map(|name| std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file()))
+    [
+        "brave",
+        "brave-browser",
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 fn launch_browser(binary: &Path, workdir: &Path, real_home: Option<std::ffi::OsString>) -> Child {
@@ -121,7 +146,12 @@ fn launch_browser(binary: &Path, workdir: &Path, real_home: Option<std::ffi::OsS
     let mut command = Command::new(binary);
     command
         .arg(format!("--user-data-dir={}", profile.display()))
-        .arg(format!("--load-extension={}", Path::new(env!("CARGO_MANIFEST_DIR")).join("extension").display()))
+        .arg(format!(
+            "--load-extension={}",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("extension")
+                .display()
+        ))
         .args([
             "--headless=new",
             "--window-size=1280,900",
@@ -142,7 +172,10 @@ fn launch_browser(binary: &Path, workdir: &Path, real_home: Option<std::ffi::OsS
 fn find(snapshot: &str, needles: &[&str]) -> String {
     snapshot
         .lines()
-        .filter(|line| line.trim_start().starts_with("- ") && needles.iter().all(|needle| line.contains(needle)))
+        .filter(|line| {
+            line.trim_start().starts_with("- ")
+                && needles.iter().all(|needle| line.contains(needle))
+        })
         .find_map(|line| line.split("[ref=").nth(1))
         .and_then(|rest| rest.split(']').next())
         .map(str::to_string)
@@ -166,7 +199,10 @@ impl Page {
 
     async fn click(&mut self, needles: &[&str]) {
         let reference = find(&self.snapshot, needles);
-        self.browser.click(&reference).await.unwrap_or_else(|e| panic!("click {needles:?}: {e}"));
+        self.browser
+            .click(&reference)
+            .await
+            .unwrap_or_else(|e| panic!("click {needles:?}: {e}"));
         self.refresh().await;
     }
 
@@ -178,7 +214,10 @@ impl Page {
 
     async fn type_into(&mut self, needles: &[&str], text: &str, submit: bool) {
         let reference = find(&self.snapshot, needles);
-        self.browser.type_text(&reference, text, true, submit).await.unwrap();
+        self.browser
+            .type_text(&reference, text, true, submit)
+            .await
+            .unwrap();
         self.refresh().await;
     }
 
@@ -196,7 +235,10 @@ impl Page {
 
     async fn upload(&mut self, needles: &[&str], path: &Path) {
         let reference = find(&self.snapshot, needles);
-        self.browser.upload(&reference, &[path.display().to_string()]).await.unwrap();
+        self.browser
+            .upload(&reference, &[path.display().to_string()])
+            .await
+            .unwrap();
         self.refresh().await;
     }
 
@@ -211,8 +253,10 @@ impl Page {
 
 async fn settings_panel(page: &mut Page, site: &Site, logo: &Path) {
     page.open(&site.url("settings.html")).await;
-    page.choose(&["combobox", "English (US)"], "Spanish (Mexico)").await;
-    page.select(&["combobox", "Time zone"], "America/Mexico_City").await;
+    page.choose(&["combobox", "English (US)"], "Spanish (Mexico)")
+        .await;
+    page.select(&["combobox", "Time zone"], "America/Mexico_City")
+        .await;
     page.click(&["switch", "Dark mode"]).await;
     page.click(&["tab", "Notifications"]).await;
     page.click(&["switch", "Email"]).await;
@@ -249,15 +293,25 @@ async fn settings_panel(page: &mut Page, site: &Site, logo: &Path) {
 async fn wizard(page: &mut Page, site: &Site) {
     page.open(&site.url("wizard.html")).await;
     page.click(&["button", "Next"]).await;
-    assert!(page.text().await.contains("Fill in company"), "validation must block an empty first step");
-    page.type_into(&["textbox", "Company name"], "Acme Ltd", false).await;
-    page.type_into(&["textbox", "Contact email"], "ops@acme.test", false).await;
+    assert!(
+        page.text().await.contains("Fill in company"),
+        "validation must block an empty first step"
+    );
+    page.type_into(&["textbox", "Company name"], "Acme Ltd", false)
+        .await;
+    page.type_into(&["textbox", "Contact email"], "ops@acme.test", false)
+        .await;
     page.select(&["combobox", "Team size"], "51-200").await;
     page.click(&["button", "Next"]).await;
     page.click(&["radio", "South America"]).await;
     page.click(&["checkbox", "Managed database"]).await;
     page.click(&["checkbox", "Daily backups"]).await;
-    page.type_into(&["textbox", "Notes"], "Migration planned for January", false).await;
+    page.type_into(
+        &["textbox", "Notes"],
+        "Migration planned for January",
+        false,
+    )
+    .await;
     page.click(&["button", "Next"]).await;
     page.click(&["checkbox", "terms"]).await;
     page.click(&["button", "Create project"]).await;
@@ -274,16 +328,34 @@ async fn wizard(page: &mut Page, site: &Site) {
 async fn covered_clicks(page: &mut Page, site: &Site) {
     page.open(&site.url("overlay.html")).await;
     let reference = find(&page.snapshot, &["button", "Save order"]);
-    let error = page.browser.click(&reference).await.expect_err("a covered button must not be clicked");
+    let error = page
+        .browser
+        .click(&reference)
+        .await
+        .expect_err("a covered button must not be clicked");
     assert!(error.to_string().contains("covered by"), "{error}");
     assert!(site.saved("overlay").is_null());
     page.click(&["button", "Accept cookies"]).await;
     page.click(&["button", "Save order"]).await;
-    assert!(!site.saved.lock().unwrap().get("overlay").cloned().unwrap_or_default().is_empty());
+    assert!(!site
+        .saved
+        .lock()
+        .unwrap()
+        .get("overlay")
+        .cloned()
+        .unwrap_or_default()
+        .is_empty());
 
     page.open(&site.url("sticky.html")).await;
     page.click(&["button", "Deep button"]).await;
-    assert!(!site.saved.lock().unwrap().get("sticky").cloned().unwrap_or_default().is_empty());
+    assert!(!site
+        .saved
+        .lock()
+        .unwrap()
+        .get("sticky")
+        .cloned()
+        .unwrap_or_default()
+        .is_empty());
 }
 
 async fn gestures(page: &mut Page, site: &Site, logo: &Path) {
@@ -291,7 +363,11 @@ async fn gestures(page: &mut Page, site: &Site, logo: &Path) {
     page.choose(&["button", "Country"], "Spain").await;
     assert!(page.text().await.contains("Picked: Spain"));
     let reference = find(&page.snapshot, &["button", "Country"]);
-    let error = page.browser.choose(&reference, "Narnia").await.expect_err("a missing option is an error");
+    let error = page
+        .browser
+        .choose(&reference, "Narnia")
+        .await
+        .expect_err("a missing option is an error");
     assert!(error.to_string().contains("Options visible"), "{error}");
     page.refresh().await;
 
@@ -306,7 +382,10 @@ async fn gestures(page: &mut Page, site: &Site, logo: &Path) {
     }
 
     let alert = find(&page.snapshot, &["button", "Alert"]);
-    page.browser.click(&alert).await.expect("a click that opens an alert returns");
+    page.browser
+        .click(&alert)
+        .await
+        .expect("a click that opens an alert returns");
     assert!(page.browser.snapshot().await.is_err());
     assert_eq!(page.browser.open_dialog().as_deref(), Some("alert: hello"));
     page.browser.dialog(true, None).await.unwrap();
@@ -316,9 +395,21 @@ async fn gestures(page: &mut Page, site: &Site, logo: &Path) {
 
 async fn workspace(page: &mut Page, site: &Site) {
     page.open(&site.url("workspace.html")).await;
-    assert!(page.snapshot.contains("[invalid=true] description=\"Enter a valid address\""), "{}", page.snapshot);
-    let filtered = page.browser.snapshot_matching(Some("Member 40")).await.unwrap();
-    assert!(filtered.contains("option \"Member 40\" [ref="), "{filtered}");
+    assert!(
+        page.snapshot
+            .contains("[invalid=true] description=\"Enter a valid address\""),
+        "{}",
+        page.snapshot
+    );
+    let filtered = page
+        .browser
+        .snapshot_matching(Some("Member 40"))
+        .await
+        .unwrap();
+    assert!(
+        filtered.contains("option \"Member 40\" [ref="),
+        "{filtered}"
+    );
     page.refresh().await;
 
     let members = find(&page.snapshot, &["listbox", "Members"]);
@@ -329,20 +420,43 @@ async fn workspace(page: &mut Page, site: &Site) {
     page.key("Control+a").await;
     page.key("Backspace").await;
     let text = page.text().await;
-    assert!(text.contains("Name is:") && !text.contains("old value"), "{text}");
+    assert!(
+        text.contains("Name is:") && !text.contains("old value"),
+        "{text}"
+    );
 
     let started = std::time::Instant::now();
-    assert!(page.browser.wait_for_text("Search or start", false, Duration::from_secs(5)).await.unwrap());
-    assert!(started.elapsed() < Duration::from_secs(1), "placeholder found after {:?}", started.elapsed());
+    assert!(page
+        .browser
+        .wait_for_text("Search or start", false, Duration::from_secs(5))
+        .await
+        .unwrap());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "placeholder found after {:?}",
+        started.elapsed()
+    );
 
     let save = find(&page.snapshot, &["button", "Save"]);
     page.browser.click(&save).await.unwrap();
     let started = std::time::Instant::now();
     page.browser.click(&save).await.unwrap();
-    assert!(started.elapsed() < Duration::from_millis(1200), "a click on a busy page took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "a click on a busy page took {:?}",
+        started.elapsed()
+    );
     page.refresh().await;
-    assert!(page.browser.wait_for_text("Saved changes", false, Duration::from_secs(5)).await.unwrap());
-    assert!(page.browser.wait_for_text("Saving", true, Duration::from_secs(1)).await.unwrap());
+    assert!(page
+        .browser
+        .wait_for_text("Saved changes", false, Duration::from_secs(5))
+        .await
+        .unwrap());
+    assert!(page
+        .browser
+        .wait_for_text("Saving", true, Duration::from_secs(1))
+        .await
+        .unwrap());
 
     page.click(&["button", "Open help"]).await;
     let mut note = None;
@@ -362,17 +476,30 @@ async fn workspace(page: &mut Page, site: &Site) {
     let help = tabs.iter().find(|tab| tab.active).expect("an active tab");
     assert_eq!(help.title, "Help read");
     page.browser.close_tab(help.id).await.unwrap();
-    assert!(page.browser.page_info().await.contains("Workspace settings"));
+    assert!(page
+        .browser
+        .page_info()
+        .await
+        .contains("Workspace settings"));
     assert_eq!(page.browser.list_tabs().await.len(), 1);
 }
 
 async fn frames(page: &mut Page, site: &Site) {
-    for (url, message) in [("embedded.html", "same origin"), ("embedded-x.html", "cross origin")] {
+    for (url, message) in [
+        ("embedded.html", "same origin"),
+        ("embedded-x.html", "cross origin"),
+    ] {
         page.open(&site.url(url)).await;
-        page.select(&["combobox", "Topic"], "Technical support").await;
-        page.type_into(&["textbox", "Message"], message, false).await;
+        page.select(&["combobox", "Topic"], "Technical support")
+            .await;
+        page.type_into(&["textbox", "Message"], message, false)
+            .await;
         page.click(&["button", "Send message"]).await;
-        assert_eq!(site.saved("iframe"), json!({ "topic": "Technical support", "msg": message }), "{url}");
+        assert_eq!(
+            site.saved("iframe"),
+            json!({ "topic": "Technical support", "msg": message }),
+            "{url}"
+        );
     }
 }
 
@@ -394,8 +521,13 @@ async fn drives_real_pages_through_the_extension() {
 
     let site = serve(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")).await;
     let _browser = launch_browser(&binary, &workdir, real_home);
-    let browser = Browser::start().await.expect("the extension connects to Corex");
-    let mut page = Page { browser, snapshot: String::new() };
+    let browser = Browser::start()
+        .await
+        .expect("the extension connects to Corex");
+    let mut page = Page {
+        browser,
+        snapshot: String::new(),
+    };
 
     settings_panel(&mut page, &site, &logo).await;
     wizard(&mut page, &site).await;

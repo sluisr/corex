@@ -30,6 +30,9 @@ pub(super) fn handle_mouse(app: &mut App, mouse: MouseEvent, (w, h): (u16, u16))
     } else {
         w
     };
+    if app.fleet_dialog.terminal_hidden {
+        return false;
+    }
     let is_on_server = if is_horizontal {
         mouse.column >= split_col
     } else {
@@ -106,57 +109,45 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Re
         return Ok(Flow::Handled);
     }
 
-    // Split view: chat (left) and VPS terminal (right).
-    // Tab swaps keyboard focus; F1-F9 / Alt+1-9 pick a server; Ctrl+R probes metrics.
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let term_focus = app.fleet_dialog.command_mode;
 
-    let is_pane_toggle = key.code == KeyCode::F(6)
-        || (ctrl && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')))
-        || key.code == KeyCode::BackTab
-        || (shift && key.code == KeyCode::Tab)
-        || (alt && key.code == KeyCode::Tab)
-        || (alt && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')))
-        || (!term_focus && key.code == KeyCode::Tab && app.input_buffer.trim().is_empty());
+    // Legacy terminals report Ctrl+\ and Ctrl+] as Ctrl+4 and Ctrl+5.
+    let is_focus_toggle = key.code == KeyCode::F(6)
+        || key.code == KeyCode::Char('\x1d')
+        || (ctrl && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')));
+    let is_hide_toggle = key.code == KeyCode::F(7)
+        || key.code == KeyCode::Char('\x1c')
+        || (ctrl && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4')));
 
     let pick_server: Option<usize> = match key.code {
-        KeyCode::F(n) if (1..=9).contains(&n) && n != 2 => Some((n - 1) as usize),
+        KeyCode::F(n) if (1..=9).contains(&n) && !matches!(n, 2 | 6 | 7) => Some((n - 1) as usize),
         KeyCode::Char(d) if alt && d.is_ascii_digit() && d != '0' => Some((d as usize) - ('1' as usize)),
-        KeyCode::Char(d) if ctrl && d.is_ascii_digit() && d != '0' => Some((d as usize) - ('1' as usize)),
         _ => None,
     };
-
-    let next_vps = alt && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Right);
-    let prev_vps = alt && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Left);
     let open_selector = alt && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'));
 
-    if let Some(idx) = pick_server {
+    if is_focus_toggle {
+        app.fleet_dialog.terminal_hidden = false;
+        app.fleet_dialog.command_mode = !term_focus;
+    } else if is_hide_toggle {
+        app.toggle_fleet_terminal();
+    } else if let Some(idx) = pick_server {
         if idx < app.fleet_dialog.items.len() {
             app.fleet_dialog.selected_idx = idx;
-            ensure_session(app);
-        }
-    } else if next_vps {
-        if !app.fleet_dialog.items.is_empty() {
-            app.fleet_dialog.select_next();
-            ensure_session(app);
-        }
-    } else if prev_vps {
-        if !app.fleet_dialog.items.is_empty() {
-            app.fleet_dialog.select_prev();
+            app.fleet_dialog.terminal_hidden = false;
             ensure_session(app);
         }
     } else if open_selector {
+        app.fleet_dialog.terminal_hidden = false;
         app.fleet_dialog.active_session = None;
         app.fleet_dialog.command_mode = true;
-    } else if key.code == KeyCode::Char('r') && ctrl {
-        probe_telemetry(app);
-    } else if is_pane_toggle {
-        app.fleet_dialog.command_mode = !term_focus;
     } else if !term_focus {
-        // Chat focus: the normal chat keys apply.
-        // (Chat PageUp/PageDown scroll the conversation; terminal scroll needs Tab.)
+        if ctrl && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R')) {
+            probe_telemetry(app);
+            return Ok(Flow::Handled);
+        }
         return Ok(Flow::Pass);
     } else if app.fleet_dialog.is_selected_connected() {
         terminal_key(app, key);
@@ -167,7 +158,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent, event_tx: &EventTx) -> Re
 }
 
 /// Asks every server for fresh telemetry (Ctrl+R).
-fn probe_telemetry(app: &mut App) {
+pub(crate) fn probe_telemetry(app: &mut App) {
     app.fleet_dialog.status_msg = Some("Probing telemetry...".to_string());
     let tx = app.fleet_dialog.telemetry_tx.clone();
     for n in app.fleet_dialog.items.iter().map(|i| i.config.clone()) {
@@ -883,5 +874,45 @@ mod tests {
         assert!(app.fleet_dialog.reconnect.is_none());
         assert!(app.fleet_dialog.pty_session.is_none() && app.fleet_dialog.active_session.is_none());
         assert_eq!(app.fleet_dialog.status_msg.as_deref(), Some("Stopped reconnecting to offline."));
+    }
+
+    #[tokio::test]
+    async fn fleet_keys_leave_the_shell_and_the_modes_alone() {
+        crate::test_support::isolate_home();
+        let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, std::path::PathBuf::from("/tmp"), false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        app.fleet_dialog.is_open = true;
+        let key = |code, mods| KeyEvent::new(code, mods);
+        let ctrl = KeyModifiers::CONTROL;
+        let press = |app: &mut App, code, mods| handle_key(app, key(code, mods), &tx).unwrap();
+
+        assert!(matches!(press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT), Flow::Pass), "Shift+Tab cycles modes");
+        assert!(matches!(press(&mut app, KeyCode::Tab, KeyModifiers::NONE), Flow::Pass), "Tab completes in chat");
+        assert!(!app.fleet_dialog.command_mode);
+
+        press(&mut app, KeyCode::Char(']'), ctrl);
+        assert!(app.fleet_dialog.command_mode);
+        press(&mut app, KeyCode::Char('5'), ctrl);
+        assert!(!app.fleet_dialog.command_mode, "legacy Ctrl+]");
+        press(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+        assert!(app.fleet_dialog.command_mode, "F6 toggles instead of picking server 6");
+
+        press(&mut app, KeyCode::Char('r'), ctrl);
+        assert_ne!(app.fleet_dialog.status_msg.as_deref(), Some("Probing telemetry..."), "Ctrl+R stays with the terminal");
+
+        press(&mut app, KeyCode::F(7), KeyModifiers::NONE);
+        assert!(app.fleet_dialog.terminal_hidden && !app.fleet_dialog.command_mode, "F7 hides instead of picking server 7");
+        press(&mut app, KeyCode::F(7), KeyModifiers::NONE);
+        assert!(!app.fleet_dialog.terminal_hidden);
+        press(&mut app, KeyCode::Char('\\'), ctrl);
+        assert!(app.fleet_dialog.terminal_hidden && !app.fleet_dialog.command_mode);
+        assert!(matches!(press(&mut app, KeyCode::Char('r'), ctrl), Flow::Handled));
+        assert_eq!(app.fleet_dialog.status_msg.as_deref(), Some("Probing telemetry..."));
+        press(&mut app, KeyCode::Char(']'), ctrl);
+        assert!(!app.fleet_dialog.terminal_hidden && app.fleet_dialog.command_mode, "Ctrl+] brings it back");
+
+        assert_eq!(crate::fleet_pty::key_event_to_bytes(key(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(crate::fleet_pty::key_event_to_bytes(key(KeyCode::Char('w'), ctrl)), Some(vec![0x17]));
     }
 }

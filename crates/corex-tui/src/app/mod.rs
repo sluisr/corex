@@ -100,6 +100,7 @@ impl App {
             rewind_dialog: Default::default(),
             model_dialog: ModelDialogState::new(),
             session_dialog: SessionDialogState::new(),
+            tasks_dialog: Default::default(),
             auth_dialog,
             sudo_dialog: SudoDialogState::new(),
             fleet_dialog: FleetDialogState::new(),
@@ -132,6 +133,9 @@ impl App {
             last_url_open: None,
             session_allowed_commands: Vec::new(),
             logs_expanded: false,
+            scroll_anchor: None,
+            expanded_messages: Default::default(),
+            chat_header_lines: 0,
             git_branch: branch,
             last_turn_start: None,
             latency: SessionLatency::default(),
@@ -150,8 +154,6 @@ impl App {
             accept_edits: false,
             user_shell_rx: None,
             user_shell_stopped: false,
-            context_files: 0,
-            context_files_checked: None,
             last_file_query: None,
             last_query_is_folder: false,
             term_width: 80,
@@ -163,7 +165,6 @@ impl App {
             cached_render_width: 0,
             cached_session_id: String::new(),
             cached_logs_expanded: false,
-            cached_has_collapsed_logs: false,
             message_clock: Default::default(),
             streaming_md_cache: Vec::new(),
             streaming_md_committed_lines: Vec::new(),
@@ -412,13 +413,17 @@ impl App {
 
         if is_point_click && !is_focus_activation && !is_startup_grace {
             let (line_idx, char_col) = selection.anchor;
+            if self.toggle_log_at(line_idx) {
+                self.clear_selection();
+                return;
+            }
             if let Some(number) = self.copy_number_at(line_idx) {
                 self.clear_selection();
                 self.copy_block(Some(number));
                 return;
             }
-            if let Some(line) = self.selection_lines.get(line_idx) {
-                if let Some(url) = formatting::find_url_in_line(line, Some(char_col as usize)) {
+            {
+                if let Some(url) = self.url_at(line_idx, char_col as usize) {
                     let already_opened_recently = self.last_url_open
                         .as_ref()
                         .map(|(t, prev_url)| {
@@ -703,17 +708,6 @@ impl App {
         true
     }
 
-    /// Counts the instruction files (`SYSTEM.md`, `COREX.md`, `AGENTS.md`, …) the system prompt
-    /// loads, at most every few seconds; true when the number changed and the bar must redraw.
-    pub fn refresh_context_files(&mut self) -> bool {
-        if self.context_files_checked.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
-            return false;
-        }
-        self.context_files_checked = Some(std::time::Instant::now());
-        let memory = corex_core::memory::Memory::new(&self.workspace_dir);
-        let count = memory.candidates().iter().filter(|(_, path)| path.is_file()).count();
-        std::mem::replace(&mut self.context_files, count) != count
-    }
 
     /// Takes a finished background index build; true when one arrived and the popup must redraw.
     pub fn poll_file_index(&mut self) -> bool {
@@ -760,6 +754,7 @@ impl App {
             || self.model_dialog.is_open
             || self.auth_dialog.is_open
             || self.session_dialog.is_open
+            || self.tasks_dialog.is_open
             || self.user_dialog.is_open;
 
         if is_modal_open {
@@ -900,6 +895,81 @@ impl App {
         let _ = self.session.save();
     }
 
+    pub fn toggle_logs(&mut self) {
+        if !self.auto_scroll {
+            self.scroll_anchor = self.chat_anchor();
+        }
+        self.logs_expanded = !self.logs_expanded;
+        self.expanded_messages.clear();
+        if let Some(ref mut pending) = self.pending_confirmation {
+            pending.diff_expanded = self.logs_expanded;
+        }
+        self.invalidate_message_cache();
+    }
+
+    pub(crate) fn url_at(&self, line_idx: usize, col: usize) -> Option<String> {
+        use unicode_width::UnicodeWidthStr;
+        let line = self.selection_lines.get(line_idx)?;
+        let chat_width = self.last_chat_rect.map(|r| r.width as usize).unwrap_or(0);
+        let broken = |text: &str| {
+            let w = text.width();
+            chat_width > 0 && (w == chat_width || w + 2 == chat_width) && !text.ends_with(' ')
+        };
+        let body = |text: &str| text.trim_start_matches([' ', '│']).to_string();
+        let mut first = line_idx;
+        while first > 0 && self.selection_lines.get(first - 1).is_some_and(|prev| broken(prev)) {
+            first -= 1;
+        }
+        let mut last = line_idx;
+        while broken(self.selection_lines.get(last)?) && self.selection_lines.get(last + 1).is_some_and(|next| !body(next).is_empty()) {
+            last += 1;
+        }
+        if first == last {
+            return formatting::find_url_in_line(line, Some(col));
+        }
+        let mut joined = String::new();
+        let mut click = col;
+        for idx in first..=last {
+            let text = self.selection_lines.get(idx)?;
+            let piece = if idx == first { text.to_string() } else { body(text) };
+            if idx == line_idx {
+                click = joined.width() + col.saturating_sub(text.width() - piece.width());
+            }
+            joined.push_str(&piece);
+        }
+        formatting::find_url_in_line(&joined, Some(click))
+    }
+
+    pub fn toggle_log_at(&mut self, line_idx: usize) -> bool {
+        if self.logs_expanded {
+            return false;
+        }
+        let Some(idx) = line_idx.checked_sub(self.selection_lines.head.len()) else { return false };
+        if !self.selection_lines.cached.get(idx).is_some_and(|text| is_log_toggle(text)) {
+            return false;
+        }
+        let starts = &self.cached_message_line_offsets[..self.cached_message_count.min(self.cached_message_line_offsets.len())];
+        let Some(msg) = starts.partition_point(|&start| start <= idx).checked_sub(1) else { return false };
+        self.scroll_anchor = self.chat_anchor();
+        self.auto_scroll = false;
+        if !self.expanded_messages.remove(&msg) {
+            self.expanded_messages.insert(msg);
+        }
+        self.invalidate_message_cache_from(msg);
+        true
+    }
+
+    pub fn chat_anchor(&self) -> Option<(usize, usize)> {
+        let line = self.scroll_offset.checked_sub(self.chat_header_lines)?;
+        let starts = &self.cached_message_line_offsets[..self.cached_message_count.min(self.cached_message_line_offsets.len())];
+        let end = self.cached_message_line_offsets.get(self.cached_message_count).copied()?;
+        if line >= end {
+            return None;
+        }
+        let msg = starts.partition_point(|&start| start <= line).checked_sub(1)?;
+        Some((msg, line - starts[msg]))
+    }
+
     pub fn invalidate_message_cache(&mut self) {
         self.cached_message_lines.clear();
         self.cached_message_line_offsets.clear();
@@ -1027,6 +1097,7 @@ impl App {
         self.sudo_dialog.is_open
             || self.model_dialog.is_open
             || self.session_dialog.is_open
+            || self.tasks_dialog.is_open
             || self.auth_dialog.is_open
             || self.user_dialog.is_open
             || self.rewind_dialog.is_open
@@ -1419,7 +1490,11 @@ impl App {
         self.cancel_token = Some(cancel_token.clone());
 
         let client = self.llm_client.clone();
+        let recent_images = llm_cfg.recent_images;
+        let images_dir = self.session.images_dir();
         tokio::spawn(async move {
+            let mut messages = messages;
+            corex_core::session_images::keep_recent_images(&mut messages, recent_images, images_dir.as_deref());
             match client.stream_chat(messages, Some(tools), cancel_token.clone()).await {
                 Ok(mut rx) => {
                     while let Some(evt) = rx.recv().await {
@@ -1552,11 +1627,11 @@ impl App {
                     cfg.flash_settings = flash.clone();
                     cfg.temperature = flash.temperature;
                     cfg.reasoning_effort = flash.reasoning_effort.clone();
-                    format!(
-                        "- Temperature: {:.1}\n- Reasoning: {}",
-                        cfg.temperature,
-                        cfg.reasoning_effort
-                    )
+                    if crate::model_dialog::flash_thinking_off(&cfg.reasoning_effort) {
+                        format!("- Temperature: {:.1}\n- Reasoning: off", cfg.temperature)
+                    } else {
+                        format!("- Reasoning: {}", cfg.reasoning_effort)
+                    }
                 }
                 ModelFamily::Pro => {
                     cfg.pro_settings = pro.clone();
@@ -1567,11 +1642,16 @@ impl App {
                     )
                 }
                 ModelFamily::Generic => {
-                    cfg.temperature = generic_temp;
+                    let (lo, hi) = corex_core::providers::temperature_range(provider.kind(), &profile.id);
+                    cfg.temperature = generic_temp.clamp(lo, hi);
                     if !generic_reasoning.is_empty() {
                         cfg.reasoning_effort = generic_reasoning.clone();
                     }
-                    format!("- Temperature: {:.1}\n- Endpoint: {}", generic_temp, provider.base_url)
+                    if corex_core::providers::applies_temperature(&profile.id) {
+                        format!("- Temperature: {:.1}\n- Endpoint: {}", cfg.temperature, provider.base_url)
+                    } else {
+                        format!("- Endpoint: {}", provider.base_url)
+                    }
                 }
             }
         };
@@ -1584,7 +1664,7 @@ impl App {
         self.session.provider = cfg.active_provider.clone();
         self.session.temperature = Some(cfg.temperature);
         self.session.reasoning_effort = Some(cfg.reasoning_effort.clone());
-        let _ = self.session.save();
+        self.session.save_async();
         self.session.add_message(Message::system(format!(
             "Activated {} · {}\n{}",
             provider.display_name(),
@@ -1629,6 +1709,12 @@ impl App {
     }
 
     /// Exits Fleet / SysAdmin mode, saving the fleet session and restoring the normal conversation.
+    pub fn toggle_fleet_terminal(&mut self) {
+        let fleet = &mut self.fleet_dialog;
+        fleet.terminal_hidden = !fleet.terminal_hidden;
+        fleet.command_mode = !fleet.terminal_hidden;
+    }
+
     pub fn exit_fleet_mode(&mut self) {
         if let Some(normal) = self.normal_session_stash.take() {
             let _ = self.session.save();
@@ -1790,3 +1876,11 @@ pub(crate) fn fim_context_window(content: &str, hole_idx: usize, window: usize) 
 
 #[cfg(test)]
 mod tests;
+
+fn is_log_toggle(text: &str) -> bool {
+    let text = text.trim_start_matches([' ', '│', '✓', '✕', '·']).trim();
+    let marker = text.starts_with("… (+") && text.to_lowercase().contains("ctrl+o");
+    let header = text.ends_with(" lines)")
+        && (text.starts_with("Output (") || text.starts_with("Command failed (") || text.starts_with("Exit code "));
+    marker || header
+}

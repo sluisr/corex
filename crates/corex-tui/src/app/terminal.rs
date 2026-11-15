@@ -12,6 +12,11 @@ use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 pub const MOUSE_REPORTING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub const MOUSE_REPORTING_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
+// Mode 1007: with mouse reporting off, a terminal sends the wheel as Up/Down keys.
+pub const WHEEL_AS_ARROWS_OFF: &str = "\x1b[?1007s\x1b[?1007l";
+// Back on (the usual default), then the saved value where the terminal can save modes.
+const WHEEL_AS_ARROWS_RESTORE: &str = "\x1b[?1007h\x1b[?1007r";
+
 /// Saves and restores the window title on xterm's title stack, so the shell gets its own title
 /// back after the agent's states. Terminals without the stack ignore both.
 const TITLE_PUSH: &str = "\x1b[22;0t";
@@ -57,6 +62,7 @@ pub fn restore_terminal() {
     // Explicitly switch every mouse mode off (also the ones enabled by hand in the TUI loop)
     // and reset attributes so a dead session never leaves escape junk in the shell.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let _ = stdout.write_all(WHEEL_AS_ARROWS_RESTORE.as_bytes());
     let _ = stdout.write_all(b"\x1b[?1003l\x1b[0m");
     let _ = execute!(
         stdout,
@@ -100,6 +106,7 @@ pub fn suspend() {
     let _ = enable_raw_mode();
     let mut out = stdout();
     let _ = out.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let _ = out.write_all(WHEEL_AS_ARROWS_OFF.as_bytes());
     let _ = execute!(out, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange);
     let _ = out.flush();
     RESUMED.store(true, std::sync::atomic::Ordering::Relaxed);

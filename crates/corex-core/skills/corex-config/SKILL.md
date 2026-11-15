@@ -22,7 +22,8 @@ Corex uses a clear, human-readable hierarchy of configuration files in **TOML** 
 
 |File | Scope | Format | Purpose |
 |:--- | :--- | :--- | :--- |
-|**`~/.corex/SYSTEM.md`** *(+ `~/.corex/COREX.md`)* | **Global** | Markdown | **User Personality & Global Rules**: custom tone, role instructions, language, conventions applied to all projects and sessions. |
+|**`~/.corex/SYSTEM.md`** | **Global** | Markdown | **User Personality & Global Rules**, written by hand and never edited by Corex: custom tone, role instructions, language, conventions applied to all projects and sessions. |
+|**`~/.corex/COREX.md`** | **Global** | Markdown | **Saved notes**: what `/memory add` and the agent's memory tool store when asked to remember something. Sent to the model under its own heading, after `SYSTEM.md`. Keep a rule in one of the two files, not both. |
 |**`.corex/SYSTEM.md`** *(+ `./COREX.md`, `./AGENTS.md`, `./DEEPSEEK.md`)* | **Project Local** | Markdown | **Project Instructions**: repository-specific architecture, build commands, and rules. |
 |**`~/.corex/fleet.toml`** *(or `.corex/fleet.toml`)* | **Global or Local** | TOML | **Remote Fleet & Allowed Commands**: SSH server inventory, `safe_commands` (auto-approved commands), and `dangerous_commands`. A workspace `.corex/fleet.toml` only contributes servers: its command lists are ignored and its servers always ask before Corex reaches them. |
 |**`~/.corex/settings.json`** | **Global** | JSON | **Corex Engine Settings**: active model and provider, reasoning effort, temperature, YOLO mode default, allowed commands. Only values that differ from the defaults are written. |
@@ -183,6 +184,9 @@ Your messages are labelled with the login of the machine (`$USER`) and drawn in 
 * `user_color`: the colour of your messages, as `#rrggbb`. An invalid value keeps the default and Corex says so at startup. Pick a light colour for dark terminals and a dark one for light terminals, so it stays readable.
 
 When the user asks to change their name or the colour of their messages, edit these keys in `~/.corex/settings.json` (keep the other keys as they are) and tell them to restart `cx`: settings are read at startup.
+
+### Images sent to the model (`recent_images`)
+Screenshots stay in the session (saved as files under `~/.corex/sessions/images/<session id>/`), but each request only carries the newest ones: 3 by default. An older image goes as a note with the path of its saved file, and the agent can look at it again with `read_image` on that path when the user asks about it. Set `"recent_images": 5` (any number) in `~/.corex/settings.json` or a project `.corex/settings.json` to change it, or `0` to send every image as before.
 
 ### Where `/export` saves chats (`exports_dir`)
 By default `/export` writes to `~/.corex/exports/<project>/`, where `<project>` is the name of the folder `cx` was started in (`home` when started in the home folder). Files are named by date and chat title, such as `2026-11-09_22-50_check-the-disk.md`, and an export never overwrites an earlier one (`-2`, `-3`… is added).

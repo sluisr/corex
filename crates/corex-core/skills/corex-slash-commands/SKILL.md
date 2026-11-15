@@ -8,6 +8,8 @@ description: >-
   /save, /export, /update, /info, /clear, /help, /quit. Also activate for questions
   like 'what can I type with /', 'list commands', 'how do I switch model',
   'how do I check balance', 'how do I resume a session', 'how to compress context'.
+  Also activate for keyboard shortcuts and hotkeys ('atajos', 'teclas', 'shortcuts',
+  'what does Ctrl+O do', 'how do I expand logs', 'what does the status bar mean').
 ---
 
 # Corex Slash Commands Reference
@@ -43,7 +45,7 @@ cx -l                          # Short alias for --list-sessions
 
 |Command | Description |
 |:--- | :--- |
-|`/model` | Open the interactive model selector (Cloud / Local across 15 providers) |
+|`/model` | Open the interactive model selector (Cloud / Local across 15 providers). `↑↓` select, `Tab` switches pane, `←→` adjusts a setting (temperature, reasoning, save; temperature is hidden where the model ignores it: Claude 4.7+/5.x, OpenAI o-series and DeepSeek Flash unless reasoning is `off`; it stays within the provider's range, 0–1 for Claude and Mistral), `Enter` uses the highlighted model from the models or settings pane, `E` edits the provider's key, `Esc` closes |
 |`/key [api_key]` | Configure or update the API key for the active provider (kept in the system keyring, not in `settings.json`) |
 |`/auth [api_key]` | Alias for `/key` |
 
@@ -157,7 +159,8 @@ cx fetch "https://news.ycombinator.com"
 |`/yolo all` | Enable YOLO All mode (auto-approves EVERYTHING, zero prompts) |
 |`/yolo off` | Disable YOLO mode |
 |`/sudo [clear]` | Configure or clear ephemeral in-memory sudo password for privileged commands |
-|`/tasks` | List all running background tasks (alias: `/background`) |
+|`/tasks` | Open the live tasks panel (alias: `/background`): running tasks first with a live duration, finished ones newest first, commands under a second folded into one line, and the last lines of the selected task's output updating as it runs. `↑↓` select, `Enter` posts its details to the chat, `k` kills it, `s` sends it input, `a` shows the folded quick commands, `Esc` closes |
+|`/tasks list` | Print the task table into the chat as text |
 |`/tasks status <pid>` | Show status of a specific background task |
 |`/tasks kill <pid>` | Kill a background task |
 |`/tasks send <pid> <input>` | Send stdin input to a running background task |
@@ -192,6 +195,7 @@ cx --yolo-all    # YOLO All
 |`/mouse` | Toggle mouse capture (also F2). On by default, so the wheel always scrolls the chat and Up/Down always browse sent messages; Shift+drag keeps the terminal's own selection. Off, the terminal handles the mouse and the wheel no longer scrolls Corex |
 |`/keyboard` | Termux / Android: pause mouse reporting for a few seconds so the next tap raises the soft keyboard |
 |`/help` | Show keyboard shortcuts and command list |
+|`/logs` | Expand / collapse every tool log and command, same as `Ctrl+O` |
 |`/clear` | Clear the terminal conversation view |
 |`/quit` | Exit the session (saves state for later resumption) |
 |`/exit` | Alias for `/quit` |
@@ -200,19 +204,41 @@ cx --yolo-all    # YOLO All
 
 ## ⌨ Keyboard Shortcuts
 
+`?` on an empty prompt prints this list inside Corex; `/help` shows it with the commands.
+
+### Prompt
 |Key | Action |
 |:--- | :--- |
 |`Enter` | Send message / confirm (queued while the agent works) |
 |`Alt+Enter` | While the agent works: deliver the message at the next safe point |
-|`Esc` | Cancel the generation / close popup / snap scroll to bottom; twice within 0.5 s clears the prompt |
-|`Ctrl+C` | Copy the mouse selection; otherwise cancel the generation, twice within 2 s quits |
-|`Alt+Y` | Copy the last code block of the chat (any block: click the `⧉ copy` label above it) |
-|`Ctrl+Z` | Undo the last letter, paste or deletion in the prompt; on an empty prompt, twice suspends to the shell (`fg` resumes) |
-|`Ctrl+T` | Expand / collapse Chain-of-Thought reasoning blocks |
-|`Ctrl+O` | Expand / collapse full tool output & diff previews |
-|`Ctrl+L` | Repaint the screen |
+|`@path` | Reference a file or folder (Tab or Enter inserts the highlighted one) |
+|`/command` | Run a command; the popup lists them |
+|`!command` | Run a shell command yourself; the agent sees its output next turn |
+|`Tab` | Accept the highlighted autocomplete suggestion |
+|`Shift+Tab` | Cycle modes: normal → `edits` → `plan` → `auto` → `auto` in red (full auto) → normal |
+|`Esc` | Take back a queued message, then cancel the reply / close popup / jump to the bottom; twice within 0.5 s clears the prompt |
+|`↑ / ↓`, `Ctrl+P / Ctrl+N`, `Alt+↑ / Alt+↓` | Previous / next prompt in history |
+|`Ctrl+V` | Paste an image (or a copied image file) from the clipboard, or its text |
+|`Alt+V` | Paste the clipboard's text only, even if it is the path of an image |
+|`Ctrl+Z` | Undo in the prompt; on an empty prompt, twice suspends to the shell (`fg` resumes) |
+
+### Chat
+|Key | Action |
+|:--- | :--- |
+|`Ctrl+O` / `/logs` | Expand / collapse every tool log, command and diff preview; the view stays on the line you were reading |
+|Click a collapsed log | Clicking `… (+N lines above) · ctrl+o` or the `Output (N lines)` header opens only that answer's logs; clicking the header again folds them |
+|`Ctrl+T` | Expand / collapse reasoning (thinking) blocks |
+|`Ctrl+C` | Copy the mouse selection; otherwise cancel the generation; twice within 2 s quits (first press closes an open dialog) |
+|`Alt+Y` | Copy the last code block (any block: click the `⧉ copy` label above it) |
+|`PageUp / PageDown`, `Shift+↑ / Shift+↓`, wheel | Scroll the conversation |
 |`F2` | Toggle mouse reporting (wheel and selection in Corex vs. the terminal) |
-|`↑ / ↓` | Navigate command autocomplete / prompt history |
-|`Ctrl+P / Ctrl+N`, `Alt+↑ / Alt+↓` | Previous / next prompt in history |
-|`PageUp / PageDown`, `Shift+↑ / Shift+↓` | Scroll the conversation |
-|`Tab` | Select highlighted autocomplete suggestion / switch Fleet focus |
+|`Ctrl+L` | Repaint the screen |
+
+### What the screen shows
+- The banner shows the version, the model and, on its third line, the workspace folder.
+- The status bar starts with the mode: `edits`, `plan`, `auto` (yellow, guarded auto-approve) or `auto` in red (approves everything), followed by the workspace folder's name (hidden first on narrow screens). A grey `logs` means `Ctrl+O` expanded every log.
+- On the right, `ctx N%` is how much of the model's context window the conversation uses; it turns yellow once past the auto-compact limit. Then the model, temperature and reasoning level. `/memory` lists the instruction files loaded.
+- `/model` and `/resume` take the composer's place and hide the status bar while open.
+
+### Fleet split view
+See the `corex-fleet` skill: `F6` swaps chat ↔ terminal, `F7` hides the terminal, `Alt+1..9` picks a server.

@@ -90,6 +90,39 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
         }
     }
 
+    // Pruning can unlink the file between open and lock; a lock on that inode excludes nobody.
+    for _ in 0..8 {
+        let file = match open_lock_file(&lock_file) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    "[LOCK] cannot open {}: {} — falling back to in-process locking only",
+                    lock_file.display(),
+                    e
+                );
+                return None;
+            }
+        };
+
+        // Blocks until no other process holds it. Safe to block here: the caller moved us onto a
+        // blocking thread precisely so an async worker is never parked on this.
+        if let Err(e) = file.lock() {
+            tracing::warn!(
+                "[LOCK] OS lock failed on {}: {} — falling back to in-process locking only",
+                lock_file.display(),
+                e
+            );
+            return None;
+        }
+        if still_linked(&file, &lock_file) {
+            return Some(file);
+        }
+    }
+    tracing::warn!("[LOCK] {} kept being replaced — falling back to in-process locking only", lock_file.display());
+    None
+}
+
+fn open_lock_file(lock_file: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -97,18 +130,7 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-
-    let file = match opts.open(&lock_file) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                "[LOCK] cannot open {}: {} — falling back to in-process locking only",
-                lock_file.display(),
-                e
-            );
-            return None;
-        }
-    };
+    let file = opts.open(lock_file)?;
 
     #[cfg(unix)]
     {
@@ -121,19 +143,51 @@ fn acquire_os_lock(path: &Path) -> Option<std::fs::File> {
             }
         }
     }
+    Ok(file)
+}
 
-    // Blocks until no other process holds it. Safe to block here: the caller moved us onto a
-    // blocking thread precisely so an async worker is never parked on this.
-    if let Err(e) = file.lock() {
-        tracing::warn!(
-            "[LOCK] OS lock failed on {}: {} — falling back to in-process locking only",
-            lock_file.display(),
-            e
-        );
-        return None;
+#[cfg(unix)]
+fn still_linked(file: &std::fs::File, lock_file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(lock_file)) {
+        (Ok(held), Ok(named)) => held.ino() == named.ino() && held.dev() == named.dev(),
+        _ => false,
     }
+}
 
-    Some(file)
+#[cfg(not(unix))]
+fn still_linked(_file: &std::fs::File, _lock_file: &Path) -> bool {
+    true
+}
+
+pub fn prune_stale_locks(max_age: std::time::Duration) -> usize {
+    prune_stale_locks_in(&locks_dir(), max_age)
+}
+
+fn prune_stale_locks_in(dir: &Path, max_age: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "lock") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= max_age);
+        if !old {
+            continue;
+        }
+        let Ok(file) = open_lock_file(&path) else { continue };
+        if file.try_lock().is_ok() && still_linked(&file, &path) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Acquires the lock guarding `path`, serializing mutations of that same file **across processes
@@ -298,5 +352,43 @@ mod tests {
         assert_eq!(file_mode, 0, "lock file must not grant group/other permissions");
 
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_skips_held_and_recent_locks() {
+        let dir = std::env::temp_dir().join(format!("corex_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idle = dir.join("idle.lock");
+        let held = dir.join("held.lock");
+        std::fs::write(&idle, "").unwrap();
+        std::fs::write(&held, "").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        let holder = open_lock_file(&held).unwrap();
+        holder.lock().unwrap();
+
+        assert_eq!(prune_stale_locks_in(&dir, std::time::Duration::from_secs(3600)), 0, "recent files stay");
+        assert_eq!(prune_stale_locks_in(&dir, std::time::Duration::ZERO), 1);
+        assert!(!idle.exists() && held.exists() && dir.join("notes.txt").exists());
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_taken_on_an_unlinked_file_is_retaken() {
+        let target = std::env::temp_dir().join(format!("corex_relink_{}.txt", std::process::id()));
+        let lock_file = lock_file_for(&target);
+        crate::secure_fs::ensure_private_dir(lock_file.parent().unwrap()).unwrap();
+        let first = open_lock_file(&lock_file).unwrap();
+        std::fs::remove_file(&lock_file).unwrap();
+        assert!(!still_linked(&first, &lock_file));
+
+        let guard = acquire_os_lock(&target).expect("locks the file that now has the name");
+        assert!(still_linked(&guard, &lock_file));
+        drop(guard);
+        let _ = std::fs::remove_file(&lock_file);
     }
 }

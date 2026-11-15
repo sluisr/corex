@@ -114,6 +114,7 @@ pub async fn run() -> Result<()> {
     }
     std::thread::spawn(|| {
         let _ = corex_browser::install_native_host();
+        corex_core::file_lock::prune_stale_locks(std::time::Duration::from_secs(24 * 60 * 60));
     });
     if let Some(arg0) = std::env::args().next() {
         if (arg0.ends_with("cxs") || arg0.ends_with("cx-fleet")) && !cli.fleet {
@@ -560,8 +561,10 @@ async fn run_headless(
         }
 
         let cancel_token = CancellationToken::new();
+        let mut request = messages.clone();
+        corex_core::session_images::keep_recent_images(&mut request, client.get_config().recent_images, session.images_dir().as_deref());
         let mut rx = client
-            .stream_chat(messages.clone(), Some(tools.clone()), cancel_token.clone())
+            .stream_chat(request, Some(tools.clone()), cancel_token.clone())
             .await?;
 
         let mut current_tool_calls: Vec<ToolCall> = Vec::new();

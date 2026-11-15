@@ -83,6 +83,8 @@ pub fn render_markdown_with_copy(
     max_width: usize,
     copy_buttons: bool,
 ) -> Vec<Line<'static>> {
+    let text = crate::text::expand_tabs(text);
+    let text = &*text;
     let mut result_lines = Vec::new();
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
@@ -333,6 +335,32 @@ pub fn wrap_spans_with_indent(
 
             let current_indent_len = if lines.is_empty() { first_len } else { cont_len };
 
+            if word_len + cont_len > max_width && max_width > cont_len + 4 {
+                if current_len > current_indent_len {
+                    lines.push(Line::from(std::mem::take(&mut current_line)));
+                    current_line.push(Span::raw(continuation_indent.to_string()));
+                    current_len = cont_len;
+                }
+                let mut piece = String::new();
+                for ch in word.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if current_len + cw > max_width {
+                        if !piece.is_empty() {
+                            current_line.push(Span::styled(std::mem::take(&mut piece), style));
+                        }
+                        lines.push(Line::from(std::mem::take(&mut current_line)));
+                        current_line.push(Span::raw(continuation_indent.to_string()));
+                        current_len = cont_len;
+                    }
+                    piece.push(ch);
+                    current_len += cw;
+                }
+                if !piece.is_empty() {
+                    current_line.push(Span::styled(piece, style));
+                }
+                continue;
+            }
+
             if current_len + added_len > max_width && current_len > current_indent_len {
                 lines.push(Line::from(std::mem::take(&mut current_line)));
                 current_len = 0;
@@ -370,6 +398,59 @@ pub fn wrap_spans_with_indent(
 
 /// Wraps a list of spans so that no line exceeds `max_width` visible characters,
 /// preserving indentation and span styling.
+// Code rows continue on the wrapped rail so copying joins the pieces again.
+pub fn fit_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    if width < 8 || lines.iter().all(|l| l.width() <= width) {
+        return lines;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let margin: String = plain.chars().take_while(|c| matches!(c, ' ' | '│' | '▎' | '▏')).collect();
+        let prefix = if margin.starts_with(CODE_RAIL.trim_end()) {
+            CODE_RAIL_WRAPPED.to_string()
+        } else if margin.is_empty() || margin.ends_with(' ') {
+            margin
+        } else {
+            format!("{margin} ")
+        };
+        let prefix = if prefix.width() * 2 > width { String::new() } else { prefix };
+        let prefix_style = line.spans.first().map(|s| s.style).unwrap_or_default();
+        let mut current: Vec<Span<'static>> = Vec::new();
+        let mut used = 0;
+        for span in line.spans {
+            let mut piece = String::new();
+            for ch in span.content.chars() {
+                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + cw > width && used > prefix.width() {
+                    if !piece.is_empty() {
+                        current.push(Span::styled(std::mem::take(&mut piece), span.style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut current)).style(line.style));
+                    if !prefix.is_empty() {
+                        current.push(Span::styled(prefix.clone(), prefix_style));
+                    }
+                    used = prefix.width();
+                }
+                piece.push(ch);
+                used += cw;
+            }
+            if !piece.is_empty() {
+                current.push(Span::styled(piece, span.style));
+            }
+        }
+        if !current.is_empty() {
+            out.push(Line::from(current).style(line.style));
+        }
+    }
+    out
+}
+
 pub fn wrap_spans(
     spans: Vec<Span<'static>>,
     max_width: usize,
@@ -1332,5 +1413,31 @@ mod code_block_tests {
             incremental.extend(render_markdown(&prefix[split..], &theme, 60));
             assert_eq!(incremental, full, "mismatch at prefix end={end}, split={split}");
         }
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_split_on_its_own_rows() {
+        let spans = vec![Span::raw("see https://example.com/a/very/long/path/that/never/ends now")];
+        let rows: Vec<String> = wrap_spans_with_indent(spans, 20, "  ", "  ")
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rows[0], "  see");
+        assert!(rows.iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 20), "{rows:#?}");
+        let joined: String = rows.iter().map(|r| r.trim_start()).collect::<Vec<_>>().join("");
+        assert!(joined.contains("https://example.com/a/very/long/path/that/never/ends"), "{rows:#?}");
+    }
+
+    #[test]
+    fn fit_lines_keeps_the_gutter_and_the_code_rail() {
+        let log = Line::from(vec![Span::raw("    │ "), Span::raw("x".repeat(30))]);
+        let code = Line::from(vec![Span::raw(CODE_RAIL), Span::raw("y".repeat(30))]);
+        let rows: Vec<String> = fit_lines(vec![log, code], 20)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(rows.iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 20), "{rows:#?}");
+        assert!(rows[1].starts_with("    │ x"), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.starts_with(CODE_RAIL_WRAPPED)), "{rows:#?}");
     }
 }

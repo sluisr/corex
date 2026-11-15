@@ -34,11 +34,11 @@ Editing a sensitive file with the file tools is refused outright.
 /yolo off        # Disable YOLO mode
 ```
 
-Toggling `/yolo` without arguments switches between Normal and Off. Status is shown in the TUI status bar as `[YOLO]` or `[YOLO ALL]`.
+Toggling `/yolo` without arguments switches between Normal and Off. The status bar shows `auto` in yellow for YOLO Normal and `auto` in red for YOLO All.
 
 ### Option 2 — With Shift+Tab
 In the TUI, press `Shift+Tab` to cycle between execution modes:
-`Normal` → `[ACCEPT EDITS]` → `[PLAN MODE]` → `[YOLO]` → `[YOLO ALL]` → `Normal`
+Normal → `edits` (accept edits) → `plan` → `auto` (yellow, YOLO Normal) → `auto` (red, YOLO All) → Normal
 
 ### Option 3 — From the CLI flags
 ```bash

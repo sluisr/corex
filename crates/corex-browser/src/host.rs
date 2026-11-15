@@ -48,10 +48,14 @@ impl Router {
     }
 
     fn route_to_client(&mut self, text: &str) {
-        let Ok(mut message) = serde_json::from_str::<Value>(text) else { return };
+        let Ok(mut message) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
         let target = match message.get("id").and_then(Value::as_u64) {
             Some(id) => {
-                let Some((client, original, method)) = self.pending.remove(&id) else { return };
+                let Some((client, original, method)) = self.pending.remove(&id) else {
+                    return;
+                };
                 if method == "Corex.openTab" {
                     if let Some(tab) = message["result"]["tabId"].as_i64() {
                         self.owners.insert(tab, client);
@@ -64,13 +68,17 @@ impl Router {
                 let params = &message["params"];
                 match message["method"].as_str() {
                     Some("Corex.tabOpened") => {
-                        let owner = params["openerTabId"].as_i64().and_then(|opener| self.owners.get(&opener).copied());
+                        let owner = params["openerTabId"]
+                            .as_i64()
+                            .and_then(|opener| self.owners.get(&opener).copied());
                         if let (Some(owner), Some(tab)) = (owner, params["tabId"].as_i64()) {
                             self.owners.insert(tab, owner);
                         }
                         owner
                     }
-                    Some("Corex.tabClosed") => params["tabId"].as_i64().and_then(|tab| self.owners.remove(&tab)),
+                    Some("Corex.tabClosed") => params["tabId"]
+                        .as_i64()
+                        .and_then(|tab| self.owners.remove(&tab)),
                     _ => message["sessionId"]
                         .as_str()
                         .and_then(|session| session.split(':').next()?.parse::<i64>().ok())
@@ -86,7 +94,12 @@ impl Router {
     fn drop_client(&mut self, client: u64) -> Vec<i64> {
         self.clients.remove(&client);
         self.pending.retain(|_, (owner, _, _)| *owner != client);
-        let tabs: Vec<i64> = self.owners.iter().filter(|(_, owner)| **owner == client).map(|(tab, _)| *tab).collect();
+        let tabs: Vec<i64> = self
+            .owners
+            .iter()
+            .filter(|(_, owner)| **owner == client)
+            .map(|(tab, _)| *tab)
+            .collect();
         self.owners.retain(|_, owner| *owner != client);
         tabs
     }
@@ -128,7 +141,9 @@ where
         async move {
             let mut next_client = 0u64;
             while let Ok((stream, _)) = listener.accept().await {
-                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else { continue };
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
                 next_client += 1;
                 let client = next_client;
                 let (mut sink, mut incoming) = ws.split();
@@ -149,7 +164,10 @@ where
                     while let Some(Ok(message)) = incoming.next().await {
                         match message {
                             Message::Text(text) => {
-                                let routed = router.lock().ok().and_then(|mut r| r.route_to_browser(client, text.as_str()));
+                                let routed = router
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut r| r.route_to_browser(client, text.as_str()));
                                 if let Some(routed) = routed {
                                     let _ = to_browser.send(routed);
                                 }
@@ -158,9 +176,15 @@ where
                             _ => {}
                         }
                     }
-                    let orphans = router.lock().map(|mut r| r.drop_client(client)).unwrap_or_default();
+                    let orphans = router
+                        .lock()
+                        .map(|mut r| r.drop_client(client))
+                        .unwrap_or_default();
                     for tab in orphans {
-                        let _ = to_browser.send(json!({ "method": "Corex.closeTab", "params": { "tabId": tab } }).to_string());
+                        let _ = to_browser.send(
+                            json!({ "method": "Corex.closeTab", "params": { "tabId": tab } })
+                                .to_string(),
+                        );
                     }
                 });
             }
@@ -197,19 +221,37 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 fn browser_config_dirs() -> Vec<PathBuf> {
-    let Some(base) = directories::BaseDirs::new() else { return Vec::new() };
+    let Some(base) = directories::BaseDirs::new() else {
+        return Vec::new();
+    };
     let (root, names): (PathBuf, &[&str]) = if cfg!(target_os = "macos") {
         (
             base.home_dir().join("Library/Application Support"),
-            &["Google/Chrome", "Chromium", "BraveSoftware/Brave-Browser", "Microsoft Edge", "Vivaldi"],
+            &[
+                "Google/Chrome",
+                "Chromium",
+                "BraveSoftware/Brave-Browser",
+                "Microsoft Edge",
+                "Vivaldi",
+            ],
         )
     } else {
         (
             base.home_dir().join(".config"),
-            &["google-chrome", "chromium", "BraveSoftware/Brave-Browser", "microsoft-edge", "vivaldi"],
+            &[
+                "google-chrome",
+                "chromium",
+                "BraveSoftware/Brave-Browser",
+                "microsoft-edge",
+                "vivaldi",
+            ],
         )
     };
-    names.iter().map(|name| root.join(name)).filter(|dir| dir.is_dir()).collect()
+    names
+        .iter()
+        .map(|name| root.join(name))
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 fn write_if_changed(path: &Path, content: &str, mode: u32) -> Result<()> {
@@ -228,7 +270,10 @@ pub fn install_native_host() -> Result<()> {
     let launcher = root.join("corex-browser-host");
     write_if_changed(
         &launcher,
-        &format!("#!/bin/sh\nexec '{}' browser-host \"$@\"\n", exe.to_string_lossy().replace('\'', "'\\''")),
+        &format!(
+            "#!/bin/sh\nexec '{}' browser-host \"$@\"\n",
+            exe.to_string_lossy().replace('\'', "'\\''")
+        ),
         0o755,
     )?;
     let manifest = serde_json::to_string_pretty(&serde_json::json!({

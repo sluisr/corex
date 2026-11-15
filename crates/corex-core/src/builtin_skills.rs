@@ -76,4 +76,19 @@ mod tests {
         assert!(get_builtin_skill("corex-config").is_some());
         assert!(get_builtin_skill("non-existent").is_none());
     }
+
+    #[test]
+    fn the_repo_agents_copy_matches_the_embedded_skills() {
+        let mirror = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills");
+        let Ok(entries) = std::fs::read_dir(&mirror) else { return };
+        let mut mirrored: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        mirrored.sort();
+        let mut embedded: Vec<String> = BUILTIN_SKILLS.iter().map(|s| s.name.to_string()).collect();
+        embedded.sort();
+        assert_eq!(mirrored, embedded, ".agents/skills must list the same skills as BUILTIN_SKILLS");
+        for skill in BUILTIN_SKILLS {
+            let copy = std::fs::read_to_string(mirror.join(skill.name).join("SKILL.md")).unwrap_or_default();
+            assert!(copy == skill.content, ".agents/skills/{}/SKILL.md differs from crates/corex-core/skills", skill.name);
+        }
+    }
 }

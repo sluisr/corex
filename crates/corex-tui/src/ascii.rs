@@ -92,6 +92,36 @@ pub fn shorten_model_for_mobile(model: &str) -> String {
     }
 }
 
+fn pack_segments(emblem: Span<'static>, segments: Vec<Vec<Span<'static>>>, sep: Color, width: usize) -> Vec<Line<'static>> {
+    let seg_width = |seg: &[Span<'static>]| seg.iter().map(|s| s.width()).sum::<usize>();
+    let mut lines = Vec::new();
+    let mut current = vec![Span::raw("  "), emblem, Span::raw("  ")];
+    let mut used = 2 + current[1].width() + 2;
+    let mut empty = true;
+    for seg in segments {
+        let w = seg_width(&seg);
+        if !empty && used + 3 + w > width {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            current.push(Span::raw(" ".repeat(BANNER_TEXT_COLUMN)));
+            used = BANNER_TEXT_COLUMN;
+            empty = true;
+        }
+        if !empty {
+            current.push(Span::styled(" · ", Style::default().fg(sep)));
+            used += 3;
+        }
+        used += w;
+        current.extend(seg);
+        empty = false;
+    }
+    lines.push(Line::from(current));
+    lines
+}
+
+pub const BANNER_TEXT_COLUMN: usize = 6;
+
+pub const BANNER_MUTED: Color = Color::Rgb(120, 130, 142);
+
 pub fn render_gradient_logo(
     version: &str,
     model: &str,
@@ -117,7 +147,7 @@ pub fn render_gradient_logo_adaptive(
 
     // Subtle, cohesive palette with muted contrast
     let cyan = Color::Rgb(130, 185, 215);           // Soft tranquil arctic mist
-    let muted_gray = Color::Rgb(120, 130, 142);     // Understated neutral gray
+    let muted_gray = BANNER_MUTED;
     let sep_gray = Color::Rgb(85, 93, 105);         // Discreet separator dots
 
     let engine_mode = if local_mode { " (Local)" } else { "" };
@@ -126,57 +156,29 @@ pub fn render_gradient_logo_adaptive(
     let chevron = chevron_style();
     let (emblem_top, emblem_bottom) = emblem();
 
-    // Line 1: Chevron top (solid gray) + Solid Corex + version
-    let mut line1 = Vec::new();
-    line1.push(Span::raw("  "));
-    line1.push(Span::styled(emblem_top, chevron));
-    line1.push(Span::raw("  "));
-    line1.push(Span::styled(
-        "Corex",
-        Style::default()
-            .fg(Color::Reset)
-            .add_modifier(Modifier::BOLD),
+    let muted = Style::default().fg(muted_gray);
+    let local_tag = || Span::styled(engine_mode, Style::default().fg(Color::Rgb(110, 190, 160)));
+    let title = vec![
+        Span::styled("Corex", Style::default().fg(Color::Reset).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" v{}", version), muted),
+    ];
+    lines.extend(pack_segments(
+        Span::styled(emblem_top, chevron),
+        vec![title, vec![Span::styled("sluisr", muted)]],
+        sep_gray,
+        max_width,
     ));
-    line1.push(Span::styled(format!(" v{}", version), Style::default().fg(muted_gray)));
-    line1.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-    line1.push(Span::styled("sluisr", Style::default().fg(muted_gray)));
-    lines.push(Line::from(line1));
 
-    // Line 2: Chevron bottom (solid gray) + Model + Quick Commands
-    let mut line2 = Vec::new();
-    line2.push(Span::raw("  "));
-    line2.push(Span::styled(emblem_bottom, chevron));
-    line2.push(Span::raw("  "));
-
-    if is_compact {
-        let short_m = shorten_model_for_mobile(model);
-        line2.push(Span::styled(short_m, Style::default().fg(cyan)));
-        if local_mode {
-            line2.push(Span::styled(engine_mode, Style::default().fg(Color::Rgb(110, 190, 160))));
-        }
-        line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-        line2.push(Span::styled("/help", Style::default().fg(muted_gray)));
-        line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-        line2.push(Span::styled("/model", Style::default().fg(muted_gray)));
-        if !authenticated && !local_mode {
-            line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-            line2.push(Span::styled("/key", Style::default().fg(muted_gray)));
-        }
-    } else {
-        line2.push(Span::styled(model.to_string(), Style::default().fg(cyan)));
-        if local_mode {
-            line2.push(Span::styled(engine_mode, Style::default().fg(Color::Rgb(110, 190, 160))));
-        }
-        line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-        line2.push(Span::styled("/help", Style::default().fg(muted_gray)));
-        line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-        line2.push(Span::styled("/model", Style::default().fg(muted_gray)));
-        if !authenticated && !local_mode {
-            line2.push(Span::styled(" · ", Style::default().fg(sep_gray)));
-            line2.push(Span::styled("/key to connect", Style::default().fg(muted_gray)));
-        }
+    let shown_model = if is_compact { shorten_model_for_mobile(model) } else { model.to_string() };
+    let mut model_seg = vec![Span::styled(shown_model, Style::default().fg(cyan))];
+    if local_mode {
+        model_seg.push(local_tag());
     }
-    lines.push(Line::from(line2));
+    let mut segments = vec![model_seg, vec![Span::styled("/help", muted)], vec![Span::styled("/model", muted)]];
+    if !authenticated && !local_mode {
+        segments.push(vec![Span::styled(if is_compact { "/key" } else { "/key to connect" }, muted)]);
+    }
+    lines.extend(pack_segments(Span::styled(emblem_bottom, chevron), segments, sep_gray, max_width));
 
     // Optional: Update notice
     if let Some(newer) = update_notice {

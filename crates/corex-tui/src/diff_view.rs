@@ -16,6 +16,8 @@ fn format_rail_row(
     inner_width: usize,
     rail: Color,
 ) -> Line<'static> {
+    let content = crate::text::expand_tabs(content);
+    let content = &*content;
     let cursor_len = usize::from(cursor.is_some());
     let prefix_len = unicode_width::UnicodeWidthStr::width(prefix);
     let avail = inner_width.saturating_sub(prefix_len + cursor_len);
@@ -57,6 +59,8 @@ fn format_rail_wrapped(
     inner_width: usize,
     rail: Color,
 ) -> Vec<Line<'static>> {
+    let content = crate::text::expand_tabs(content);
+    let content = &*content;
     let prefix_w = unicode_width::UnicodeWidthStr::width(prefix);
     if inner_width <= prefix_w || unicode_width::UnicodeWidthStr::width(content) <= inner_width - prefix_w {
         return vec![format_rail_row(prefix, prefix_style, content, content_style, None, inner_width, rail)];
@@ -186,8 +190,8 @@ pub fn build_tool_confirmation_lines(
                 result.push(format_rail_row(
                     "",
                     Style::default(),
-                    line,
-                    Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD),
+                    &crate::app::formatting::hunk_label(line),
+                    Style::default().fg(theme.muted),
                     None,
                     inner_width,
                     rail,

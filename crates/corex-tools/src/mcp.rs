@@ -25,6 +25,7 @@ pub struct McpServerStatus {
 
 const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TOOL_PAGES: usize = 100;
 /// Version advertised to local (stdio) servers, which every SDK already speaks.
 const STDIO_PROTOCOL_VERSION: &str = "2024-11-05";
 /// Version advertised to remote servers: Streamable HTTP was introduced in 2025-03-26, and a
@@ -342,6 +343,7 @@ pub struct McpClient {
     pub server_name: String,
     transport: Arc<Mutex<McpTransport>>,
     request_id: AtomicU64,
+    request_timeout: Duration,
     /// Only local servers have a process to keep alive (and to kill on drop).
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
 }
@@ -412,13 +414,14 @@ impl McpClient {
     /// Connects to a server: a remote endpoint when the config has a `url`, otherwise a local
     /// process launched from its `command`.
     pub async fn connect(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
+        let timeout = cfg.timeout_secs.filter(|&secs| secs > 0).map(Duration::from_secs).unwrap_or(MCP_REQUEST_TIMEOUT);
         match cfg.url.as_deref().map(str::trim).filter(|url| !url.is_empty()) {
-            Some(url) => Self::connect_remote(server_name, url, &cfg.headers).await,
+            Some(url) => Self::connect_remote(server_name, url, &cfg.headers, timeout).await,
             None if cfg.command.trim().is_empty() => bail!(
                 "MCP server '{}' has neither a command nor a url in its configuration",
                 server_name
             ),
-            None => Self::spawn(server_name, cfg).await,
+            None => Self::spawn(server_name, cfg, timeout).await,
         }
     }
 
@@ -426,6 +429,7 @@ impl McpClient {
         server_name: &str,
         url: &str,
         headers: &HashMap<String, String>,
+        request_timeout: Duration,
     ) -> Result<Self> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             bail!("MCP server '{}' has url '{}', which is not http:// or https://", server_name, url);
@@ -447,6 +451,7 @@ impl McpClient {
                 protocol_version: None,
             }))),
             request_id: AtomicU64::new(1),
+            request_timeout,
             _child: None,
         };
 
@@ -454,7 +459,7 @@ impl McpClient {
         Ok(client)
     }
 
-    async fn spawn(server_name: &str, cfg: &McpServerConfig) -> Result<Self> {
+    async fn spawn(server_name: &str, cfg: &McpServerConfig, request_timeout: Duration) -> Result<Self> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
         // Servers get no credentials from our environment unless their config names them in `env`.
@@ -488,6 +493,7 @@ impl McpClient {
                 read_buf: Vec::new(),
             }))),
             request_id: AtomicU64::new(1),
+            request_timeout,
             _child: Some(Arc::new(Mutex::new(child))),
         };
 
@@ -498,9 +504,12 @@ impl McpClient {
 
     async fn send_raw(&self, request: &Value) -> Result<Value> {
         let mut transport = self.transport.lock().await;
-        match tokio::time::timeout(MCP_REQUEST_TIMEOUT, transport.request(request)).await {
+        match tokio::time::timeout(self.request_timeout, transport.request(request)).await {
             Ok(res) => res,
-            Err(_) => bail!("Timeout waiting for MCP server response (60s)"),
+            Err(_) => bail!(
+                "Timeout waiting for MCP server response ({}s; raise timeout_secs in its config if it needs longer)",
+                self.request_timeout.as_secs()
+            ),
         }
     }
 
@@ -549,28 +558,40 @@ impl McpClient {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<(String, String, Value)>> {
-        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
-        let req = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/list",
-            "params": {}
-        });
-
-        let resp = self.send_raw(&req).await?;
-        if let Some(err) = resp.get("error") {
-            bail!("MCP tools/list error: {}", err);
-        }
-
         let mut tools = Vec::new();
-        if let Some(tool_list) = resp.get("result").and_then(|r| r.get("tools")).and_then(|t| t.as_array()) {
-            for t in tool_list {
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"}));
-                if !name.is_empty() {
-                    tools.push((name, desc, schema));
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_TOOL_PAGES {
+            let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+            let params = match &cursor {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/list",
+                "params": params
+            });
+
+            let resp = self.send_raw(&req).await?;
+            if let Some(err) = resp.get("error") {
+                bail!("MCP tools/list error: {}", err);
+            }
+            let result = resp.get("result");
+            if let Some(tool_list) = result.and_then(|r| r.get("tools")).and_then(|t| t.as_array()) {
+                for t in tool_list {
+                    let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"}));
+                    if !name.is_empty() {
+                        tools.push((name, desc, schema));
+                    }
                 }
+            }
+            let next = result.and_then(|r| r.get("nextCursor")).and_then(|c| c.as_str()).filter(|c| !c.is_empty());
+            match next {
+                Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_string()),
+                _ => break,
             }
         }
 
@@ -1026,5 +1047,59 @@ mod tests {
         let github = find_catalog_item("github").expect("github entry");
         assert!(github.url.is_none(), "local servers keep working unchanged");
     }
-}
 
+    const FAKE_SERVER: &str = r#"
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    method, params = msg["method"], msg.get("params", {})
+    if method == "initialize":
+        result = {"protocolVersion": params["protocolVersion"], "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
+    elif method == "tools/list" and params.get("cursor") is None:
+        result = {"tools": [{"name": "first", "inputSchema": {"type": "object"}}], "nextCursor": "page2"}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "second", "inputSchema": {"type": "object"}}]}
+    else:
+        time.sleep(float(params["arguments"]["sleep"]))
+        result = {"content": [{"type": "text", "text": "done"}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+"#;
+
+    fn fake_server(timeout_secs: Option<u64>) -> McpServerConfig {
+        let mut cfg = McpServerConfig::stdio("python3", vec!["-c".to_string(), FAKE_SERVER.to_string()]);
+        cfg.timeout_secs = timeout_secs;
+        cfg
+    }
+
+    #[tokio::test]
+    async fn tools_list_follows_every_page() {
+        let client = McpClient::connect("fake", &fake_server(None)).await.unwrap();
+        let names: Vec<String> = client.list_tools().await.unwrap().into_iter().map(|(name, _, _)| name).collect();
+        assert_eq!(names, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn each_server_can_wait_longer_than_the_default() {
+        let short = McpClient::connect("fake", &fake_server(Some(1))).await.unwrap();
+        let out = short.call_tool("slow", json!({"sleep": 2})).await.unwrap();
+        assert!(out.is_error && out.output.contains("1s"), "{}", out.output);
+
+        let long = McpClient::connect("fake", &fake_server(Some(5))).await.unwrap();
+        let out = long.call_tool("slow", json!({"sleep": 2})).await.unwrap();
+        assert!(!out.is_error && out.output.contains("done"), "{}", out.output);
+
+        assert_eq!(McpClient::connect("fake", &fake_server(None)).await.unwrap().request_timeout, MCP_REQUEST_TIMEOUT);
+        assert_eq!(McpClient::connect("fake", &fake_server(Some(0))).await.unwrap().request_timeout, MCP_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn timeout_secs_is_optional_in_settings() {
+        let plain: McpServerConfig = serde_json::from_str(r#"{"command":"node"}"#).unwrap();
+        assert_eq!(plain.timeout_secs, None);
+        let slow: McpServerConfig = serde_json::from_str(r#"{"command":"node","timeout_secs":450}"#).unwrap();
+        assert_eq!(slow.timeout_secs, Some(450));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("timeout_secs"));
+    }
+}

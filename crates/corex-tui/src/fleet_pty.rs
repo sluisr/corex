@@ -349,6 +349,9 @@ pub fn key_event_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]), // Standard ASCII DEL for backspace
         KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Left if alt => Some(b"\x1bb".to_vec()),
+        KeyCode::Right if alt => Some(b"\x1bf".to_vec()),
         KeyCode::Esc => Some(vec![0x1b]),
         KeyCode::Up => Some(b"\x1b[A".to_vec()),
         KeyCode::Down => Some(b"\x1b[B".to_vec()),

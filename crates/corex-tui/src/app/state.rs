@@ -311,6 +311,7 @@ pub struct App {
     pub rewind_dialog: crate::rewind_dialog::RewindDialog,
     pub model_dialog: ModelDialogState,
     pub session_dialog: SessionDialogState,
+    pub tasks_dialog: crate::tasks_dialog::TasksDialogState,
     pub auth_dialog: AuthDialogState,
     pub sudo_dialog: SudoDialogState,
     pub fleet_dialog: FleetDialogState,
@@ -322,6 +323,9 @@ pub struct App {
 
     pub scroll_offset: usize,
     pub auto_scroll: bool,
+    pub scroll_anchor: Option<(usize, usize)>,
+    pub expanded_messages: std::collections::HashSet<usize>,
+    pub chat_header_lines: usize,
     pub total_rendered_items: usize,
     pub plan_mode: bool,
     pub always_allow_tools: bool,
@@ -372,9 +376,6 @@ pub struct App {
     pub user_shell_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// Esc was pressed while the `!command` ran, so its report says it was stopped.
     pub user_shell_stopped: bool,
-    /// Instruction files in the system prompt, for the status bar, and when they were counted.
-    pub context_files: usize,
-    pub context_files_checked: Option<std::time::Instant>,
     /// The `@path` query the popup last showed, kept so it can close smoothly.
     pub last_file_query: Option<String>,
     /// That query was a `/directory add` folder, not an `@path`.
@@ -388,9 +389,6 @@ pub struct App {
     pub cached_render_width: usize,
     pub cached_session_id: String,
     pub cached_logs_expanded: bool,
-    /// Whether any cached message hid lines behind a collapsed log, so the footer shows the
-    /// Ctrl+O hint once instead of every block repeating it.
-    pub cached_has_collapsed_logs: bool,
     pub(crate) message_clock: super::browser_run::MessageClock,
     /// Parsed markdown of `streaming_text`, reused across frames until the text grows.
     pub streaming_md_cache: Vec<Line<'static>>,

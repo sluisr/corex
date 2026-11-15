@@ -31,7 +31,15 @@ const BLOCKER_CHECK: &str = "function(other) { \
     const label = el.getAttribute('aria-label') || el.id || (typeof el.className === 'string' ? el.className.split(' ')[0] : ''); \
     return el.tagName.toLowerCase() + (label ? ' ' + String(label).slice(0, 60) : ''); }";
 
-const CHOICE_ROLES: &[&str] = &["option", "menuitem", "menuitemradio", "menuitemcheckbox", "treeitem", "radio", "tab"];
+const CHOICE_ROLES: &[&str] = &[
+    "option",
+    "menuitem",
+    "menuitemradio",
+    "menuitemcheckbox",
+    "treeitem",
+    "radio",
+    "tab",
+];
 
 fn collect_child_frames(frame: &Value, found: &mut Vec<String>) {
     for child in frame["childFrames"].as_array().into_iter().flatten() {
@@ -43,10 +51,15 @@ fn collect_child_frames(frame: &Value, found: &mut Vec<String>) {
 }
 
 fn is_current(event: &Value, current: &std::sync::Mutex<String>) -> bool {
-    current.lock().is_ok_and(|session| event["sessionId"] == session.as_str())
+    current
+        .lock()
+        .is_ok_and(|session| event["sessionId"] == session.as_str())
 }
 
-fn track_child_frames(mut events: tokio::sync::broadcast::Receiver<Value>, children: Arc<std::sync::Mutex<Vec<ChildFrame>>>) {
+fn track_child_frames(
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+    children: Arc<std::sync::Mutex<Vec<ChildFrame>>>,
+) {
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
@@ -54,13 +67,16 @@ fn track_child_frames(mut events: tokio::sync::broadcast::Receiver<Value>, child
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            let Some(session) = event["sessionId"].as_str().filter(|s| !s.contains(':')) else { continue };
+            let Some(session) = event["sessionId"].as_str().filter(|s| !s.contains(':')) else {
+                continue;
+            };
             let params = &event["params"];
             match event["method"].as_str() {
                 Some("Target.attachedToTarget") if params["targetInfo"]["type"] == "iframe" => {
-                    let (Some(raw), Some(frame_id)) =
-                        (params["sessionId"].as_str(), params["targetInfo"]["targetId"].as_str())
-                    else {
+                    let (Some(raw), Some(frame_id)) = (
+                        params["sessionId"].as_str(),
+                        params["targetInfo"]["targetId"].as_str(),
+                    ) else {
                         continue;
                     };
                     if let Ok(mut list) = children.lock() {
@@ -72,7 +88,9 @@ fn track_child_frames(mut events: tokio::sync::broadcast::Receiver<Value>, child
                     }
                 }
                 Some("Target.detachedFromTarget") => {
-                    if let (Some(raw), Ok(mut list)) = (params["sessionId"].as_str(), children.lock()) {
+                    if let (Some(raw), Ok(mut list)) =
+                        (params["sessionId"].as_str(), children.lock())
+                    {
                         list.retain(|child| child.raw_session != raw);
                     }
                 }
@@ -82,8 +100,16 @@ fn track_child_frames(mut events: tokio::sync::broadcast::Receiver<Value>, child
     });
 }
 
-fn splice_frame(nodes: &mut Vec<Value>, inner: &Value, prefix: &str, owner_id: i64, session: Option<&str>) {
-    let Some(inner_nodes) = inner["nodes"].as_array().filter(|list| !list.is_empty()) else { return };
+fn splice_frame(
+    nodes: &mut Vec<Value>,
+    inner: &Value,
+    prefix: &str,
+    owner_id: i64,
+    session: Option<&str>,
+) {
+    let Some(inner_nodes) = inner["nodes"].as_array().filter(|list| !list.is_empty()) else {
+        return;
+    };
     let prefixed = |id: &Value| id.as_str().map(|s| json!(format!("{prefix}{s}")));
     let root = prefixed(&inner_nodes[0]["nodeId"]);
     let mut added = Vec::with_capacity(inner_nodes.len());
@@ -104,8 +130,12 @@ fn splice_frame(nodes: &mut Vec<Value>, inner: &Value, prefix: &str, owner_id: i
         }
         added.push(node);
     }
-    let (Some(root), Some(holder)) = (root, nodes.iter_mut().find(|n| n["backendDOMNodeId"].as_i64() == Some(owner_id)))
-    else {
+    let (Some(root), Some(holder)) = (
+        root,
+        nodes
+            .iter_mut()
+            .find(|n| n["backendDOMNodeId"].as_i64() == Some(owner_id)),
+    ) else {
         return;
     };
     match holder["childIds"].as_array_mut() {
@@ -118,7 +148,10 @@ fn splice_frame(nodes: &mut Vec<Value>, inner: &Value, prefix: &str, owner_id: i
 fn quoted_name(line: &str) -> &str {
     let entry = line.trim_start().trim_start_matches("- ");
     let after_role = entry.split_once(' ').map_or("", |(_, rest)| rest);
-    after_role.strip_prefix('"').and_then(|rest| rest.split('"').next()).unwrap_or("")
+    after_role
+        .strip_prefix('"')
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +224,10 @@ pub struct TabInfo {
     pub active: bool,
 }
 
-fn watch_tabs(mut events: tokio::sync::broadcast::Receiver<Value>, tab_events: Arc<std::sync::Mutex<TabEvents>>) {
+fn watch_tabs(
+    mut events: tokio::sync::broadcast::Receiver<Value>,
+    tab_events: Arc<std::sync::Mutex<TabEvents>>,
+) {
     tokio::spawn(async move {
         loop {
             let event = match events.recv().await {
@@ -199,8 +235,12 @@ fn watch_tabs(mut events: tokio::sync::broadcast::Receiver<Value>, tab_events: A
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            let Some(tab) = event["params"]["tabId"].as_i64() else { continue };
-            let Ok(mut state) = tab_events.lock() else { continue };
+            let Some(tab) = event["params"]["tabId"].as_i64() else {
+                continue;
+            };
+            let Ok(mut state) = tab_events.lock() else {
+                continue;
+            };
             match event["method"].as_str() {
                 Some("Corex.tabOpened") => state.opened.push(tab),
                 Some("Corex.tabClosed") => state.closed.push(tab),
@@ -216,13 +256,22 @@ impl Browser {
     }
 
     async fn attach_extension(cdp: Arc<Cdp>) -> Result<Self> {
-        let opened = cdp.call(None, "Corex.openTab", json!({ "url": "about:blank" })).await?;
-        let tab = opened["tabId"].as_i64().ok_or_else(|| anyhow!("the extension did not return a tab id"))?;
+        let opened = cdp
+            .call(None, "Corex.openTab", json!({ "url": "about:blank" }))
+            .await?;
+        let tab = opened["tabId"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("the extension did not return a tab id"))?;
         let session = tab.to_string();
         let current = Arc::new(std::sync::Mutex::new(session.clone()));
         let console = Arc::new(std::sync::Mutex::new(Vec::new()));
         let dialog = Arc::new(std::sync::Mutex::new(None));
-        collect_console(cdp.subscribe(), current.clone(), console.clone(), dialog.clone());
+        collect_console(
+            cdp.subscribe(),
+            current.clone(),
+            console.clone(),
+            dialog.clone(),
+        );
         let children = Arc::new(std::sync::Mutex::new(Vec::new()));
         track_child_frames(cdp.subscribe(), children.clone());
         let tab_events = Arc::default();
@@ -268,7 +317,10 @@ impl Browser {
         if let Ok(mut open) = self.dialog.lock() {
             *open = None;
         }
-        let _ = self.cdp.call(None, "Corex.activateTab", json!({ "tabId": tab })).await;
+        let _ = self
+            .cdp
+            .call(None, "Corex.activateTab", json!({ "tabId": tab }))
+            .await;
         self.prepare_tab().await?;
         self.wait_ready().await;
         Ok(())
@@ -277,7 +329,14 @@ impl Browser {
     async fn wait_ready(&self) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
-            if self.evaluate("document.readyState").await.ok().as_ref().and_then(Value::as_str) == Some("complete") {
+            if self
+                .evaluate("document.readyState")
+                .await
+                .ok()
+                .as_ref()
+                .and_then(Value::as_str)
+                == Some("complete")
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -286,7 +345,10 @@ impl Browser {
 
     pub async fn sync_tabs(&mut self) -> Result<Option<String>> {
         let (opened, closed) = match self.tab_events.lock() {
-            Ok(mut state) => (std::mem::take(&mut state.opened), std::mem::take(&mut state.closed)),
+            Ok(mut state) => (
+                std::mem::take(&mut state.opened),
+                std::mem::take(&mut state.closed),
+            ),
             Err(_) => return Ok(None),
         };
         for tab in &opened {
@@ -311,7 +373,10 @@ impl Browser {
             return Err(anyhow!("the Corex tab was closed"));
         };
         self.switch_to(previous).await?;
-        Ok(Some(format!("The active tab was closed; back on {}.", self.page_info().await)))
+        Ok(Some(format!(
+            "The active tab was closed; back on {}.",
+            self.page_info().await
+        )))
     }
 
     pub async fn list_tabs(&self) -> Vec<TabInfo> {
@@ -340,19 +405,27 @@ impl Browser {
 
     pub async fn switch_tab(&mut self, tab: i64) -> Result<()> {
         if !self.tabs.contains(&tab) {
-            return Err(anyhow!("tab {tab} is not one of the Corex tabs; use the tabs action to list them"));
+            return Err(anyhow!(
+                "tab {tab} is not one of the Corex tabs; use the tabs action to list them"
+            ));
         }
         self.switch_to(tab).await
     }
 
     pub async fn close_tab(&mut self, tab: i64) -> Result<()> {
         if !self.tabs.contains(&tab) {
-            return Err(anyhow!("tab {tab} is not one of the Corex tabs; use the tabs action to list them"));
+            return Err(anyhow!(
+                "tab {tab} is not one of the Corex tabs; use the tabs action to list them"
+            ));
         }
         if self.tabs.len() == 1 {
-            return Err(anyhow!("that is the last Corex tab; use the close action to end the browser session"));
+            return Err(anyhow!(
+                "that is the last Corex tab; use the close action to end the browser session"
+            ));
         }
-        self.cdp.call(None, "Corex.closeTab", json!({ "tabId": tab })).await?;
+        self.cdp
+            .call(None, "Corex.closeTab", json!({ "tabId": tab }))
+            .await?;
         self.tabs.retain(|open| *open != tab);
         if tab == self.current_tab() {
             let previous = *self.tabs.last().expect("another tab remains");
@@ -382,7 +455,8 @@ impl Browser {
             loop {
                 match events.recv().await {
                     Ok(event)
-                        if event["method"] == "Page.javascriptDialogOpening" && event["sessionId"] == session.as_str() =>
+                        if event["method"] == "Page.javascriptDialogOpening"
+                            && event["sessionId"] == session.as_str() =>
                     {
                         if let Ok(mut open) = dialog.lock() {
                             *open = Some(describe_dialog(&event["params"]));
@@ -410,7 +484,9 @@ impl Browser {
         if let Some(details) = result.get("exceptionDetails") {
             return Err(anyhow!(
                 "{}",
-                details["exception"]["description"].as_str().unwrap_or("script error")
+                details["exception"]["description"]
+                    .as_str()
+                    .unwrap_or("script error")
             ));
         }
         Ok(result["result"]["value"].clone())
@@ -421,7 +497,10 @@ impl Browser {
             .evaluate("JSON.stringify({url: location.href, title: document.title})")
             .await
             .ok()
-            .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            })
             .unwrap_or(Value::Null);
         format!(
             "Page: {} ({})",
@@ -435,7 +514,8 @@ impl Browser {
         let session = self.session.clone();
         let _ = tokio::time::timeout(LOAD_TIMEOUT, async move {
             while let Ok(event) = events.recv().await {
-                let ready = event["method"] == "Page.domContentEventFired" || event["method"] == "Page.loadEventFired";
+                let ready = event["method"] == "Page.domContentEventFired"
+                    || event["method"] == "Page.loadEventFired";
                 if ready && event["sessionId"] == session.as_str() {
                     break;
                 }
@@ -470,7 +550,8 @@ impl Browser {
         }
         let entry = history["entries"][(index - 1) as usize]["id"].clone();
         let events = self.cdp.subscribe();
-        self.send("Page.navigateToHistoryEntry", json!({ "entryId": entry })).await?;
+        self.send("Page.navigateToHistoryEntry", json!({ "entryId": entry }))
+            .await?;
         self.wait_for_load(events).await;
         Ok(())
     }
@@ -486,27 +567,74 @@ impl Browser {
         let separate_processes: Vec<ChildFrame> = self
             .children
             .lock()
-            .map(|list| list.iter().filter(|child| child.session.starts_with(&prefix)).cloned().collect())
+            .map(|list| {
+                list.iter()
+                    .filter(|child| child.session.starts_with(&prefix))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         for (index, frame_id) in child_frames.iter().enumerate() {
-            if separate_processes.iter().any(|child| &child.frame_id == frame_id) {
+            if separate_processes
+                .iter()
+                .any(|child| &child.frame_id == frame_id)
+            {
                 continue;
             }
-            let Ok(owner) = self.send("DOM.getFrameOwner", json!({ "frameId": frame_id })).await else { continue };
-            let Some(owner_id) = owner["backendNodeId"].as_i64() else { continue };
-            let Ok(inner) = self.send("Accessibility.getFullAXTree", json!({ "frameId": frame_id })).await else { continue };
+            let Ok(owner) = self
+                .send("DOM.getFrameOwner", json!({ "frameId": frame_id }))
+                .await
+            else {
+                continue;
+            };
+            let Some(owner_id) = owner["backendNodeId"].as_i64() else {
+                continue;
+            };
+            let Ok(inner) = self
+                .send(
+                    "Accessibility.getFullAXTree",
+                    json!({ "frameId": frame_id }),
+                )
+                .await
+            else {
+                continue;
+            };
             splice_frame(&mut nodes, &inner, &format!("f{index}-"), owner_id, None);
         }
         for (index, child) in separate_processes.iter().enumerate() {
             for domain in ["DOM", "Accessibility"] {
-                let _ = self.cdp.call(Some(&child.session), &format!("{domain}.enable"), json!({})).await;
+                let _ = self
+                    .cdp
+                    .call(Some(&child.session), &format!("{domain}.enable"), json!({}))
+                    .await;
             }
-            let Ok(owner) = self.send("DOM.getFrameOwner", json!({ "frameId": child.frame_id })).await else { continue };
-            let Some(owner_id) = owner["backendNodeId"].as_i64() else { continue };
-            let Ok(inner) = self.cdp.call(Some(&child.session), "Accessibility.getFullAXTree", json!({})).await else {
+            let Ok(owner) = self
+                .send("DOM.getFrameOwner", json!({ "frameId": child.frame_id }))
+                .await
+            else {
                 continue;
             };
-            splice_frame(&mut nodes, &inner, &format!("o{index}-"), owner_id, Some(&child.session));
+            let Some(owner_id) = owner["backendNodeId"].as_i64() else {
+                continue;
+            };
+            let Ok(inner) = self
+                .cdp
+                .call(
+                    Some(&child.session),
+                    "Accessibility.getFullAXTree",
+                    json!({}),
+                )
+                .await
+            else {
+                continue;
+            };
+            splice_frame(
+                &mut nodes,
+                &inner,
+                &format!("o{index}-"),
+                owner_id,
+                Some(&child.session),
+            );
         }
         Ok(json!({ "nodes": nodes }))
     }
@@ -517,7 +645,9 @@ impl Browser {
 
     pub async fn snapshot_matching(&mut self, query: Option<&str>) -> Result<String> {
         if let Some(dialog) = self.open_dialog() {
-            return Err(anyhow!("a JavaScript dialog is open ({dialog}); answer it with the dialog action first"));
+            return Err(anyhow!(
+                "a JavaScript dialog is open ({dialog}); answer it with the dialog action first"
+            ));
         }
         let tree = self.accessibility_tree().await?;
         let snap = snapshot::build(&tree, query);
@@ -539,21 +669,46 @@ impl Browser {
     }
 
     async fn send_in(&self, node: &NodeRef, method: &str, params: Value) -> Result<Value> {
-        self.cdp.call(Some(node.session.as_deref().unwrap_or(&self.session)), method, params).await
+        self.cdp
+            .call(
+                Some(node.session.as_deref().unwrap_or(&self.session)),
+                method,
+                params,
+            )
+            .await
     }
 
     async fn scroll_into_view(&self, node: &NodeRef) {
         if let Some(owner) = node.owner {
-            let _ = self.send("DOM.scrollIntoViewIfNeeded", json!({ "backendNodeId": owner })).await;
+            let _ = self
+                .send(
+                    "DOM.scrollIntoViewIfNeeded",
+                    json!({ "backendNodeId": owner }),
+                )
+                .await;
         }
-        let _ = self.send_in(node, "DOM.scrollIntoViewIfNeeded", json!({ "backendNodeId": node.backend })).await;
+        let _ = self
+            .send_in(
+                node,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": node.backend }),
+            )
+            .await;
     }
 
     async fn run_on_node(&self, node: &NodeRef, function: &str) -> Result<()> {
-        let resolved = self.send_in(node, "DOM.resolveNode", json!({ "backendNodeId": node.backend })).await?;
-        let object_id = resolved["object"]["objectId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("the element is no longer on the page"))?;
+        let gone = || {
+            anyhow!("the element is no longer on the page; take a new snapshot and use its refs")
+        };
+        let resolved = self
+            .send_in(
+                node,
+                "DOM.resolveNode",
+                json!({ "backendNodeId": node.backend }),
+            )
+            .await
+            .map_err(|_| gone())?;
+        let object_id = resolved["object"]["objectId"].as_str().ok_or_else(gone)?;
         self.send_in(
             node,
             "Runtime.callFunctionOn",
@@ -564,8 +719,19 @@ impl Browser {
     }
 
     async fn center_of(&self, node: &NodeRef) -> Option<(f64, f64)> {
-        let model = self.send_in(node, "DOM.getBoxModel", json!({ "backendNodeId": node.backend })).await.ok()?;
-        let points: Vec<f64> = model["model"]["content"].as_array()?.iter().filter_map(Value::as_f64).collect();
+        let model = self
+            .send_in(
+                node,
+                "DOM.getBoxModel",
+                json!({ "backendNodeId": node.backend }),
+            )
+            .await
+            .ok()?;
+        let points: Vec<f64> = model["model"]["content"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_f64)
+            .collect();
         if points.len() != 8 {
             return None;
         }
@@ -574,8 +740,15 @@ impl Browser {
             points.iter().skip(1).step_by(2).sum::<f64>() / 4.0,
         );
         if let Some(owner) = node.owner {
-            let frame = self.send("DOM.getBoxModel", json!({ "backendNodeId": owner })).await.ok()?;
-            let origin: Vec<f64> = frame["model"]["content"].as_array()?.iter().filter_map(Value::as_f64).collect();
+            let frame = self
+                .send("DOM.getBoxModel", json!({ "backendNodeId": owner }))
+                .await
+                .ok()?;
+            let origin: Vec<f64> = frame["model"]["content"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_f64)
+                .collect();
             x += origin.first()?;
             y += origin.get(1)?;
         }
@@ -595,9 +768,18 @@ impl Browser {
         if hit_id == backend_id {
             return None;
         }
-        let object_of = |resolved: Value| resolved["object"]["objectId"].as_str().map(str::to_string);
-        let target = object_of(self.send("DOM.resolveNode", json!({ "backendNodeId": backend_id })).await.ok()?)?;
-        let other = object_of(self.send("DOM.resolveNode", json!({ "backendNodeId": hit_id })).await.ok()?)?;
+        let object_of =
+            |resolved: Value| resolved["object"]["objectId"].as_str().map(str::to_string);
+        let target = object_of(
+            self.send("DOM.resolveNode", json!({ "backendNodeId": backend_id }))
+                .await
+                .ok()?,
+        )?;
+        let other = object_of(
+            self.send("DOM.resolveNode", json!({ "backendNodeId": hit_id }))
+                .await
+                .ok()?,
+        )?;
         let verdict = self
             .send(
                 "Runtime.callFunctionOn",
@@ -610,12 +792,17 @@ impl Browser {
             )
             .await
             .ok()?;
-        verdict["result"]["value"].as_str().filter(|text| !text.is_empty()).map(str::to_string)
+        verdict["result"]["value"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
     }
 
     async fn point_at(&self, node: &NodeRef) {
         if let Some((x, y)) = self.center_of(node).await {
-            let _ = self.send("Corex.pointer", json!({ "x": x, "y": y, "press": true })).await;
+            let _ = self
+                .send("Corex.pointer", json!({ "x": x, "y": y, "press": true }))
+                .await;
         }
     }
 
@@ -630,7 +817,8 @@ impl Browser {
 
         let Some((mut x, mut y)) = self.center_of(&node).await else {
             if gesture == Gesture::Click {
-                self.run_on_node(&node, "function() { this.click(); }").await?;
+                self.run_on_node(&node, "function() { this.click(); }")
+                    .await?;
                 self.settle(events).await;
                 return Ok(());
             }
@@ -639,7 +827,10 @@ impl Browser {
 
         if gesture != Gesture::Hover && self.blocker_at(&node, x, y).await.is_some() {
             let _ = self
-                .run_on_node(&node, "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }")
+                .run_on_node(
+                    &node,
+                    "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }",
+                )
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             if let Some(moved) = self.center_of(&node).await {
@@ -692,24 +883,40 @@ impl Browser {
         let needle = wanted.to_lowercase();
         let entries: Vec<(&str, &str)> = snapshot
             .lines()
-            .filter(|line| CHOICE_ROLES.iter().any(|role| line.trim_start().starts_with(&format!("- {role} "))))
+            .filter(|line| {
+                CHOICE_ROLES
+                    .iter()
+                    .any(|role| line.trim_start().starts_with(&format!("- {role} ")))
+            })
             .filter_map(|line| Some((line, line.split("[ref=").nth(1)?.split(']').next()?)))
             .filter(|(_, found)| *found != reference)
             .collect();
         let hit = entries
             .iter()
             .find(|(line, _)| quoted_name(line).to_lowercase() == needle)
-            .or_else(|| entries.iter().find(|(line, _)| quoted_name(line).to_lowercase().contains(&needle)));
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|(line, _)| quoted_name(line).to_lowercase().contains(&needle))
+            });
         match hit {
             Some((_, found)) => {
                 let found = found.to_string();
                 self.click(&found).await
             }
             None => {
-                let seen: Vec<String> = entries.iter().take(20).map(|(line, _)| line.trim().to_string()).collect();
+                let seen: Vec<String> = entries
+                    .iter()
+                    .take(20)
+                    .map(|(line, _)| line.trim().to_string())
+                    .collect();
                 Err(anyhow!(
                     "no option matching '{wanted}' after opening {reference}. Options visible: {}",
-                    if seen.is_empty() { "none (take a snapshot or a screenshot)".to_string() } else { seen.join(" | ") }
+                    if seen.is_empty() {
+                        "none (take a snapshot or a screenshot)".to_string()
+                    } else {
+                        seen.join(" | ")
+                    }
                 ))
             }
         }
@@ -722,7 +929,12 @@ impl Browser {
                 return Err(anyhow!("'{path}' is not a file on this machine"));
             }
         }
-        self.send_in(&node, "DOM.setFileInputFiles", json!({ "backendNodeId": node.backend, "files": paths })).await?;
+        self.send_in(
+            &node,
+            "DOM.setFileInputFiles",
+            json!({ "backendNodeId": node.backend, "files": paths }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -735,12 +947,25 @@ impl Browser {
         Ok(())
     }
 
-    async fn settle(&self, events: tokio::sync::broadcast::Receiver<Value>) {
-        let session = self.session.clone();
-        let mut events = events;
-        let navigated = tokio::time::timeout(Duration::from_millis(250), async move {
+    async fn main_frame(&self) -> Option<String> {
+        let tree = self.send("Page.getFrameTree", json!({})).await.ok()?;
+        tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    async fn settle(&self, mut events: tokio::sync::broadcast::Receiver<Value>) {
+        let main = self.main_frame().await;
+        let session = self.session.as_str();
+        let navigated = tokio::time::timeout(Duration::from_millis(250), async {
             while let Ok(event) = events.recv().await {
-                if event["method"] == "Page.frameStartedLoading" && event["sessionId"] == session.as_str() {
+                let in_main = main
+                    .as_deref()
+                    .is_none_or(|id| event["params"]["frameId"] == id);
+                if event["method"] == "Page.frameStartedLoading"
+                    && event["sessionId"] == session
+                    && in_main
+                {
                     return true;
                 }
             }
@@ -749,18 +974,24 @@ impl Browser {
         .await
         .unwrap_or(false);
         if navigated {
-            let events = self.cdp.subscribe();
             self.wait_for_load(events).await;
         } else {
             self.wait_quiet().await;
         }
     }
 
-    pub async fn type_text(&mut self, reference: &str, text: &str, clear: bool, submit: bool) -> Result<()> {
+    pub async fn type_text(
+        &mut self,
+        reference: &str,
+        text: &str,
+        clear: bool,
+        submit: bool,
+    ) -> Result<()> {
         let node = self.node(reference)?;
         self.scroll_into_view(&node).await;
         self.point_at(&node).await;
-        self.send_in(&node, "DOM.focus", json!({ "backendNodeId": node.backend })).await?;
+        self.send_in(&node, "DOM.focus", json!({ "backendNodeId": node.backend }))
+            .await?;
         if clear {
             self.run_on_node(
                 &node,
@@ -770,7 +1001,8 @@ impl Browser {
             )
             .await?;
         }
-        self.send_in(&node, "Input.insertText", json!({ "text": text })).await?;
+        self.send_in(&node, "Input.insertText", json!({ "text": text }))
+            .await?;
         if submit {
             self.press_key("Enter").await?;
         }
@@ -794,8 +1026,15 @@ impl Browser {
     }
 
     pub async fn press_key(&self, key: &str) -> Result<()> {
-        let Key { name, code, text, vk, modifiers, command } =
-            parse_key(key).ok_or_else(|| anyhow!("unsupported key '{key}'. Supported: {SUPPORTED_KEYS}"))?;
+        let Key {
+            name,
+            code,
+            text,
+            vk,
+            modifiers,
+            command,
+        } = parse_key(key)
+            .ok_or_else(|| anyhow!("unsupported key '{key}'. Supported: {SUPPORTED_KEYS}"))?;
         let events = self.cdp.subscribe();
         let base = json!({ "key": name, "code": code, "windowsVirtualKeyCode": vk, "modifiers": modifiers });
         let mut down = base.clone();
@@ -824,7 +1063,9 @@ impl Browser {
             "down" => 1.0,
             other => return Err(anyhow!("direction must be 'up' or 'down', got '{other}'")),
         };
-        let viewport = self.evaluate("[window.innerWidth, window.innerHeight]").await?;
+        let viewport = self
+            .evaluate("[window.innerWidth, window.innerHeight]")
+            .await?;
         let width = viewport[0].as_f64().unwrap_or(1280.0);
         let height = viewport[1].as_f64().unwrap_or(800.0);
         let (x, y) = match reference {
@@ -849,9 +1090,17 @@ impl Browser {
         let needle = Value::String(text.to_lowercase()).to_string();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(25));
+            let left = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(Duration::from_secs(25));
             let expression = format!("({TEXT_WATCH})({needle}, {gone}, {})", left.as_millis());
-            if self.evaluate(&expression).await.ok().and_then(|v| v.as_bool()) == Some(true) {
+            if self
+                .evaluate(&expression)
+                .await
+                .ok()
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -862,16 +1111,27 @@ impl Browser {
     }
 
     pub async fn page_text(&self) -> Result<String> {
-        let value = self.evaluate("document.body ? document.body.innerText : ''").await?;
+        let value = self
+            .evaluate("document.body ? document.body.innerText : ''")
+            .await?;
         Ok(value.as_str().unwrap_or("").to_string())
     }
 
     pub async fn screenshot(&self) -> Result<Screenshot> {
         let shot = self
-            .send("Page.captureScreenshot", json!({ "format": "jpeg", "quality": 70 }))
+            .send(
+                "Page.captureScreenshot",
+                json!({ "format": "jpeg", "quality": 70 }),
+            )
             .await?;
-        let base64 = shot["data"].as_str().ok_or_else(|| anyhow!("empty screenshot"))?.to_string();
-        Ok(Screenshot { base64, media_type: "image/jpeg" })
+        let base64 = shot["data"]
+            .as_str()
+            .ok_or_else(|| anyhow!("empty screenshot"))?
+            .to_string();
+        Ok(Screenshot {
+            base64,
+            media_type: "image/jpeg",
+        })
     }
 
     pub fn take_console(&self) -> Vec<String> {
@@ -922,7 +1182,11 @@ fn collect_console(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    format!("[{}] {}", event["params"]["type"].as_str().unwrap_or("log"), parts.join(" "))
+                    format!(
+                        "[{}] {}",
+                        event["params"]["type"].as_str().unwrap_or("log"),
+                        parts.join(" ")
+                    )
                 }
                 Some("Runtime.exceptionThrown") => format!(
                     "[exception] {}",
@@ -957,7 +1221,11 @@ fn collect_console(
 }
 
 fn describe_dialog(params: &Value) -> String {
-    format!("{}: {}", params["type"].as_str().unwrap_or("alert"), params["message"].as_str().unwrap_or(""))
+    format!(
+        "{}: {}",
+        params["type"].as_str().unwrap_or("alert"),
+        params["message"].as_str().unwrap_or("")
+    )
 }
 
 struct Key {
@@ -1013,13 +1281,33 @@ fn parse_key(spec: &str) -> Option<Key> {
     let chord = modifiers & (CTRL | ALT | META) != 0;
     if let Some((name, code, text, vk)) = named_key(key) {
         let text = text.filter(|_| !chord).map(str::to_string);
-        return Some(Key { name: name.into(), code: code.into(), text, vk, modifiers, command: None });
+        return Some(Key {
+            name: name.into(),
+            code: code.into(),
+            text,
+            vk,
+            modifiers,
+            command: None,
+        });
     }
-    if let Some(number) = key.strip_prefix(['F', 'f']).and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=12).contains(n)) {
-        return Some(Key { name: format!("F{number}"), code: format!("F{number}"), text: None, vk: 111 + number, modifiers, command: None });
+    if let Some(number) = key
+        .strip_prefix(['F', 'f'])
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| (1..=12).contains(n))
+    {
+        return Some(Key {
+            name: format!("F{number}"),
+            code: format!("F{number}"),
+            text: None,
+            vk: 111 + number,
+            modifiers,
+            command: None,
+        });
     }
     let mut chars = key.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else { return None };
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
     let upper = c.to_ascii_uppercase();
     let (code, vk) = if c.is_ascii_alphabetic() {
         (format!("Key{upper}"), upper as u32)
@@ -1082,7 +1370,14 @@ mod tests {
     #[test]
     fn parses_key_combinations() {
         let select_all = parse_key("Control+a").unwrap();
-        assert_eq!((select_all.code.as_str(), select_all.vk, select_all.modifiers), ("KeyA", 65, CTRL));
+        assert_eq!(
+            (
+                select_all.code.as_str(),
+                select_all.vk,
+                select_all.modifiers
+            ),
+            ("KeyA", 65, CTRL)
+        );
         assert!(select_all.text.is_none());
         let back = parse_key("shift+Tab").unwrap();
         assert_eq!((back.name.as_str(), back.modifiers), ("Tab", SHIFT));
@@ -1096,8 +1391,10 @@ mod tests {
 
     #[test]
     fn leaves_the_tree_alone_when_the_frame_owner_is_unknown() {
-        let mut nodes = vec![json!({"nodeId": "1", "role": {"value": "RootWebArea"}, "childIds": []})];
-        let inner = json!({"nodes": [{"nodeId": "1", "role": {"value": "RootWebArea"}, "childIds": []}]});
+        let mut nodes =
+            vec![json!({"nodeId": "1", "role": {"value": "RootWebArea"}, "childIds": []})];
+        let inner =
+            json!({"nodes": [{"nodeId": "1", "role": {"value": "RootWebArea"}, "childIds": []}]});
         splice_frame(&mut nodes, &inner, "f0-", 99, None);
         assert_eq!(nodes.len(), 1);
     }

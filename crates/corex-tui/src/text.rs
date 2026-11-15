@@ -1,5 +1,7 @@
 //! Small text helpers shared by the dialogs: column-aware fitting and display formatting.
 
+use std::borrow::Cow;
+
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Fits `s` into `width` columns. Whole words are kept when that loses little, and a `…` always
@@ -28,6 +30,68 @@ pub fn fit_text(s: &str, width: usize) -> String {
     }
     let kept = out.trim_end_matches([' ', '·']);
     format!("{}…", kept)
+}
+
+pub fn expand_tabs(text: &str) -> Cow<'_, str> {
+    if text.contains('\t') {
+        Cow::Owned(text.replace('\t', "    "))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub fn control_picture(c: char) -> char {
+    match c {
+        '\t' | '\n' | '\r' | '\x0b' | '\x0c' => ' ',
+        '\0'..='\x1f' => char::from_u32(0x2400 + c as u32).unwrap_or(char::REPLACEMENT_CHARACTER),
+        '\x7f' => '\u{2421}',
+        _ => char::REPLACEMENT_CHARACTER,
+    }
+}
+
+// Command output only: in a command awaiting approval the sequences must stay visible.
+pub fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if !text.contains('\x1b') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        rest = &rest[esc + 1..];
+        rest = &rest[escape_sequence_len(rest)..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+fn escape_sequence_len(after_esc: &str) -> usize {
+    let bytes = after_esc.as_bytes();
+    match bytes.first() {
+        Some(b'[') => {
+            let body = bytes[1..].iter().take_while(|b| (0x20..=0x3f).contains(*b)).count();
+            match bytes.get(1 + body) {
+                Some(last) if (0x40..=0x7e).contains(last) => body + 2,
+                _ => 0,
+            }
+        }
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => {
+            let bel = after_esc.find('\x07').map(|i| i + 1);
+            let st = after_esc.find("\x1b\\").map(|i| i + 2);
+            match (bel, st) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b).unwrap_or(0),
+            }
+        }
+        Some(_) => {
+            let intermediates = bytes.iter().take_while(|b| (0x20..=0x2f).contains(*b)).count();
+            match bytes.get(intermediates) {
+                Some(last) if (0x30..=0x7e).contains(last) => intermediates + 1,
+                _ => 0,
+            }
+        }
+        None => 0,
+    }
 }
 
 pub fn fit_path(path: &str, width: usize) -> String {
@@ -249,6 +313,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn strip_ansi_drops_whole_sequences_only() {
+        assert_eq!(strip_ansi("\x1b[32m✓\x1b[0m done"), "✓ done");
+        assert_eq!(strip_ansi("\x1b]0;title\x07a\x1b]8;;http://x\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1b(Bb\x1bcc"), "abc");
+        assert_eq!(strip_ansi("\x1b[?1000l\x1b[2Jx"), "x");
+        assert_eq!(strip_ansi("cut \x1b[38;2"), "cut [38;2");
+        assert_eq!(strip_ansi("open \x1b]0;never closed"), "open ]0;never closed");
+        assert!(matches!(strip_ansi("plain"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn control_pictures_take_one_cell() {
+        assert_eq!(control_picture('\x1b'), '␛');
+        assert_eq!(control_picture('\x07'), '␇');
+        assert_eq!(control_picture('\x7f'), '␡');
+        assert_eq!(control_picture('\t'), ' ');
+        assert_eq!(control_picture('\r'), ' ');
+        assert_eq!(control_picture('\u{9b}'), '\u{fffd}');
+    }
 
     #[test]
     fn fit_text_marks_cuts_and_prefers_whole_words() {

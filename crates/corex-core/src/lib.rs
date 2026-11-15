@@ -18,6 +18,7 @@ pub mod reasoning_cache;
 pub mod repeat_guard;
 pub mod secure_fs;
 pub mod session;
+pub mod session_images;
 pub mod spill;
 pub mod subagent;
 pub mod tool_images;

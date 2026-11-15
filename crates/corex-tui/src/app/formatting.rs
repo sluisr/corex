@@ -466,6 +466,27 @@ fn patch_rows(patch: &str) -> Vec<DiffRow> {
     rows
 }
 
+pub fn hunk_label(header: &str) -> String {
+    let rest = header.trim_start_matches('@').trim();
+    let (line, context) = match rest.split_once("@@") {
+        Some((ranges, context)) => (
+            ranges
+                .split_whitespace()
+                .find_map(|r| r.strip_prefix('+'))
+                .and_then(|r| r.split(',').next())
+                .and_then(|n| n.parse::<usize>().ok()),
+            context.trim(),
+        ),
+        None => (None, rest),
+    };
+    match (line, context.is_empty()) {
+        (Some(n), true) => format!("⋯ line {n}"),
+        (Some(n), false) => format!("⋯ line {n} · {context}"),
+        (None, true) => "⋯".to_string(),
+        (None, false) => format!("⋯ {context}"),
+    }
+}
+
 /// The target a diff header names, without the `a/`/`b/` prefix or the `/dev/null` sentinel.
 fn patch_path(raw: &str) -> Option<String> {
     let path = raw.split('\t').next().unwrap_or("").trim();
@@ -523,7 +544,7 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme, full: b
                 if first.len() < cmd.len() && !cut.ends_with("...") { format!("{cut} …") } else { cut }
             };
             vec![
-                Span::styled(" $ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
+                Span::styled("$ ", chip.fg(theme.accent_yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(shown, chip.fg(theme.text_strong)),
                 Span::styled(" ", chip),
             ]

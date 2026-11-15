@@ -83,6 +83,13 @@ pub fn docked_panel(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) 
     Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(2))
 }
 
+pub fn docked_panel_open_bottom(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme) -> Rect {
+    frame.render_widget(Clear, area);
+    let rule = ratatui::widgets::Paragraph::new(Span::styled("─".repeat(area.width as usize), Style::default().fg(theme.border_dim)));
+    frame.render_widget(rule, Rect::new(area.x, area.y, area.width, area.height.min(1)));
+    Rect::new(area.x, area.y.saturating_add(1), area.width, area.height.saturating_sub(1))
+}
+
 pub fn docked_height(body_rows: usize, screen_height: u16) -> u16 {
     (body_rows as u16 + DOCKED_CHROME_ROWS).min(screen_height.saturating_sub(6)).max(3)
 }

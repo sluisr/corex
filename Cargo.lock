@@ -596,6 +596,7 @@ version = "0.12.0-beta.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "diffy",
  "directories",

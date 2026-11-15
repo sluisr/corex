@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use corex_core::types::Message;
-use crate::ascii::{render_gradient_logo, render_gradient_logo_adaptive, shorten_model_for_mobile};
+use crate::ascii::{render_gradient_logo_adaptive, shorten_model_for_mobile};
 use crate::auth_dialog::render_auth_dialog;
 use crate::diff_view::{build_streaming_tool_preview_lines, build_tool_confirmation_lines};
 use crate::fleet_dialog::render_fleet_dialog;
@@ -174,7 +174,7 @@ pub(crate) fn user_label() -> String {
 const COLLAPSED_LOG_ROWS: usize = 5;
 
 /// Appends `rows` as a gutter-prefixed log: all of it when `expanded`, otherwise only the last
-/// `COLLAPSED_LOG_ROWS` behind a `… (+N lines above)` marker (which `is_collapsed_marker` finds).
+/// `COLLAPSED_LOG_ROWS` behind a `… (+N lines above)` marker.
 fn push_log_tail(
     lines: &mut Vec<Line<'static>>,
     rows: &[&str],
@@ -183,18 +183,46 @@ fn push_log_tail(
     gutter: &str,
     text: Color,
     dim: Color,
+    theme: &Theme,
 ) {
-    let skipped = if expanded { 0 } else { rows.len().saturating_sub(COLLAPSED_LOG_ROWS) };
-    if skipped > 0 {
-        lines.push(Line::from(vec![
+    let diff = looks_like_diff(rows);
+    let hidden = if expanded {
+        0
+    } else if diff {
+        rows.len().saturating_sub(COLLAPSED_DIFF_ROWS)
+    } else {
+        rows.len().saturating_sub(COLLAPSED_LOG_ROWS)
+    };
+    let marker = |where_: &str| {
+        Line::from(vec![
             Span::styled(gutter.to_string(), Style::default().fg(dim)),
-            Span::styled(format!("… (+{} lines above)", skipped), Style::default().fg(dim)),
-        ]));
+            Span::styled(format!("… (+{hidden} lines {where_})"), Style::default().fg(dim)),
+            Span::styled(" · ctrl+o", Style::default().fg(dim).add_modifier(Modifier::DIM)),
+        ])
+    };
+    let shown = if diff { &rows[..rows.len() - hidden] } else { &rows[hidden..] };
+    if hidden > 0 && !diff {
+        lines.push(marker("above"));
     }
-    for row in &rows[skipped..] {
-        let spans = vec![Span::styled(row.replace('\t', "    "), Style::default().fg(text))];
-        lines.extend(crate::markdown::wrap_spans(spans, width, gutter));
+    for row in shown {
+        let row = crate::text::expand_tabs(&crate::text::strip_ansi(row)).into_owned();
+        let color = match diff {
+            true if row.starts_with("+++") || row.starts_with("---") => text,
+            true if row.starts_with('+') => theme.accent_green,
+            true if row.starts_with('-') => theme.accent_red,
+            true if row.starts_with("@@") => theme.accent_cyan,
+            _ => text,
+        };
+        lines.extend(crate::markdown::wrap_spans(vec![Span::styled(row, Style::default().fg(color))], width, gutter));
     }
+    if hidden > 0 && diff {
+        lines.push(marker("below"));
+    }
+}
+
+fn looks_like_diff(rows: &[&str]) -> bool {
+    let hunk = rows.iter().any(|r| r.starts_with("@@ ") && r[3..].contains(" @@"));
+    hunk && rows.iter().any(|r| r.starts_with("--- ") || r.starts_with("+++ ") || r.starts_with("diff "))
 }
 
 /// Diff rows of an edit that stay visible while logs are collapsed.
@@ -235,7 +263,7 @@ fn push_edit_diff(
             ]),
             DiffRow::Hunk(text) => Line::from(vec![
                 Span::styled("      ", Style::default()),
-                Span::styled(text.clone(), Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(crate::app::formatting::hunk_label(text), Style::default().fg(theme.muted)),
             ]),
             DiffRow::Added(body) => Line::from(vec![
                 Span::styled("      + ", Style::default().fg(theme.diff_added_fg).add_modifier(Modifier::BOLD)),
@@ -316,10 +344,6 @@ fn pending_owner(messages: &[Message], pending: &PendingToolBatch) -> Option<usi
     })
 }
 
-/// The `… (+N lines above)` row a collapsed log leaves behind.
-fn is_collapsed_marker(line: &Line<'_>) -> bool {
-    line.spans.iter().any(|s| s.content.starts_with("… (+") && s.content.ends_with("lines above)"))
-}
 
 /// Lowercase role tag shared by every subagent badge (`[scout:sub_1]`), whichever path produced it.
 fn subagent_role_label(role: &str) -> String {
@@ -458,7 +482,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         }
         lines.push(Line::from(badge_spans));
 
-        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim, theme);
 
         return lines;
     }
@@ -494,7 +518,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
             status_spans.push(Span::styled(format!(" ({duration})"), Style::default().fg(muted_dim)));
         }
         lines.push(Line::from(status_spans));
-        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim, theme);
         return lines;
     }
 
@@ -530,7 +554,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
         }
         lines.push(Line::from(badge_spans));
 
-        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim);
+        push_log_tail(&mut lines, &output_lines, logs_expanded, content_max_width, "    │ ", muted_text, muted_dim, theme);
 
         return lines;
     }
@@ -557,7 +581,7 @@ pub fn format_system_message(text: &str, theme: &Theme, content_max_width: usize
                     spans.push(Span::styled(format!("{}: ", k.trim()), Style::default().fg(muted_label)));
                     let val = v.trim();
                     let val_color = match val.to_lowercase().as_str() {
-                        "dynamic" | "low" | "enabled" => theme.success,
+                        "low" | "enabled" => theme.success,
                         "medium" => theme.warning,
                         "high" | "max" => theme.accent_purple,
                         _ => theme.gray,
@@ -954,7 +978,7 @@ pub fn render_message_lines(
                 ];
                 lines.push(Line::from(badge_spans));
 
-                push_log_tail(&mut lines, &raw_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray);
+                push_log_tail(&mut lines, &raw_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray, theme);
             } else {
                 let raw_output_lines: Vec<&str> = content
                     .lines()
@@ -979,7 +1003,8 @@ pub fn render_message_lines(
                 };
 
                 if raw_output_lines.len() <= 1 {
-                    let first_line_raw = raw_output_lines.first().copied().unwrap_or("Done").replace('\t', "    ");
+                    let first_line_raw = crate::text::strip_ansi(raw_output_lines.first().copied().unwrap_or("Done"));
+                    let first_line_raw = crate::text::expand_tabs(&first_line_raw);
                     let display_first_line = truncate_to_width(&first_line_raw, 140);
 
                     let line_spans = vec![
@@ -1001,7 +1026,7 @@ pub fn render_message_lines(
                         Span::styled(header_label, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
                     ]));
 
-                    push_log_tail(&mut lines, &raw_output_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray);
+                    push_log_tail(&mut lines, &raw_output_lines, logs_expanded, content_max_width, "        │ ", theme.gray, theme.dark_gray, theme);
                 }
             }
 
@@ -1035,10 +1060,29 @@ pub fn render_message_lines(
 }
 
 pub fn render_ui(frame: &mut Frame, app: &mut App) {
+    render_layout(frame, app);
+    neutralize_control_cells(frame.buffer_mut());
+}
+
+// The backend prints symbols verbatim: the terminal would execute a control character.
+fn neutralize_control_cells(buf: &mut Buffer) {
+    for cell in buf.content.iter_mut() {
+        if cell.symbol().contains(char::is_control) {
+            let safe: String = cell
+                .symbol()
+                .chars()
+                .map(|c| if c.is_control() { crate::text::control_picture(c) } else { c })
+                .collect();
+            cell.set_symbol(&safe);
+        }
+    }
+}
+
+fn render_layout(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
     // Fleet / SysAdmin mode: normal AI chat on one side, live VPS terminal on the other.
-    if app.fleet_dialog.is_open {
+    if app.fleet_dialog.is_open && !app.fleet_dialog.terminal_hidden {
         // One divider colour for every fleet layout; the live terminal lights up when focused.
         let divider = app.theme.rule;
         let border = Style::default().fg(divider);
@@ -1069,7 +1113,7 @@ pub fn render_ui(frame: &mut Frame, app: &mut App) {
             // Narrow/Mobile screens (e.g. mobile portrait, narrow terminals):
             // Instead of crushing chat and terminal into a 50/50 vertical split with 0 usable terminal lines,
             // render the active focused pane in FULL SCREEN!
-            // Tab / Shift+Tab toggles between Chat and VPS Terminal.
+            // Ctrl+] toggles between Chat and VPS Terminal.
             if app.fleet_dialog.command_mode {
                 render_fleet_dialog(frame, size, &app.fleet_dialog, &app.theme);
             } else {
@@ -1128,13 +1172,20 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         && app.pending_confirmation.is_none()
         && !app.user_dialog.is_open
         && !app.sudo_dialog.is_open;
-    let activity_height = if show_activity { 1 } else { 0 };
+    let activity_height = if !show_activity {
+        0
+    } else {
+        let extras = if app.message_queue.is_empty() { 0 } else { 14 } + if app.steer_messages.is_empty() { 0 } else { 26 };
+        let needed = 4 + unicode_width::UnicodeWidthStr::width(app.status_transition.target_text.as_str()) + extras;
+        if needed > size.width as usize { 2 } else { 1 }
+    };
 
     // The prompt prefix and the composer height are resolved before the layout because the
     // composer grows with the wrapped input: a long message must push the text onto extra rows
     // instead of running off the right edge of the terminal.
     let prompt_prefix = if app.always_allow_tools {
-        Span::styled("* ", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD))
+        let color = if app.yolo_mode == corex_core::YoloMode::All { app.theme.accent_red } else { app.theme.accent_yellow };
+        Span::styled("* ", Style::default().fg(color).add_modifier(Modifier::BOLD))
     } else if app.plan_mode {
         Span::styled("? ", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD))
     } else {
@@ -1168,6 +1219,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         crate::auth_dialog::dialog_height(size.height)
     } else if app.session_dialog.is_open {
         crate::session_dialog::dialog_height(size.height)
+    } else if app.tasks_dialog.is_open {
+        crate::tasks_dialog::dialog_height(size.height)
     } else if app.model_dialog.is_open {
         app.model_dialog.height(size.width, size.height)
     } else if app.rewind_dialog.is_open {
@@ -1178,6 +1231,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         composer_content_lines as u16 + 2
     };
 
+    let status_height = u16::from(!(app.model_dialog.is_open || app.session_dialog.is_open || app.tasks_dialog.is_open));
     let chunks = if popup_height > 0 {
         Layout::default()
             .direction(Direction::Vertical)
@@ -1186,7 +1240,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 Constraint::Length(popup_height), // Autocomplete Popup Slot
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(composer_height), // Input Composer
-                Constraint::Length(1),            // Status Footer Bar
+                Constraint::Length(status_height), // Status Footer Bar
             ])
             .split(size)
     } else {
@@ -1196,7 +1250,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 Constraint::Min(5),               // Chat Feed
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(composer_height), // Input Composer
-                Constraint::Length(1),            // Status Footer Bar
+                Constraint::Length(status_height), // Status Footer Bar
             ])
             .split(size)
     };
@@ -1208,7 +1262,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         (None, chunks[1], chunks[2], chunks[3])
     };
 
-    let content_max_width = (chat_chunk.width as usize).saturating_sub(4).max(20);
+    let content_max_width = (chat_chunk.width as usize).saturating_sub(2).max(20);
 
     // The banner scrolls away with the feed instead of staying pinned.
     // Config is snapshotted once per frame and reused by the status footer below.
@@ -1216,24 +1270,20 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let is_auth = !cfg.api_key.trim().is_empty();
     let is_local = cfg.local_llm_enabled;
     let update_notice = app.update_available.lock().ok().and_then(|l| l.clone());
-    let header_lines: Vec<Line<'static>> = if is_mobile_portrait(size.width, size.height) {
-        render_gradient_logo_adaptive(
-            env!("CARGO_PKG_VERSION"),
-            &cfg.model,
-            is_auth,
-            is_local,
-            update_notice.as_deref(),
-            chat_chunk.width as usize,
-        )
-    } else {
-        render_gradient_logo(
-            env!("CARGO_PKG_VERSION"),
-            &cfg.model,
-            is_auth,
-            is_local,
-            update_notice.as_deref(),
-        )
-    };
+    let mut header_lines: Vec<Line<'static>> = render_gradient_logo_adaptive(
+        env!("CARGO_PKG_VERSION"),
+        &cfg.model,
+        is_auth,
+        is_local,
+        update_notice.as_deref(),
+        chat_chunk.width as usize,
+    );
+    let location = Line::from(vec![
+        Span::raw(" ".repeat(crate::ascii::BANNER_TEXT_COLUMN)),
+        Span::styled(app.shorten_path(), Style::default().fg(crate::ascii::BANNER_MUTED)),
+    ]);
+    let after_logo = header_lines.len().saturating_sub(1 + usize::from(update_notice.is_some()));
+    header_lines.insert(after_logo, location);
 
     if app.cached_render_width != content_max_width
         || app.cached_session_id != app.session.id
@@ -1244,8 +1294,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.selection_lines.cached.clear();
         app.copy_headers.cached.clear();
         app.cached_message_count = 0;
-        app.cached_has_collapsed_logs = false;
         app.cached_render_width = content_max_width;
+        if app.cached_session_id != app.session.id {
+            app.expanded_messages.clear();
+        }
         app.cached_session_id = app.session.id.clone();
         app.cached_logs_expanded = app.logs_expanded;
     }
@@ -1326,6 +1378,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             let next_msg = messages[..target_cache_count].get(msg_idx + 1);
             let answers = needs_answers(msg).then_some(shared_answers.as_ref()).flatten();
             let run = if app.logs_expanded { None } else { browser_run::run_start(messages, msg_idx) };
+            let msg_expanded = app.logs_expanded || app.expanded_messages.contains(&msg_idx);
             let rendered = match run {
                 Some(start) if start < msg_idx => Vec::new(),
                 Some(start) => {
@@ -1337,7 +1390,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                         &app.theme,
                         content_max_width,
                         None,
-                        app.logs_expanded,
+                        msg_expanded,
                         app.thinking_state.is_expanded,
                         None,
                         true,
@@ -1360,7 +1413,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     &app.theme,
                     content_max_width,
                     None,
-                    app.logs_expanded,
+                    msg_expanded,
                     app.thinking_state.is_expanded,
                     answered_tool_call(messages, msg_idx),
                     true,
@@ -1371,9 +1424,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         }
         drop(shared_answers);
         for (first_block, rendered) in rendered_batch {
-            if !app.logs_expanded && rendered.iter().any(is_collapsed_marker) {
-                app.cached_has_collapsed_logs = true;
-            }
+            let rendered = crate::markdown::fit_lines(rendered, chat_chunk.width as usize);
             let base = app.cached_message_lines.len();
             app.copy_headers.cached.extend(super::copy::number_headers(&rendered, base, first_block));
             app.cached_message_lines.extend(rendered);
@@ -1591,6 +1642,24 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         tail_lines.push(Line::from(""));
     }
 
+    app.chat_header_lines = header_lines.len();
+    if let Some((msg, within)) = app.scroll_anchor.take() {
+        if let (Some(&start), Some(&next)) = (app.cached_message_line_offsets.get(msg), app.cached_message_line_offsets.get(msg + 1)) {
+            app.scroll_offset = header_lines.len() + start + within.min(next.saturating_sub(start + 1));
+        }
+    }
+    let chat_width = chat_chunk.width as usize;
+    if tail_lines.iter().any(|l| l.width() > chat_width) {
+        tail_lines = crate::markdown::fit_lines(tail_lines, chat_width);
+        let numbers: Vec<usize> = app.copy_headers.tail.iter().map(|(_, n)| *n).collect();
+        let rows = tail_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| crate::markdown::is_copy_header(&super::formatting::line_plain_text(l)))
+            .map(|(i, _)| i);
+        app.copy_headers.tail = rows.zip(numbers).collect();
+    }
+    let header_lines = crate::markdown::fit_lines(header_lines, chat_width);
     let total_lines = header_lines.len() + app.cached_message_lines.len() + tail_lines.len();
     app.total_rendered_items = total_lines;
 
@@ -1723,14 +1792,18 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             .find(|opt| bar_width > left_len + width_of(opt))
             .copied();
 
-        let mut spans = left_spans;
-        if let Some(text) = right_text {
-            let pad = bar_width - (left_len + width_of(text));
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(text, Style::default().fg(app.theme.dark_gray)));
+        if left_len > bar_width {
+            let rows = crate::markdown::wrap_spans_with_indent(left_spans, bar_width, "", "    ");
+            frame.render_widget(Paragraph::new(rows), activity_chunk);
+        } else {
+            let mut spans = left_spans;
+            if let Some(text) = right_text {
+                let pad = bar_width - (left_len + width_of(text));
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(text, Style::default().fg(app.theme.dark_gray)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
         }
-
-        frame.render_widget(Paragraph::new(Line::from(spans)), activity_chunk);
     }
 
     let show_esc_hint = !app.input_buffer.is_empty()
@@ -1822,6 +1895,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         render_auth_dialog(frame, composer_chunk, &app.auth_dialog, &app.theme);
     } else if app.session_dialog.is_open {
         render_session_dialog(frame, composer_chunk, &mut app.session_dialog, &app.theme);
+    } else if app.tasks_dialog.is_open {
+        let mgr = corex_tools::background::get_task_manager();
+        let guard = mgr.lock().unwrap_or_else(|e| e.into_inner());
+        crate::tasks_dialog::render_tasks_dialog(frame, composer_chunk, &mut app.tasks_dialog, &guard, &app.theme);
     } else if app.model_dialog.is_open {
         render_model_dialog(frame, composer_chunk, &app.model_dialog, &app.theme);
     } else if app.rewind_dialog.is_open {
@@ -1894,15 +1971,10 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     };
 
     if is_flash {
-        let effort = if cfg.local_llm_enabled && cfg.reasoning_effort != "dynamic" {
-            // The local engine always runs the adaptive policy, whatever the setting says.
-            "dynamic"
-        } else {
-            cfg.reasoning_effort.as_str()
-        };
+        let effort = cfg.reasoning_effort.as_str();
 
         let r_color = match effort {
-            "none" => app.theme.muted,
+            "none" | "off" => app.theme.muted,
             "low" => app.theme.effort_low,
             "high" => app.theme.effort_high,
             "xhigh" | "max" => app.theme.effort_max,
@@ -1910,7 +1982,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         };
 
         right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4.1-Flash".to_string()), model_style));
-        if !is_mobile {
+        if !is_mobile && crate::model_dialog::flash_thinking_off(effort) {
             right_spans.push(Span::styled(" · ", sep_style));
             right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         }
@@ -1945,7 +2017,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         };
 
         right_spans.push(Span::styled(display_name, model_style));
-        if !is_mobile {
+        if !is_mobile && corex_core::providers::applies_temperature(&cfg.model) {
             right_spans.push(Span::styled(" · ", sep_style));
             right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         }
@@ -1961,19 +2033,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         right_spans.push(Span::styled("+Local ", Style::default().fg(app.theme.accent_cyan)));
     }
 
-    // Share of the model's window in use, so a compaction is never a surprise. The count comes from
-    // the API's last reported prompt size; the window is a per-provider default unless
-    // `context_window_tokens` is set, hence the "~". Hidden below half the window, where it says
-    // nothing worth the room; yellow once the prompt is past the auto-compact limit.
+    // The window is a per-provider default unless `context_window_tokens` is set.
     if !is_mobile_portrait(size.width, size.height) && !app.session.messages.is_empty() {
         let used = app.session.context_tokens();
         let window = if cfg.model.starts_with("local") { 24_000 } else { footer.window };
         let percent = (used * 100 / window.max(1)).min(100);
         let past_compact = cfg.auto_compact && used >= footer.compact_threshold;
-        if percent >= 50 || past_compact {
-            let color = if past_compact { app.theme.accent_yellow } else { app.theme.muted };
-            right_spans.insert(0, Span::styled(format!("~{percent}% · "), Style::default().fg(color)));
-        }
+        let color = if past_compact { app.theme.accent_yellow } else { app.theme.dark_gray };
+        right_spans.insert(0, Span::styled(format!("ctx {percent}% · "), Style::default().fg(color)));
     }
 
     // Center spans: Local LLM status indicator and Active Background Tasks badge
@@ -2034,26 +2101,17 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         ));
     }
 
-    let tail_has_collapsed = !app.logs_expanded && tail_lines.iter().any(is_collapsed_marker);
-    if app.logs_expanded || app.cached_has_collapsed_logs || tail_has_collapsed {
+    if app.fleet_dialog.is_open && app.fleet_dialog.terminal_hidden {
         if !center_spans.is_empty() {
             center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
         }
-        if app.logs_expanded {
-            center_spans.push(Span::styled(
-                "[Logs: Full (Ctrl+O)]",
-                Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            center_spans.push(Span::styled("Ctrl+O full logs", Style::default().fg(app.theme.dark_gray)));
-        }
+        center_spans.push(Span::styled("f7 terminal", Style::default().fg(app.theme.dark_gray)));
     }
-
-    if app.context_files > 0 && !is_mobile {
+    if app.logs_expanded {
         if !center_spans.is_empty() {
             center_spans.push(Span::styled("  ·  ", Style::default().fg(app.theme.gray)));
         }
-        center_spans.push(Span::styled(format!("{} ctx", app.context_files), Style::default().fg(app.theme.dark_gray)));
+        center_spans.push(Span::styled("logs", Style::default().fg(app.theme.dark_gray)));
     }
 
     // Left spans: Workspace directory, git branch, plan mode, and exit warning
@@ -2069,43 +2127,16 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let right_width = right_spans.iter().map(|s| s.width()).sum::<usize>();
     let center_width = center_spans.iter().map(|s| s.width()).sum::<usize>();
 
-    let mut left_spans = Vec::new();
+    let mut left_spans = mode_badges(app);
     if let Some(warning) = exit_warning {
-        let warning_width = warning.len() + 1;
-        // Available width for the left side of the status bar (accounting for right & center widgets)
-        let avail = (status_chunk.width as usize).saturating_sub(right_width + center_width + 1);
-        let path_str = format!(" {} ", app.shorten_path());
-        let branch_str = if !app.git_branch.is_empty() {
-            format!("({}) ", app.git_branch)
-        } else {
-            String::new()
-        };
-        let full_needed = unicode_width::UnicodeWidthStr::width(path_str.as_str())
-            + unicode_width::UnicodeWidthStr::width(branch_str.as_str())
-            + warning_width;
-
-        if avail >= full_needed {
-            // Full space available: render mode badges + path + branch + warning
-            left_spans.extend(mode_badges(app));
-            left_spans.push(Span::styled(path_str, Style::default().fg(app.theme.foreground)));
-            if !branch_str.is_empty() {
-                left_spans.push(Span::styled(branch_str, Style::default().fg(app.theme.accent_cyan)));
-            }
-            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.gray)));
-        } else if avail >= unicode_width::UnicodeWidthStr::width(branch_str.as_str()) + warning_width && !branch_str.is_empty() {
-            // Medium space: prioritize branch and the exit warning so it is never truncated
-            left_spans.push(Span::styled(format!(" {} ", branch_str.trim()), Style::default().fg(app.theme.accent_cyan)));
-            left_spans.push(Span::styled(format!("{warning} "), Style::default().fg(app.theme.gray)));
-        } else {
-            // Narrow space (e.g. /fleet split mode on narrower terminals): show complete exit warning
-            left_spans.push(Span::styled(format!(" {warning}"), Style::default().fg(app.theme.gray)));
-        }
-    } else {
-        // The mode comes first: when the bar is short, the path is cut instead of the mode.
-        left_spans.extend(mode_badges(app));
-        left_spans.push(Span::styled(format!(" {} ", app.shorten_path()), Style::default().fg(app.theme.foreground)));
-        if !app.git_branch.is_empty() {
-            left_spans.push(Span::styled(format!("({}) ", app.git_branch), Style::default().fg(app.theme.accent_cyan)));
+        left_spans.push(Span::styled(format!(" {warning} "), Style::default().fg(app.theme.gray)));
+    } else if let Some(folder) = app.workspace_dir.file_name().map(|n| n.to_string_lossy().into_owned()) {
+        let badges: usize = left_spans.iter().map(|s| s.width()).sum();
+        let sep = if badges == 0 { " " } else { " · " };
+        let room = (status_chunk.width as usize).saturating_sub(right_width + center_width + if center_width > 0 { 4 } else { 0 } + 1);
+        if badges + unicode_width::UnicodeWidthStr::width(sep) + unicode_width::UnicodeWidthStr::width(folder.as_str()) <= room {
+            left_spans.push(Span::styled(sep.to_string(), Style::default().fg(app.theme.dark_gray)));
+            left_spans.push(Span::styled(folder, Style::default().fg(app.theme.gray)));
         }
     }
 
@@ -2198,23 +2229,19 @@ fn footer_model(app: &mut App, cfg: &corex_core::config::Config) -> super::state
     model
 }
 
-// YOLO is the riskiest mode: spelled out here, the `*` prompt prefix alone is easy to miss.
 fn mode_badges(app: &App) -> Vec<Span<'static>> {
+    let theme = &app.theme;
     let mut spans = Vec::new();
     match app.yolo_mode {
-        corex_core::YoloMode::All => {
-            spans.push(Span::styled(" [YOLO ALL]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
-        }
-        corex_core::YoloMode::Normal => {
-            spans.push(Span::styled(" [YOLO]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)));
-        }
+        corex_core::YoloMode::All => spans.push(Span::styled(" auto", Style::default().fg(theme.accent_red))),
+        corex_core::YoloMode::Normal => spans.push(Span::styled(" auto", Style::default().fg(theme.accent_yellow))),
         corex_core::YoloMode::Off => {}
     }
     if app.accept_edits {
-        spans.push(Span::styled(" [ACCEPT EDITS]", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" edits", Style::default().fg(theme.accent_cyan)));
     }
     if app.plan_mode {
-        spans.push(Span::styled(" [PLAN MODE]", Style::default().fg(app.theme.warning).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" plan", Style::default().fg(theme.accent_purple)));
     }
     spans
 }
@@ -2287,3 +2314,45 @@ pub fn paint_selection(
     }
 }
 
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    fn draw(rows: &[&str], expanded: bool) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let theme = Theme::default();
+        push_log_tail(&mut lines, rows, expanded, 100, "│ ", theme.gray, theme.dark_gray, &theme);
+        lines
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_diff_keeps_its_head_and_is_coloured() {
+        let mut rows = vec!["--- a/x.rs", "+++ b/x.rs", "@@ -1,3 +1,3 @@", "-old", "+new"];
+        rows.extend(std::iter::repeat_n(" ctx", 20));
+        let theme = Theme::default();
+        let lines = draw(&rows, false);
+
+        assert!(text(&lines[0]).contains("--- a/x.rs"));
+        assert_eq!(text(lines.last().unwrap()), "│ … (+13 lines below) · ctrl+o");
+        let fg = |needle: &str| lines.iter().find(|l| text(l).ends_with(needle)).unwrap().spans[1].style.fg;
+        assert_eq!(fg("-old"), Some(theme.accent_red));
+        assert_eq!(fg("+new"), Some(theme.accent_green));
+        assert_eq!(fg("+++ b/x.rs"), Some(theme.gray));
+        assert_eq!(draw(&rows, true).len(), rows.len());
+    }
+
+    #[test]
+    fn other_logs_keep_their_tail() {
+        let rows: Vec<String> = (0..20).map(|i| format!("-line {i}")).collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let lines = draw(&rows, false);
+        assert_eq!(text(&lines[0]), "│ … (+15 lines above) · ctrl+o");
+        assert!(text(lines.last().unwrap()).ends_with("-line 19"));
+        assert_eq!(lines[1].spans[1].style.fg, Some(Theme::default().gray));
+    }
+}

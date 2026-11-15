@@ -7,7 +7,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::overlay::{docked_height, docked_panel, highlight_cursor, key_hints, rail, row_text, Row};
+use crate::overlay::{docked_height, docked_panel_open_bottom, highlight_cursor, key_hints, rail, row_text, Row};
 use crate::text::{fit_path, fit_text, group_thousands, pad_right, strip_inline_markdown};
 use crate::theme::Theme;
 
@@ -132,7 +132,7 @@ const PREVIEW_FROM_WIDTH: u16 = 80;
 const COLUMN_GAP: u16 = 2;
 
 pub fn dialog_height(screen_height: u16) -> u16 {
-    docked_height(BODY_ROWS, screen_height)
+    docked_height(BODY_ROWS, screen_height).saturating_sub(1)
 }
 
 pub fn render_session_dialog(
@@ -147,7 +147,7 @@ pub fn render_session_dialog(
 
     state.update_preview();
 
-    let panel = docked_panel(frame, area, theme);
+    let panel = docked_panel_open_bottom(frame, area, theme);
     let inner = Rect::new(panel.x, panel.y, panel.width.min(CONTENT_MAX_WIDTH), panel.height);
     let with_preview = inner.width >= PREVIEW_FROM_WIDTH && !crate::app::is_mobile_portrait(inner.width, 0);
 

@@ -1,5 +1,5 @@
 use corex_core::config::{Config, FlashSettings, ProSettings};
-use corex_core::providers::{locate_active, ModelFamily, ModelProfile, ProviderConfig};
+use corex_core::providers::{applies_temperature, locate_active, temperature_range, ModelFamily, ModelProfile, ProviderConfig};
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -7,13 +7,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::overlay::{docked_height, docked_panel, highlight_cursor, key_hints, rail, row_text, Row};
+use crate::overlay::{docked_height, docked_panel_open_bottom, highlight_cursor, key_hints, rail, row_text, Row};
 use crate::text::{fit_text, pad_right, wrap_words};
 use crate::theme::Theme;
 
 pub const TEMPERATURE_PRESETS: &[f32] = &[0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0];
 /// DeepSeek rejects `medium` (the client turns it into `high`), so it is not offered.
-pub const REASONING_LEVELS: &[&str] = &["dynamic", "low", "high", "max"];
+pub const REASONING_LEVELS: &[&str] = &["off", "low", "high", "max"];
 pub const PRO_REASONING_LEVELS: &[&str] = &["max", "high", "low"];
 
 const PROVIDERS_COL_WIDTH: u16 = 24;
@@ -151,19 +151,26 @@ fn cycle_static(levels: &[&str], current: &str, forward: bool) -> String {
     cycle_str(&owned, current, forward)
 }
 
-fn cycle_temperature(current: f32, forward: bool) -> f32 {
-    let cur = TEMPERATURE_PRESETS
+// DeepSeek ignores `temperature` while thinking is on.
+pub fn flash_thinking_off(level: &str) -> bool {
+    matches!(level, "off" | "none")
+}
+
+fn cycle_temperature(current: f32, forward: bool, (lo, hi): (f32, f32)) -> f32 {
+    let presets: Vec<f32> = TEMPERATURE_PRESETS.iter().copied().filter(|t| (lo..=hi).contains(t)).collect();
+    let current = current.clamp(lo, hi);
+    let cur = presets
         .iter()
         .position(|&t| (t - current).abs() < 0.01)
-        .unwrap_or(6);
+        .unwrap_or_else(|| presets.iter().rposition(|&t| t <= current).unwrap_or(0));
     let next = if forward {
-        (cur + 1) % TEMPERATURE_PRESETS.len()
+        (cur + 1) % presets.len()
     } else if cur == 0 {
-        TEMPERATURE_PRESETS.len() - 1
+        presets.len() - 1
     } else {
         cur - 1
     };
-    TEMPERATURE_PRESETS[next]
+    presets[next]
 }
 
 impl ModelDialogState {
@@ -182,7 +189,7 @@ impl ModelDialogState {
             persist: true,
 
             temperature: 1.0,
-            flash_reasoning: "dynamic".to_string(),
+            flash_reasoning: "high".to_string(),
 
             pro_reasoning: "max".to_string(),
 
@@ -259,14 +266,20 @@ impl ModelDialogState {
     pub fn settings_rows(&self) -> Vec<SettingRow> {
         let Some(m) = self.selected_model() else { return vec![SettingRow::Persist] };
         match m.family {
-            ModelFamily::Flash => vec![
-                SettingRow::Temperature,
-                SettingRow::Reasoning,
-                SettingRow::Persist,
-            ],
+            ModelFamily::Flash => {
+                let mut rows = vec![SettingRow::Reasoning];
+                if flash_thinking_off(&self.flash_reasoning) {
+                    rows.push(SettingRow::Temperature);
+                }
+                rows.push(SettingRow::Persist);
+                rows
+            }
             ModelFamily::Pro => vec![SettingRow::Reasoning, SettingRow::Persist],
             ModelFamily::Generic => {
-                let mut rows = vec![SettingRow::Temperature];
+                let mut rows = Vec::new();
+                if applies_temperature(&m.id) {
+                    rows.push(SettingRow::Temperature);
+                }
                 if !m.reasoning.is_empty() {
                     rows.push(SettingRow::Reasoning);
                 }
@@ -276,10 +289,18 @@ impl ModelDialogState {
         }
     }
 
+    fn temperature_bounds(&self) -> (f32, f32) {
+        match (self.selected_provider(), self.selected_model()) {
+            (Some(p), Some(m)) => temperature_range(p.kind(), &m.id),
+            _ => (0.0, 2.0),
+        }
+    }
+
     fn current_temperature(&self) -> f32 {
+        let (lo, hi) = self.temperature_bounds();
         match self.selected_model().map(|m| m.family) {
-            Some(ModelFamily::Flash) => self.temperature,
-            _ => self.generic_temperature,
+            Some(ModelFamily::Flash) => self.temperature.clamp(lo, hi),
+            _ => self.generic_temperature.clamp(lo, hi),
         }
     }
 
@@ -318,10 +339,11 @@ impl ModelDialogState {
         let family = self.selected_model().map(|m| m.family).unwrap_or_default();
         match row {
             SettingRow::Temperature => {
+                let bounds = self.temperature_bounds();
                 if family == ModelFamily::Flash {
-                    self.temperature = cycle_temperature(self.temperature, forward);
+                    self.temperature = cycle_temperature(self.temperature, forward, bounds);
                 } else {
-                    self.generic_temperature = cycle_temperature(self.generic_temperature, forward);
+                    self.generic_temperature = cycle_temperature(self.generic_temperature, forward, bounds);
                 }
             }
             SettingRow::Reasoning => match family {
@@ -337,6 +359,9 @@ impl ModelDialogState {
                 }
             },
             SettingRow::Persist => self.persist = !self.persist,
+        }
+        if let Some(i) = self.settings_rows().iter().position(|r| *r == row) {
+            self.row_idx = i;
         }
     }
 
@@ -484,14 +509,10 @@ impl ModelDialogState {
             },
             KeyCode::Enter => match self.pane {
                 Pane::Providers => self.pane = Pane::Models,
-                Pane::Models => {
+                Pane::Models | Pane::Settings => {
                     if self.selected_model().is_some() {
                         return DialogAction::Activate { provider: self.prov_idx, model: self.model_idx };
                     }
-                }
-                Pane::Settings => {
-                    self.adjust_row(true);
-                    return DialogAction::SettingsChanged;
                 }
             },
             _ => {}
@@ -543,7 +564,7 @@ impl ModelDialogState {
         } else {
             detail_row_count(self).max(provider_row_count(self)) + extra_meta
         };
-        docked_height(body, screen_height)
+        docked_height(body, screen_height).saturating_sub(1)
     }
 }
 
@@ -555,7 +576,7 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
     let compact = is_compact(area.width);
     state.compact.set(compact);
 
-    let inner = docked_panel(frame, area, theme);
+    let inner = docked_panel_open_bottom(frame, area, theme);
     let title = " Model";
     let lead = if compact { title.len() + 2 } else { (PROVIDERS_COL_WIDTH + COLUMN_GAP) as usize + 3 };
     let meta_w = (inner.width as usize).saturating_sub(lead + 1).max(12);
@@ -617,6 +638,9 @@ pub fn render_model_dialog(frame: &mut Frame, area: Rect, state: &ModelDialogSta
         pairs.push(("Tab", "pane"));
     }
     pairs.push(next);
+    if state.pane == Pane::Settings {
+        pairs.push(("Enter", "use"));
+    }
     if !compact && state.selected_provider().is_some_and(|p| !p.is_local()) {
         pairs.push(("E", "key"));
     }
@@ -768,8 +792,10 @@ fn can_cycle_setting(row: SettingRow, family: ModelFamily, state: &ModelDialogSt
 fn setting_display(row: SettingRow, family: ModelFamily, state: &ModelDialogState) -> (&'static str, String, &'static str) {
     match row {
         SettingRow::Temperature => {
-            let t = if family == ModelFamily::Flash { state.temperature } else { state.generic_temperature };
-            ("temperature", format!("{t:.1}"), "")
+            let t = state.current_temperature();
+            let below_google_default = t < 1.0 && state.selected_provider().is_some_and(|p| p.is_google());
+            let note = if below_google_default { "Google recommends 1.0" } else { "" };
+            ("temperature", format!("{t:.1}"), note)
         }
         SettingRow::Reasoning => {
             let level = match family {
@@ -781,8 +807,8 @@ fn setting_display(row: SettingRow, family: ModelFamily, state: &ModelDialogStat
                 && state.selected_model().is_some_and(|m| m.reasoning.len() <= 1);
             let note = if fixed_generic {
                 "fixed for this model"
-            } else if family == ModelFamily::Flash && level == "dynamic" {
-                "low on tool-result turns, high otherwise"
+            } else if family == ModelFamily::Flash && flash_thinking_off(level) {
+                "no thinking · temperature applies"
             } else {
                 ""
             };
@@ -842,7 +868,7 @@ mod tests {
         let screen = rows.join("\n");
 
         assert!(!screen.contains(['┌', '┐', '└', '┘', '┬', '┴', '├', '┤', '│', '●', '○']), "{screen}");
-        assert_eq!(rows.iter().filter(|r| r.contains("────")).count(), 2, "{screen}");
+        assert_eq!(rows.iter().filter(|r| r.contains("────")).count(), 1, "{screen}");
         assert_eq!(screen.matches('✓').count(), 2, "active provider and active model:\n{screen}");
         assert!(screen.contains("Enter use") && screen.contains("Esc close"), "{screen}");
         assert!(!screen.contains("Flash-1017"), "Flash is listed once");
@@ -866,7 +892,7 @@ mod tests {
         let highlighted = highlighted_rows(&buf);
         assert_eq!(highlighted.len(), 1);
         let row = &rows[highlighted[0] as usize];
-        assert!(row.contains("temperature") && row.contains('‹') && row.contains('›'), "{row}");
+        assert!(row.contains("reasoning") && row.contains('‹') && row.contains('›'), "{row}");
         assert_eq!(rows.join("\n").matches('‹').count(), 1, "only the cursor row offers ‹ ›");
     }
 
@@ -943,10 +969,12 @@ mod tests {
     #[test]
     fn settings_rows_follow_model_family() {
         let mut s = open_default();
+        assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::Persist]); // flash
+        s.flash_reasoning = "off".into();
         assert_eq!(
             s.settings_rows(),
-            vec![SettingRow::Temperature, SettingRow::Reasoning, SettingRow::Persist]
-        ); // flash
+            vec![SettingRow::Reasoning, SettingRow::Temperature, SettingRow::Persist]
+        );
         s.model_idx = 1; // pro
         assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::Persist]);
         let local = s.providers.iter().position(|p| p.is_local()).unwrap();
@@ -955,11 +983,61 @@ mod tests {
     }
 
     #[test]
+    fn temperature_row_is_hidden_where_the_model_ignores_it() {
+        let mut s = open_default();
+        let anthropic = s.providers.iter().position(|p| p.is_anthropic()).unwrap();
+        s.select_provider(anthropic);
+        assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+        let openai = s.providers.iter().position(|p| p.is_openai()).unwrap();
+        s.select_provider(openai);
+        assert!(s.settings_rows().contains(&SettingRow::Temperature));
+        s.model_idx = s.providers[openai].models.iter().position(|m| m.id == "o3-mini").unwrap();
+        assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+    }
+
+    #[test]
+    fn temperature_cycles_inside_the_provider_range() {
+        assert_eq!(cycle_temperature(1.0, true, (0.0, 1.0)), 0.0);
+        assert_eq!(cycle_temperature(2.0, false, (0.0, 1.0)), 0.7);
+        assert_eq!(cycle_temperature(1.0, true, (0.0, 2.0)), 1.2);
+    }
+
+    #[test]
     fn right_in_settings_pane_adjusts_value() {
         let mut s = open_default();
         s.pane = Pane::Settings;
-        let before = s.temperature;
+        let before = s.flash_reasoning.clone();
         assert_eq!(s.handle_key(KeyCode::Right), DialogAction::SettingsChanged);
+        assert_ne!(s.flash_reasoning, before);
+    }
+
+    #[test]
+    fn flash_temperature_row_appears_only_with_thinking_off() {
+        let mut s = open_default();
+        s.pane = Pane::Settings;
+        s.flash_reasoning = "max".into();
+        s.handle_key(KeyCode::Right);
+        assert_eq!(s.flash_reasoning, "off");
+        assert_eq!(s.settings_rows()[s.row_idx], SettingRow::Reasoning);
+        s.handle_key(KeyCode::Down);
+        let before = s.temperature;
+        s.handle_key(KeyCode::Right);
         assert_ne!(s.temperature, before);
+        s.handle_key(KeyCode::Up);
+        s.handle_key(KeyCode::Right);
+        assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+        assert_eq!(s.settings_rows()[s.row_idx], SettingRow::Reasoning);
+    }
+
+    #[test]
+    fn enter_in_settings_pane_uses_the_model_without_changing_values() {
+        let mut s = open_default();
+        s.pane = Pane::Settings;
+        let before = s.temperature;
+        let action = s.handle_key(KeyCode::Enter);
+        assert_eq!(action, DialogAction::Activate { provider: s.prov_idx, model: s.model_idx });
+        assert_eq!(s.temperature, before);
+        let (_, rows) = draw(&s, 140);
+        assert!(rows.join("\n").contains("Enter use"));
     }
 }

@@ -11,7 +11,10 @@ async fn read_frame(stream: &mut DuplexStream) -> Option<Value> {
 
 async fn write_frame(stream: &mut DuplexStream, value: Value) {
     let bytes = value.to_string().into_bytes();
-    stream.write_all(&(bytes.len() as u32).to_le_bytes()).await.unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
 
@@ -33,7 +36,9 @@ async fn drives_a_tab_through_the_native_host() {
             seen.push((method.clone(), msg["sessionId"].clone()));
             let result = match method.as_str() {
                 "Corex.openTab" => json!({"tabId": 7}),
-                "Runtime.evaluate" => json!({"result": {"value": "{\"url\":\"https://x.test/\",\"title\":\"Fake\"}"}}),
+                "Runtime.evaluate" => {
+                    json!({"result": {"value": "{\"url\":\"https://x.test/\",\"title\":\"Fake\"}"}})
+                }
                 "Corex.closeTab" => break,
                 _ => json!({}),
             };
@@ -42,7 +47,9 @@ async fn drives_a_tab_through_the_native_host() {
         seen
     });
 
-    let browser = corex_browser::Browser::start().await.expect("browser attaches through the host");
+    let browser = corex_browser::Browser::start()
+        .await
+        .expect("browser attaches through the host");
     assert!(browser.is_alive());
     assert!(browser.page_info().await.contains("Fake"));
     drop(browser);

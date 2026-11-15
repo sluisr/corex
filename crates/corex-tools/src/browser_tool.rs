@@ -136,11 +136,19 @@ impl Tool for BrowserTool {
             }
         }
         if !guard.as_ref().is_some_and(Browser::is_alive) {
+            let was_open = guard.is_some() || note.is_some();
             match Browser::start().await {
                 Ok(browser) => *guard = Some(browser),
                 Err(e) => {
                     return Ok(ToolOutput::error(format!("{e}")));
                 }
+            }
+            if let Some(reference) = arg(&args, "ref").filter(|_| action != "scroll") {
+                let why = if was_open { "The connection to the browser was lost" } else { "No browser was open in this session" };
+                return Ok(ToolOutput::error(format!(
+                    "{why}, so Corex opened a new blank tab. Refs from earlier snapshots, such as '{reference}', \
+                     no longer exist: navigate to the page again and act on the refs of its new snapshot."
+                )));
             }
         }
         let browser = guard.as_mut().expect("browser started above");

@@ -467,7 +467,7 @@ use corex_core::types::ToolCall;
         assert!(all_text.contains('✓'));
         assert!(all_text.contains("..."));
         assert!(all_text.len() < 300, "tool summary should be truncated: length was {}", all_text.len());
-        assert!(lines.len() <= 3, "expected at most 3 wrapped lines, got {}", lines.len());
+        assert!(lines.len() <= 4, "expected at most 4 wrapped lines, got {}", lines.len());
     }
 
     #[test]
@@ -1041,7 +1041,7 @@ use corex_core::types::ToolCall;
         assert!(!collapsed.contains('\n') && collapsed.contains("cd web …"), "{collapsed:?}");
         let groups = split_spans_at_newlines(format_tool_call_spans("run_shell_command", &script, &theme, true));
         let rows: Vec<String> = groups.into_iter().map(text).collect();
-        assert_eq!(rows, [" $ cd web", "   npm run build "], "each line on its own row, aligned under the command");
+        assert_eq!(rows, ["$ cd web", "  npm run build "], "each line on its own row, aligned under the command");
     }
 
     #[test]
@@ -1051,7 +1051,7 @@ use corex_core::types::ToolCall;
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!joined.contains('⚡'), "Must not contain lightning bolt emoji: {}", joined);
         assert!(!joined.contains('›'), "Must not contain chevron: {}", joined);
-        assert_eq!(joined, " $ cargo build ");
+        assert_eq!(joined, "$ cargo build ");
         assert!(spans.iter().all(|s| s.style.bg == Some(theme.code_bg)), "the command sits on a shaded chip");
 
         let search_spans = format_tool_call_spans("web_search", r#"{"query":"sluisr sluisr.com Linux"}"#, &theme, false);
@@ -1187,7 +1187,7 @@ use corex_core::types::ToolCall;
             0, &msg, None, &theme, 80, None, false, false, Some(("apply_patch", args.as_str())), false,
         ))
         .join("\n");
-        assert!(shown.contains("@@ fn run"), "the hunk header stays visible: {shown}");
+        assert!(shown.contains("⋯ fn run"), "the hunk header stays visible: {shown}");
         assert!(shown.contains("- let old = 1;"), "the removed line is shown: {shown}");
         assert!(shown.contains("+ let new = 2;"), "the added line is shown: {shown}");
     }
@@ -1243,12 +1243,22 @@ use corex_core::types::ToolCall;
             .iter()
             .filter(|r| {
                 let t = r.trim_start();
-                t.starts_with('▸') || t.starts_with("@@")
+                t.starts_with('▸') || t.starts_with('⋯')
             })
             .collect();
-        assert_eq!(markers.len(), 2, "one file header and one hunk, never two @@ rows: {rows:#?}");
+        assert_eq!(markers.len(), 2, "one file header and one hunk, never two hunk rows: {rows:#?}");
         assert!(markers[0].trim_start().starts_with("▸ src/a.rs"), "the header is drawn once: {rows:#?}");
-        assert_eq!(markers[1].trim(), "@@", "only the real hunk keeps its @@: {rows:#?}");
+        assert_eq!(markers[1].trim(), "⋯", "only the real hunk gets a marker: {rows:#?}");
+    }
+
+    #[test]
+    fn hunk_headers_read_as_line_numbers() {
+        use crate::app::formatting::hunk_label;
+        assert_eq!(hunk_label("@@ -95,6 +95,7 @@"), "⋯ line 95");
+        assert_eq!(hunk_label("@@ -1 +1 @@"), "⋯ line 1");
+        assert_eq!(hunk_label("@@ -390,19 +391,20 @@ fn main() {"), "⋯ line 391 · fn main() {");
+        assert_eq!(hunk_label("@@ fn run"), "⋯ fn run");
+        assert_eq!(hunk_label("@@"), "⋯");
     }
 
     #[test]
@@ -1389,40 +1399,30 @@ use corex_core::types::ToolCall;
     }
 
     #[tokio::test]
-    async fn the_status_bar_counts_context_files() {
+    async fn the_status_bar_names_the_folder_after_the_mode() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use crate::app::render::render_ui;
 
-        let ws = std::env::temp_dir().join(format!("corex-context-files-{}", std::process::id()));
-        std::fs::create_dir_all(&ws).unwrap();
-        let mut app = App::new(corex_core::client::LlmClient::new(corex_core::config::Config::default()), ws.clone(), false);
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp/project/website"), false);
         app.auth_dialog.close();
+        let footer = |app: &mut App, width: u16| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal.draw(|f| render_ui(f, app)).unwrap();
+            (0..width).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect()
+        };
 
-        app.refresh_context_files();
-        let global = app.context_files;
-        assert!(!app.refresh_context_files(), "counted at most every few seconds");
-
-        std::fs::write(ws.join("AGENTS.md"), "rules").unwrap();
-        std::fs::write(ws.join("COREX.md"), "notes").unwrap();
-        app.context_files_checked = None;
-        assert!(app.refresh_context_files());
-        let _ = std::fs::remove_dir_all(&ws);
-        assert_eq!(app.context_files, global + 2);
-
-        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
-        let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
-        assert!(footer.contains(&format!("{} ctx", global + 2)), "{footer}");
-
-        app.context_files = 0;
-        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
-        let footer: String = (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect();
-        assert!(!footer.contains(" ctx"), "hidden when none are loaded: {footer}");
+        assert!(footer(&mut app, 160).trim_start().starts_with("website"), "{}", footer(&mut app, 160));
+        app.set_yolo_mode(corex_core::YoloMode::Normal);
+        let bar = footer(&mut app, 160);
+        assert!(bar.trim_start().starts_with("auto · website") && !bar.contains("/tmp/project"), "{bar}");
+        assert!(!bar.contains(" ctx ") || bar.contains("ctx 0%"), "no instruction-file count: {bar}");
+        let narrow = footer(&mut app, 34);
+        assert!(narrow.trim_start().starts_with("auto") && !narrow.contains("website"), "the folder gives way first: {narrow}");
     }
 
     #[tokio::test]
-    async fn context_usage_shows_only_from_half_the_window() {
+    async fn context_usage_is_always_shown_once_the_chat_starts() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use crate::app::render::render_ui;
@@ -1436,12 +1436,13 @@ use corex_core::types::ToolCall;
             (0..160).map(|x| terminal.backend().buffer()[(x, 29)].symbol()).collect()
         };
 
+        assert!(!footer(&mut app).contains("ctx"), "an empty chat shows no usage: {}", footer(&mut app));
         app.session.add_message(Message::user("hi".to_string()));
         app.session.update_usage(&corex_core::types::Usage { prompt_tokens: window / 10, ..Default::default() });
-        assert!(!footer(&mut app).contains('%'), "10% says nothing worth the room: {}", footer(&mut app));
+        assert!(footer(&mut app).contains("ctx 10% · "), "{}", footer(&mut app));
 
         app.session.update_usage(&corex_core::types::Usage { prompt_tokens: window * 6 / 10, ..Default::default() });
-        assert!(footer(&mut app).contains("~60%"), "{}", footer(&mut app));
+        assert!(footer(&mut app).contains("ctx 60% · "), "{}", footer(&mut app));
     }
 
     #[tokio::test]
@@ -1724,15 +1725,15 @@ use corex_core::types::ToolCall;
         app.model_dialog.open(&corex_core::config::Config::default());
         let rows = screen_rows(&mut app, 120, 40);
         let rules: Vec<usize> = rows.iter().enumerate().filter(|(_, r)| r.starts_with("────")).map(|(y, _)| y).collect();
-        assert_eq!(rules.len(), 2, "{}", rows.join("\n"));
-        assert_eq!(rules[1], rows.len() - 2, "the panel ends right above the status line");
+        assert_eq!(rules.len(), 1, "{}", rows.join("\n"));
+        assert!(rows.last().unwrap().contains("Esc close"), "the panel replaces the status line");
         assert!(rows[rules[0] + 1].starts_with(" Model"), "{}", rows.join("\n"));
         assert!(!rows.join("\n").contains(placeholder), "the panel takes the composer's place");
 
         app.model_dialog.close();
         app.session_dialog.is_open = true;
         let rows = screen_rows(&mut app, 120, 40);
-        assert!(rows[rows.len() - 2].starts_with("────") && rows.iter().any(|r| r.starts_with(" Sessions")));
+        assert!(!rows[rows.len() - 2].starts_with("────") && rows.iter().any(|r| r.starts_with(" Sessions")));
 
         app.session_dialog.close();
         app.auth_dialog.open();
@@ -2237,4 +2238,69 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
         ));
         assert!(pending.iter().any(|r| r.contains("a.rs")), "{pending:#?}");
         assert!(!pending.iter().any(|r| r.contains("contenido_de_A")), "{pending:#?}");
+    }
+
+    #[tokio::test]
+    async fn control_characters_never_reach_the_screen() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        crate::test_support::isolate_home();
+        let evil = "A\x1b[?1000l\x1b[2JB\rC\x07D\x1bcE\tF\u{9b}G";
+        for case in ["user", "assistant", "tool", "system", "input", "stream", "call"] {
+            let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+            app.auth_dialog.close();
+            match case {
+                "user" => app.session.add_message(Message::user(evil)),
+                "assistant" => app.session.add_message(Message::assistant(format!("```\n{evil}\n```\n{evil}"), None)),
+                "system" => app.session.add_message(Message::system(evil)),
+                "tool" | "call" => {
+                    let command = if case == "call" { evil } else { "ls" };
+                    let args = serde_json::json!({ "command": command }).to_string();
+                    app.session.add_message(Message::assistant_with_tools(None, None, vec![ToolCall::new("c1", "run_shell_command", args)]));
+                    app.session.add_message(Message::tool_response("c1", format!("{evil}\n{evil}")));
+                }
+                "input" => app.input_buffer = evil.to_string(),
+                _ => {
+                    app.is_streaming = true;
+                    app.streaming_text = evil.to_string();
+                }
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+            let leaked: Vec<&str> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .filter(|symbol| symbol.contains(char::is_control))
+                .collect();
+            assert!(leaked.is_empty(), "{case}: {leaked:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn command_output_loses_its_colour_codes_but_a_command_keeps_them_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::app::render::render_ui;
+
+        crate::test_support::isolate_home();
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        let args = serde_json::json!({ "command": "ls \x1b]0;rm -rf ~\x07" }).to_string();
+        app.session.add_message(Message::assistant_with_tools(None, None, vec![ToolCall::new("c1", "run_shell_command", args)]));
+        app.session.add_message(Message::tool_response("c1", "\x1b[32mgreen\x1b[0m\n\tindented"));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| render_ui(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..30)
+            .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("green") && !screen.contains("[32m"), "{screen}");
+        assert!(screen.contains("│     indented"), "{screen}");
+        assert!(screen.contains("rm -rf ~"), "{screen}");
     }

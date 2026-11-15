@@ -548,6 +548,10 @@ impl App {
                 self.toggle_mouse_capture();
                 true
             }
+            "/logs" => {
+                self.toggle_logs();
+                true
+            }
             "/keyboard" => {
                 self.tap_keyboard.request_keyboard(Instant::now(), &mut self.mouse_capture);
                 self.session.add_message(Message::system("Tap the screen to raise the keyboard: mouse reporting is paused for a few seconds so Termux handles the tap."));
@@ -822,12 +826,7 @@ impl App {
             "/tasks" | "/background" => {
                 let mgr = corex_tools::background::get_task_manager();
                 if parts.len() == 1 {
-                    let guard = match mgr.lock() {
-                        Ok(g) => g,
-                        Err(e) => e.into_inner(),
-                    };
-                    let list = guard.list();
-                    self.session.add_message(Message::system(format!("Background Tasks:\n\n{}", list)));
+                    self.tasks_dialog.open();
                 } else {
                     let sub = parts[1].to_lowercase();
                     match sub.as_str() {
@@ -973,6 +972,10 @@ impl App {
                         ));
                     }
                     self.scroll_to_bottom();
+                } else if parts.len() > 1 && parts[1] == "hide" && self.fleet_dialog.is_open {
+                    self.toggle_fleet_terminal();
+                } else if parts.len() > 1 && parts[1] == "probe" && self.fleet_dialog.is_open {
+                    super::event_loop::fleet::probe_telemetry(self);
                 } else if parts.len() > 1 && matches!(parts[1], "off" | "close" | "exit" | "quit") {
                     self.exit_fleet_mode();
                 } else if parts.len() > 1 && (parts[1] == "resume" || parts[1] == "sessions" || parts[1] == "history") {
@@ -1105,16 +1108,18 @@ pub(crate) fn shortcuts_help() -> String {
         "  /command         run a command (/help lists them)",
         "  !command         run a shell command yourself; the agent sees its output next turn",
         "  Enter            send (queues while the agent works) · Alt+Enter: send now",
-        "  Shift+Tab        cycle modes: normal · accept edits · plan · yolo · yolo all",
+        "  Shift+Tab        cycle modes: normal · edits · plan · auto · full auto (red)",
         "  Esc              take back a queued message, then cancel the reply",
         "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
         "  Ctrl+V           paste an image (or a copied image file) from the clipboard, or its text",
         "  Alt+V            paste the clipboard's text only, even if it is the path of an image",
         "  Ctrl+Z           undo in the prompt · twice on an empty prompt: suspend",
-        "  Ctrl+O           full logs and commands · Ctrl+T: thinking",
+        "  Ctrl+O / /logs   full logs and commands · click a collapsed log to open just it",
+        "  Ctrl+T           thinking blocks · Ctrl+L: repaint",
         "  Ctrl+C           copy the selection, cancel, or twice to exit",
         "  Alt+Y            copy the last code block · click ⧉ copy above a block for any other",
         "  Wheel / PageUp   scroll the chat · F2: mouse reporting on or off",
+        "  Fleet            F6 chat ↔ terminal · F7 hide terminal · Alt+1..9 server",
     ]
     .join("\n")
 }
@@ -1307,3 +1312,4 @@ mod stats_tests {
         assert!(line.contains("$0.088580"), "{line}");
     }
 }
+

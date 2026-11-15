@@ -43,14 +43,24 @@ impl Cdp {
         let reader_events = events.clone();
         tokio::spawn(async move {
             while let Some(Ok(message)) = stream.next().await {
-                let Message::Text(text) = message else { continue };
-                let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                    continue;
+                };
                 match value.get("id").and_then(Value::as_u64) {
                     Some(id) => {
-                        let sender = reader_pending.lock().ok().and_then(|mut map| map.remove(&id));
+                        let sender = reader_pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut map| map.remove(&id));
                         if let Some(sender) = sender {
                             let _ = sender.send(match value.get("error") {
-                                Some(error) => Err(error["message"].as_str().unwrap_or("CDP error").to_string()),
+                                Some(error) => Err(error["message"]
+                                    .as_str()
+                                    .unwrap_or("CDP error")
+                                    .to_string()),
                                 None => Ok(value["result"].clone()),
                             });
                         }
@@ -77,7 +87,9 @@ impl Cdp {
 
     pub fn notify(&self, method: &str, params: Value) {
         let request = json!({ "id": self.next_id.fetch_add(1, Ordering::SeqCst), "method": method, "params": params });
-        let _ = self.outgoing.send(Message::Text(request.to_string().into()));
+        let _ = self
+            .outgoing
+            .send(Message::Text(request.to_string().into()));
     }
 
     pub fn is_alive(&self) -> bool {

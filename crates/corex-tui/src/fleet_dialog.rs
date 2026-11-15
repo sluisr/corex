@@ -117,6 +117,7 @@ pub struct FleetDialogState {
     /// Optional 3-column layout (chat | output | fleet telemetry). Off by default;
     /// toggled with `/fleet wide`. The default is the minimal 2-pane layout.
     pub wide_layout: bool,
+    pub terminal_hidden: bool,
     pub last_tab_input: Option<String>,
     pub pty_session: Option<crate::fleet_pty::FleetPtySession>,
     pub reconnect: Option<PtyReconnect>,
@@ -158,6 +159,7 @@ impl FleetDialogState {
             terminal_scroll: 0,
             auto_connect_pending: false,
             wide_layout: false,
+            terminal_hidden: false,
             last_tab_input: None,
             pty_session: None,
             reconnect: None,
@@ -657,20 +659,23 @@ fn render_server_selector(
     frame.render_widget(Paragraph::new(action_line), v[5]);
     frame.render_widget(rule(area.width, theme), v[6]);
 
-    let mut footer_spans = vec![
-        Span::raw(" "),
-        Span::styled("↑↓ / Tab / 1-9", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(" Select VPS  ·  ", dim),
-        Span::styled("Enter", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(" Connect  ·  ", dim),
-        Span::styled("Ctrl+S", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" Source: {}  ·  ", state.source_filter.label()), dim),
-        Span::styled(if focused { "Esc" } else { "/fleet off" }, Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)),
-        Span::styled(if focused { " Chat" } else { " Exit" }, dim),
-    ];
-    if !state.search_query.is_empty() {
-        footer_spans.push(Span::styled("  ·  Esc", Style::default().fg(theme.gray).add_modifier(Modifier::BOLD)));
-        footer_spans.push(Span::styled(" Clear Filter", dim));
+    let key_style = Style::default().fg(theme.gray).add_modifier(Modifier::BOLD);
+    let source = format!("source: {}", state.source_filter.label());
+    let mut pairs: Vec<(&str, &str)> = if focused {
+        vec![("↑↓ 1-9", "select"), ("enter", "connect"), ("ctrl+s", &source), ("f6", "chat")]
+    } else {
+        vec![("f6", "servers"), ("f7", "hide"), ("/fleet off", "exit")]
+    };
+    if focused && !state.search_query.is_empty() {
+        pairs.push(("esc", "clear filter"));
+    }
+    let mut footer_spans = vec![Span::raw(" ")];
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            footer_spans.push(Span::styled(" · ", dim));
+        }
+        footer_spans.push(Span::styled(*key, key_style));
+        footer_spans.push(Span::styled(format!(" {label}"), dim));
     }
     frame.render_widget(Paragraph::new(Line::from(footer_spans)), v[7]);
 }
@@ -1272,44 +1277,17 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &FleetDialogState, theme:
         ));
     }
 
-    if state.pty_session.is_some() {
-        if state.command_mode {
-            spans.push(Span::styled("Shift+Tab", key_style));
-            spans.push(Span::styled(" Chat  ·  ", dim));
-
-            spans.push(Span::styled("Alt+1..9/n", key_style));
-            spans.push(Span::styled(" Switch VPS  ·  ", dim));
-
-            spans.push(Span::styled("Tab", key_style));
-            spans.push(Span::styled(" AutoComplete  ·  ", dim));
-
-            spans.push(Span::styled("exit", key_style));
-            spans.push(Span::styled(" Disconnect", dim));
-        } else {
-            spans.push(Span::styled("Shift+Tab / Tab", key_style));
-            spans.push(Span::styled(" VPS Terminal  ·  ", dim));
-
-            spans.push(Span::styled("/fleet off", key_style));
-            spans.push(Span::styled(" Exit", dim));
+    let pairs: &[(&str, &str)] = match (state.command_mode, state.pty_session.is_some()) {
+        (true, true) => &[("f6", "chat"), ("alt+1-9", "vps"), ("exit", "disconnect")],
+        (true, false) => &[("f6", "chat"), ("alt+1-9", "vps"), ("esc", "servers"), ("pgup/dn", "scroll")],
+        (false, _) => &[("f6", "terminal"), ("f7", "hide"), ("alt+1-9", "vps"), ("/fleet off", "exit")],
+    };
+    for (i, (key, label)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
         }
-    } else if state.command_mode {
-        spans.push(Span::styled("Tab", key_style));
-        spans.push(Span::styled(" Complete/Chat  ·  ", dim));
-
-        spans.push(Span::styled("Shift+Tab", key_style));
-        spans.push(Span::styled(" Focus  ·  ", dim));
-
-        spans.push(Span::styled("Esc", key_style));
-        spans.push(Span::styled(" Servers  ·  ", dim));
-
-        spans.push(Span::styled("PgUp/Dn", key_style));
-        spans.push(Span::styled(" Scroll", dim));
-    } else {
-        spans.push(Span::styled("Tab", key_style));
-        spans.push(Span::styled(" Terminal  ·  ", dim));
-
-        spans.push(Span::styled("/fleet off", key_style));
-        spans.push(Span::styled(" Exit", dim));
+        spans.push(Span::styled(*key, key_style));
+        spans.push(Span::styled(format!(" {label}"), dim));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);

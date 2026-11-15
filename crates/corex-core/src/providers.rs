@@ -51,13 +51,35 @@ pub fn default_context_window(kind: ProviderKind) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFamily {
-    /// DeepSeek flash: temperature + dynamic CoT (general/command/code/search).
+    /// DeepSeek flash: reasoning level, plus temperature when reasoning is off.
     Flash,
     /// DeepSeek pro: reasoning depth + search CoT.
     Pro,
     /// Anything else: temperature and (optionally) a reasoning level.
     #[default]
     Generic,
+}
+
+fn bare_model_id(model_id: &str) -> String {
+    model_id.rsplit('/').next().unwrap_or(model_id).to_ascii_lowercase()
+}
+
+// Claude 4.7+/5.x and OpenAI reasoning models reject `temperature`.
+pub fn applies_temperature(model_id: &str) -> bool {
+    let id = bare_model_id(model_id);
+    if id.starts_with("claude-") {
+        return crate::anthropic::model_profile(&id).accepts_temperature;
+    }
+    !["o1", "o3", "o4", "gpt-5"].iter().any(|p| id.starts_with(p))
+}
+
+pub fn temperature_range(kind: ProviderKind, model_id: &str) -> (f32, f32) {
+    let id = bare_model_id(model_id);
+    match kind {
+        ProviderKind::Anthropic | ProviderKind::Mistral => (0.0, 1.0),
+        _ if id.starts_with("claude-") => (0.0, 1.0),
+        _ => (0.0, 2.0),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -224,7 +246,7 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             models: vec![
                 // `deepseek-v4.1-flash-1017` is not listed: it is the same Flash model, and the
                 // client still accepts it by name (`-m`, saved settings resolve to this entry).
-                model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["dynamic", "low", "medium", "high"], ModelFamily::Flash),
+                model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["off", "low", "high", "max"], ModelFamily::Flash),
                 model("deepseek-pro", "DeepSeek-V4-Pro", &["thinking"], &["max", "high", "medium", "low"], ModelFamily::Pro),
             ],
         },
@@ -246,10 +268,10 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             base_url: "https://api.anthropic.com/v1".into(),
             api_key_env: "ANTHROPIC_API_KEY".into(),
             models: vec![
-                model("claude-opus-5-5", "Claude Opus 5.5", &["thinking", "coding", "agentic", "tools", "recommended"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-                model("claude-sonnet-5-5", "Claude Sonnet 5.5", &["thinking", "coding", "tools"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-                model("claude-haiku-5-5", "Claude Haiku 5.5", &["fast", "cheap", "tools"], &["dynamic", "low", "medium", "high"], ModelFamily::Generic),
-                model("claude-fable-5-1", "Claude Fable 5.1", &["thinking", "deep", "complex", "tools"], &["dynamic", "low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-opus-5-5", "Claude Opus 5.5", &["thinking", "coding", "agentic", "tools", "recommended"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-sonnet-5-5", "Claude Sonnet 5.5", &["thinking", "coding", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-haiku-5-5", "Claude Haiku 5.5", &["fast", "cheap", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                model("claude-fable-5-1", "Claude Fable 5.1", &["thinking", "deep", "complex", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
             ],
         },
         ProviderConfig {
@@ -283,7 +305,6 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             models: vec![
                 model("llama-3.3-70b-versatile", "Groq - Llama 3.3 70B", &["free-tier", "ultra-fast", "tools"], &[], ModelFamily::Generic),
                 model("llama-3.1-8b-instant", "Groq - Llama 3.1 8B", &["free-tier", "fastest", "tools"], &[], ModelFamily::Generic),
-                model("deepseek-r1-distill-llama-70b", "Groq - DeepSeek R1 70B", &["free-tier", "reasoning"], &[], ModelFamily::Generic),
             ],
         },
         ProviderConfig {
@@ -292,7 +313,6 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key_env: "OPENROUTER_API_KEY".into(),
             models: vec![
-                model("anthropic/claude-3.7-sonnet", "Claude 3.7 Sonnet (Router)", &["flagship", "tools"], &[], ModelFamily::Generic),
                 model("openai/gpt-4o", "GPT-4o (Router)", &["flagship", "tools"], &[], ModelFamily::Generic),
                 model("deepseek/deepseek-chat", "DeepSeek-V3 (Router)", &["cheap", "fast", "tools"], &[], ModelFamily::Generic),
                 model("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B (Router)", &["open-weights", "tools"], &[], ModelFamily::Generic),
@@ -381,6 +401,25 @@ pub fn locate_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temperature_support_follows_the_model() {
+        assert!(!applies_temperature("claude-opus-5-5"));
+        assert!(!applies_temperature("anthropic/claude-sonnet-5-5"));
+        assert!(applies_temperature("claude-sonnet-4-6"));
+        assert!(!applies_temperature("o3-mini"));
+        assert!(!applies_temperature("gpt-5"));
+        assert!(applies_temperature("gpt-4o"));
+        assert!(applies_temperature("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn temperature_range_follows_the_provider() {
+        assert_eq!(temperature_range(ProviderKind::Anthropic, "claude-sonnet-4-6"), (0.0, 1.0));
+        assert_eq!(temperature_range(ProviderKind::Mistral, "codestral-latest"), (0.0, 1.0));
+        assert_eq!(temperature_range(ProviderKind::OpenRouter, "anthropic/claude-sonnet-4.5"), (0.0, 1.0));
+        assert_eq!(temperature_range(ProviderKind::Google, "gemini-3.5-flash"), (0.0, 2.0));
+    }
 
     #[test]
     fn custom_provider_overrides_and_inserts_before_local() {

@@ -32,7 +32,16 @@ const INTERACTIVE: &[&str] = &[
     "Time",
 ];
 
-const TRANSPARENT: &[&str] = &["none", "generic", "presentation", "InlineTextBox", "LineBreak", "RootWebArea", "LabelText", "MenuListPopup"];
+const TRANSPARENT: &[&str] = &[
+    "none",
+    "generic",
+    "presentation",
+    "InlineTextBox",
+    "LineBreak",
+    "RootWebArea",
+    "LabelText",
+    "MenuListPopup",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRef {
@@ -85,7 +94,11 @@ struct Walker<'a> {
 
 impl Walker<'_> {
     fn emit(&mut self, line: &str) {
-        if self.query.as_ref().is_none_or(|query| line.to_lowercase().contains(query)) {
+        if self
+            .query
+            .as_ref()
+            .is_none_or(|query| line.to_lowercase().contains(query))
+        {
             self.out.push_str(line);
             self.out.push('\n');
         }
@@ -97,7 +110,9 @@ impl<'a> Walker<'a> {
         if self.out.len() > self.limit || !self.seen.insert(id) {
             return;
         }
-        let Some(&node) = self.nodes.get(id) else { return };
+        let Some(&node) = self.nodes.get(id) else {
+            return;
+        };
         let children: Vec<&str> = node["childIds"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_str).collect())
@@ -107,7 +122,11 @@ impl<'a> Walker<'a> {
         let ignored = node["ignored"].as_bool().unwrap_or(false);
         let aria_hidden = ignored
             && node["ignoredReasons"].as_array().is_some_and(|reasons| {
-                reasons.iter().any(|r| r["name"].as_str().is_some_and(|n| n.starts_with("ariaHidden")))
+                reasons.iter().any(|r| {
+                    r["name"]
+                        .as_str()
+                        .is_some_and(|n| n.starts_with("ariaHidden"))
+                })
             });
         if aria_hidden {
             return;
@@ -123,7 +142,11 @@ impl<'a> Walker<'a> {
 
         if role == "StaticText" {
             if !name.is_empty() && !parent_named {
-                self.emit(&format!("{}- text \"{}\"", "  ".repeat(depth), shorten(&name, MAX_NAME)));
+                self.emit(&format!(
+                    "{}- text \"{}\"",
+                    "  ".repeat(depth),
+                    shorten(&name, MAX_NAME)
+                ));
             }
             return;
         }
@@ -152,7 +175,10 @@ impl<'a> Walker<'a> {
         if let Some(level) = property(node, "level") {
             let _ = write!(line, " level={level}");
         }
-        for flag in ["checked", "pressed", "expanded", "selected", "disabled", "required", "readonly", "invalid", "focused", "modal"] {
+        for flag in [
+            "checked", "pressed", "expanded", "selected", "disabled", "required", "readonly",
+            "invalid", "focused", "modal",
+        ] {
             if let Some(state) = property(node, flag) {
                 if state != "false" {
                     let _ = write!(line, " [{flag}={state}]");
@@ -189,7 +215,11 @@ pub fn build(tree: &Value, query: Option<&str>) -> Snapshot {
         out: String::new(),
         refs: HashMap::new(),
         counter: 0,
-        limit: if query.is_some() { usize::MAX } else { MAX_OUTPUT },
+        limit: if query.is_some() {
+            usize::MAX
+        } else {
+            MAX_OUTPUT
+        },
         query: query.map(str::to_lowercase),
     };
     if let Some(root) = list.first().and_then(|n| n["nodeId"].as_str()) {
@@ -207,7 +237,10 @@ pub fn build(tree: &Value, query: Option<&str>) -> Snapshot {
              (for example the label of the field you need) to list matching elements from the whole page\n",
         );
     }
-    Snapshot { text, refs: walker.refs }
+    Snapshot {
+        text,
+        refs: walker.refs,
+    }
 }
 
 #[cfg(test)]
@@ -226,7 +259,14 @@ mod tests {
             {"nodeId": "5", "role": {"value": "generic"}, "ignored": true, "childIds": []}
         ]});
         let snap = build(&tree, None);
-        assert_eq!(snap.refs.get("e1"), Some(&NodeRef { backend: 42, session: None, owner: None }));
+        assert_eq!(
+            snap.refs.get("e1"),
+            Some(&NodeRef {
+                backend: 42,
+                session: None,
+                owner: None
+            })
+        );
         assert!(snap.text.contains("- button \"Go\" [ref=e1]"));
         assert!(snap.text.contains("- heading \"Welcome\" level=1"));
         assert!(!snap.text.contains("text \"Welcome\""));
@@ -242,7 +282,11 @@ mod tests {
         let snap = build(&tree, None);
         assert_eq!(
             snap.refs.get("e1"),
-            Some(&NodeRef { backend: 5, session: Some("7:abc".into()), owner: Some(3) })
+            Some(&NodeRef {
+                backend: 5,
+                session: Some("7:abc".into()),
+                owner: Some(3)
+            })
         );
     }
 
@@ -257,7 +301,9 @@ mod tests {
             {"nodeId": "4", "role": {"value": "button"}, "name": {"value": "Overlay"}, "backendDOMNodeId": 9, "childIds": []}
         ]});
         let snap = build(&tree, None);
-        assert!(snap.text.contains("- DisclosureTriangle \"Advanced\" [ref=e1]"));
+        assert!(snap
+            .text
+            .contains("- DisclosureTriangle \"Advanced\" [ref=e1]"));
         assert!(!snap.text.contains("Overlay"));
     }
 
@@ -290,6 +336,8 @@ mod tests {
         let full = build(&tree, None).text;
         assert!(!full.contains("x.test/docs"));
         assert!(full.contains("-> https://x.test/icon"));
-        assert!(build(&tree, Some("docs")).text.contains("-> https://x.test/docs"));
+        assert!(build(&tree, Some("docs"))
+            .text
+            .contains("-> https://x.test/docs"));
     }
 }

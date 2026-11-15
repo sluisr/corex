@@ -7,7 +7,7 @@
 
 mod background;
 mod dialogs;
-mod fleet;
+pub(crate) mod fleet;
 mod prompt;
 mod stream;
 mod tools;
@@ -67,6 +67,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let mut stdout = stdout();
     // Clear any stale mouse mode left by a previously killed session before starting.
     let _ = stdout.write_all(MOUSE_REPORTING_OFF.as_bytes());
+    let _ = stdout.write_all(crate::app::terminal::WHEEL_AS_ARROWS_OFF.as_bytes());
     let title_enabled = crate::app::terminal::window_title_enabled();
     crate::app::terminal::save_title(&mut stdout);
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
@@ -104,7 +105,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
         app.poll_local_health_check();
         let _ = app.poll_mcp_tools();
-        if app.poll_file_index() | app.refresh_context_files() | app.poll_user_shell() {
+        if app.poll_file_index() | app.poll_user_shell() {
             needs_redraw = true;
         }
 
@@ -182,7 +183,8 @@ pub async fn run_tui(mut app: App) -> Result<()> {
 
         let pty_dirty = app.fleet_dialog.is_open && app.fleet_dialog.pty_session.as_ref().map(|p| p.is_alive() && p.take_dirty()).unwrap_or(false);
         // A running task changes nothing on screen by itself; once a second covers what it may show.
-        let task_tick = has_active_tasks && last_draw.elapsed() >= Duration::from_secs(1);
+        let task_tick = (has_active_tasks && last_draw.elapsed() >= Duration::from_secs(1))
+            || (app.tasks_dialog.is_open && last_draw.elapsed() >= Duration::from_millis(250));
         if needs_redraw || app.is_streaming || app.is_checking_balance || task_tick || is_animating || pty_dirty {
             terminal.draw(|f| render_ui(f, &mut app))?;
             crate::app::mobile::clean_trailing_margins(app.last_chat_rect, &app.visible_line_widths, terminal.backend_mut());
@@ -289,6 +291,10 @@ async fn dispatch_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, t
         }
         Event::FocusGained => {
             let _ = terminal.clear();
+            // A terminal reset drops the mouse modes, and the wheel then arrives as arrow keys.
+            if app.mouse_capture {
+                let _ = terminal.backend_mut().write_all(MOUSE_REPORTING_ON.as_bytes());
+            }
             app.last_focus_gained = Some(Instant::now());
             app.mouse_down_time = None;
             app.mouse_down_pos = None;
@@ -355,6 +361,7 @@ async fn handle_key_inner(
     offer!(dialogs::sudo_key(app, key, event_tx));
     offer!(dialogs::auth_key(app, key));
     offer!(dialogs::session_key(app, key));
+    offer!(dialogs::tasks_key(app, key));
     offer!(fleet::handle_key(app, key, event_tx)?);
     offer!(model_key(app, key));
     offer!(dialogs::confirmation_key(app, key, event_tx));
@@ -463,12 +470,7 @@ fn global_hotkey(app: &mut App, key: KeyEvent, terminal: Option<&mut Tui>) -> Re
         || key.code == KeyCode::Char('\x0f');
 
     if is_ctrl_o {
-        app.logs_expanded = !app.logs_expanded;
-        if let Some(ref mut pending) = app.pending_confirmation {
-            pending.diff_expanded = app.logs_expanded;
-        }
-        app.invalidate_message_cache();
-        app.auto_scroll = true;
+        app.toggle_logs();
         return Ok(Flow::Handled);
     }
 
@@ -530,4 +532,182 @@ mod ctrl_c_tests {
         let flow4 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
         assert!(matches!(flow4, Flow::Quit), "second Ctrl+C after /resume quits");
     }
+}
+
+#[cfg(test)]
+mod ctrl_o_tests {
+    use super::*;
+    use corex_core::client::LlmClient;
+    use corex_core::config::Config;
+    use corex_core::types::{Message, ToolCall};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn rows(app: &mut App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::app::render::render_ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_keeps_the_reading_position() {
+        let mut app = App::new(LlmClient::new(Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        for i in 0..12 {
+            app.session.add_message(Message::user(format!("question {i}")));
+            let id = format!("c{i}");
+            let call = ToolCall::new(&id, "run_shell_command", &format!(r#"{{"command":"seq {i}"}}"#));
+            app.session.add_message(Message::assistant_with_tools(None, None, vec![call]));
+            let out: Vec<String> = (0..40).map(|n| format!("out{i}-{n}")).collect();
+            app.session.add_message(Message::tool_response(&id, out.join("\n")));
+        }
+        rows(&mut app);
+        let target = app.cached_message_line_offsets[3 * 5];
+        app.auto_scroll = false;
+        app.scroll_offset = app.chat_header_lines + target;
+        let before = rows(&mut app);
+        assert!(before[0].contains("question 5"), "{}", before.join("\n"));
+        assert!(before.iter().any(|r| r.contains("lines above) · ctrl+o")), "{}", before.join("\n"));
+        assert!(!before.last().unwrap().contains("logs"), "{}", before.join("\n"));
+
+        let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        for expanded in [true, false] {
+            global_hotkey(&mut app, ctrl_o, None).unwrap();
+            let after = rows(&mut app);
+            assert_eq!(app.logs_expanded, expanded);
+            assert!(!app.auto_scroll);
+            assert_eq!(after[0], before[0], "{}", after.join("\n"));
+            assert_eq!(after.last().unwrap().contains("logs"), expanded, "{}", after.join("\n"));
+        }
+
+        app.auto_scroll = true;
+        global_hotkey(&mut app, ctrl_o, None).unwrap();
+        let bottom = rows(&mut app);
+        assert!(app.auto_scroll && bottom.join("\n").contains("out11-39"), "{}", bottom.join("\n"));
+
+        assert!(app.handle_slash_command("/logs").await);
+        assert!(!app.logs_expanded);
+    }
+}
+
+#[cfg(test)]
+mod log_click_tests {
+    use super::*;
+    use corex_core::client::LlmClient;
+    use corex_core::config::Config;
+    use corex_core::types::{Message, ToolCall};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn draw(app: &mut App) {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| crate::app::render::render_ui(f, app)).unwrap();
+    }
+
+    fn line_of(app: &App, needle: &str, nth: usize) -> usize {
+        let head = app.selection_lines.head.len();
+        head + app.selection_lines.cached.iter().enumerate().filter(|(_, l)| l.contains(needle)).nth(nth).unwrap().0
+    }
+
+    fn shown(app: &App, needle: &str) -> bool {
+        app.selection_lines.cached.iter().any(|l| l.trim_end().ends_with(needle))
+    }
+
+    #[tokio::test]
+    async fn clicking_a_collapsed_log_expands_only_that_one() {
+        let mut app = App::new(LlmClient::new(Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        for i in 0..3 {
+            app.session.add_message(Message::user(format!("question {i}")));
+            let id = format!("c{i}");
+            let call = ToolCall::new(&id, "run_shell_command", &format!(r#"{{"command":"seq {i}"}}"#));
+            app.session.add_message(Message::assistant_with_tools(None, None, vec![call]));
+            let out: Vec<String> = (0..40).map(|n| format!("out{i}-{n}")).collect();
+            app.session.add_message(Message::tool_response(&id, out.join("\n")));
+        }
+        draw(&mut app);
+        assert!(!shown(&app, "out1-0") && !shown(&app, "out0-0"));
+
+        assert!(app.toggle_log_at(line_of(&app, "lines above) · ctrl+o", 1)));
+        draw(&mut app);
+        assert!(shown(&app, "out1-0"), "the clicked log opens");
+        assert!(!shown(&app, "out0-0") && !shown(&app, "out2-0"), "the others stay collapsed");
+        assert!(!app.logs_expanded);
+
+        assert!(app.toggle_log_at(line_of(&app, "Output (40 lines)", 1)));
+        draw(&mut app);
+        assert!(!shown(&app, "out1-0"), "its header folds it back");
+
+        assert!(!app.toggle_log_at(line_of(&app, "question 0", 0)), "plain lines are not toggles");
+    }
+}
+
+
+
+#[cfg(test)]
+mod narrow_screens {
+    use super::*;
+    use corex_core::types::{Message, ToolCall};
+    use unicode_width::UnicodeWidthStr;
+
+    fn fill(app: &mut App) {
+        app.session.add_message(Message::user("check this link https://example.com/org/project/blob/main/crates/app/src/render/module.rs#L1260 please".to_string()));
+        let reply = "Reply with `an_inline_code_identifier_without_spaces_that_cannot_fit` and a URL https://example.com/a/very/long/path/that/never/ends/anywhere.html\n\n```rust\nfn main() { let a_variable_with_a_long_name = another_function_with_a_long_name(first_argument, second_argument); }\n```\n\n| Column A | Longer column B | C |\n|---|---|---|\n| value one | a value with quite a lot of text here | x |\n\n- a list item with many words to see whether it wraps on small screens\n  - nested AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\n> a quote with long text that should wrap inside the quote block\n\n# A very long heading that should wrap on small screens too";
+        let calls = vec![
+            ToolCall::new("a", "run_shell_command", r#"{"command":"cargo test --workspace --all-features -- --nocapture --test-threads=1 some_really_long_filter_name"}"#),
+            ToolCall::new("b", "web_fetch", r#"{"url":"https://example.com/org/project/blob/main/crates/app/src/event_loop/module.rs"}"#),
+            ToolCall::new("c", "edit", r#"{"file_path":"/tmp/project/crates/app/src/event_loop/a_very_long_module_name_here.rs","old_string":"let a = 1;","new_string":"let a_much_longer_variable_name_here = compute_something_really_long(1, 2, 3);"}"#),
+        ];
+        app.session.add_message(Message::assistant_with_tools(Some(reply.to_string()), None, calls));
+        app.session.add_message(Message::tool_response("a", (0..8).map(|i| format!("test module::submodule::a_really_long_test_name_number_{i}_xxxxxxxxxxxxxxxxxxxx ... ok")).collect::<Vec<_>>().join("\n")));
+        app.session.add_message(Message::tool_response("b", "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n-let aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa = 1;\n+let bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb = 2;\n context".to_string()));
+        app.session.add_message(Message::tool_response("c", "Successfully edited /tmp/project/crates/app/src/event_loop/a_very_long_module_name_here.rs".to_string()));
+        app.session.add_message(Message::system("Activated Google (Gemini) · Gemini 3.5 Flash-Lite\n- Temperature: 1.0\n- Endpoint: https://generativelanguage.googleapis.com/v1beta/openai/"));
+        app.input_buffer = "a fairly long message typed in the prompt to see whether it wraps correctly".to_string();
+        app.cursor_idx = app.input_buffer.len();
+        app.git_branch = "feature/a-really-long-branch-name".to_string();
+    }
+
+    fn screen(width: u16, height: u16) -> (App, Vec<String>) {
+        let mut app = App::new(corex_core::client::LlmClient::new(corex_core::config::Config::default()), std::path::PathBuf::from("/tmp/project/with/a/deep/path"), false);
+        app.auth_dialog.close();
+        fill(&mut app);
+        app.auto_scroll = false;
+        app.scroll_offset = 0;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        t.draw(|f| crate::app::render::render_ui(f, &mut app)).unwrap();
+        let b = t.backend().buffer().clone();
+        let rows = (0..height).map(|y| (0..width).map(|x| b[(x, y)].symbol()).collect::<String>()).collect();
+        (app, rows)
+    }
+
+    #[tokio::test]
+    async fn nothing_runs_past_the_right_edge_on_small_screens() {
+        for &(w, h) in &[(30u16, 40u16), (40, 40), (60, 30)] {
+            let (app, rows) = screen(w, h);
+            let chat_w = app.last_chat_rect.unwrap().width as usize;
+            for line in &app.cached_message_lines {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(text.width() <= chat_w, "{w} cols: {text:?}");
+            }
+            let banner = rows[..8].join("\n");
+            assert!(banner.contains("Corex") && banner.contains("/help") && banner.contains("/key"), "{banner}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_url_opens_whole() {
+        let (app, _) = screen(40, 40);
+        let url = "https://example.com/org/project/blob/main/crates/app/src/render/module.rs#L1260";
+        let lines = &app.selection_lines;
+        let start = (0..lines.len()).find(|&i| lines.get(i).is_some_and(|l| l.contains("https://example.com/org"))).unwrap();
+        let middle = lines.get(start + 1).unwrap();
+        let col = middle.len() - middle.trim_start().len() + 2;
+        assert_eq!(app.url_at(start + 1, col).as_deref(), Some(url));
+        assert_eq!(app.url_at(start, 14).as_deref(), Some(url));
+    }
+
 }

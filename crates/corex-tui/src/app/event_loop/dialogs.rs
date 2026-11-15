@@ -153,6 +153,39 @@ fn save_api_key(app: &mut App, key_str: String) {
     }
 }
 
+pub(super) fn tasks_key(app: &mut App, key: KeyEvent) -> Flow {
+    use crate::tasks_dialog::{task_list, TasksAction};
+    if !app.tasks_dialog.is_open {
+        return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.tasks_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        return Flow::Handled;
+    }
+    let mgr = corex_tools::background::get_task_manager();
+    let list = task_list(&mgr.lock().unwrap_or_else(|e| e.into_inner()), app.tasks_dialog.show_all);
+    match app.tasks_dialog.handle_key(key.code, &list) {
+        TasksAction::None => {}
+        TasksAction::Close => app.tasks_dialog.close(),
+        TasksAction::Details(pid) => {
+            let status = mgr.lock().unwrap_or_else(|e| e.into_inner()).get_status(pid);
+            app.tasks_dialog.close();
+            app.session.add_message(Message::system(status.unwrap_or_else(|| format!("Task {pid} not found."))));
+            app.scroll_to_bottom();
+        }
+        TasksAction::Kill(pid) => {
+            let killed = mgr.lock().unwrap_or_else(|e| e.into_inner()).kill(pid);
+            app.tasks_dialog.notice = Some(if killed { format!("stopped {pid}") } else { format!("{pid} already finished") });
+        }
+        TasksAction::Send(pid, text) => {
+            let sent = matches!(mgr.lock().unwrap_or_else(|e| e.into_inner()).send_input(pid, text), Ok(true));
+            app.tasks_dialog.notice = Some(if sent { format!("sent input to {pid}") } else { format!("{pid} does not take input") });
+        }
+    }
+    Flow::Handled
+}
+
 pub(super) fn session_key(app: &mut App, key: KeyEvent) -> Flow {
     if !app.session_dialog.is_open {
         return Flow::Pass;

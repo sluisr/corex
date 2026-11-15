@@ -5,7 +5,8 @@ description: >-
   SysAdmin mode, /fleet, /sysadmin, /vps, running commands across multiple machines,
   checking remote server RAM/CPU/Disk metrics, or automating infrastructure.
   Trigger phrases: 'modo servidor', 'cambia a modo servidor', 'fleet', 'sysadmin',
-  'vps', 'servidores', 'administrar servidores', 'cluster', 'remote command'.
+  'vps', 'servidores', 'administrar servidores', 'cluster', 'remote command',
+  and Fleet keyboard shortcuts ('atajos de fleet', 'how do I hide the terminal').
 ---
 
 # Corex Fleet & SysAdmin Operations
@@ -28,3 +29,23 @@ When the user asks to switch to "modo servidor", check servers, or inspect remot
 - Immediately query `fleet_get_telemetry` or `fleet_list_nodes`.
 - Report server health clearly with latency, CPU, and RAM metrics.
 - Ask the user what actions or deployments they want to perform on those servers.
+
+## Split view keyboard (`/fleet`)
+The chat sits on the left and the live SSH terminal on the right (full screen one at a time below 110 columns).
+
+|Key | Action |
+|:--- | :--- |
+|`F6` (or `Ctrl+]`) | Swap focus between chat and terminal (also shows a hidden terminal) |
+|`F7`, `/fleet hide` (or `Ctrl+\`) | Hide / show the terminal; the chat fills the screen and the SSH session stays alive |
+|`Alt+1..9`, `F1`–`F9` (not F2/F6/F7) | Pick a server |
+|`Alt+S` | Open the server selector |
+|`Ctrl+R` (chat focus) or `/fleet probe` | Refresh telemetry for every server |
+|`Shift+Tab` | Chat: cycle modes, as outside Fleet. Terminal: sent to the shell |
+|`Tab` | Chat: autocomplete. Terminal: shell completion |
+|`PageUp / PageDown`, wheel | Scroll the terminal's scrollback |
+|`exit` in the terminal | Disconnect from the server |
+|`/fleet off` | Leave Fleet (closes the SSH session) |
+
+With the terminal focused every other key, including `Ctrl+R`, `Ctrl+W`, `Alt+←/→` and `Ctrl+C`, goes to the remote shell. In the server selector: `↑↓` or `1-9` select, `Enter` connects, typing filters, `Ctrl+S` switches the source (all · corex · ssh), `Esc` clears the filter or returns to the chat.
+
+Subcommands: `/fleet list`, `/fleet connect <node>`, `/fleet wide` (3 columns: chat · terminal · telemetry), `/fleet hide`, `/fleet probe`, `/fleet resume`, `/fleet off`.

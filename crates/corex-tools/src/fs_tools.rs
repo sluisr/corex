@@ -674,7 +674,7 @@ impl Tool for ReadImageTool {
             _ => return Ok(ToolOutput::error("Missing 'file_path' argument.")),
         };
         let path = resolve_path(&context.workspace_dir, rel_path);
-        if is_sensitive_system_path(&path) {
+        if is_sensitive_system_path(&path) && !corex_core::session_images::is_session_image(&path) {
             return Ok(ToolOutput::error(format!(
                 "Access denied: reading sensitive credential or authentication file '{}' is forbidden.",
                 rel_path

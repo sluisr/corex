@@ -12,6 +12,7 @@ pub mod model_dialog;
 pub mod overlay;
 pub mod rewind_dialog;
 pub mod session_dialog;
+pub mod tasks_dialog;
 pub mod slash_commands;
 pub mod spinner;
 pub mod sudo_dialog;

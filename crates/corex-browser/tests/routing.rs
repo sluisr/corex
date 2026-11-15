@@ -11,7 +11,10 @@ async fn read_frame(stream: &mut DuplexStream) -> Option<Value> {
 
 async fn write_frame(stream: &mut DuplexStream, value: Value) {
     let bytes = value.to_string().into_bytes();
-    stream.write_all(&(bytes.len() as u32).to_le_bytes()).await.unwrap();
+    stream
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
 
@@ -51,14 +54,20 @@ async fn two_sessions_share_one_host_without_stealing_replies() {
         }
     });
 
-    let first = corex_browser::Browser::start().await.expect("first session attaches");
-    let second = corex_browser::Browser::start().await.expect("second session attaches");
+    let first = corex_browser::Browser::start()
+        .await
+        .expect("first session attaches");
+    let second = corex_browser::Browser::start()
+        .await
+        .expect("second session attaches");
     assert!(first.page_info().await.contains("Tab 7"));
     assert!(second.page_info().await.contains("Tab 8"));
     assert!(first.is_alive() && second.is_alive());
 
     drop(first);
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), closed_rx.recv()).await.unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), closed_rx.recv())
+        .await
+        .unwrap();
     assert_eq!(closed, Some(7));
     assert!(second.page_info().await.contains("Tab 8"));
     let _ = std::fs::remove_dir_all(home);

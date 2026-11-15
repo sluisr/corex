@@ -111,8 +111,6 @@ pub fn model_profile(model: &str) -> ModelProfile {
     }
 }
 
-/// Maps Corex's `reasoning_effort` setting onto an Anthropic effort level.
-/// `"dynamic"` (and unknown values) leave the model default in place.
 pub fn effort_for(profile: &ModelProfile, reasoning_effort: &str) -> Option<String> {
     if !profile.accepts_effort {
         return None;
@@ -962,7 +960,7 @@ mod tests {
         assert_eq!(opus55.thinking, ThinkingMode::Adaptive);
         assert!(!opus55.accepts_temperature);
         assert_eq!(effort_for(&opus55, "xhigh").as_deref(), Some("xhigh"));
-        assert_eq!(effort_for(&opus55, "dynamic"), None);
+        assert_eq!(effort_for(&opus55, ""), None);
 
         let sonnet45 = model_profile("claude-sonnet-4-5-20250929");
         assert_eq!(sonnet45.thinking, ThinkingMode::Budget);

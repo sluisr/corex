@@ -23,7 +23,9 @@ async fn try_hosts() -> Option<Arc<Cdp>> {
     for (_, path) in sockets {
         match UnixStream::connect(&path).await {
             Ok(stream) => {
-                if let Ok((socket, _)) = tokio_tungstenite::client_async("ws://corex.local/", stream).await {
+                if let Ok((socket, _)) =
+                    tokio_tungstenite::client_async("ws://corex.local/", stream).await
+                {
                     return Some(Cdp::from_socket(socket));
                 }
             }

@@ -262,6 +262,17 @@ impl TaskManager {
         Some(guard.clone())
     }
 
+    pub fn tail(&self, pid: u32, lines: usize) -> Option<String> {
+        let proc = self.processes.get(&pid)?;
+        let buf = proc.output_buffer.lock().ok()?;
+        if lines == 0 {
+            return Some(String::new());
+        }
+        let text = buf.trim_end_matches('\n');
+        let start = text.rmatch_indices('\n').nth(lines - 1).map(|(i, _)| i + 1).unwrap_or(0);
+        Some(text[start..].to_string())
+    }
+
     pub fn send_input(&self, pid: u32, mut input: String) -> Result<bool> {
         if let Some(proc) = self.processes.get(&pid) {
             if !proc.is_active() {
@@ -735,6 +746,18 @@ mod tests {
         assert!(list.contains("99991"));
         assert!(list.contains("EXITED(0)"));
         assert!(list.contains("cargo test"));
+    }
+
+    #[test]
+    fn tail_reads_only_the_last_lines() {
+        let mut mgr = TaskManager::new();
+        let buf = Arc::new(Mutex::new("one\ntwo\nthree\nfour\n".to_string()));
+        let flag = || Arc::new(Mutex::new(false));
+        mgr.register(99990, "seq".into(), buf, flag(), Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)), flag(), None);
+        assert_eq!(mgr.tail(99990, 2).as_deref(), Some("three\nfour"));
+        assert_eq!(mgr.tail(99990, 10).as_deref(), Some("one\ntwo\nthree\nfour"));
+        assert_eq!(mgr.tail(99990, 0).as_deref(), Some(""));
+        assert_eq!(mgr.tail(1, 2), None);
     }
 
     #[test]

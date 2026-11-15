@@ -5,7 +5,7 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 fn default_flash_temperature() -> f32 { 1.0 }
-fn default_flash_reasoning() -> String { "dynamic".to_string() }
+fn default_flash_reasoning() -> String { "high".to_string() }
 
 /// Per-user state directory. `COREX_HOME` lets a session or installation keep its settings
 /// and sessions isolated from the default `~/.corex` directory.
@@ -25,10 +25,6 @@ pub fn isolated_home() -> bool {
         .unwrap_or(false)
 }
 
-/// Depth used by the `dynamic` reasoning mode on turns that only answer a tool result (~200ms).
-pub const DYNAMIC_TOOL_TURN_EFFORT: &str = "low";
-/// Depth used by the `dynamic` reasoning mode on every other turn.
-pub const DYNAMIC_DEFAULT_EFFORT: &str = "high";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlashSettings {
@@ -80,6 +76,8 @@ pub struct McpServerConfig {
     /// environment variables as `${NAME}` so keys never have to be written to disk.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl McpServerConfig {
@@ -91,6 +89,7 @@ impl McpServerConfig {
             env: HashMap::new(),
             url: None,
             headers: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -102,6 +101,7 @@ impl McpServerConfig {
             env: HashMap::new(),
             url: Some(url.into()),
             headers,
+            timeout_secs: None,
         }
     }
 
@@ -123,6 +123,7 @@ struct LocalOverrides {
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     auto_compact: Option<bool>,
+    recent_images: Option<usize>,
     compact_threshold_tokens: Option<usize>,
     history_token_limit: Option<usize>,
     context_window_tokens: Option<usize>,
@@ -308,6 +309,9 @@ pub struct Config {
     pub local_llm_model: String,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
+    /// Newest images sent with each request; `0` sends all of them.
+    #[serde(default = "default_recent_images")]
+    pub recent_images: usize,
     /// Estimated prompt size that triggers auto-compaction. Unset: 80% of the context window.
     /// (`95000`, the old fixed default that earlier versions wrote to `settings.json`, also
     /// counts as unset.)
@@ -352,6 +356,10 @@ pub struct Config {
 
 fn default_auto_compact() -> bool {
     true
+}
+
+fn default_recent_images() -> usize {
+    3
 }
 
 /// Compaction threshold that earlier versions applied to every model and saved to `settings.json`.
@@ -495,6 +503,7 @@ impl Default for Config {
             local_llm_url: default_local_llm_url(),
             local_llm_model: default_local_llm_model(),
             auto_compact: default_auto_compact(),
+            recent_images: default_recent_images(),
             compact_threshold_tokens: None,
             history_token_limit: None,
             context_window_tokens: None,
@@ -957,7 +966,10 @@ impl Config {
     pub fn load_flash_settings_with_workspace(workspace: Option<&Path>) -> FlashSettings {
         if let Some(path) = Self::resolve_settings_path(workspace, "flash_settings.json") {
             if let Ok(c) = fs::read_to_string(&path) {
-                if let Ok(parsed) = serde_json::from_str::<FlashSettings>(&c) {
+                if let Ok(mut parsed) = serde_json::from_str::<FlashSettings>(&c) {
+                    if parsed.reasoning_effort == "dynamic" {
+                        parsed.reasoning_effort = default_flash_reasoning();
+                    }
                     return parsed;
                 }
             }
@@ -1074,6 +1086,9 @@ impl Config {
                         }
                         if let Some(r) = o.reasoning_effort.filter(|r| !r.trim().is_empty()) {
                             config.reasoning_effort = r;
+                        }
+                        if let Some(n) = o.recent_images {
+                            config.recent_images = n;
                         }
                         if let Some(a) = o.auto_compact {
                             config.auto_compact = a;
@@ -1211,6 +1226,18 @@ impl Config {
         Self::mcp_servers_in(&content)
     }
 
+    fn yolo_mode_from_disk() -> YoloMode {
+        Self::resolve_settings_path(None, "settings.json")
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|content| Self::yolo_mode_in(&content))
+            .unwrap_or_default()
+    }
+
+    fn yolo_mode_in(content: &str) -> Option<YoloMode> {
+        let value: serde_json::Value = serde_json::from_str(content).ok()?;
+        serde_json::from_value(value.get("yolo_mode")?.clone()).ok()
+    }
+
     /// The `mcp_servers` map of a settings document: `Some` empty when the key is absent (the
     /// user removed every server), `None` when the document is not JSON.
     fn mcp_servers_in(content: &str) -> Option<HashMap<String, McpServerConfig>> {
@@ -1263,6 +1290,8 @@ impl Config {
         if !write_mcp_servers {
             to_save.keep_mcp_servers_from(Self::mcp_servers_from_disk());
         }
+        // `-y` / Shift+Tab are per run; only a hand edit of the file makes YOLO stick.
+        to_save.yolo_mode = Self::yolo_mode_from_disk();
         if to_save.api_key.trim().is_empty() || Self::is_env_supplied_key(&to_save.api_key) {
             // Keep whatever key the file already had; an environment key stays in the environment.
             to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
@@ -1596,6 +1625,17 @@ mod tests {
             url.starts_with("https://") || key.is_empty(),
             "API key must never be paired with a remote plaintext http:// base_url"
         );
+    }
+
+    #[test]
+    fn saved_yolo_mode_comes_from_the_file() {
+        assert_eq!(Config::yolo_mode_in(r#"{"yolo_mode": "normal"}"#), Some(YoloMode::Normal));
+        assert_eq!(Config::yolo_mode_in(r#"{"model": "m"}"#), None);
+        assert_eq!(Config::yolo_mode_in("not json"), None);
+        let cli_yolo = Config { yolo_mode: YoloMode::Normal, ..Config::default() };
+        let mut to_save = cli_yolo.clone();
+        to_save.yolo_mode = Config::yolo_mode_in(r#"{"model": "m"}"#).unwrap_or_default();
+        assert!(!Config::settings_document(&to_save).unwrap().contains("yolo_mode"));
     }
 
     #[test]

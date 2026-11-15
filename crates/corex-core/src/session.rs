@@ -286,9 +286,16 @@ impl Session {
         }
     }
 
+    pub fn images_dir(&self) -> Option<PathBuf> {
+        crate::session_images::images_dir(&self.target_dir().join(format!("{}.json", self.id)))
+    }
+
     pub fn save(&self) -> Result<()> {
-        let dir = self.target_dir();
-        crate::secure_fs::ensure_private_dir(&dir)?;
+        self.save_in(&self.target_dir())
+    }
+
+    fn save_in(&self, dir: &Path) -> Result<()> {
+        crate::secure_fs::ensure_private_dir(dir)?;
         let safe_id: String = self
             .id
             .chars()
@@ -298,7 +305,12 @@ impl Session {
             bail!("Invalid session identifier.");
         }
         let file = dir.join(format!("{}.json", safe_id));
-        let serialized = serde_json::to_string(self)?;
+        let mut stored = self.clone();
+        if let Some(images) = crate::session_images::images_dir(&file) {
+            crate::session_images::externalize(&mut stored.messages, &images);
+            crate::session_images::externalize(&mut stored.history, &images);
+        }
+        let serialized = serde_json::to_string(&stored)?;
         crate::secure_fs::write_private_atomic(&file, serialized.as_bytes())?;
         let summary = SessionSummary {
             id: self.id.clone(),
@@ -378,6 +390,17 @@ impl Session {
             && !s.contains('\0')
     }
 
+    fn read_file(file: &Path) -> Result<Self> {
+        let mut session: Session = serde_json::from_str(&fs::read_to_string(file)?)?;
+        if let Some(images) = crate::session_images::images_dir(file) {
+            let lists: [&[Message]; 2] = [&session.messages, &session.history];
+            crate::session_images::prune_unreferenced(&lists, &images, std::time::Duration::from_secs(600));
+            crate::session_images::restore(&mut session.messages, &images);
+            crate::session_images::restore(&mut session.history, &images);
+        }
+        Ok(session)
+    }
+
     pub fn load_by_id_or_tag(id_or_tag: &str) -> Result<Self> {
         let target = id_or_tag.trim();
 
@@ -387,9 +410,7 @@ impl Session {
 
         if Self::is_safe_session_id(target) {
             if let Some(direct_file) = Self::find_session_file(target) {
-                let content = fs::read_to_string(&direct_file)?;
-                let session: Session = serde_json::from_str(&content)?;
-                return Ok(session);
+                return Self::read_file(&direct_file);
             }
         }
 
@@ -405,9 +426,7 @@ impl Session {
                 let target_id = &all_summaries[idx - 1].id;
                 if Self::is_safe_session_id(target_id) {
                     if let Some(file) = Self::find_session_file(target_id) {
-                        let content = fs::read_to_string(&file)?;
-                        let session: Session = serde_json::from_str(&content)?;
-                        return Ok(session);
+                        return Self::read_file(&file);
                     }
                 }
             }
@@ -438,9 +457,7 @@ impl Session {
             let id = &exact_tag_matches[0].0.id;
             if Self::is_safe_session_id(id) {
                 if let Some(file) = Self::find_session_file(id) {
-                    let content = fs::read_to_string(&file)?;
-                    let session: Session = serde_json::from_str(&content)?;
-                    return Ok(session);
+                    return Self::read_file(&file);
                 }
             }
         }
@@ -449,9 +466,7 @@ impl Session {
             let id = &matches[0].0.id;
             if Self::is_safe_session_id(id) {
                 if let Some(file) = Self::find_session_file(id) {
-                    let content = fs::read_to_string(&file)?;
-                    let session: Session = serde_json::from_str(&content)?;
-                    return Ok(session);
+                    return Self::read_file(&file);
                 }
             }
         }
@@ -485,6 +500,9 @@ impl Session {
             let _ = fs::remove_file(&file);
             if let Some(summary) = Self::summary_path(&file) {
                 let _ = fs::remove_file(summary);
+            }
+            if let Some(images) = crate::session_images::images_dir(&file) {
+                let _ = fs::remove_dir_all(images);
             }
         }
         Ok(session.id)
@@ -749,5 +767,30 @@ mod history_tests {
         value.as_object_mut().expect("session object").remove("provider");
         let old: Session = serde_json::from_value(value).expect("old session without provider");
         assert_eq!(old.provider, None);
+    }
+
+    #[test]
+    fn saved_sessions_keep_images_in_files_not_in_the_json() {
+        let dir = std::env::temp_dir().join(format!("corex_session_images_save_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let mut session = Session::new();
+        let mut message = Message::user("see".to_string());
+        message.content = Some(MessageContent::Parts(vec![
+            crate::types::ContentPart::text("see"),
+            crate::types::ContentPart::image_url(png),
+        ]));
+        session.add_message(message);
+
+        session.save_in(&dir).unwrap();
+        let file = dir.join(format!("{}.json", session.id));
+        let json = std::fs::read_to_string(&file).unwrap();
+        assert!(!json.contains("iVBORw0KGgo=") && json.contains("corex-image:"), "{json}");
+        assert!(session.messages[0].content.as_ref().is_some_and(|c| serde_json::to_string(c).unwrap().contains(png)), "memory keeps the image");
+
+        let back = Session::read_file(&file).unwrap();
+        let Some(MessageContent::Parts(parts)) = &back.messages[0].content else { panic!("parts expected") };
+        assert_eq!(parts[1].image_url.as_ref().map(|i| i.url.as_str()), Some(png));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

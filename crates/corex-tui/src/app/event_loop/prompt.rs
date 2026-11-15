@@ -536,16 +536,19 @@ mod tests {
             assert!(app.input_buffer.is_empty(), "? on an empty prompt is not typed");
             assert!(last_text(&app).starts_with("Shortcuts:") && last_text(&app).contains("!command"), "{}", last_text(&app));
             assert!(last_text(&app).contains("Shift+Tab"), "the shortcuts list the mode cycle");
-            for expected in ["[ACCEPT EDITS]", "[PLAN MODE]", "[YOLO]", "[YOLO ALL]", ""] {
+            let path = ws.file_name().unwrap().to_str().unwrap();
+            let (_, rows) = screen(&mut app);
+            assert!(rows.iter().take(6).any(|r| r.contains(path)), "the banner shows the workspace:\n{}", rows.join("\n"));
+            let bar = rows.last().unwrap();
+            assert!(bar.contains(path) && !bar.contains(&ws.display().to_string()), "the status bar names only the folder: {bar}");
+            for expected in ["edits", "plan", "auto", "auto", ""] {
                 prompt_key(&mut app, KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &tx).await;
                 let (_, rows) = screen(&mut app);
-                let all = rows.join("\n");
-                if expected.is_empty() {
-                    assert!(!all.contains("[ACCEPT EDITS]") && !all.contains("[PLAN MODE]") && !all.contains("[YOLO]"), "back to normal:\n{all}");
-                } else {
-                    let bar = rows.iter().find(|r| r.contains(expected)).unwrap_or_else(|| panic!("Shift+Tab shows {expected}:\n{all}"));
-                    let path = ws.file_name().unwrap().to_str().unwrap();
-                    assert!(bar.find(expected) < bar.find(path), "the mode comes before the path, so a long path cannot hide it: {bar}");
+                let bar = rows.last().unwrap();
+                let mode = bar.trim_start();
+                assert!(mode.starts_with(expected), "the mode leads the status bar: {bar}");
+                if expected.is_empty() || expected == "auto" {
+                    assert!(!mode.contains("all") && !mode.contains("plan") && !mode.contains("edits"), "only {expected:?} is shown: {bar}");
                 }
             }
             type_text(&mut app, "why?", &tx).await;
@@ -960,10 +963,6 @@ mod tests {
             let cell = &terminal.backend().buffer()[(at_col, prompt_row as u16)];
             assert_eq!(cell.fg, app.theme.accent_purple, "the @path is drawn in purple");
 
-            app.context_files_checked = None;
-            app.refresh_context_files();
-            let (_, rows) = screen(&mut app);
-            assert!(rows.iter().any(|r| r.contains("1 ctx")), "{}", rows.join("\n"));
 
             app.input_buffer.clear();
             app.cursor_idx = 0;

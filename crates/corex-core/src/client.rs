@@ -301,8 +301,7 @@ impl LlmClient {
             return Ok(translated);
         }
         let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
-        let supports_temp = !target_model.starts_with("o1")
-            && !target_model.starts_with("o3")
+        let supports_temp = crate::providers::applies_temperature(&target_model)
             && !target_model.contains("reasoner");
         let mut request_body = serde_json::json!({
             "model": target_model,
@@ -848,8 +847,7 @@ impl LlmClient {
                 }
             } else {
                 let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
-                let supports_temp = !target_model.starts_with("o1")
-                    && !target_model.starts_with("o3")
+                let supports_temp = crate::providers::applies_temperature(&target_model)
                     && !target_model.contains("reasoner");
                 let mut request_body = serde_json::json!({
                     "model": target_model,
@@ -1353,22 +1351,10 @@ impl LlmClient {
 
         let tools_count = tools.as_ref().map(|t| t.len()).unwrap_or(0);
         let messages_count = messages.len();
-        // When configured as "dynamic" (default for flash), adapt reasoning depth per turn:
-        // tool-response turns use DYNAMIC_TOOL_TURN_EFFORT ("low"), others use DYNAMIC_DEFAULT_EFFORT ("high").
-        let is_flash = !crate::config::is_pro_model(&cfg.model)
-            && (cfg.model.to_ascii_lowercase().contains("flash") || cfg.model == "deepseek-chat");
-        let raw_reasoning_effort = if cfg.local_llm_enabled
-            || cfg.reasoning_effort == "dynamic"
-            || (is_flash && cfg.flash_settings.reasoning_effort == "dynamic")
-        {
-            let is_tool_response_turn = messages.last().map(|m| m.role == "tool").unwrap_or(false);
-            if is_tool_response_turn {
-                crate::config::DYNAMIC_TOOL_TURN_EFFORT.to_string()
-            } else {
-                crate::config::DYNAMIC_DEFAULT_EFFORT.to_string()
-            }
-        } else {
-            cfg.reasoning_effort.clone()
+        let raw_reasoning_effort = match cfg.reasoning_effort.as_str() {
+            // Saved by older versions; DeepSeek has no such level.
+            "dynamic" if is_deepseek => "high".to_string(),
+            other => other.to_string(),
         };
 
         // DeepSeek-V4.1-Flash reasoning_effort normalization:
@@ -1416,11 +1402,11 @@ impl LlmClient {
             None
         };
 
-        let effective_temperature = if is_openai_reasoning {
-            // OpenAI o1/o3 reject the temperature parameter with 400 Bad Request
+        let effective_temperature = if !crate::providers::applies_temperature(&api_model) {
             None
         } else if !is_deepseek {
-            Some(cfg.temperature)
+            let (lo, hi) = crate::providers::temperature_range(provider_kind, &api_model);
+            Some(cfg.temperature.clamp(lo, hi))
         } else if is_thinking_disabled {
             if api_model.contains("flash") {
                 Some(cfg.flash_settings.temperature)
@@ -1702,13 +1688,10 @@ impl LlmClient {
             .map(|effort| crate::anthropic::AnthropicOutputConfig { effort });
 
         // Thinking requires the default sampling, and 4.7+/5.x models reject `temperature`.
-        let temperature = if thinking_config.is_some()
-            || !profile.accepts_temperature
-            || !(0.0..=1.0).contains(&cfg.temperature)
-        {
+        let temperature = if thinking_config.is_some() || !profile.accepts_temperature {
             None
         } else {
-            Some(cfg.temperature)
+            Some(cfg.temperature.clamp(0.0, 1.0))
         };
 
         let request_body = crate::anthropic::AnthropicRequest {

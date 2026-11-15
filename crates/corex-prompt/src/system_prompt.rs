@@ -183,20 +183,8 @@ impl PromptBuilder {
 
     /// The memory section exactly as it is appended to the system prompt.
     pub fn memory_prompt(&self) -> String {
-        let mut memory = String::new();
-        for file in Memory::new(&self.workspace_dir).files() {
-            match file.scope {
-                MemoryScope::Global => memory.push_str(&format!(
-                    "\n# USER GLOBAL PERSONALITY & INSTRUCTIONS ({})\nThe following guidelines and personality instructions were configured globally by the user. You MUST adhere to them across all sessions and projects:\n{}\n",
-                    file.display, file.content
-                )),
-                MemoryScope::Project => memory.push_str(&format!(
-                    "\n# PROJECT INSTRUCTIONS & CONTEXT ({})\n{}\n",
-                    file.display, file.content
-                )),
-            }
-        }
-        memory
+        let store = Memory::new(&self.workspace_dir);
+        memory_section(&store.files(), store.add_target(MemoryScope::Global).as_deref())
     }
 
     fn discover_skills(&self) -> String {
@@ -546,6 +534,27 @@ pub(crate) fn parse_skill_metadata(content: &str, fallback_name: &str) -> (Strin
     (name, description)
 }
 
+fn memory_section(files: &[corex_core::memory::MemoryFile], saved_notes: Option<&std::path::Path>) -> String {
+    let mut memory = String::new();
+    for file in files {
+        match file.scope {
+            MemoryScope::Global if saved_notes == Some(file.path.as_path()) => memory.push_str(&format!(
+                "\n# USER NOTES SAVED WITH /memory add ({})\nPreferences the user asked you to remember. Follow them across all sessions and projects:\n{}\n",
+                file.display, file.content
+            )),
+            MemoryScope::Global => memory.push_str(&format!(
+                "\n# USER GLOBAL PERSONALITY & INSTRUCTIONS ({})\nThe following guidelines and personality instructions were configured globally by the user. You MUST adhere to them across all sessions and projects:\n{}\n",
+                file.display, file.content
+            )),
+            MemoryScope::Project => memory.push_str(&format!(
+                "\n# PROJECT INSTRUCTIONS & CONTEXT ({})\n{}\n",
+                file.display, file.content
+            )),
+        }
+    }
+    memory
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +764,22 @@ description: >-
             .build_fleet(Some(("vps-1", "root", "192.0.2.1")), &[("vps-1", "root", "192.0.2.1")]);
         let target_pos = f_none.find("## ACTIVE INFRASTRUCTURE TARGET").unwrap();
         assert_eq!(&f_none[..target_pos], &f_active[..target_pos]);
+    }
+
+    #[test]
+    fn saved_notes_are_not_labelled_like_the_hand_written_file() {
+        use corex_core::memory::MemoryFile;
+        let file = |path: &str, display: &str, content: &str| MemoryFile {
+            scope: MemoryScope::Global,
+            path: std::path::PathBuf::from(path),
+            display: display.to_string(),
+            content: content.to_string(),
+            original_len: content.len(),
+        };
+        let files = [file("/h/.corex/SYSTEM.md", "~/.corex/SYSTEM.md", "hand written"), file("/h/.corex/COREX.md", "~/.corex/COREX.md", "- saved")];
+        let memory = memory_section(&files, Some(std::path::Path::new("/h/.corex/COREX.md")));
+        assert!(memory.contains("# USER GLOBAL PERSONALITY & INSTRUCTIONS (~/.corex/SYSTEM.md)\n"), "{memory}");
+        assert!(memory.contains("# USER NOTES SAVED WITH /memory add (~/.corex/COREX.md)\n"), "{memory}");
+        assert_eq!(memory.matches("USER GLOBAL PERSONALITY").count(), 1);
     }
 }
