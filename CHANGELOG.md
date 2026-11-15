@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.12.0] - 2026-11-15
 
 ### Changed
 - **DeepSeek Flash reasoning follows the API**: The levels are now `off`, `low`, `high` and `max`, default `high` as in DeepSeek. `dynamic` is gone: it was a Corex-only mode (`low` on tool-result turns, `high` otherwise), and a saved `dynamic` now loads as `high`. DeepSeek ignores `temperature` while thinking, so `/model`, the status bar and the activation notice show it only with reasoning `off`, which disables thinking.
