@@ -190,6 +190,8 @@ pub enum WindowSource {
     Provider,
     /// A guess per provider; the model may differ.
     Default,
+    /// `context_limit_tokens`, lower than the model's window.
+    Limit,
 }
 
 impl WindowSource {
@@ -199,6 +201,39 @@ impl WindowSource {
             Self::Catalog => "provider list",
             Self::Provider => "reported by the provider",
             Self::Default => "default for this provider, not confirmed for this model",
+            Self::Limit => "your limit (/context-limit)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WheelAcceleration {
+    Off,
+    Gentle,
+    #[default]
+    Normal,
+    Fast,
+}
+
+impl WheelAcceleration {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Gentle, Self::Normal, Self::Fast];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Gentle => "gentle",
+            Self::Normal => "normal",
+            Self::Fast => "fast",
+        }
+    }
+
+    pub fn thresholds(self) -> Option<(usize, usize)> {
+        match self {
+            Self::Off => None,
+            Self::Gentle => Some((6, 12)),
+            Self::Normal => Some((4, 8)),
+            Self::Fast => Some((3, 5)),
         }
     }
 }
@@ -309,9 +344,16 @@ pub struct Config {
     pub local_llm_model: String,
     #[serde(default = "default_auto_compact")]
     pub auto_compact: bool,
+    #[serde(default)]
+    pub deepseek_web_tools: bool,
+    // Off: no temperature is sent, so the provider uses its own default.
+    #[serde(default)]
+    pub temperature_enabled: bool,
     /// Newest images sent with each request; `0` sends all of them.
     #[serde(default = "default_recent_images")]
     pub recent_images: usize,
+    #[serde(default)]
+    pub wheel_acceleration: WheelAcceleration,
     /// Estimated prompt size that triggers auto-compaction. Unset: 80% of the context window.
     /// (`95000`, the old fixed default that earlier versions wrote to `settings.json`, also
     /// counts as unset.)
@@ -325,6 +367,9 @@ pub struct Config {
     /// (see `providers::default_context_window`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
+    /// Most context sent per request, whatever the model allows; compaction runs at 80% of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_limit_tokens: Option<usize>,
     /// Use a reduced system prompt for small local models (Gemma 2B, Llama 3B, etc.).
     /// Lite mode strips complex tool enforcement instructions that confuse SLMs.
     #[serde(default)]
@@ -503,10 +548,14 @@ impl Default for Config {
             local_llm_url: default_local_llm_url(),
             local_llm_model: default_local_llm_model(),
             auto_compact: default_auto_compact(),
+            deepseek_web_tools: false,
+            temperature_enabled: false,
             recent_images: default_recent_images(),
+            wheel_acceleration: WheelAcceleration::default(),
             compact_threshold_tokens: None,
             history_token_limit: None,
             context_window_tokens: None,
+            context_limit_tokens: None,
             local_prompt_lite: false,
             allowed_commands: Vec::new(),
             providers: Vec::new(),
@@ -516,6 +565,125 @@ impl Default for Config {
             user_color: None,
             exports_dir: None,
         }
+    }
+}
+
+pub const AGENT_SETTABLE: &[&str] = &[
+    "model",
+    "active_provider",
+    "reasoning_effort",
+    "temperature",
+    "auto_compact",
+    "deepseek_web_tools",
+    "temperature_enabled",
+    "recent_images",
+    "wheel_acceleration",
+    "compact_threshold_tokens",
+    "history_token_limit",
+    "context_window_tokens",
+    "context_limit_tokens",
+    "local_prompt_lite",
+    "local_llm_enabled",
+    "local_llm_url",
+    "local_llm_model",
+    "user_name",
+    "user_color",
+    "exports_dir",
+    "yolo_mode",
+    "allowed_commands",
+    "providers",
+    "mcp_servers",
+];
+
+pub const AGENT_SETTABLE_ALWAYS_ASK: &[&str] = &["yolo_mode", "allowed_commands", "providers", "mcp_servers"];
+
+const HIDDEN: &str = "[hidden]";
+
+fn redact(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                let k = key.to_lowercase();
+                let secret = !k.ends_with("_env")
+                    && !k.ends_with("_tokens")
+                    && !k.ends_with("_token_limit")
+                    && ["key", "token", "secret", "password", "authorization", "cookie"].iter().any(|w| k.contains(w));
+                if k == "env" || k == "headers" || k == "provider_api_keys" {
+                    if let serde_json::Value::Object(inner) = v {
+                        inner.values_mut().for_each(|x| *x = HIDDEN.into());
+                    }
+                } else if secret && !v.is_null() && v.as_str() != Some("") {
+                    *v = HIDDEN.into();
+                } else {
+                    redact(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+        _ => {}
+    }
+}
+
+impl Config {
+    pub fn redacted_json(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        redact(&mut value);
+        value
+    }
+
+    pub fn set_agent_setting(&mut self, key: &str, value: serde_json::Value) -> Result<(), String> {
+        if !AGENT_SETTABLE.contains(&key) {
+            return Err(match key {
+                "api_key" | "provider_api_keys" => "API keys are changed only by the user, with /key.".to_string(),
+                _ => format!("'{key}' cannot be changed from here. Settable: {}.", AGENT_SETTABLE.join(", ")),
+            });
+        }
+        let mut doc = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
+        doc[key] = value;
+        let new: Config = serde_json::from_value(doc).map_err(|e| format!("invalid value for '{key}': {e}"))?;
+        match key {
+            "model" => self.model = new.model,
+            "active_provider" => self.active_provider = new.active_provider,
+            "reasoning_effort" => self.reasoning_effort = new.reasoning_effort,
+            "temperature" => self.temperature = new.temperature,
+            "auto_compact" => self.auto_compact = new.auto_compact,
+            "deepseek_web_tools" => self.deepseek_web_tools = new.deepseek_web_tools,
+            "temperature_enabled" => self.temperature_enabled = new.temperature_enabled,
+            "recent_images" => self.recent_images = new.recent_images,
+            "wheel_acceleration" => self.wheel_acceleration = new.wheel_acceleration,
+            "compact_threshold_tokens" => self.compact_threshold_tokens = new.compact_threshold_tokens,
+            "history_token_limit" => self.history_token_limit = new.history_token_limit,
+            "context_window_tokens" => self.context_window_tokens = new.context_window_tokens,
+            "context_limit_tokens" => self.context_limit_tokens = new.context_limit_tokens,
+            "local_prompt_lite" => self.local_prompt_lite = new.local_prompt_lite,
+            "local_llm_enabled" => self.local_llm_enabled = new.local_llm_enabled,
+            "local_llm_url" => self.local_llm_url = new.local_llm_url,
+            "local_llm_model" => self.local_llm_model = new.local_llm_model,
+            "user_name" => self.user_name = new.user_name,
+            "user_color" => self.user_color = new.user_color,
+            "exports_dir" => self.exports_dir = new.exports_dir,
+            "yolo_mode" => self.yolo_mode = new.yolo_mode,
+            "allowed_commands" => self.allowed_commands = new.allowed_commands,
+            "providers" => self.providers = new.providers,
+            "mcp_servers" => {
+                let mut servers = new.mcp_servers;
+                for (name, server) in servers.iter_mut() {
+                    let Some(old) = self.mcp_servers.get(name) else { continue };
+                    let keep = |values: &mut HashMap<String, String>, old: &HashMap<String, String>| {
+                        for (k, v) in values.iter_mut().filter(|(_, v)| v.as_str() == HIDDEN) {
+                            if let Some(real) = old.get(k) {
+                                *v = real.clone();
+                            }
+                        }
+                    };
+                    keep(&mut server.env, &old.env);
+                    keep(&mut server.headers, &old.headers);
+                }
+                self.mcp_servers = servers;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -529,6 +697,14 @@ impl Config {
     /// model's `context_window` in the provider list, what the provider reported
     /// (see `model_info`), and finally the provider's default.
     pub fn context_window_with_source(&self) -> (usize, WindowSource) {
+        let (window, source) = self.model_context_window_with_source();
+        match self.context_limit_tokens.filter(|&limit| limit > 0 && limit < window) {
+            Some(limit) => (limit, WindowSource::Limit),
+            None => (window, source),
+        }
+    }
+
+    pub fn model_context_window_with_source(&self) -> (usize, WindowSource) {
         if let Some(tokens) = self.context_window_tokens.filter(|&t| t > 0) {
             return (tokens, WindowSource::Settings);
         }
@@ -700,6 +876,17 @@ impl Config {
 
     /// A key that belongs to DeepSeek, for its search and fetch endpoints. The key of any other
     /// provider is never returned: it would be sent to `api.deepseek.com`.
+    // DeepSeek's own endpoints (search, fetch, OCR) are billed to DeepSeek, so only its provider uses them.
+    pub fn temperature_active(&self) -> bool {
+        self.temperature_enabled && crate::providers::applies_temperature(&self.model)
+    }
+
+    pub fn deepseek_tools_key(&self) -> Option<String> {
+        (self.provider_kind() == crate::providers::ProviderKind::DeepSeek)
+            .then(|| self.deepseek_api_key())
+            .flatten()
+    }
+
     pub fn deepseek_api_key(&self) -> Option<String> {
         let stored = self.provider_api_keys.get(crate::providers::DEEPSEEK_ID).cloned();
         let default = is_deepseek_base_url(&self.base_url).then(|| self.api_key.clone());
@@ -1308,6 +1495,10 @@ impl Config {
         Self::save_to_destinations(&content, "settings.json", workspace)
     }
 
+    pub fn save_agent_setting(&self, key: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
+        self.save_settings(workspace, key == "mcp_servers")
+    }
+
     pub fn add_mcp_server(
         &mut self,
         name: String,
@@ -1339,6 +1530,17 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn temperature_is_opt_in_and_only_where_the_model_accepts_it() {
+        let mut cfg = Config::default();
+        assert!(!cfg.temperature_enabled && !cfg.temperature_active());
+        cfg.temperature_enabled = true;
+        cfg.model = "gpt-4o".into();
+        assert!(cfg.temperature_active());
+        cfg.model = "o3-mini".into();
+        assert!(!cfg.temperature_active());
+    }
     fn config_for(provider: &str) -> Config {
         Config {
             model: "some-model".to_string(),
@@ -1391,6 +1593,12 @@ mod tests {
         cfg.context_window_tokens = None;
         cfg.model = "acme-2".into();
         assert_eq!(cfg.context_window_with_source().1, WindowSource::Default);
+
+        cfg.context_limit_tokens = Some(16_000);
+        assert_eq!(cfg.context_window_with_source(), (16_000, WindowSource::Limit));
+        assert_eq!(cfg.effective_compact_threshold(), 12_800);
+        cfg.context_limit_tokens = Some(10_000_000);
+        assert_ne!(cfg.context_window_with_source().1, WindowSource::Limit);
     }
 
     #[test]

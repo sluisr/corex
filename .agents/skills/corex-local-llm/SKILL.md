@@ -6,7 +6,8 @@ description: >-
   configure the local model, what the local URL is, how to enable local LLM,
   or how to save API costs. Trigger phrases: 'local llm', 'offline', 'llama',
   'ollama', 'free cost', '$0.00', 'no api key', 'private', 'air-gapped',
-  'local model setup'.
+  'local model setup'. Not for NVIDIA NIM's cloud API or other providers' keys and
+  models: that is the corex-config skill.
 ---
 
 # Corex Local LLM Setup

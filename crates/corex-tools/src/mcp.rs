@@ -23,6 +23,22 @@ pub struct McpServerStatus {
     pub error: Option<String>,
 }
 
+// One regex the provider cannot compile makes it reject the whole request, so drop it; the MCP server still validates.
+fn drop_unportable_patterns(schema: &mut Value) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::String(p)) = map.get("pattern") {
+                if regex::Regex::new(p).is_err() {
+                    map.remove("pattern");
+                }
+            }
+            map.values_mut().for_each(drop_unportable_patterns);
+        }
+        Value::Array(items) => items.iter_mut().for_each(drop_unportable_patterns),
+        _ => {}
+    }
+}
+
 const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_TOOL_PAGES: usize = 100;
@@ -582,7 +598,8 @@ impl McpClient {
                 for t in tool_list {
                     let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"}));
+                    let mut schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"}));
+                    drop_unportable_patterns(&mut schema);
                     if !name.is_empty() {
                         tools.push((name, desc, schema));
                     }
@@ -931,6 +948,20 @@ pub fn find_catalog_item(id: &str) -> Option<&'static McpCatalogItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unportable_schema_patterns_are_dropped() {
+        let mut schema = json!({"type": "object", "properties": {
+            "path": {"type": "string", "pattern": "^[^\\uD800-\\uDFFF]*$"},
+            "name": {"type": "string", "pattern": "^[a-z]+$"},
+            "pattern": {"type": "string"}
+        }});
+        drop_unportable_patterns(&mut schema);
+        let props = &schema["properties"];
+        assert!(props["path"].get("pattern").is_none());
+        assert_eq!(props["name"]["pattern"], "^[a-z]+$");
+        assert_eq!(props["pattern"]["type"], "string");
+    }
 
     #[test]
     fn tool_names_always_satisfy_provider_rules() {

@@ -50,6 +50,10 @@ pub fn needs_approval_even_in_yolo(name: &str, args: &serde_json::Value) -> bool
             .is_some_and(crate::shell::command_references_sensitive_or_protected_path),
         "save_memory" => args.get("scope").and_then(|v| v.as_str()).unwrap_or("global") != "project",
         "browser" => args.get("action").and_then(|v| v.as_str()) == Some("upload"),
+        "corex_settings" => args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .is_some_and(|k| corex_core::config::AGENT_SETTABLE_ALWAYS_ASK.contains(&k)),
         _ => false,
     }
 }

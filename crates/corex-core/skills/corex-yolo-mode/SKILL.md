@@ -65,13 +65,13 @@ This makes YOLO permanent across all sessions until changed.
 Corex asks before:
 - **Writing files** (`write_file`, `edit_file`, `apply_patch`)
 - **Running shell commands** (`run_shell_command`)
-- **Remote fleet mutating/dangerous commands** (`fleet_run_command`, `fleet_broadcast_command`, `fleet_manage`)
+- **Remote fleet mutating/dangerous commands** (`fleet` actions `run_command` and `broadcast_command`)
 - **Deleting or overwriting** files
 
 Corex does NOT ask before:
 - Reading files (`read_file`, `glob_files`, `grep_search`, `list_dir`)
 - Web searches (`web_search`, `web_fetch`)
-- Background task inspection (`manage_background_process` with `list` or `status`)
+- Background task inspection (`manage_task` with `list` or `status`)
 
 When a tool requires approval, Corex presents a **5-option confirmation selector**:
 1. **`1` / `y`** — Allow this execution once

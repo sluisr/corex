@@ -14,6 +14,7 @@ pub const GITHUB_ID: &str = "github";
 pub const GROQ_ID: &str = "groq";
 pub const OPENROUTER_ID: &str = "openrouter";
 pub const MISTRAL_ID: &str = "mistral";
+pub const NVIDIA_ID: &str = "nvidia";
 pub const LOCAL_ID: &str = "local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +126,15 @@ impl ProviderConfig {
         if self.label.is_empty() { &self.name } else { &self.label }
     }
 
+    /// Line shown in `/model` while `models` is empty: it says where to list them.
+    pub fn empty_models_note(&self) -> &'static str {
+        if self.is_nvidia() {
+            "hundreds of models at build.nvidia.com/models · add the ones you want under `providers` in settings.json"
+        } else {
+            "no models · add them under `providers` in settings.json"
+        }
+    }
+
     pub fn is_deepseek(&self) -> bool {
         self.name == DEEPSEEK_ID
     }
@@ -157,6 +167,10 @@ impl ProviderConfig {
         self.name == MISTRAL_ID
     }
 
+    pub fn is_nvidia(&self) -> bool {
+        self.name == NVIDIA_ID
+    }
+
     pub fn is_local(&self) -> bool {
         self.name == LOCAL_ID
     }
@@ -185,6 +199,7 @@ impl ProviderConfig {
             GROQ_ID => "https://console.groq.com/keys (Free Tier)",
             OPENROUTER_ID => "https://openrouter.ai/keys",
             MISTRAL_ID => "https://console.mistral.ai/api-keys",
+            NVIDIA_ID => "https://build.nvidia.com/models",
             DEEPSEEK_ID => "https://platform.deepseek.com",
             _ => "https://platform.deepseek.com",
         }
@@ -328,6 +343,15 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
                 model("mistral-large-latest", "Mistral Large", &["flagship", "reasoning", "tools"], &[], ModelFamily::Generic),
             ],
         },
+        // The NIM catalog has hundreds of models that come and go, so none is shipped: the ones
+        // worth having are listed by hand under `providers` in settings.json.
+        ProviderConfig {
+            name: NVIDIA_ID.into(),
+            label: "NVIDIA NIM".into(),
+            base_url: "https://integrate.api.nvidia.com/v1".into(),
+            api_key_env: "NVIDIA_API_KEY".into(),
+            models: Vec::new(),
+        },
         ProviderConfig {
             name: LOCAL_ID.into(),
             label: "Local".into(),
@@ -344,7 +368,17 @@ pub fn merge_providers(custom: &[ProviderConfig]) -> Vec<ProviderConfig> {
     let mut all = builtin_providers();
     for c in custom {
         if let Some(slot) = all.iter_mut().find(|p| p.name == c.name) {
-            *slot = c.clone();
+            let mut merged = c.clone();
+            for (field, builtin) in [
+                (&mut merged.label, &slot.label),
+                (&mut merged.base_url, &slot.base_url),
+                (&mut merged.api_key_env, &slot.api_key_env),
+            ] {
+                if field.trim().is_empty() {
+                    *field = builtin.clone();
+                }
+            }
+            *slot = merged;
         } else {
             let at = all.iter().position(|p| p.is_local()).unwrap_or(all.len());
             all.insert(at, c.clone());
@@ -401,6 +435,22 @@ pub fn locate_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_entry_for_a_builtin_provider_only_needs_its_models() {
+        let custom: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": NVIDIA_ID,
+            "models": [{ "id": "meta/llama-3.3-70b-instruct", "label": "Llama 3.3 70B" }]
+        }))
+        .unwrap();
+        let all = merge_providers(&[custom]);
+        let nvidia = all.iter().find(|p| p.is_nvidia()).unwrap();
+        assert_eq!(nvidia.base_url, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(nvidia.api_key_env, "NVIDIA_API_KEY");
+        assert_eq!(nvidia.label, "NVIDIA NIM");
+        assert_eq!(nvidia.models.len(), 1);
+        assert_eq!(nvidia.models[0].id, "meta/llama-3.3-70b-instruct");
+    }
 
     #[test]
     fn temperature_support_follows_the_model() {
@@ -465,5 +515,42 @@ mod tests {
             all[p].models.iter().filter(|m| m.family == ModelFamily::Flash).count(),
             1
         );
+    }
+
+    #[test]
+    fn nvidia_ships_no_models_and_points_at_its_catalog() {
+        let all = builtin_providers();
+        let nv = all.iter().find(|p| p.is_nvidia()).expect("nvidia provider");
+        assert!(nv.models.is_empty());
+        assert_eq!(nv.base_url, "https://integrate.api.nvidia.com/v1");
+        assert_eq!(nv.api_key_env, "NVIDIA_API_KEY");
+        assert_eq!(nv.portal_url(), "https://build.nvidia.com/models");
+        assert!(nv.empty_models_note().contains("build.nvidia.com"));
+        assert!(all.iter().position(|p| p.is_nvidia()) < all.iter().position(|p| p.is_local()));
+    }
+
+    #[test]
+    fn nvidia_models_in_settings_json_replace_the_builtin_entry() {
+        let json = r#"[{
+            "name": "nvidia",
+            "label": "NVIDIA NIM",
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "api_key_env": "NVIDIA_API_KEY",
+            "models": [
+                {
+                    "id": "meta/llama-3.3-70b-instruct",
+                    "label": "Llama 3.3 70B (NIM)",
+                    "tags": ["tools"],
+                    "reasoning": ["low", "high"]
+                }
+            ]
+        }]"#;
+        let custom: Vec<ProviderConfig> = serde_json::from_str(json).expect("settings.json shape");
+        let all = merge_providers(&custom);
+        assert_eq!(all.iter().filter(|p| p.is_nvidia()).count(), 1);
+        let nv = all.iter().find(|p| p.is_nvidia()).expect("nvidia provider");
+        assert_eq!(nv.models.len(), 1);
+        assert_eq!(nv.models[0].id, "meta/llama-3.3-70b-instruct");
+        assert_eq!(all.last().unwrap().name, LOCAL_ID);
     }
 }

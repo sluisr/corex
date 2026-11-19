@@ -22,8 +22,8 @@ use crossterm::event::{
     self, EnableBracketedPaste, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::execute;
-use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+use crossterm::terminal::{enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen};
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -140,7 +140,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         }
 
         let has_active_tasks = background::has_active_tasks(&app);
-        let is_animating = app.is_slash_animating() || app.status_transition.is_animating();
+        if app.step_scroll() {
+            needs_redraw = true;
+        }
+        let is_animating = app.is_slash_animating() || app.status_transition.is_animating() || app.pending_scroll != 0;
 
         if app.copied_block.is_some_and(|(_, at)| at.elapsed() >= crate::app::copy::COPIED_FLASH) {
             app.copied_block = None;
@@ -186,8 +189,14 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         let task_tick = (has_active_tasks && last_draw.elapsed() >= Duration::from_secs(1))
             || (app.tasks_dialog.is_open && last_draw.elapsed() >= Duration::from_millis(250));
         if needs_redraw || app.is_streaming || app.is_checking_balance || task_tick || is_animating || pty_dirty {
+            // Synchronized output (DEC 2026) so the terminal never shows a half-drawn or cleared frame.
+            queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+            if std::mem::take(&mut app.pending_full_repaint) {
+                terminal.clear()?;
+            }
             terminal.draw(|f| render_ui(f, &mut app))?;
             crate::app::mobile::clean_trailing_margins(app.last_chat_rect, &app.visible_line_widths, terminal.backend_mut());
+            execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             needs_redraw = false;
             last_draw = Instant::now();
         }
@@ -204,7 +213,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
         // Short transitions (popup slide, status wave) last ~200 ms, so they keep 60 FPS to look
         // smooth; the long-running streaming only needs 30 FPS (the tool-preview beam is the
         // fastest thing on screen). The live PTY keeps the tight tick for immediate remote output.
-        let is_transitioning = app.is_slash_animating() || app.status_transition.is_animating();
+        let is_transitioning = app.is_slash_animating() || app.status_transition.is_animating() || app.pending_scroll != 0;
         let tick_rate = if pty_dirty || is_transitioning {
             Duration::from_millis(16)
         } else if app.is_streaming {
@@ -286,11 +295,11 @@ async fn dispatch_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, t
         // A resize or regaining focus can leave ghost cells the diff renderer believes
         // are correct; wipe the backing buffer so the next draw repaints everything.
         Event::Resize(w, h) => {
-            let _ = terminal.clear();
+            app.pending_full_repaint = true;
             app.handle_resize(w, h);
         }
         Event::FocusGained => {
-            let _ = terminal.clear();
+            app.pending_full_repaint = true;
             // A terminal reset drops the mouse modes, and the wheel then arrives as arrow keys.
             if app.mouse_capture {
                 let _ = terminal.backend_mut().write_all(MOUSE_REPORTING_ON.as_bytes());
@@ -362,6 +371,7 @@ async fn handle_key_inner(
     offer!(dialogs::auth_key(app, key));
     offer!(dialogs::session_key(app, key));
     offer!(dialogs::tasks_key(app, key));
+    offer!(dialogs::settings_key(app, key));
     offer!(fleet::handle_key(app, key, event_tx)?);
     offer!(model_key(app, key));
     offer!(dialogs::confirmation_key(app, key, event_tx));
@@ -431,17 +441,10 @@ fn early_key(app: &mut App, key: KeyEvent) -> Flow {
         app.clear_selection();
     }
 
-    // Cancel the generation on Esc or Ctrl+C.
-    if app.is_streaming && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && is_ctrl)) {
-        // Esc first takes back the newest pending message, one per press; the
-        // generation is only cancelled once nothing is left to take back.
-        if key.code == KeyCode::Esc && app.has_pending_messages() {
-            if let Some(pending) = app.undo_last_pending() {
-                app.restore_to_input(vec![pending]);
-            }
-            return Flow::Handled;
-        }
-
+    // Cancel the generation on Esc or Ctrl+C. While something is typed, Esc belongs to the prompt
+    // (a double Esc clears it), so it only cancels from an empty prompt.
+    let esc_for_prompt = key.code == KeyCode::Esc && !app.input_buffer.trim().is_empty();
+    if app.is_streaming && !esc_for_prompt && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && is_ctrl)) {
         // Cancelling must not eat what the user typed: whatever never reached
         // the model goes back to the composer.
         let undelivered = app.take_all_pending();

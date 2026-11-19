@@ -510,13 +510,11 @@ impl Browser {
     }
 
     // The DOM is usable at DOMContentLoaded; the load event also waits for images, ads and trackers.
-    async fn wait_for_load(&self, mut events: tokio::sync::broadcast::Receiver<Value>) {
+    async fn wait_for_load(&self, mut events: tokio::sync::broadcast::Receiver<Value>, main: Option<String>) {
         let session = self.session.clone();
         let _ = tokio::time::timeout(LOAD_TIMEOUT, async move {
             while let Ok(event) = events.recv().await {
-                let ready = event["method"] == "Page.domContentEventFired"
-                    || event["method"] == "Page.loadEventFired";
-                if ready && event["sessionId"] == session.as_str() {
+                if load_finished(&event, &session, main.as_deref()) {
                     break;
                 }
             }
@@ -538,7 +536,8 @@ impl Browser {
         if let Some(error) = result["errorText"].as_str() {
             return Err(anyhow!("navigation failed: {error}"));
         }
-        self.wait_for_load(events).await;
+        let main = result["frameId"].as_str().map(str::to_string);
+        self.wait_for_load(events, main).await;
         Ok(())
     }
 
@@ -549,10 +548,11 @@ impl Browser {
             return Err(anyhow!("no earlier page in the history"));
         }
         let entry = history["entries"][(index - 1) as usize]["id"].clone();
+        let main = self.main_frame().await;
         let events = self.cdp.subscribe();
         self.send("Page.navigateToHistoryEntry", json!({ "entryId": entry }))
             .await?;
-        self.wait_for_load(events).await;
+        self.wait_for_load(events, main).await;
         Ok(())
     }
 
@@ -974,7 +974,7 @@ impl Browser {
         .await
         .unwrap_or(false);
         if navigated {
-            self.wait_for_load(events).await;
+            self.wait_for_load(events, main).await;
         } else {
             self.wait_quiet().await;
         }
@@ -1220,6 +1220,20 @@ fn collect_console(
     });
 }
 
+// A soft navigation (pushState, Navigation API intercept, history entry) never fires DOMContentLoaded.
+fn load_finished(event: &Value, session: &str, main: Option<&str>) -> bool {
+    if event["sessionId"] != session {
+        return false;
+    }
+    match event["method"].as_str() {
+        Some("Page.domContentEventFired" | "Page.loadEventFired") => true,
+        Some("Page.frameStoppedLoading" | "Page.navigatedWithinDocument") => {
+            main.is_none_or(|id| event["params"]["frameId"] == id)
+        }
+        _ => false,
+    }
+}
+
 fn describe_dialog(params: &Value) -> String {
     format!(
         "{}: {}",
@@ -1348,6 +1362,17 @@ pub const SUPPORTED_KEYS: &str = "Enter, Tab, Escape, Backspace, Delete, Space, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_soft_navigation_in_the_main_frame_counts_as_loaded() {
+        let event = |method: &str, frame: &str| json!({"method": method, "sessionId": "7", "params": {"frameId": frame}});
+        assert!(load_finished(&event("Page.domContentEventFired", ""), "7", Some("main")));
+        assert!(load_finished(&event("Page.frameStoppedLoading", "main"), "7", Some("main")));
+        assert!(load_finished(&event("Page.navigatedWithinDocument", "main"), "7", Some("main")));
+        assert!(!load_finished(&event("Page.frameStoppedLoading", "ad"), "7", Some("main")));
+        assert!(!load_finished(&event("Page.frameStoppedLoading", "main"), "8", Some("main")));
+        assert!(!load_finished(&event("Page.frameStartedLoading", "main"), "7", Some("main")));
+    }
 
     #[test]
     fn splices_a_frame_tree_under_its_owner_and_tags_separate_process_nodes() {

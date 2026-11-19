@@ -49,12 +49,19 @@ fn joins_run(msg: &Message) -> bool {
     }
 }
 
+fn speaks(msg: &Message) -> bool {
+    msg.text_content().is_some_and(|text| !text.trim().is_empty())
+}
+
 pub fn run_start(messages: &[Message], idx: usize) -> Option<usize> {
     let mut start = None;
     for i in (0..=idx.min(messages.len().checked_sub(1)?)).rev() {
         let msg = &messages[i];
         if is_browser_step(msg) {
             start = Some(i);
+            if speaks(msg) {
+                break;
+            }
         }
         if !joins_run(msg) {
             break;
@@ -66,7 +73,7 @@ pub fn run_start(messages: &[Message], idx: usize) -> Option<usize> {
 pub fn run_end(messages: &[Message], start: usize, limit: usize) -> usize {
     let limit = limit.min(messages.len());
     let mut end = (start + 1).min(limit);
-    while end < limit && joins_run(&messages[end]) {
+    while end < limit && joins_run(&messages[end]) && !(is_browser_step(&messages[end]) && speaks(&messages[end])) {
         end += 1;
     }
     end
@@ -240,6 +247,24 @@ mod tests {
         assert_eq!(run_start(&messages, 5), None);
         assert_eq!(run_end(&messages, 1, messages.len()), 5);
         assert_eq!(run_end(&messages, 1, 3), 3);
+    }
+
+    #[test]
+    fn a_step_that_says_something_starts_its_own_group() {
+        let messages = vec![
+            Message::user("rename the page"),
+            step(r#"{"action":"click","ref":"e1"}"#),
+            result("Clicked"),
+            Message { content: Some(corex_core::types::MessageContent::Text("Found it".to_string())), ..step(r#"{"action":"click","ref":"e2"}"#) },
+            result("Clicked"),
+            step(r#"{"action":"type","text":"Triade","ref":"e3"}"#),
+            result("Typed"),
+        ];
+        assert_eq!(run_start(&messages, 2), Some(1));
+        assert_eq!(run_end(&messages, 1, messages.len()), 3);
+        assert_eq!(run_start(&messages, 3), Some(3));
+        assert_eq!(run_start(&messages, 6), Some(3));
+        assert_eq!(run_end(&messages, 3, messages.len()), 7);
     }
 
     #[test]

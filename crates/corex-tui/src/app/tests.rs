@@ -364,15 +364,17 @@ use corex_core::types::ToolCall;
         // Scrolling with the button held takes the endpoint with the view, so the selection stays
         // anchored to the text instead of to the screen.
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 8));
-        assert_eq!(app.scroll_offset, 97);
+        while app.step_scroll() {}
+        assert_eq!(app.scroll_offset, 99);
         let selection = app.selection.unwrap();
         assert_eq!(selection.anchor.0, 105, "the anchor does not move");
-        assert_eq!(selection.cursor.0, 105, "the endpoint follows the text");
+        assert_eq!(selection.cursor.0, 107, "the endpoint follows the text");
 
         // With nothing selected the wheel is a plain scroll again.
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 8));
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 8));
-        assert_eq!(app.scroll_offset, 94);
+        while app.step_scroll() {}
+        assert_eq!(app.scroll_offset, 98);
     }
 
     #[tokio::test]
@@ -1738,7 +1740,9 @@ use corex_core::types::ToolCall;
         app.session_dialog.close();
         app.auth_dialog.open();
         let rows = screen_rows(&mut app, 120, 40);
-        assert!(rows[rows.len() - 2].starts_with("────") && rows.iter().any(|r| r.starts_with(" DeepSeek API key")));
+        assert!(rows.iter().any(|r| r.starts_with(" DeepSeek API key")), "{}", rows.join("\n"));
+        assert!(rows.last().unwrap().contains("Esc cancel"), "the key panel replaces the status line too");
+        assert!(!rows.iter().rev().take(2).any(|r| r.starts_with("────")), "no rule under the key panel:\n{}", rows.join("\n"));
     }
 
     #[tokio::test]
@@ -1767,17 +1771,21 @@ use corex_core::types::ToolCall;
         app.cursor_idx = 0;
         app.message_queue.push_back("check the logs too".to_string());
         let queued = screen_text(&mut app, 170);
-        assert!(queued.contains("Alt+Enter: send now · Esc: undo"), "{queued}");
-        assert!(queued.contains("[queued]") && queued.contains("(after the answer)"), "{queued}");
+        assert!(queued.contains("Alt+Enter send now · Alt+E edit · Ctrl+X delete · Esc stop"), "{queued}");
+        assert!(queued.contains("◦ check the logs too  queued"), "{queued}");
+        assert!(!queued.contains("[queued]"), "{queued}");
+        let rows: Vec<&str> = queued.lines().collect();
+        let waiting = rows.iter().position(|r| r.contains("◦ check the logs too")).unwrap();
+        assert!(rows[waiting + 1].contains("Alt+Enter send now"), "the queue sits right above the activity bar:\n{queued}");
 
         // And once promoted, the interrupt shortcut is the one on offer.
         app.promote_queued_to_steer();
         let steering = screen_text(&mut app, 170);
-        assert!(steering.contains("[sending]") && steering.contains("Alt+Enter: interrupt now"), "{steering}");
+        assert!(steering.contains("◦ check the logs too  next step") && steering.contains("Alt+Enter interrupt"), "{steering}");
 
         // On a crowded status line the hint shrinks but the shortcut stays visible.
         let crowded = screen_text(&mut app, 110);
-        assert!(crowded.contains("Esc: undo"), "{crowded}");
+        assert!(crowded.contains("Ctrl+X delete"), "{crowded}");
     }
 
     #[test]
@@ -2051,7 +2059,7 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
 }
 
     #[tokio::test]
-    async fn browser_steps_collapse_into_one_live_line() {
+    async fn browser_steps_collapse_between_what_the_model_says() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use crate::app::render::render_ui;
@@ -2095,10 +2103,10 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
             ..step("b", r#"{"action":"type","ref":"e9","text":"hola, ya llegué"}"#)
         });
         let live = screen(&mut app);
-        assert_eq!(live.matches("Browser").count(), 1, "{live}");
-        assert!(!live.contains("Now I'll write to Ana"), "{live}");
-        assert!(!live.contains("Thought"), "{live}");
-        assert!(live.contains("● Browser · 2 steps"), "{live}");
+        assert_eq!(live.matches("Browser").count(), 2, "{live}");
+        assert!(live.contains("Now I'll write to Ana"), "{live}");
+        assert!(live.contains("✓ Browser · 1 step — opening web.whatsapp.com"), "{live}");
+        assert!(live.contains("● Browser · 1 step"), "{live}");
         assert!(live.contains("typing \"hola, ya llegué\"…"), "{live}");
         assert!(!live.contains("Executing"), "{live}");
 
@@ -2106,13 +2114,14 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
         app.session.add_message(Message { role: "assistant".to_string(), ..Message::user("Sent.".to_string()) });
         app.is_streaming = false;
         let done = screen(&mut app);
-        assert_eq!(done.matches("Browser").count(), 1, "{done}");
-        assert!(done.contains("✓ Browser · 2 steps — typing \"hola, ya llegué\""), "{done}");
+        assert_eq!(done.matches("Browser").count(), 2, "{done}");
+        assert!(done.contains("Now I'll write to Ana"), "{done}");
+        assert!(done.contains("✓ Browser · 1 step — typing \"hola, ya llegué\""), "{done}");
         assert!(done.contains("Sent."), "{done}");
 
         app.logs_expanded = true;
         let expanded = screen(&mut app);
-        assert!(!expanded.contains("✓ Browser · 2 steps"), "{expanded}");
+        assert!(!expanded.contains("✓ Browser · 1 step"), "{expanded}");
     }
 
     #[test]
@@ -2304,3 +2313,45 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
         assert!(screen.contains("│     indented"), "{screen}");
         assert!(screen.contains("rm -rf ~"), "{screen}");
     }
+
+#[cfg(test)]
+mod smooth_scroll {
+    use super::*;
+
+    #[tokio::test]
+    async fn wheel_glides_to_the_same_place() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.last_chat_rect = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.total_rendered_items = 200;
+        app.scroll_offset = 50;
+        app.auto_scroll = false;
+        app.queue_scroll(-3);
+        app.queue_scroll(-3);
+        let mut frames = 0;
+        while app.step_scroll() {
+            frames += 1;
+        }
+        assert_eq!(app.scroll_offset, 44);
+        assert!(frames > 2, "{frames}");
+        app.queue_scroll(-3);
+        app.queue_scroll(3);
+        assert_eq!(app.pending_scroll, 3, "reversing drops the old direction");
+    }
+
+    #[tokio::test]
+    async fn a_fast_wheel_speeds_up_and_a_slow_one_stays_at_one_line() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        let start = Instant::now();
+        let lines = |app: &mut App, at: Instant| {
+            app.pending_scroll = 0;
+            app.wheel(1, at);
+            app.pending_scroll
+        };
+        let slow: Vec<i32> = (0..6).map(|i| lines(&mut app, start + Duration::from_millis(200 * i))).collect();
+        assert_eq!(slow, [1; 6]);
+        let base = start + Duration::from_secs(5);
+        let fast: Vec<i32> = (0..12).map(|i| lines(&mut app, base + Duration::from_millis(10 * i))).collect();
+        assert_eq!(fast, [1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]);
+        assert_eq!(lines(&mut app, base + Duration::from_millis(500)), 1, "a pause resets the speed");
+    }
+}

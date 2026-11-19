@@ -185,6 +185,9 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
     sub_reg.unregister("save_memory");
     // Images are queued process-wide for the main conversation, never for a subagent.
     sub_reg.unregister("read_image");
+    let text_reader: std::sync::Arc<dyn crate::types::Tool> = std::sync::Arc::new(TextOnlyReadFile);
+    sub_reg.register(text_reader.clone());
+    sub_reg.register_alias("view_file", text_reader);
     sub_reg.unregister("activate_skill");
 
     // Scout and Researcher start without any user approval, so they must not be able to drive
@@ -419,6 +422,7 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
             tool_call_id: None,
             name: None,
             extra_content: None,
+            server_tool_calls: None,
         });
 
         // Execute tool calls concurrently while preserving original call order for tool responses.
@@ -657,3 +661,40 @@ impl SubagentChatBackend for OfflineChat {
 
 #[cfg(test)]
 pub(super) const OFFLINE_REPORT: &str = "Offline test backend: task finished without a model.";
+
+struct TextOnlyReadFile;
+
+#[async_trait::async_trait]
+impl crate::types::Tool for TextOnlyReadFile {
+    fn name(&self) -> &str {
+        "read_file"
+    }
+
+    fn description(&self) -> &str {
+        crate::types::Tool::description(&crate::fs_tools::ReadFileTool)
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        crate::types::Tool::parameters(&crate::fs_tools::ReadFileTool)
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &crate::types::ToolContext) -> bool {
+        crate::types::Tool::needs_confirmation(&crate::fs_tools::ReadFileTool, args, context)
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        context: &crate::types::ToolContext,
+    ) -> anyhow::Result<crate::types::ToolOutput> {
+        let raw = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let path = crate::fs_tools::resolve_path(&context.workspace_dir, raw);
+        let ocr = args.get("ocr").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ocr && path.is_file() && crate::fs_tools::file_is_image(&path) {
+            return Ok(crate::types::ToolOutput::error(format!(
+                "{raw} is an image. Subagents cannot view images; describe what you need and let the main agent look at it."
+            )));
+        }
+        crate::types::Tool::execute(&crate::fs_tools::ReadFileTool, args, context).await
+    }
+}

@@ -98,9 +98,6 @@ impl TapKeyboardGate {
 
 /// Lines the feed moves per wheel event. Termux sends one event per text row the finger travels,
 /// so one line each keeps the chat under the finger; a desktop wheel notch is one event for three lines.
-pub(crate) fn wheel_lines() -> i32 {
-    if is_android_or_termux() { 1 } else { 3 }
-}
 
 /// Whether the TUI should request mouse reporting from the terminal.
 ///
@@ -247,5 +244,16 @@ mod tests {
         // Starts with DECSC and ends with DECRC + hide cursor
         assert!(s.starts_with("\x1b7"));
         assert!(s.ends_with("\x1b8\x1b[?25l"));
+    }
+}
+
+// Set COREX_WHEEL_LOG=<file> to record the real timing of wheel events when tuning the acceleration.
+pub(crate) fn log_wheel(gap: Option<std::time::Duration>, rate: usize, lines: i32) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("COREX_WHEEL_LOG").ok()) else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let gap = gap.map(|g| format!("{:.1}", g.as_secs_f64() * 1000.0)).unwrap_or_else(|| "-".into());
+        let _ = writeln!(f, "gap_ms={gap} events_in_window={rate} lines={lines}");
     }
 }

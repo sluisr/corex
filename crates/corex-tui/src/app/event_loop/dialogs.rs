@@ -86,20 +86,12 @@ pub(super) fn auth_key(app: &mut App, key: KeyEvent) -> Flow {
         return Flow::Pass;
     }
     if is_ctrl_c(&key) {
-        app.auth_dialog.close();
         app.last_ctrl_c_press = Some(Instant::now());
-        app.session.add_message(Message::system(
-            "Auth dialog cancelled. You can set keys anytime via /model, /key, or run offline via /local."
-        ));
+        cancel_auth_dialog(app);
         return Flow::Handled;
     }
     match key.code {
-        KeyCode::Esc => {
-            app.auth_dialog.close();
-            app.session.add_message(Message::system(
-                "Auth dialog cancelled. You can set keys anytime via /model, /key, or run offline via /local."
-            ));
-        }
+        KeyCode::Esc => cancel_auth_dialog(app),
         KeyCode::Backspace => {
             app.auth_dialog.input_buffer.pop();
         }
@@ -119,6 +111,17 @@ pub(super) fn auth_key(app: &mut App, key: KeyEvent) -> Flow {
     Flow::Handled
 }
 
+fn cancel_auth_dialog(app: &mut App) {
+    let back_to_model = app.auth_dialog.from_model_dialog.then(|| app.auth_dialog.provider_name.clone());
+    app.auth_dialog.close();
+    match back_to_model {
+        Some(provider) => app.reopen_model_dialog_at(&provider),
+        None => app.session.add_message(Message::system(
+            "Auth dialog cancelled. You can set keys anytime via /model, /key, or run offline via /local."
+        )),
+    }
+}
+
 /// Saves the key typed in the auth dialog for its provider and activates the model that
 /// asked for it, if any.
 fn save_api_key(app: &mut App, key_str: String) {
@@ -126,6 +129,7 @@ fn save_api_key(app: &mut App, key_str: String) {
     let prov_name = app.auth_dialog.provider_name.clone();
     let prov_label = app.auth_dialog.provider_label.clone();
     let pending = app.auth_dialog.pending_activation;
+    let from_model_dialog = app.auth_dialog.from_model_dialog;
 
     let mut cfg = app.llm_client.get_config();
     if prov_name == "deepseek" {
@@ -150,6 +154,8 @@ fn save_api_key(app: &mut App, key_str: String) {
 
     if let Some((p_idx, m_idx)) = pending {
         app.activate_model(p_idx, m_idx);
+    } else if from_model_dialog {
+        app.reopen_model_dialog_at(&prov_name);
     }
 }
 
@@ -181,6 +187,36 @@ pub(super) fn tasks_key(app: &mut App, key: KeyEvent) -> Flow {
         TasksAction::Send(pid, text) => {
             let sent = matches!(mgr.lock().unwrap_or_else(|e| e.into_inner()).send_input(pid, text), Ok(true));
             app.tasks_dialog.notice = Some(if sent { format!("sent input to {pid}") } else { format!("{pid} does not take input") });
+        }
+    }
+    Flow::Handled
+}
+
+pub(super) fn settings_key(app: &mut App, key: KeyEvent) -> Flow {
+    use crate::settings_dialog::{apply, label, value, SettingsAction};
+    if !app.settings_dialog.is_open {
+        return Flow::Pass;
+    }
+    if is_ctrl_c(&key) {
+        app.settings_dialog.close();
+        app.last_ctrl_c_press = Some(Instant::now());
+        return Flow::Handled;
+    }
+    match app.settings_dialog.handle_key(key.code) {
+        SettingsAction::None => {}
+        SettingsAction::Close => app.settings_dialog.close(),
+        SettingsAction::Change(setting, forward) => {
+            let mut cfg = app.llm_client.get_config();
+            apply(&mut cfg, setting, forward);
+            let saved = cfg.save_with_workspace(Some(&app.workspace_dir)).is_ok();
+            let shown = value(&cfg, setting);
+            app.wheel_acceleration = cfg.wheel_acceleration;
+            app.llm_client.update_config(cfg);
+            app.settings_dialog.notice = Some(if saved {
+                format!("{} → {shown}", label(setting))
+            } else {
+                format!("{} → {shown} (not saved, this session only)", label(setting))
+            });
         }
     }
     Flow::Handled

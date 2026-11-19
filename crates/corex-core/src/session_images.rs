@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::types::{Message, MessageContent};
 
 const IMAGE_REF: &str = "corex-image:";
+const LEFT_OUT_PREFIX: &str = "[Earlier image left out of this request to save context. It is saved at ";
+const LEFT_OUT_SUFFIX: &str = "; call read_image on that path to look at it again.]";
 const MISSING_NOTE: &str = "[An image from earlier in this session is no longer stored on disk.]";
 
 const FORMATS: &[(&str, &str)] = &[
@@ -71,12 +73,30 @@ pub fn keep_recent_images(messages: &mut [Message], keep: usize, dir: Option<&Pa
             part.part_type = "text".to_string();
             part.image_url = None;
             part.text = Some(match saved {
-                Some(path) => format!(
-                    "[Earlier image left out of this request to save context. It is saved at {}; call read_image on that path to look at it again.]",
-                    path.display()
-                ),
+                Some(path) => format!("{LEFT_OUT_PREFIX}{}{LEFT_OUT_SUFFIX}", path.display()),
                 None => "[Earlier image left out of this request to save context.]".to_string(),
             });
+        }
+    }
+}
+
+pub fn restore_left_out_images(messages: &mut [Message]) {
+    for message in messages {
+        let Some(MessageContent::Parts(parts)) = message.content.as_mut() else { continue };
+        for part in parts.iter_mut().filter(|p| p.image_url.is_none()) {
+            let Some(path) = part
+                .text
+                .as_deref()
+                .and_then(|t| t.strip_prefix(LEFT_OUT_PREFIX))
+                .and_then(|t| t.strip_suffix(LEFT_OUT_SUFFIX))
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            let Some(mime) = path.file_name().and_then(|n| n.to_str()).and_then(mime_for) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            *part = crate::types::ContentPart::image_url(format!("data:{mime};base64,{data}"));
         }
     }
 }
@@ -260,6 +280,20 @@ mod tests {
         let left: Vec<String> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(left.len(), 2, "{left:?}");
         assert!(left.iter().any(|n| url_of(&kept[0]).unwrap().ends_with(n.as_str())) && left.contains(&"notes.txt".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn left_out_images_come_back_after_a_request() {
+        let dir = std::env::temp_dir().join(format!("corex_left_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let original = "data:image/png;base64,iVBORw0KGgo=";
+        let mut messages = vec![with_image(original), with_image("data:image/png;base64,AAAA")];
+        keep_recent_images(&mut messages, 1, Some(&dir));
+        assert_eq!(url_of(&messages[0]), None);
+        restore_left_out_images(&mut messages);
+        assert_eq!(url_of(&messages[0]).as_deref(), Some(original));
+        assert_eq!(url_of(&messages[1]).as_deref(), Some("data:image/png;base64,AAAA"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

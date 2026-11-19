@@ -59,6 +59,13 @@ pub enum StreamEvent {
     },
     AllToolsDone,
     Notice(String),
+    ServerTool {
+        id: String,
+        done: bool,
+        summary: String,
+    },
+    ServerToolCalls(serde_json::Value),
+    Title(String),
     ContextCompacted {
         compacted_messages: Vec<Message>,
         notice: String,
@@ -167,13 +174,16 @@ pub struct LlmClient {
     reasoning_cache: ReasoningCache,
     local_client: Arc<Mutex<crate::local_client::LocalLlmClient>>,
     meter: crate::pricing::UsageMeter,
+    // Prompt size the API reported for the last request, and how many messages that request had.
+    last_prompt: Arc<Mutex<Option<(u64, usize)>>>,
 }
 
 impl LlmClient {
     pub fn new(config: Config) -> Self {
         let _ = crate::engine_signature();
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            // A total timeout would cut long answers mid-stream; only silence ends a request.
+            .read_timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -192,6 +202,7 @@ impl LlmClient {
             reasoning_cache: ReasoningCache::new(),
             local_client: Arc::new(Mutex::new(local_client)),
             meter: crate::pricing::UsageMeter::default(),
+            last_prompt: Arc::new(Mutex::new(None)),
         };
         client.look_up_context_window(&config);
         client
@@ -203,7 +214,7 @@ impl LlmClient {
         let kind = cfg.provider_kind();
         if kind == crate::providers::ProviderKind::Local
             || !matches!(
-                cfg.context_window_with_source().1,
+                cfg.model_context_window_with_source().1,
                 crate::config::WindowSource::Provider | crate::config::WindowSource::Default
             )
         {
@@ -627,6 +638,65 @@ impl LlmClient {
         }).sum()
     }
 
+    /// How many messages at the end stay verbatim: about a quarter of the prompt, at least 4,
+    /// and always leaving 2 or more older messages to summarize.
+    fn recent_tail_len(messages: &[Message], start: usize, current_tokens: usize) -> usize {
+        let budget = current_tokens / 4;
+        let mut kept = 0;
+        let mut used = 0;
+        for m in messages[start..].iter().rev() {
+            used += Self::estimate_messages_tokens(std::slice::from_ref(m));
+            if kept >= 4 && used > budget {
+                break;
+            }
+            kept += 1;
+        }
+        kept.min(messages.len().saturating_sub(start + 2))
+    }
+
+    /// The compacted turns as the summarizer reads them: every user message, what the assistant
+    /// said and called, and each tool result cut to head and tail.
+    pub fn compaction_transcript(slice: &[Message], prev_summary: Option<&str>, max_chars: usize) -> String {
+        let earlier = prev_summary.map(|prev| format!("[EARLIER SUMMARY]\n{prev}\n\n")).unwrap_or_default();
+        let max_chars = max_chars.saturating_sub(earlier.len());
+        let render = |result_chars: usize| {
+            let mut out = String::new();
+            for m in slice {
+                let text = m.display_text().unwrap_or_default();
+                let text = text.trim();
+                match m.role.as_str() {
+                    "system" if text.contains("<CONTEXT_SUMMARY>") => {}
+                    "user" if crate::tool_images::is_tool_image_message(m) => {}
+                    "user" => out.push_str(&format!("[USER]\n{}\n\n", head_tail(text, 4_000))),
+                    "assistant" => {
+                        if !text.is_empty() {
+                            out.push_str(&format!("[ASSISTANT]\n{}\n\n", head_tail(text, 3_000)));
+                        }
+                        for c in m.tool_calls.iter().flatten() {
+                            out.push_str(&format!("[CALL] {}({})\n", c.function.name, head_tail(&c.function.arguments, 400)));
+                        }
+                    }
+                    "tool" => out.push_str(&format!("[RESULT]\n{}\n\n", head_tail(text, result_chars))),
+                    _ if !text.is_empty() => out.push_str(&format!("[NOTE]\n{}\n\n", head_tail(text, 1_500))),
+                    _ => {}
+                }
+            }
+            out
+        };
+        let mut transcript = render(1_500);
+        if transcript.len() > max_chars {
+            transcript = render(300);
+        }
+        if transcript.len() > max_chars {
+            let mut cut = transcript.len() - max_chars;
+            while !transcript.is_char_boundary(cut) {
+                cut += 1;
+            }
+            transcript = format!("[… oldest part left out …]\n{}", &transcript[cut..]);
+        }
+        earlier + &transcript
+    }
+
     /// Automatically or manually compacts older conversation turns into a dense, structured memory block.
     /// Preserves system prompt and root user prompt (anchor) and latest active turns.
     pub async fn compact_messages(
@@ -635,7 +705,7 @@ impl LlmClient {
         force: bool,
     ) -> Result<Option<String>> {
         let cfg = self.get_config();
-        let current_tokens = Self::estimate_messages_tokens(messages);
+        let current_tokens = self.context_tokens(messages);
 
         let effective_threshold = if cfg.model.starts_with("local") {
             cfg.effective_compact_threshold().min(24_000)
@@ -679,67 +749,34 @@ impl LlmClient {
                     .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
         });
 
-        // Determine the middle slice to compact while preserving both `first_non_system`
-        // (session anchor) and `last_user_idx` (active directive).
-        let (middle_start, mut split_at) = if let Some(last_u_idx) = last_user_idx {
-            let pre_user_start = first_non_system + 1;
-            let pre_user_count = last_u_idx.saturating_sub(pre_user_start);
-            let only_summary_before = pre_user_count == 1
-                && messages[pre_user_start].role == "system"
-                && messages[pre_user_start]
-                    .text_content()
-                    .map(|t| t.contains("<CONTEXT_SUMMARY>"))
-                    .unwrap_or(false);
-            let post_user_count = total_msgs.saturating_sub(last_u_idx + 1);
-
-            if pre_user_count >= 2 && (!only_summary_before && post_user_count < 8) {
-                (pre_user_start, last_u_idx)
-            } else if post_user_count >= 6 {
-                let anchor = last_u_idx;
-                let keep_recent = 6.min(total_msgs.saturating_sub(anchor + 3)).max(4);
-                let start = anchor + 1;
-                let end = total_msgs.saturating_sub(keep_recent);
-                (start, end)
-            } else if pre_user_count >= 2 {
-                (pre_user_start, last_u_idx)
-            } else {
-                let keep_recent = 8.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
-                let start = first_non_system + 1;
-                let end = total_msgs.saturating_sub(keep_recent);
-                (start, end)
-            }
-        } else {
-            let keep_recent = 8.min(total_msgs.saturating_sub(first_non_system + 4)).max(4);
-            let start = first_non_system + 1;
-            let end = total_msgs.saturating_sub(keep_recent);
-            (start, end)
-        };
-
-        // Never split an atomic `assistant(tool_calls) -> tool` group at `split_at`.
-        while split_at > middle_start && split_at < messages.len() && messages[split_at].role == "tool" {
-            split_at -= 1;
-        }
-        // If stepping back landed on the assistant message that owns those tool responses, include
-        // that assistant + its tool responses in the kept tail rather than orphaning them.
-        if split_at > middle_start
-            && split_at < messages.len()
-            && messages[split_at].role == "assistant"
-            && messages[split_at].tool_calls.is_some()
-        {
-            // `split_at` is exclusive in `middle_start..split_at`, so `messages[split_at]` is the
-            // first message KEPT after compaction, keeping the assistant and its tool outputs together.
-        }
-
-        if middle_start >= split_at || split_at.saturating_sub(middle_start) < 2 {
+        // Kept verbatim: the system prompt, the root prompt, a recent tail of about a quarter of the
+        // prompt, and the active user directive even when it falls inside the compacted range.
+        let middle_start = first_non_system + 1;
+        let tail_len = Self::recent_tail_len(messages, middle_start, current_tokens);
+        if tail_len == 0 {
             return Ok(prune_note);
         }
-
-        let older_slice = &messages[middle_start..split_at];
+        let mut split_at = total_msgs - tail_len;
+        while split_at > middle_start && messages[split_at].role == "tool" {
+            split_at -= 1;
+        }
+        if split_at.saturating_sub(middle_start) < 2 {
+            return Ok(prune_note);
+        }
+        let kept_directive = last_user_idx.filter(|&i| (middle_start..split_at).contains(&i));
+        let compacted: Vec<Message> = messages[middle_start..split_at]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(middle_start + i) != kept_directive)
+            .map(|(_, m)| m.clone())
+            .collect();
+        let older_slice = compacted.as_slice();
         let older_count = older_slice.len();
 
         // Extract intermediate user requests, tool actions, and errors
         let mut user_requests = Vec::new();
         let mut tool_actions = Vec::new();
+        let mut assistant_notes = Vec::new();
         let mut prev_summary: Option<String> = None;
 
         for m in older_slice {
@@ -756,6 +793,9 @@ impl LlmClient {
                     user_requests.push(crate::types::truncate_ellipsis(text, 500));
                 }
             } else if m.role == "assistant" {
+                if !text.is_empty() {
+                    assistant_notes.push(crate::types::truncate_ellipsis(text, 300));
+                }
                 if let Some(ref calls) = m.tool_calls {
                     for c in calls {
                         let short_args = crate::types::truncate_ellipsis(&c.function.arguments, 160);
@@ -793,7 +833,8 @@ impl LlmClient {
         // 2. If no local SLM, try calling Cloud API for semantic summary if API key is present
         let (ep_base_url, ep_api_key) = cfg.endpoint();
         if summary_opt.is_none() && !ep_api_key.trim().is_empty() {
-            let summary_system = "You are the Context Compactor for Corex. Condense the intermediate conversation turns into a dense technical summary. Include: 1) User Directives & Goals, 2) Files touched/modified, 3) Key decisions & pending tasks.";
+            let summary_system = COMPACTION_PROMPT;
+            let digest = Self::compaction_transcript(older_slice, prev_summary.as_deref(), COMPACTION_TRANSCRIPT_CHARS);
             if cfg.provider_kind() == crate::providers::ProviderKind::Anthropic {
                 let trimmed_base = ep_base_url.trim_end_matches('/');
                 let url = if trimmed_base.ends_with("/v1") {
@@ -804,7 +845,7 @@ impl LlmClient {
                 let profile = crate::anthropic::model_profile(&cfg.model);
                 let mut request_body = serde_json::json!({
                     "model": cfg.model,
-                    "max_tokens": 600,
+                    "max_tokens": COMPACTION_MAX_TOKENS,
                     "system": summary_system,
                     "messages": [
                         {"role": "user", "content": digest}
@@ -836,8 +877,10 @@ impl LlmClient {
                                 total_tokens: hit + miss + out,
                             });
                         }
+                        let truncated = json_resp.get("stop_reason").and_then(|r| r.as_str()) == Some("max_tokens");
                         if let Some(text) = json_resp
                             .get("content")
+                            .filter(|_| !truncated)
                             .and_then(|c| c.as_array())
                             .and_then(|arr| arr.iter().find_map(|item| item.get("text").and_then(|t| t.as_str())))
                         {
@@ -855,8 +898,12 @@ impl LlmClient {
                         {"role": "system", "content": summary_system},
                         {"role": "user", "content": digest}
                     ],
-                    "max_tokens": 600
+                    "max_tokens": COMPACTION_MAX_TOKENS
                 });
+                // DeepSeek thinks by default, and the reasoning would eat the summary's token budget.
+                if cfg.is_deepseek_endpoint() {
+                    request_body["thinking"] = serde_json::json!({"type": "disabled"});
+                }
                 if supports_temp {
                     request_body["temperature"] = serde_json::json!(0.3);
                 }
@@ -874,9 +921,10 @@ impl LlmClient {
                         if let Some(usage) = json_resp.get("usage").and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok()) {
                             self.record_usage(&target_model, &usage);
                         }
-                        if let Some(text) = json_resp
-                            .get("choices")
-                            .and_then(|c| c.get(0))
+                        let choice = json_resp.get("choices").and_then(|c| c.get(0));
+                        let truncated = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) == Some("length");
+                        if let Some(text) = choice
+                            .filter(|_| !truncated)
                             .and_then(|c| c.get("message"))
                             .and_then(|m| m.get("content"))
                             .and_then(|t| t.as_str())
@@ -887,6 +935,7 @@ impl LlmClient {
                 }
             }
         }
+        summary_opt = summary_opt.filter(|s| !s.trim().is_empty());
 
         // 3. Fallback: structured deterministic extractive summary
         let summary_text = summary_opt.unwrap_or_else(|| {
@@ -903,7 +952,13 @@ impl LlmClient {
             if !tool_actions.is_empty() {
                 parts.push(format!(
                     "## Touched Files & Actions:\n{}",
-                    tool_actions.iter().take(30).map(|a| format!("- {}", a)).collect::<Vec<_>>().join("\n")
+                    tool_actions.iter().rev().take(40).rev().map(|a| format!("- {}", a)).collect::<Vec<_>>().join("\n")
+                ));
+            }
+            if !assistant_notes.is_empty() {
+                parts.push(format!(
+                    "## What the Assistant Said Last:\n{}",
+                    assistant_notes.iter().rev().take(10).rev().map(|a| format!("- {}", a)).collect::<Vec<_>>().join("\n")
                 ));
             }
             if parts.is_empty() {
@@ -918,11 +973,13 @@ impl LlmClient {
             summary_text.trim()
         );
 
-        // Drain ONLY the middle slice and insert the compacted block
-        messages.drain(middle_start..split_at);
-        let compacted_message = Message::system(compacted_content);
-        messages.insert(middle_start, compacted_message);
+        let directive = kept_directive.map(|i| messages[i].clone());
+        messages.splice(
+            middle_start..split_at,
+            directive.into_iter().chain(std::iter::once(Message::system(compacted_content))),
+        );
 
+        *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let new_tokens = Self::estimate_messages_tokens(messages);
         let saved_tokens = current_tokens.saturating_sub(new_tokens);
         let notice = if force {
@@ -932,7 +989,7 @@ impl LlmClient {
             )
         } else {
             format!(
-                "Context compacted at ~{} tokens (auto-compact limit {}): preserved initial user prompt + active window (saved ~{} tokens). Change the limit with `compact_threshold_tokens` in ~/.corex/settings.json, or turn it off with `auto_compact: false`.",
+                "Context compacted at ~{} tokens (auto-compact limit {}): preserved initial user prompt + active window (saved ~{} tokens). Change it with /context-limit, or turn it off with `auto_compact: false` in ~/.corex/settings.json.",
                 current_tokens, effective_threshold, saved_tokens
             )
         };
@@ -973,15 +1030,15 @@ impl LlmClient {
                 first_non_system
             };
 
-            // Never drop the latest active user prompt if there are alternative turns to trim
-            if let Some(last_u) = last_user_idx {
-                if drop_idx == last_u {
-                    if drop_idx + 1 < messages.len() {
-                        drop_idx += 1;
-                    } else {
-                        break;
-                    }
-                }
+            let protected = |i: usize, m: &Message| {
+                Some(i) == last_user_idx
+                    || (m.role == "system" && m.text_content().is_some_and(|t| t.contains("<CONTEXT_SUMMARY>")))
+            };
+            while drop_idx + 1 < messages.len() && protected(drop_idx, &messages[drop_idx]) {
+                drop_idx += 1;
+            }
+            if protected(drop_idx, &messages[drop_idx]) {
+                break;
             }
 
             if drop_idx >= messages.len() {
@@ -1011,6 +1068,21 @@ impl LlmClient {
     fn record_usage(&self, model: &str, usage: &Usage) {
         let cfg = self.get_config();
         self.meter.record(usage, crate::pricing::rates_for(&cfg, model));
+    }
+
+    fn note_prompt_size(&self, usage: &Usage, sent_messages: usize) {
+        if usage.prompt_tokens > 0 {
+            *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = Some((usage.prompt_tokens, sent_messages));
+        }
+    }
+
+    pub fn context_tokens(&self, messages: &[Message]) -> usize {
+        match *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((tokens, len)) if len <= messages.len() => {
+                tokens as usize + Self::estimate_messages_tokens(&messages[len..])
+            }
+            _ => Self::estimate_messages_tokens(messages),
+        }
     }
 
     pub async fn stream_chat(
@@ -1063,6 +1135,7 @@ impl LlmClient {
             && messages.iter().any(Self::has_images);
 
         let (tx, out) = mpsc::channel::<StreamEvent>(100);
+        let sent_messages = messages.len();
         if overflow {
             let mut retry_messages = messages;
             if let Ok(Some(notice)) = self.compact_messages(&mut retry_messages, true).await {
@@ -1125,6 +1198,7 @@ impl LlmClient {
             if let Some(ev) = first {
                 if let StreamEvent::UsageUpdate(ref usage) = ev {
                     client.record_usage(&client.get_config().model, usage);
+                    client.note_prompt_size(usage, sent_messages);
                 }
                 if tx.send(ev).await.is_err() {
                     return;
@@ -1133,6 +1207,7 @@ impl LlmClient {
             while let Some(ev) = rx.recv().await {
                 if let StreamEvent::UsageUpdate(ref usage) = ev {
                     client.record_usage(&client.get_config().model, usage);
+                    client.note_prompt_size(usage, sent_messages);
                 }
                 if tx.send(ev).await.is_err() {
                     break;
@@ -1281,6 +1356,11 @@ impl LlmClient {
         }
 
         let has_tools = tools.is_some();
+        if !is_deepseek {
+            for msg in &mut messages {
+                msg.server_tool_calls = None;
+            }
+        }
 
         // DeepSeek V4 Reasoning spec:
         for msg in &mut messages {
@@ -1402,7 +1482,7 @@ impl LlmClient {
             None
         };
 
-        let effective_temperature = if !crate::providers::applies_temperature(&api_model) {
+        let effective_temperature = if !cfg.temperature_enabled || !crate::providers::applies_temperature(&api_model) {
             None
         } else if !is_deepseek {
             let (lo, hi) = crate::providers::temperature_range(provider_kind, &api_model);
@@ -1417,6 +1497,26 @@ impl LlmClient {
             None
         };
 
+        // Only deepseek-flash runs the server web tools; they replace Corex's own search and fetch.
+        // With client tools, DeepSeek accepts the server web tools only in thinking mode.
+        let server_web_tools =
+            is_deepseek && cfg.deepseek_web_tools && api_model == "deepseek-flash" && !is_thinking_disabled;
+        if server_web_tools {
+            if let Some(ref mut list) = tools {
+                list.retain(|t| !SERVER_WEB_REPLACED_TOOLS.contains(&t.function.name.as_str()));
+            }
+            if let Some(MessageContent::Text(prompt)) = messages.first_mut().filter(|m| m.role == "system").and_then(|m| m.content.as_mut()) {
+                prompt.push_str(SERVER_WEB_PROMPT_NOTE);
+            }
+        }
+
+        // DeepSeek writes the conversation title with the first answer; with client tools only in thinking mode.
+        let title = (is_deepseek && !is_thinking_disabled && !messages.iter().any(|m| m.role == "assistant"))
+            .then(|| serde_json::json!({"enabled": true}));
+        if is_deepseek {
+            crate::deepseek_reminder::insert_latest_reminder(&mut messages, chrono::Local::now().date_naive());
+        }
+
         let request_body = ChatCompletionRequest {
             model: api_model.clone(),
             messages,
@@ -1430,6 +1530,7 @@ impl LlmClient {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            title,
         };
 
         let provider_label = match provider_kind {
@@ -1445,7 +1546,13 @@ impl LlmClient {
             crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
         };
 
-        let body_bytes = serde_json::to_vec(&request_body)?;
+        let body_bytes = if server_web_tools {
+            let mut body = serde_json::to_value(&request_body)?;
+            with_deepseek_web_tools(&mut body);
+            serde_json::to_vec(&body)?
+        } else {
+            serde_json::to_vec(&request_body)?
+        };
         if crate::forensic::ForensicLogger::is_enabled() {
             crate::forensic::ForensicLogger::log_llm_request_bytes(
                 provider_label,
@@ -1482,6 +1589,7 @@ impl LlmClient {
             let mut total_reasoning_chars = 0;
             let mut final_usage: Option<Usage> = None;
             let mut final_reason: Option<String> = None;
+            let mut server_calls = std::collections::HashMap::new();
 
             loop {
                 tokio::select! {
@@ -1571,6 +1679,20 @@ impl LlmClient {
                                                     should_break = true;
                                                 }
                                             }
+                                            StreamEvent::ServerTool { id, done, summary } => {
+                                                let summary = if done {
+                                                    join_server_tool_summary(server_calls.remove(&id), &summary)
+                                                } else {
+                                                    server_calls.insert(id.clone(), summary.clone());
+                                                    summary
+                                                };
+                                                if tx.send(StreamEvent::ServerTool { id, done, summary }).await.is_err() { return; }
+                                            }
+                                            StreamEvent::Error(_) => {
+                                                crate::forensic::ForensicLogger::log_error("stream_chat_generation", &format!("{ev:?}"));
+                                                let _ = tx.send(ev).await;
+                                                should_break = true;
+                                            }
                                             other => {
                                                 let _ = tx.send(other).await;
                                             }
@@ -1614,6 +1736,10 @@ impl LlmClient {
                                             format!("Stream error: Invalid status code {}", status)
                                         }
                                     }
+                                    reqwest_eventsource::Error::StreamEnded => format!(
+                                        "{} closed the connection before the answer finished.",
+                                        provider_label_clone
+                                    ),
                                     other => format!("Stream error: {}", other),
                                 };
                                 let _ = tx.send(StreamEvent::Error(friendly_err)).await;
@@ -1894,7 +2020,18 @@ pub fn parse_openai_sse_data(data: &str) -> Option<Vec<StreamEvent>> {
         events.push(StreamEvent::UsageUpdate(usage));
     }
 
+    // DeepSeek reports a failure after the answer started as a last chunk with `error`, no choices and no [DONE].
+    if let Some(error) = chunk.error {
+        let message = error["message"].as_str().unwrap_or("the provider stopped the answer with an error");
+        events.push(StreamEvent::Error(format!("The answer was cut off by the provider: {message}")));
+        return Some(events);
+    }
+
     if let Some(choice) = chunk.choices.first() {
+        if let Some(summary) = choice.server_tool_event.as_ref().and_then(describe_server_tool_event) {
+            events.push(summary);
+        }
+
         if let Some(ref cot) = choice.delta.reasoning_content {
             if !cot.is_empty() {
                 events.push(StreamEvent::ReasoningDelta(cot.clone()));
@@ -1924,12 +2061,103 @@ pub fn parse_openai_sse_data(data: &str) -> Option<Vec<StreamEvent>> {
             events.push(StreamEvent::ExtraContentDelta(ec.clone()));
         }
 
+        if let Some(ref calls) = choice.delta.server_tool_calls {
+            events.push(StreamEvent::ServerToolCalls(calls.clone()));
+        }
+        if let Some(title) = choice.delta.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            events.push(StreamEvent::Title(title.to_string()));
+        }
+        if let Some(refusal) = choice.delta.refusal.as_deref().filter(|r| !r.trim().is_empty()) {
+            events.push(StreamEvent::Notice(format!("The provider refused the answer: {refusal}")));
+        }
+
         if let Some(ref reason) = choice.finish_reason {
             events.push(StreamEvent::Completed { finish_reason: Some(reason.clone()) });
         }
     }
 
     Some(events)
+}
+
+const COMPACTION_MAX_TOKENS: u32 = 8_000;
+const COMPACTION_TRANSCRIPT_CHARS: usize = 400_000;
+const COMPACTION_PROMPT: &str = "You compact a coding agent's conversation so it can keep working without the original turns. \
+Write in the language the user writes in. Be dense and concrete: exact file paths, function names, commands, error messages, numbers and decisions. \
+Use these sections, skipping any that would be empty:\n\
+## Task — the user's core request, success criteria and constraints, quoting them where the wording matters, and any ambiguity that was resolved and how.\n\
+## Progress — what was changed or found, file by file, with the commands run and their real outcome. Keep files only read or partly edited apart from finished work, and never mark an unverified test as passed.\n\
+## Findings — facts that are expensive to rediscover (where code lives, how it behaves, values, limits) and decisions with their reasons.\n\
+## Errors — every error, failed command or failing test, resolved or not, how each was handled, and approaches tried and abandoned with why.\n\
+## Active context — running processes, sessions, subagents and working hypotheses.\n\
+## Next steps — every remaining step in order, including verification and cleanup, with blockers and open questions. Keep unfinished checklist items, do not collapse them.\n\
+## Commitments — the user's standing rules, preferences and boundaries, and anything promised to them.\n\
+Do not invent anything that is not in the transcript.";
+
+fn head_tail(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars * 2 / 3).collect();
+    let tail: String = text.chars().rev().take(max_chars / 3).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}\n[…]\n{tail}")
+}
+
+const SERVER_WEB_REPLACED_TOOLS: [&str; 2] = ["web_search", "web_fetch"];
+const SERVER_WEB_PROMPT_NOTE: &str = "\n\nWEB ACCESS: you can search the web and open pages yourself, inside your reasoning, before you answer: there are no web_search or web_fetch tools to call. Never announce a search or a page read in your reply: do it first, then answer with what you found and cite the sources.";
+
+pub fn with_deepseek_web_tools(body: &mut serde_json::Value) {
+    let server = [
+        serde_json::json!({"type": "deepseek_web_search"}),
+        serde_json::json!({"type": "deepseek_read_url"}),
+    ];
+    match body["tools"].as_array_mut() {
+        Some(list) => list.extend(server),
+        None => body["tools"] = serde_json::Value::Array(server.to_vec()),
+    }
+}
+
+/// A completed call carries no `action`, so its `summary` is only the outcome; the stream loop joins it to the started call by `id`.
+fn describe_server_tool_event(event: &serde_json::Value) -> Option<StreamEvent> {
+    let call = &event["call"];
+    let id = call["id"].as_str().unwrap_or_default().to_string();
+    match event["type"].as_str()? {
+        "call_started" => {
+            let action = &call["action"];
+            let url = action["url"].as_str().unwrap_or_default();
+            let summary = match action["type"].as_str()? {
+                "search" if call["kind"].as_str().unwrap_or_default().contains("image") => "Image search".to_string(),
+                "search" => {
+                    let queries: Vec<&str> = action["queries"].as_array().into_iter().flatten().filter_map(|q| q.as_str()).collect();
+                    format!("Web search: {}", queries.join(" · "))
+                }
+                "open_page" => format!("Opened {url}"),
+                "find_in_page" => format!("Searched \"{}\" in {url}", action["pattern"].as_str().unwrap_or_default()),
+                "read_link" => format!("Read {url}"),
+                _ => return None,
+            };
+            Some(StreamEvent::ServerTool { id, done: false, summary })
+        }
+        "call_completed" => {
+            let summary = if call["status"] == "failed" {
+                format!("failed ({})", call["error"]["code"].as_str().unwrap_or("unavailable"))
+            } else if let Some(sources) = call["sources"].as_array() {
+                format!("{} sources", sources.len())
+            } else {
+                call["page"]["title"].as_str().unwrap_or_default().to_string()
+            };
+            Some(StreamEvent::ServerTool { id, done: true, summary })
+        }
+        _ => None,
+    }
+}
+
+fn join_server_tool_summary(started: Option<String>, outcome: &str) -> String {
+    let started = started.unwrap_or_else(|| "Web tool".to_string());
+    if outcome.is_empty() {
+        started
+    } else {
+        format!("{started} — {outcome}")
+    }
 }
 
 #[cfg(test)]
@@ -2010,9 +2238,86 @@ mod tests {
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].text_content().unwrap(), "Hello 1");
         assert!(messages[2].text_content().unwrap().contains("<CONTEXT_SUMMARY>"));
-        // The LATEST user prompt MUST be preserved immediately after context summary!
-        assert_eq!(messages[3].role, "user");
-        assert_eq!(messages[3].text_content().unwrap(), "Hello 6");
+        let last_user = messages.iter().rfind(|m| m.role == "user").unwrap();
+        assert_eq!(last_user.text_content().unwrap(), "Hello 6");
+        assert_eq!(messages.last().unwrap().text_content().unwrap(), "Answer 6");
+    }
+
+    #[tokio::test]
+    async fn the_active_directive_survives_when_most_of_the_work_came_before_it() {
+        let client = LlmClient::new(Config::default());
+        let mut messages = vec![Message::system("sys"), Message::user("root prompt")];
+        for i in 0..30 {
+            messages.push(Message::assistant(format!("step {i} {}", "x".repeat(400)), None));
+        }
+        messages.push(Message::user("ACTIVE: now fix the parser"));
+        for i in 0..3 {
+            let id = format!("c{i}");
+            messages.push(Message::assistant_with_tools(None, None, vec![ToolCall::new(&id, "read_file", "{}")]));
+            messages.push(Message::tool_response(&id, format!("fn parse() {{}} {}", "z".repeat(3_000))));
+        }
+
+        client.compact_messages(&mut messages, true).await.unwrap().expect("compacted");
+
+        assert_eq!(messages[1].text_content(), Some("root prompt"));
+        assert_eq!(messages[2].text_content(), Some("ACTIVE: now fix the parser"));
+        assert!(messages[3].text_content().unwrap().contains("<CONTEXT_SUMMARY>"));
+        assert!(messages.len() < 20, "{}", messages.len());
+        assert_ne!(messages[4].role, "tool");
+    }
+
+    #[test]
+    fn the_summarizer_reads_what_was_said_and_found_not_just_the_calls() {
+        let slice = vec![
+            Message::user("why is login slow?"),
+            Message::assistant_with_tools(Some("Checking the handler.".into()), None, vec![ToolCall::new("c1", "read_file", r#"{"path":"auth.rs"}"#)]),
+            Message::tool_response("c1", format!("fn login() {{ sleep(5) }}{}", "y".repeat(5_000))),
+            Message::assistant("The handler sleeps 5 s before answering.".to_string(), None),
+        ];
+        let t = LlmClient::compaction_transcript(&slice, Some("earlier: user wants speed"), 100_000);
+        assert!(t.contains("[EARLIER SUMMARY]\nearlier: user wants speed"), "{t}");
+        assert!(t.contains("[USER]\nwhy is login slow?"), "{t}");
+        assert!(t.contains(r#"[CALL] read_file({"path":"auth.rs"})"#), "{t}");
+        assert!(t.contains("fn login() { sleep(5) }"), "{t}");
+        assert!(t.contains("[…]"), "long results keep head and tail");
+        assert!(t.contains("The handler sleeps 5 s"), "{t}");
+
+        let small = LlmClient::compaction_transcript(&slice, None, 300);
+        assert!(small.len() < 400 && small.starts_with("[… oldest part left out …]"), "{small}");
+        assert!(small.contains("The handler sleeps 5 s"), "the newest part is kept");
+    }
+
+    #[tokio::test]
+    async fn an_empty_summary_falls_back_to_the_extractive_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1 << 20];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"choices":[{"message":{"content":""},"finish_reason":"length"}]}"#;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        let client = LlmClient::new(Config {
+            base_url: addr,
+            api_key: "test-key".to_string(),
+            model: "some-model".to_string(),
+            context_window_tokens: Some(128_000),
+            ..Config::default()
+        });
+        let mut messages = vec![Message::system("sys"), Message::user("root")];
+        for i in 0..10 {
+            messages.push(Message::user(format!("request number {i}")));
+            messages.push(Message::assistant(format!("answer {i}"), None));
+        }
+
+        client.compact_messages(&mut messages, true).await.unwrap().expect("compacted");
+
+        let summary = messages.iter().find_map(|m| m.text_content().filter(|t| t.contains("<CONTEXT_SUMMARY>"))).unwrap();
+        assert!(summary.contains("request number 0"), "{summary}");
     }
 
     #[tokio::test]
@@ -2054,6 +2359,16 @@ mod tests {
         // The latest user prompt should still be in messages
         let last_user = messages.iter().filter(|m| m.role == "user").last().unwrap();
         assert_eq!(last_user.text_content().unwrap(), "ACTIVE DIRECTIVE: Fix the database connection pool leak!");
+    }
+
+    #[test]
+    fn context_tokens_uses_the_reported_size_until_a_compaction() {
+        let client = LlmClient::new(Config::default());
+        let messages = vec![Message::system("sys"), Message::user("hi"), Message::user("hello there")];
+        assert_eq!(client.context_tokens(&messages), LlmClient::estimate_messages_tokens(&messages));
+        client.note_prompt_size(&Usage { prompt_tokens: 50_000, ..Default::default() }, 2);
+        assert_eq!(client.context_tokens(&messages), 50_000 + LlmClient::estimate_messages_tokens(&messages[2..]));
+        assert_eq!(client.context_tokens(&messages[..1]), LlmClient::estimate_messages_tokens(&messages[..1]));
     }
 
     #[tokio::test]
@@ -2165,6 +2480,33 @@ mod tests {
         let (url_oai, _) = cfg.endpoint();
         assert!(url_oai.contains("api.openai.com"));
         assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn transcript_cut_keeps_the_earlier_summary() {
+        let slice: Vec<Message> = (0..200).map(|i| Message::user(format!("turn {i} {}", "x".repeat(900)))).collect();
+        let transcript = LlmClient::compaction_transcript(&slice, Some("EARLIER GOAL"), 20_000);
+        assert!(transcript.starts_with("[EARLIER SUMMARY]\nEARLIER GOAL"));
+        assert!(transcript.contains("oldest part left out") && transcript.contains("turn 199"));
+        assert!(transcript.len() <= 20_100, "{}", transcript.len());
+    }
+
+    #[test]
+    fn history_cap_drops_turns_before_the_summary() {
+        let mut messages = vec![
+            Message::system("system prompt"),
+            Message::user("root"),
+            Message::system("<CONTEXT_SUMMARY>\nwhat happened\n</CONTEXT_SUMMARY>"),
+        ];
+        for i in 0..6 {
+            messages.push(Message::assistant(format!("step {i} {}", "y".repeat(3_000)), None));
+        }
+        messages.push(Message::user("latest"));
+        LlmClient::cap_history_with_limit(&mut messages, 3_500);
+        let texts: Vec<String> = messages.iter().filter_map(|m| m.text_content().map(str::to_string)).collect();
+        assert!(texts.iter().any(|t| t.contains("<CONTEXT_SUMMARY>")), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "latest"));
+        assert!(!texts.iter().any(|t| t.starts_with("step 0")));
     }
 }
 
@@ -2307,6 +2649,61 @@ mod image_fallback_tests {
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0].contains("image_url") && bodies[0].contains("AAAA"));
         assert!(!bodies[1].contains("AAAA") && bodies[1].contains("do not search the disk"));
+    }
+
+    #[test]
+    fn a_generation_failure_chunk_becomes_an_error() {
+        let data = r#"{"error":{"message":"The model failed to generate a complete response. Please retry.","type":"api_error"},"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let events = parse_openai_sse_data(data).unwrap();
+        assert!(matches!(events[0], StreamEvent::UsageUpdate(_)), "{events:?}");
+        assert!(matches!(&events[1], StreamEvent::Error(m) if m.contains("failed to generate a complete response")), "{events:?}");
+    }
+
+    #[test]
+    fn server_tool_events_are_described() {
+        let started = r#"{"choices":[{"delta":{},"server_tool_event":{"type":"call_started","step":0,"call":{"index":0,"id":"s1","type":"deepseek_web_search","kind":"deep_search","action":{"type":"search","queries":["rust 2026","tokio"]}}}}]}"#;
+        let events = parse_openai_sse_data(started).unwrap();
+        assert!(matches!(&events[0], StreamEvent::ServerTool { id, done: false, summary } if id == "s1" && summary == "Web search: rust 2026 · tokio"), "{events:?}");
+
+        let searched = r#"{"choices":[{"delta":{},"server_tool_event":{"type":"call_completed","step":0,"call":{"index":0,"id":"s1","status":"completed","sources":[{"url":"a"},{"url":"b"}]}}}]}"#;
+        let events = parse_openai_sse_data(searched).unwrap();
+        assert!(matches!(&events[0], StreamEvent::ServerTool { done: true, summary, .. } if summary == "2 sources"), "{events:?}");
+
+        let opened = r#"{"choices":[{"delta":{},"server_tool_event":{"type":"call_completed","step":1,"call":{"index":0,"id":"s2","status":"completed","page":{"url":"https://example.com","title":"Example Domain"}}}}]}"#;
+        let events = parse_openai_sse_data(opened).unwrap();
+        assert!(matches!(&events[0], StreamEvent::ServerTool { summary, .. } if summary == "Example Domain"), "{events:?}");
+
+        let failed = r#"{"choices":[{"delta":{},"server_tool_event":{"type":"call_completed","step":1,"call":{"id":"s3","status":"failed","error":{"code":"unavailable"}}}}]}"#;
+        let events = parse_openai_sse_data(failed).unwrap();
+        assert!(matches!(&events[0], StreamEvent::ServerTool { summary, .. } if summary == "failed (unavailable)"), "{events:?}");
+
+        let reasoning_done = r#"{"choices":[{"delta":{},"server_tool_event":{"type":"step_reasoning_done","step":0}}]}"#;
+        assert!(parse_openai_sse_data(reasoning_done).unwrap().is_empty());
+
+        assert_eq!(join_server_tool_summary(Some("Web search: x".into()), "2 sources"), "Web search: x — 2 sources");
+        assert_eq!(join_server_tool_summary(Some("Opened https://a".into()), ""), "Opened https://a");
+        assert_eq!(join_server_tool_summary(None, "failed (unavailable)"), "Web tool — failed (unavailable)");
+    }
+
+    #[test]
+    fn the_last_deepseek_chunk_carries_title_server_calls_and_refusal() {
+        let data = r#"{"choices":[{"delta":{"title":" Mutex en Rust ","server_tool_calls":[{"index":0,"calls":[{"id":"s1","signature":"abc"}]}],"refusal":"The following images were blocked"},"finish_reason":"stop"}]}"#;
+        let events = parse_openai_sse_data(data).unwrap();
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Title(t) if t == "Mutex en Rust")), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::ServerToolCalls(v) if v[0]["calls"][0]["signature"] == "abc")), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, StreamEvent::Notice(n) if n.contains("images were blocked"))), "{events:?}");
+    }
+
+    #[test]
+    fn deepseek_web_tools_join_the_function_tools() {
+        let mut body = serde_json::json!({"tools": [{"type": "function", "function": {"name": "read_file"}}]});
+        with_deepseek_web_tools(&mut body);
+        let types: Vec<&str> = body["tools"].as_array().unwrap().iter().map(|t| t["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["function", "deepseek_web_search", "deepseek_read_url"]);
+
+        let mut bare = serde_json::json!({"model": "deepseek-flash"});
+        with_deepseek_web_tools(&mut bare);
+        assert_eq!(bare["tools"].as_array().unwrap().len(), 2);
     }
 
     #[test]

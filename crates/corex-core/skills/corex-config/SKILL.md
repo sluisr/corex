@@ -9,7 +9,10 @@ description: >-
   'fleet.toml', 'system.md', 'corex.md', 'agents.md', 'deepseek.md', 'settings',
   'como personalizar', 'memory', 'memoria', '/memory', 'instrucciones ignoradas',
   'exportar', 'exportaciones', 'exports', 'exports_dir', 'carpeta de exportaciones',
-  'donde se guardan los chats exportados', 'cambiar ruta de exportacion'.
+  'donde se guardan los chats exportados', 'cambiar ruta de exportacion',
+  'proveedor', 'provider', 'api key', 'clave', '/key', 'añadir modelo', 'agregar modelo',
+  'modelos personalizados', 'custom models', 'nvidia', 'nvidia nim', 'nim', 'build.nvidia.com',
+  'openrouter', 'groq', 'mistral', 'providers en settings.json'.
 ---
 
 # Corex Configuration & Customization Guide
@@ -156,6 +159,8 @@ tags = ["prod", "database"]
 
 ## 3. Engine Settings (`~/.corex/settings.json`)
 
+**Changing settings yourself:** `read_file`, `edit` and the shell refuse everything under `~/.corex`, so use the `corex_settings` tool instead. `{"action": "get"}` shows the settings with API keys, tokens and passwords hidden; `{"action": "set", "key": "context_limit_tokens", "value": 256000}` changes one after the user approves it and applies it to the running session (`null` resets it). Everything can be set except the API keys, which the user changes with `/key`. `yolo_mode` applies to the running session only; `providers` takes the whole provider list (never stores API keys); `mcp_servers` takes the whole map (values shown as `[hidden]` keep their real value) and reconnects the servers. `yolo_mode`, `allowed_commands`, `providers` and `mcp_servers` always wait for the user's approval, even in YOLO mode. The user can also change the common ones in the `/settings` panel.
+
 Stored automatically when switching models via `/model` or saving a key with `/key` (the key itself goes to the system keyring, not to this file). `/yolo` only changes the current session. A project `.corex/settings.json` may override the model, temperature, reasoning effort and compaction settings; keys, YOLO mode, the local LLM switch and MCP servers are only read from the global file.
 
 ### Example `~/.corex/settings.json`:
@@ -186,7 +191,10 @@ Your messages are labelled with the login of the machine (`$USER`) and drawn in 
 When the user asks to change their name or the colour of their messages, edit these keys in `~/.corex/settings.json` (keep the other keys as they are) and tell them to restart `cx`: settings are read at startup.
 
 ### Images sent to the model (`recent_images`)
-Screenshots stay in the session (saved as files under `~/.corex/sessions/images/<session id>/`), but each request only carries the newest ones: 3 by default. An older image goes as a note with the path of its saved file, and the agent can look at it again with `read_image` on that path when the user asks about it. Set `"recent_images": 5` (any number) in `~/.corex/settings.json` or a project `.corex/settings.json` to change it, or `0` to send every image as before.
+Screenshots stay in the session (saved as files under `~/.corex/sessions/images/<session id>/`), but each request only carries the newest ones: 3 by default. An older image goes as a note with the path of its saved file, and the agent can look at it again with `read_file` on that path when the user asks about it. Set `"recent_images": 5` (any number) in `~/.corex/settings.json` or a project `.corex/settings.json` to change it, or `0` to send every image as before.
+
+### How much context each request carries (`context_limit_tokens`)
+Every agent step resends the conversation, and DeepSeek and Gemini allow 1M tokens, so by default a long session grows to ~800k before compaction summarizes it. `/context-limit 256k` (or `128k`, `512k`, any number of at least 32k, `auto` to remove it) caps that: each request carries at most the limit and compaction runs at 80% of it. It never raises a model's own window, and it is saved as `"context_limit_tokens"` in `~/.corex/settings.json`. `/context-limit` alone shows the current values; `/context` shows the window in use and where it comes from.
 
 ### Where `/export` saves chats (`exports_dir`)
 By default `/export` writes to `~/.corex/exports/<project>/`, where `<project>` is the name of the folder `cx` was started in (`home` when started in the home folder). Files are named by date and chat title, such as `2026-11-09_22-50_check-the-disk.md`, and an export never overwrites an earlier one (`-2`, `-3`… is added).
@@ -214,7 +222,48 @@ Do not move earlier exports unless the user asks; if they do, move the per-proje
 
 ---
 
-## 4. Quick Commands
+## 4. Providers and models (`/model`, API keys, NVIDIA NIM)
+
+### Choosing a provider and setting its key
+* `/model` lists every provider. Those with a key (or the local one) are on top; the rest sit under `no key`.
+* On a provider row, press `E` (or run `/key`) to paste its API key. It is saved in the system keyring and also read from the provider's environment variable (`NVIDIA_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, `MISTRAL_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`…). Keys never go in `settings.json`.
+* Pick a model on the right and press `Enter` to use it.
+
+### Adding models to a provider (`providers` in `settings.json`)
+A provider's models can be listed, or extended, with an entry under `providers` in `~/.corex/settings.json`. The entry is matched by `name`; `label`, `base_url` and `api_key_env` are taken from the built-in provider when left out, so for a built-in one only `models` is needed. The entry's `models` list **replaces** the built-in list, so include every model you want to see.
+
+Each model needs its `id` exactly as the provider names it. Optional: `label` (shown in `/model`), `reasoning` (e.g. `["low", "medium", "high"]` for models that take a reasoning effort) and `context_window` (tokens, when the provider does not report one).
+
+### NVIDIA NIM (cloud API, `build.nvidia.com`)
+NVIDIA's catalog changes too often to ship, so the provider comes **with no models**: you list the ones you want.
+1. Get a free key at https://build.nvidia.com/models (it starts with `nvapi-`).
+2. In `/model`, select **NVIDIA NIM** (under `no key`), press `E` and paste the key. It is stored for `$NVIDIA_API_KEY` and the keyring.
+3. On build.nvidia.com, open the model card you want and copy its id from the code sample (`"model": "meta/llama-3.3-70b-instruct"`).
+4. Add it to `~/.corex/settings.json` (keep the other keys as they are):
+```json
+{
+  "providers": [
+    {
+      "name": "nvidia",
+      "models": [
+        { "id": "meta/llama-3.3-70b-instruct", "label": "Llama 3.3 70B" },
+        { "id": "qwen/qwen2.5-coder-32b-instruct", "label": "Qwen2.5 Coder 32B" }
+      ]
+    }
+  ]
+}
+```
+5. Reopen `/model`: the models appear under NVIDIA NIM. Select one and press `Enter`.
+
+Endpoint: `https://integrate.api.nvidia.com/v1` (OpenAI-compatible; set automatically). If a model does not appear, check that the JSON is valid and the `id` matches the model card character for character.
+
+**Self-hosted NIM** (the NVIDIA container on your own GPU) is not this provider: it serves an OpenAI-compatible API on your machine (usually `http://localhost:8000/v1`), so use it as the **local** provider (see the `corex-local-llm` skill) or add a custom entry with that `base_url`.
+
+When the user asks how to use NVIDIA NIM (or any provider) in Corex, explain these steps in Corex terms; do not answer with generic `curl` or Docker instructions unless they ask about the API itself. If they want, configure the models for them with `corex_settings` (`action: "set", key: "providers"`, preserving existing entries from `action: "get"`): API keys stay untouched and hidden.
+
+---
+
+## 5. Quick Commands
 * `/yolo on` / `/yolo off`: Enable or disable interactive confirmations on the fly.
 * `/model`: Open interactive model selector.
 * `/fleet`: Open the dual-pane Fleet console.

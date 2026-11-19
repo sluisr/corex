@@ -27,6 +27,15 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
     let is_files_open = !matching_files.is_empty();
 
     match key.code {
+        // Alt+E (or Alt+Up, which tmux often keeps for itself) on an empty prompt brings the newest
+        // waiting message back to edit; plain Up keeps walking the prompt history.
+        KeyCode::Up | KeyCode::Char('e') | KeyCode::Char('E')
+            if alt && !ctrl && app.input_buffer.trim().is_empty() && app.has_pending_messages() =>
+        {
+            if let Some(pending) = app.undo_last_pending() {
+                app.restore_to_input(vec![pending]);
+            }
+        }
         // History via readline shortcuts: Ctrl+P / Alt+Up (previous). Before the `Char` arms,
         // which would otherwise take Ctrl+P as an unbound control key.
         _ if is_ctrl_p || (alt && key.code == KeyCode::Up) => {
@@ -114,6 +123,9 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
                 app.input_buffer.drain(start..app.cursor_idx);
                 app.cursor_idx = start;
             }
+            'x' | 'X' | '\x18' if app.input_buffer.trim().is_empty() => {
+                app.undo_last_pending();
+            }
             _ => {}
         },
         KeyCode::Char(c) => {
@@ -132,6 +144,10 @@ pub(super) async fn prompt_key(app: &mut App, key: KeyEvent, event_tx: &EventTx)
             app.cursor_idx += c.len_utf8();
             app.slash_selected_idx = 0;
             app.last_esc_press = None;
+        }
+        // On an empty prompt, Ctrl+X or Alt+Backspace deletes the newest message still waiting.
+        KeyCode::Backspace if alt && app.input_buffer.trim().is_empty() && app.has_pending_messages() => {
+            app.undo_last_pending();
         }
         KeyCode::Backspace => {
             app.clamp_cursor();
@@ -520,6 +536,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn alt_backspace_on_an_empty_prompt_deletes_the_newest_waiting_message() {
+            crate::test_support::isolate_home();
+            let ws = std::env::temp_dir().join(format!("corex-e2e-queue-del-{}", std::process::id()));
+            std::fs::create_dir_all(&ws).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let client = corex_core::client::LlmClient::new(corex_core::config::Config::default());
+            let mut app = App::new(client, ws.clone(), false);
+            app.auth_dialog.close();
+            app.is_streaming = true;
+            app.message_queue.extend(["first".to_string(), "second".to_string()]);
+            let alt_backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+
+            type_text(&mut app, "typing", &tx).await;
+            prompt_key(&mut app, alt_backspace, &tx).await;
+            assert_eq!(app.message_queue.len(), 2, "with text typed, Alt+Backspace edits the prompt");
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            app.message_queue.push_back("third".to_string());
+            prompt_key(&mut app, alt_backspace, &tx).await;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &tx).await;
+            assert_eq!(app.message_queue.iter().map(String::as_str).collect::<Vec<_>>(), ["first"]);
+            assert!(app.input_buffer.is_empty(), "a deleted message does not come back to the prompt");
+
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &tx).await;
+            assert_eq!(app.message_queue.len(), 1, "plain Up walks the history and leaves the queue alone");
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT), &tx).await;
+            assert!(app.message_queue.is_empty());
+            assert_eq!(app.input_buffer, "first", "Alt+E on an empty prompt brings the waiting message back to edit");
+
+            app.input_buffer.clear();
+            app.cursor_idx = 0;
+            app.message_queue.push_back("again".to_string());
+            prompt_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), &tx).await;
+            assert_eq!(app.input_buffer, "again", "Alt+Up does the same where the terminal passes it through");
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+
+        #[tokio::test]
         async fn question_mark_and_bang_commands() {
             crate::test_support::isolate_home();
             let ws = std::env::temp_dir().join(format!("corex-e2e-bang-{}", std::process::id()));
@@ -600,8 +657,8 @@ mod tests {
             assert!(!app.is_streaming, "a message sent during a !command does not start a turn");
             let (_, rows) = screen(&mut app);
             let all = rows.join("\n");
-            assert!(all.contains("what did it print? (after the command)"), "{all}");
-            assert!(all.contains("Esc: stop the command") && !all.contains("Esc: undo"), "{all}");
+            assert!(all.contains("what did it print?  after the command"), "{all}");
+            assert!(all.contains("Esc stop the command") && !all.contains("Esc edit"), "{all}");
             assert_eq!(app.message_queue.pop_front().as_deref(), Some("what did it print?"), "it waits for the report");
             prompt_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
             wait_for_shell(&mut app).await;

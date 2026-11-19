@@ -36,7 +36,7 @@
 Unlike traditional terminal assistants built on Node.js or Python runtimes, Corex is engineered from the ground up in pure Rust. It starts in about 1.9 ms (`cx --version`), draws its first frame in about 12.3 ms, lists hundreds of saved sessions in ~7.7 ms, ships as one native binary per platform, and idles at about 20.2 MB of resident memory (see [Performance & Resource Footprint](#performance--resource-footprint) for the measurements).
 
 > [!NOTE]
-> **Release Status:** Active Development (`v0.12.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
+> **Release Status:** Active Development (`v0.13.0`). Corex is moving quickly towards `v1.0` stabilization. APIs, internal interfaces, and CLI flags are continuously refined. Community feedback and contributions are welcome!
 
 ---
 
@@ -116,7 +116,7 @@ Corex supports three unified execution paradigms:
 ```
 
 ### 1. Frontier Cloud Matrix
-- **Providers:** DeepSeek (`deepseek-flash`, `deepseek-pro`), Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-3.8-flash`), Anthropic (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`), OpenAI (`o1`, `o3-mini`, `gpt-4o`, `gpt-4o-mini`), Groq (Llama 3.3 70B, Llama 3.1 8B, DeepSeek R1 70B), OpenRouter, Mistral AI (`codestral-latest`, `mistral-large-latest`), and GitHub Models.
+- **Providers:** DeepSeek (`deepseek-flash`, `deepseek-pro`), Google Gemini (`gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-3.8-flash`), Anthropic (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`), OpenAI (`o1`, `o3-mini`, `gpt-4o`, `gpt-4o-mini`), Groq (Llama 3.3 70B, Llama 3.1 8B, DeepSeek R1 70B), OpenRouter, Mistral AI (`codestral-latest`, `mistral-large-latest`), GitHub Models, and NVIDIA NIM (an empty entry on purpose: you list in `settings.json` the models you want from the catalog at [build.nvidia.com/models](https://build.nvidia.com/models)).
 - **Behavior:** High-throughput streaming with Google thought signatures, adaptive reasoning effort, and transparent multi-turn tool calling.
 - **Best For:** Heavy architectural refactoring, full-stack implementations, and complex reasoning tasks.
 
@@ -265,9 +265,44 @@ export MISTRAL_API_KEY="your-mistral-key"
 
 # GitHub Models
 export GITHUB_TOKEN="ghp_your-github-token"
+
+# NVIDIA NIM (build.nvidia.com)
+export NVIDIA_API_KEY="nvapi-your-nvidia-key"
 ```
 
 You can also configure credentials interactively at any time inside the TUI by typing `/auth` or selecting a model via `/model`.
+
+#### NVIDIA NIM: the models you pick
+
+The NIM catalog at [build.nvidia.com/models](https://build.nvidia.com/models) has hundreds of models that come and go, so Corex ships the provider with an empty model list and `/model` shows a note instead: adding all of them by hand is not viable. Pick the ones you want and list them under `providers` in `~/.corex/settings.json`, with the id exactly as the model card shows it:
+
+```json
+{
+  "providers": [
+    {
+      "name": "nvidia",
+      "label": "NVIDIA NIM",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "api_key_env": "NVIDIA_API_KEY",
+      "models": [
+        {
+          "id": "meta/llama-3.3-70b-instruct",
+          "label": "Llama 3.3 70B (NIM)",
+          "tags": ["open-weights", "tools"]
+        },
+        {
+          "id": "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+          "label": "Nemotron Super 49B",
+          "tags": ["reasoning", "tools"],
+          "reasoning": ["low", "high"]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`name` is the provider id (`nvidia`), never the label, and an entry with that id replaces the built-in one. Each model may set `context_window` (its input window in tokens) and `reasoning` (the effort levels it accepts; leave it empty when it has none). The key goes with `E` in `/model` or with `/key`, not in this file.
 
 ### Local LLM Endpoint Setup (Optional)
 

@@ -161,6 +161,8 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_calls: Option<serde_json::Value>,
 }
 
 impl Message {
@@ -349,6 +351,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<serde_json::Value>,
 }
 
 // ─── Chat Completion Response Chunk ──────────────────────────────────────────
@@ -407,6 +411,12 @@ pub struct ChatCompletionDelta {
     pub tool_calls: Option<Vec<DeltaToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_calls: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +425,8 @@ pub struct ChatCompletionChoice {
     pub index: usize,
     pub delta: ChatCompletionDelta,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tool_event: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +442,8 @@ pub struct ChatCompletionChunk {
     #[serde(default)]
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
 }
 
 // ─── Balance Response ────────────────────────────────────────────────────────

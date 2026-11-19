@@ -211,6 +211,9 @@ cx --yolo-all    # YOLO All
 |:--- | :--- |
 |`Enter` | Send message / confirm (queued while the agent works) |
 |`Alt+Enter` | While the agent works: deliver the message at the next safe point |
+|`Alt+E` / `Alt+↑` | On an empty prompt while messages wait: bring the newest one back to edit (`↑` alone walks the prompt history; tmux often keeps `Alt+↑` for itself) |
+|`Ctrl+X` / `Alt+Backspace` | On an empty prompt: delete the newest message still waiting in the queue |
+|`Esc` | Stop the reply (with text typed, a double `Esc` clears it) |
 |`@path` | Reference a file or folder (Tab or Enter inserts the highlighted one) |
 |`/command` | Run a command; the popup lists them |
 |`!command` | Run a shell command yourself; the agent sees its output next turn |

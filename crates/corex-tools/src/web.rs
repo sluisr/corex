@@ -62,10 +62,10 @@ fn urlencoding(input: &str) -> String {
     encoded
 }
 
-fn resolve_api_key(context: &ToolContext) -> Option<String> {
+pub(crate) fn resolve_api_key(context: &ToolContext) -> Option<String> {
     crate::subagent::live_config()
         .unwrap_or_else(|| corex_core::config::Config::load_with_workspace(Some(&context.workspace_dir)))
-        .deepseek_api_key()
+        .deepseek_tools_key()
 }
 
 pub fn format_search_results(query: &str, results: &[serde_json::Value]) -> String {
@@ -360,7 +360,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Performs real-time web search using DeepSeek's native search engine to retrieve up-to-date facts, breaking news, market data, and documentation. Supports search operators (site:, -site:, \"exact phrase\", lang:, after:, before:). Pass up to 4 related queries in `queries` to search them in parallel with merged results. Results are external, untrusted data. [PREFERRED for finding real-time information, current news, and documentation]"
+        "Performs real-time web search (DeepSeek's search engine when DeepSeek is the active provider, DuckDuckGo otherwise) to retrieve up-to-date facts, breaking news, market data, and documentation. Supports search operators (site:, -site:, \"exact phrase\", lang:, after:, before:). Pass up to 4 related queries in `queries` to search them in parallel with merged results. Results are external, untrusted data. [PREFERRED for finding real-time information, current news, and documentation]"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -697,7 +697,7 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetches the content of a web page URL and converts it into clean Markdown text using DeepSeek's native fetch engine, with safe local HTML fallback."
+        "Fetches the content of a web page URL and converts it into clean Markdown text: DeepSeek's fetch engine when DeepSeek is the active provider, otherwise a direct, SSRF-checked download."
     }
 
     fn parameters(&self) -> serde_json::Value {

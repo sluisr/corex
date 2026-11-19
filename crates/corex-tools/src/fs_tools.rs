@@ -436,7 +436,10 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Reads the contents of a file with line numbers and optional start/end ranges. Includes binary file protection and automatic pagination. [PREFERRED instead of shell cat]"
+        "Reads a file. Text comes back with line numbers and optional start/end ranges (paginated). \
+         PNG/JPEG/GIF/WebP images are shown to you in the next message (vision models; 5 MB max). \
+         With ocr=true, a PDF, Word, PowerPoint or scanned image is read through DeepSeek OCR: only with the DeepSeek provider active (it uploads the file to DeepSeek, billed per page). \
+         [PREFERRED instead of shell cat]"
     }
 
     fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
@@ -462,6 +465,14 @@ impl Tool for ReadFileTool {
                 "end_line": {
                     "type": "integer",
                     "description": "Optional 1-indexed end line number."
+                },
+                "ocr": {
+                    "type": "boolean",
+                    "description": "DeepSeek OCR for a document (pdf, doc, docx, ppt, pptx, scanned image). Only with the DeepSeek provider active; uploads the file to DeepSeek, billed per page."
+                },
+                "rich_layout": {
+                    "type": "boolean",
+                    "description": "With ocr: recognize every page as an image, keeping tables and layout."
                 }
             },
             "required": ["file_path"]
@@ -475,6 +486,12 @@ impl Tool for ReadFileTool {
         };
 
         let path = resolve_path(&context.workspace_dir, rel_path);
+        if args.get("ocr").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return crate::document::ReadDocumentTool.execute(args, context).await;
+        }
+        if path.is_file() && file_is_image(&path) {
+            return ReadImageTool.execute(args, context).await;
+        }
         if is_sensitive_system_path(&path) {
             return Ok(ToolOutput::error(format!(
                 "Access denied: reading sensitive credential or authentication file '{}' is forbidden.",
@@ -496,17 +513,12 @@ impl Tool for ReadFileTool {
         let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
 
         if is_binary_file(&path) {
-            let mut header = [0u8; 32];
-            let is_image = fs::File::open(&path)
-                .and_then(|mut f| {
-                    let n = f.read(&mut header)?;
-                    Ok(sniff_image_media_type(&header[..n]).is_some())
-                })
-                .unwrap_or(false);
-            let hint = if is_image {
-                " It is an image: use 'read_image' to view it."
-            } else {
+            let hint = if !crate::document::is_document_path(&path) {
                 ""
+            } else if crate::web::resolve_api_key(context).is_some() {
+                " It is a document: call read_file again with ocr=true to read its text through DeepSeek OCR (uploads the file, billed per page)."
+            } else {
+                " It is a document: extract its text locally, e.g. `pdftotext file.pdf -` via run_shell_command."
             };
             return Ok(ToolOutput::success(format!(
                 "[Binary file: {} ({}). Cannot display content as plain text.{}]",
@@ -612,6 +624,16 @@ impl Tool for ReadFileTool {
 }
 
 // ─── 1b. ReadImageTool ──────────────────────────────────────────────────────
+
+pub fn file_is_image(path: &Path) -> bool {
+    let mut header = [0u8; 32];
+    fs::File::open(path)
+        .and_then(|mut f| {
+            let n = f.read(&mut header)?;
+            Ok(sniff_image_media_type(&header[..n]).is_some())
+        })
+        .unwrap_or(false)
+}
 
 /// Largest image `read_image` loads; matches the strictest provider limit (5 MB per image).
 pub const READ_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -2299,9 +2321,13 @@ mod tests {
         let out = ReadImageTool.execute(json!({ "file_path": "notes.png" }), &ctx).await.unwrap();
         assert!(out.is_error && out.output.contains("not a supported image"), "{}", out.output);
 
-        // read_file on a binary image points the model at read_image.
         let out = ReadFileTool.execute(json!({ "file_path": "shot" }), &ctx).await.unwrap();
-        assert!(out.output.contains("read_image"), "{}", out.output);
+        assert!(!out.is_error && out.output.contains("image/png"), "{}", out.output);
+        assert!(corex_core::drain_tool_images_message().is_some());
+
+        fs::write(ws.join("report.pdf"), [0x25u8, 0x50, 0x44, 0x46, 0x00, 0xff]).unwrap();
+        let out = ReadFileTool.execute(json!({ "file_path": "report.pdf" }), &ctx).await.unwrap();
+        assert!(out.output.contains("ocr=true"), "{}", out.output);
         let _ = fs::remove_dir_all(&ws);
     }
 

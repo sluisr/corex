@@ -11,7 +11,10 @@ use crate::background::{
 use crate::fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
 use crate::browser_tool::BrowserTool;
 use crate::grep::GrepTool;
+use crate::grouped::{ActionGroupTool, TRACKER_ACTIONS};
+use crate::mcp_index;
 use crate::memory_tool::SaveMemoryTool;
+use crate::settings_tool::CorexSettingsTool;
 use crate::shell::ShellTool;
 use crate::types::{Tool, ToolContext, ToolOutput};
 use crate::web::{WebFetchTool, WebSearchTool};
@@ -71,7 +74,8 @@ impl ToolRegistry {
         // Register official primary tool definitions
         registry.register_primary(apply_patch.clone());
         registry.register_primary(read_file.clone());
-        registry.register_primary(Arc::new(ReadImageTool));
+        registry.register_alias("read_image", Arc::new(ReadImageTool));
+        registry.register_alias("read_document", Arc::new(crate::document::ReadDocumentTool));
         registry.register_primary(write_file.clone());
         registry.register_primary(edit.clone());
         registry.register_primary(grep_search.clone());
@@ -79,10 +83,10 @@ impl ToolRegistry {
         registry.register_primary(list_directory.clone());
         registry.register_primary(run_shell_command.clone());
         registry.register_primary(manage_task.clone());
-        registry.register_primary(list_background_processes.clone());
-        registry.register_primary(read_background_output.clone());
-        registry.register_primary(kill_background_process.clone());
-        registry.register_primary(write_background_input.clone());
+        registry.register_alias("list_background_processes", list_background_processes);
+        registry.register_alias("read_background_output", read_background_output);
+        registry.register_alias("kill_background_process", kill_background_process);
+        registry.register_alias("write_background_input", write_background_input);
         registry.register_primary(web_search.clone());
         registry.register_primary(web_fetch.clone());
         registry.register_primary(Arc::new(BrowserTool));
@@ -91,14 +95,21 @@ impl ToolRegistry {
         registry.register_primary(ask_user);
         registry.register_primary(write_todos);
         registry.register_primary(Arc::new(SaveMemoryTool));
+        registry.register_primary(Arc::new(CorexSettingsTool));
         registry.register_primary(activate_skill);
         registry.register_primary(get_internal_docs);
-        registry.register_primary(tracker_create_task);
-        registry.register_primary(tracker_update_task);
-        registry.register_primary(tracker_get_task);
-        registry.register_primary(tracker_list_tasks);
-        registry.register_primary(tracker_add_dependency);
-        registry.register_primary(tracker_visualize);
+        registry.register_group(ActionGroupTool::new(
+            "tracker",
+            "Persistent task tracker for multi-step work (tasks, statuses, dependencies).",
+            vec![
+                (TRACKER_ACTIONS[0].0, tracker_create_task),
+                (TRACKER_ACTIONS[1].0, tracker_update_task),
+                (TRACKER_ACTIONS[2].0, tracker_get_task),
+                (TRACKER_ACTIONS[3].0, tracker_list_tasks),
+                (TRACKER_ACTIONS[4].0, tracker_add_dependency),
+                (TRACKER_ACTIONS[5].0, tracker_visualize),
+            ],
+        ));
         registry.register_primary(update_topic);
         registry.register_primary(delegate_subagent.clone());
         registry.register_primary(manage_subagents.clone());
@@ -125,6 +136,18 @@ impl ToolRegistry {
         registry
     }
 
+    // Still callable for old sessions and other model families, but not offered to the model.
+    pub fn register_alias(&mut self, name: &str, tool: Arc<dyn Tool>) {
+        self.tools.insert(name.to_string(), tool);
+    }
+
+    pub fn register_group(&mut self, group: ActionGroupTool) {
+        for (_, tool) in group.actions() {
+            self.tools.insert(tool.name().to_string(), tool.clone());
+        }
+        self.register_primary(Arc::new(group));
+    }
+
     fn register_primary(&mut self, tool: Arc<dyn Tool>) {
         let def = tool.to_definition();
         if let Some(pos) = self.registered_definitions.iter().position(|d| d.function.name == def.function.name) {
@@ -136,17 +159,53 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        let is_mcp = mcp_index::is_mcp_tool(tool.name());
         self.register_primary(tool);
+        if is_mcp {
+            self.refresh_mcp_index();
+        }
     }
 
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
         self.registered_definitions.retain(|d| d.function.name != name);
+        if mcp_index::is_mcp_tool(name) {
+            self.refresh_mcp_index();
+        }
     }
 
     pub fn unregister_prefix(&mut self, prefix: &str) {
         self.tools.retain(|k, _| !k.starts_with(prefix));
         self.registered_definitions.retain(|d| !d.function.name.starts_with(prefix));
+        self.refresh_mcp_index();
+    }
+
+    fn mcp_tools(&self) -> mcp_index::McpTools {
+        Arc::new(
+            self.tools
+                .iter()
+                .filter(|(name, _)| mcp_index::is_mcp_tool(name))
+                .map(|(name, tool)| (name.clone(), tool.clone()))
+                .collect(),
+        )
+    }
+
+    fn mcp_deferred(&self) -> bool {
+        self.registered_definitions.iter().filter(|d| mcp_index::is_mcp_tool(&d.function.name)).count()
+            > mcp_index::INLINE_LIMIT
+    }
+
+    fn refresh_mcp_index(&mut self) {
+        for name in [mcp_index::SEARCH_TOOL, mcp_index::CALL_TOOL] {
+            self.tools.remove(name);
+            self.registered_definitions.retain(|d| d.function.name != name);
+        }
+        if !self.mcp_deferred() {
+            return;
+        }
+        let tools = self.mcp_tools();
+        self.register_primary(Arc::new(mcp_index::McpSearchTool::new(tools.clone())));
+        self.register_primary(Arc::new(mcp_index::McpCallTool::new(tools)));
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -154,7 +213,12 @@ impl ToolRegistry {
     }
 
     pub fn list_definitions(&self) -> Vec<ToolDefinition> {
-        self.registered_definitions.clone()
+        let deferred = self.mcp_deferred();
+        self.registered_definitions
+            .iter()
+            .filter(|d| !(deferred && mcp_index::is_mcp_tool(&d.function.name)))
+            .cloned()
+            .collect()
     }
 
     pub async fn execute(
@@ -295,6 +359,70 @@ mod tests {
         assert_eq!(recorded[0].after, recorded[1].before, "each edit must start where the previous one ended");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(restored, original);
+    }
+
+    struct FakeMcp(String);
+
+    #[async_trait::async_trait]
+    impl Tool for FakeMcp {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn description(&self) -> &str {
+            "[MCP: fake] does a thing"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value, _context: &ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput::success(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn many_mcp_tools_are_deferred_behind_search_and_call() {
+        let mut reg = ToolRegistry::new();
+        let names = |reg: &ToolRegistry| reg.list_definitions().into_iter().map(|d| d.function.name).collect::<Vec<_>>();
+        for i in 0..mcp_index::INLINE_LIMIT {
+            reg.register(Arc::new(FakeMcp(format!("mcp_fake_t{i}"))));
+        }
+        assert!(names(&reg).contains(&"mcp_fake_t0".to_string()));
+        assert!(!names(&reg).contains(&mcp_index::CALL_TOOL.to_string()));
+
+        reg.register(Arc::new(FakeMcp("mcp_fake_extra".into())));
+        let listed = names(&reg);
+        assert!(!listed.iter().any(|n| n.starts_with("mcp_fake_")));
+        assert!(listed.contains(&mcp_index::SEARCH_TOOL.to_string()) && listed.contains(&mcp_index::CALL_TOOL.to_string()));
+
+        let ctx = ToolContext {
+            workspace_dir: std::env::temp_dir(),
+            yolo_mode: true,
+            yolo_all: false,
+            sudo_password: None,
+            allowed_commands: Vec::new(),
+            extra_dirs: Vec::new(),
+        };
+        let out = reg.execute(mcp_index::CALL_TOOL, serde_json::json!({"name": "mcp_fake_extra"}), &ctx).await.unwrap();
+        assert_eq!(out.output, "mcp_fake_extra");
+
+        reg.unregister_prefix("mcp_");
+        assert!(!names(&reg).iter().any(|n| n.starts_with("mcp_")));
+    }
+
+    #[test]
+    fn grouped_tools_replace_their_members_in_the_offered_list() {
+        let reg = ToolRegistry::new();
+        let offered: Vec<String> = reg.list_definitions().into_iter().map(|d| d.function.name).collect();
+        for name in ["read_file", "manage_task", "tracker"] {
+            assert!(offered.contains(&name.to_string()), "{name} missing");
+        }
+        for name in ["read_image", "read_document", "tracker_create_task", "kill_background_process", "list_background_processes"] {
+            assert!(!offered.contains(&name.to_string()), "{name} still offered");
+            assert!(reg.get(name).is_some(), "{name} no longer callable");
+        }
+        for (_, member) in crate::grouped::TRACKER_ACTIONS {
+            assert_eq!(reg.get(member).unwrap().name(), member);
+        }
     }
 
     #[test]

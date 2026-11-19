@@ -100,6 +100,7 @@ pub struct ModelDialogState {
     // Generic family (OpenAI-compatible providers, local)
     pub generic_temperature: f32,
     pub generic_reasoning: String,
+    pub temperature_enabled: bool,
 
     pub local_prompt_lite: bool,
 
@@ -195,6 +196,7 @@ impl ModelDialogState {
 
             generic_temperature: 1.0,
             generic_reasoning: String::new(),
+            temperature_enabled: false,
 
             local_prompt_lite: false,
             compact: std::cell::Cell::new(false),
@@ -242,6 +244,7 @@ impl ModelDialogState {
         self.pro_reasoning = cfg.pro_settings.reasoning_effort.clone();
 
         self.generic_temperature = cfg.temperature;
+        self.temperature_enabled = cfg.temperature_enabled;
         self.generic_reasoning = if cfg.is_deepseek_endpoint() && !cfg.local_llm_enabled {
             String::new()
         } else {
@@ -268,7 +271,7 @@ impl ModelDialogState {
         match m.family {
             ModelFamily::Flash => {
                 let mut rows = vec![SettingRow::Reasoning];
-                if flash_thinking_off(&self.flash_reasoning) {
+                if self.temperature_enabled && flash_thinking_off(&self.flash_reasoning) {
                     rows.push(SettingRow::Temperature);
                 }
                 rows.push(SettingRow::Persist);
@@ -277,7 +280,7 @@ impl ModelDialogState {
             ModelFamily::Pro => vec![SettingRow::Reasoning, SettingRow::Persist],
             ModelFamily::Generic => {
                 let mut rows = Vec::new();
-                if applies_temperature(&m.id) {
+                if self.temperature_enabled && applies_temperature(&m.id) {
                     rows.push(SettingRow::Temperature);
                 }
                 if !m.reasoning.is_empty() {
@@ -383,6 +386,11 @@ impl ModelDialogState {
         (self.current_temperature(), self.current_reasoning())
     }
 
+    pub fn focus_provider(&mut self, idx: usize) {
+        self.select_provider(idx);
+        self.pane = Pane::Providers;
+    }
+
     fn select_provider(&mut self, idx: usize) {
         self.prov_idx = idx;
         self.model_idx = if idx == self.active_provider { self.active_model } else { 0 };
@@ -412,10 +420,8 @@ impl ModelDialogState {
     fn step_provider(&mut self, down: bool) {
         let order = self.provider_order();
         let Some(pos) = order.iter().position(|&i| i == self.prov_idx) else { return };
-        let next = if down { order.get(pos + 1) } else { pos.checked_sub(1).and_then(|p| order.get(p)) };
-        if let Some(&idx) = next {
-            self.select_provider(idx);
-        }
+        let next = if down { (pos + 1) % order.len() } else { (pos + order.len() - 1) % order.len() };
+        self.select_provider(order[next]);
     }
 
     /// Keys of the one-column layout: ↑↓ walk provider, models and settings as one list; ←→ change
@@ -424,7 +430,13 @@ impl ModelDialogState {
     fn handle_compact_key(&mut self, code: KeyCode) -> Option<DialogAction> {
         let models = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
         match (code, self.pane) {
-            (KeyCode::Up | KeyCode::Char('k'), Pane::Providers) => {}
+            (KeyCode::Up | KeyCode::Char('k'), Pane::Providers) => {
+                self.pane = Pane::Settings;
+                self.row_idx = self.settings_rows().len().saturating_sub(1);
+            }
+            (KeyCode::Down | KeyCode::Char('j'), Pane::Settings) if self.row_idx + 1 >= self.settings_rows().len() => {
+                self.pane = Pane::Providers;
+            }
             (KeyCode::Up | KeyCode::Char('k'), Pane::Models) if self.model_idx == 0 => self.pane = Pane::Providers,
             (KeyCode::Up | KeyCode::Char('k'), Pane::Settings) if self.row_idx == 0 => self.pane = Pane::Models,
             (KeyCode::Down | KeyCode::Char('j'), Pane::Providers) => self.pane = Pane::Models,
@@ -462,9 +474,12 @@ impl ModelDialogState {
             KeyCode::Up | KeyCode::Char('k') => match self.pane {
                 Pane::Providers => self.step_provider(false),
                 Pane::Models => {
-                    self.model_idx = self.model_idx.saturating_sub(1);
-                    self.row_idx = 0;
-                    self.normalize_generic_reasoning();
+                    let n = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
+                    if n > 0 {
+                        self.model_idx = (self.model_idx + n - 1) % n;
+                        self.row_idx = 0;
+                        self.normalize_generic_reasoning();
+                    }
                 }
                 Pane::Settings => {
                     if self.row_idx == 0 {
@@ -478,8 +493,8 @@ impl ModelDialogState {
                 Pane::Providers => self.step_provider(true),
                 Pane::Models => {
                     let n = self.selected_provider().map(|p| p.models.len()).unwrap_or(0);
-                    if self.model_idx + 1 < n {
-                        self.model_idx += 1;
+                    if n > 0 {
+                        self.model_idx = (self.model_idx + 1) % n;
                         self.row_idx = 0;
                         self.normalize_generic_reasoning();
                     }
@@ -753,8 +768,9 @@ fn detail_lines(state: &ModelDialogState, w: usize, theme: &Theme) -> Vec<Line<'
         lines.push(highlight_cursor(row, Line::from(spans), w, theme));
     }
     if provider.models.is_empty() {
-        let note = "no models · add them under `providers` in settings.json";
-        lines.push(Line::from(Span::styled(format!("   {}", fit_text(note, w.saturating_sub(4))), dim)));
+        for line in wrap_words(provider.empty_models_note(), w.saturating_sub(4).max(12)) {
+            lines.push(Line::from(Span::styled(format!("   {line}"), dim)));
+        }
     }
     lines.push(Line::default());
 
@@ -958,6 +974,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_nvidia_catalog_explains_where_to_list_its_models() {
+        let mut s = open_default();
+        let nvidia = s.providers.iter().position(|p| p.is_nvidia()).expect("nvidia provider");
+        s.select_provider(nvidia);
+        assert!(s.selected_model().is_none());
+        assert_eq!(s.settings_rows(), vec![SettingRow::Persist]);
+        let (_, rows) = draw(&s, 140);
+        let screen = rows.join("\n");
+        assert!(screen.contains("build.nvidia.com/models"), "{screen}");
+        assert!(screen.contains("settings.json"), "{screen}");
+    }
+
+    #[test]
     fn enter_in_models_pane_activates_selection() {
         let mut s = open_default();
         s.pane = Pane::Models;
@@ -969,6 +998,7 @@ mod tests {
     #[test]
     fn settings_rows_follow_model_family() {
         let mut s = open_default();
+        s.temperature_enabled = true;
         assert_eq!(s.settings_rows(), vec![SettingRow::Reasoning, SettingRow::Persist]); // flash
         s.flash_reasoning = "off".into();
         assert_eq!(
@@ -985,6 +1015,7 @@ mod tests {
     #[test]
     fn temperature_row_is_hidden_where_the_model_ignores_it() {
         let mut s = open_default();
+        s.temperature_enabled = true;
         let anthropic = s.providers.iter().position(|p| p.is_anthropic()).unwrap();
         s.select_provider(anthropic);
         assert!(!s.settings_rows().contains(&SettingRow::Temperature));
@@ -993,6 +1024,45 @@ mod tests {
         assert!(s.settings_rows().contains(&SettingRow::Temperature));
         s.model_idx = s.providers[openai].models.iter().position(|m| m.id == "o3-mini").unwrap();
         assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+    }
+
+    #[test]
+    fn temperature_row_is_hidden_until_the_user_turns_temperature_on() {
+        let mut s = open_default();
+        s.flash_reasoning = "off".into();
+        let local = s.providers.iter().position(|p| p.is_local()).unwrap();
+        assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+        s.select_provider(local);
+        assert!(!s.settings_rows().contains(&SettingRow::Temperature));
+        s.temperature_enabled = true;
+        assert!(s.settings_rows().contains(&SettingRow::Temperature));
+    }
+
+    #[test]
+    fn lists_wrap_around_at_both_ends() {
+        let mut s = open_default();
+        s.pane = Pane::Providers;
+        let order = s.provider_order();
+        s.select_provider(order[0]);
+        s.handle_key(KeyCode::Up);
+        assert_eq!(s.prov_idx, *order.last().unwrap());
+        s.handle_key(KeyCode::Down);
+        assert_eq!(s.prov_idx, order[0]);
+
+        s.pane = Pane::Models;
+        let n = s.selected_provider().unwrap().models.len();
+        s.model_idx = 0;
+        s.handle_key(KeyCode::Up);
+        assert_eq!(s.model_idx, n - 1);
+        s.handle_key(KeyCode::Down);
+        assert_eq!(s.model_idx, 0);
+
+        s.compact.set(true);
+        s.pane = Pane::Providers;
+        s.handle_key(KeyCode::Up);
+        assert_eq!((s.pane, s.row_idx), (Pane::Settings, s.settings_rows().len() - 1));
+        s.handle_key(KeyCode::Down);
+        assert_eq!(s.pane, Pane::Providers);
     }
 
     #[test]
@@ -1014,6 +1084,7 @@ mod tests {
     #[test]
     fn flash_temperature_row_appears_only_with_thinking_off() {
         let mut s = open_default();
+        s.temperature_enabled = true;
         s.pane = Pane::Settings;
         s.flash_reasoning = "max".into();
         s.handle_key(KeyCode::Right);

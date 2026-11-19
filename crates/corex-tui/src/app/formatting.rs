@@ -87,12 +87,11 @@ pub fn find_url_in_line(line_text: &str, click_col: Option<usize>) -> Option<Str
 }
 
 pub fn extract_tool_allow_rule(call: &ToolCall) -> String {
-    if call.function.name == "run_shell_command"
-        || call.function.name == "shell"
-        || call.function.name == "run_command"
-        || call.function.name == "fleet_run_command"
-        || call.function.name == "fleet_broadcast_command"
-    {
+    let name = corex_tools::grouped::canonical_name_raw(&call.function.name, &call.function.arguments);
+    if matches!(
+        name.as_str(),
+        "run_shell_command" | "shell" | "run_command" | "fleet_run_command" | "fleet_broadcast_command"
+    ) {
         if let Ok(args_json) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) {
             if let Some(cmd) = args_json.get("command").or_else(|| args_json.get("CommandLine")).and_then(|c| c.as_str()) {
                 let trimmed = cmd.trim();
@@ -163,7 +162,8 @@ pub fn extract_tool_allow_rules(call: &ToolCall) -> Vec<String> {
 
 pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-    match name {
+    let name = corex_tools::grouped::canonical_name_raw(name, raw_args);
+    match name.as_str() {
         "fleet_run_command" => {
             let cmd = args_val.as_ref()
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()))

@@ -11,12 +11,18 @@ pub use telemetry::{NodeTelemetry, TelemetryCollector};
 pub use tools::{FleetBroadcastTool, FleetListNodesTool, FleetRunCommandTool, FleetTelemetryTool};
 
 use std::sync::Arc;
+use corex_tools::grouped::{ActionGroupTool, FLEET_ACTIONS};
 use corex_tools::registry::ToolRegistry;
 
-/// Registers all fleet tools into the provided `ToolRegistry`.
 pub fn register_fleet_tools(registry: &mut ToolRegistry) {
-    registry.register(Arc::new(FleetListNodesTool));
-    registry.register(Arc::new(FleetRunCommandTool));
-    registry.register(Arc::new(FleetBroadcastTool));
-    registry.register(Arc::new(FleetTelemetryTool));
+    registry.register_group(ActionGroupTool::new(
+        "fleet",
+        "Manage the user's remote servers (VPS / dedicated nodes over SSH).",
+        vec![
+            (FLEET_ACTIONS[0].0, Arc::new(FleetListNodesTool)),
+            (FLEET_ACTIONS[1].0, Arc::new(FleetTelemetryTool)),
+            (FLEET_ACTIONS[2].0, Arc::new(FleetRunCommandTool)),
+            (FLEET_ACTIONS[3].0, Arc::new(FleetBroadcastTool)),
+        ],
+    ));
 }

@@ -1175,7 +1175,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     let activity_height = if !show_activity {
         0
     } else {
-        let extras = if app.message_queue.is_empty() { 0 } else { 14 } + if app.steer_messages.is_empty() { 0 } else { 26 };
+        let extras = if app.message_queue.is_empty() { 0 } else { 12 } + if app.steer_messages.is_empty() { 0 } else { 24 };
         let needed = 4 + unicode_width::UnicodeWidthStr::width(app.status_transition.target_text.as_str()) + extras;
         if needed > size.width as usize { 2 } else { 1 }
     };
@@ -1221,6 +1221,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         crate::session_dialog::dialog_height(size.height)
     } else if app.tasks_dialog.is_open {
         crate::tasks_dialog::dialog_height(size.height)
+    } else if app.settings_dialog.is_open {
+        crate::settings_dialog::dialog_height(size.height)
     } else if app.model_dialog.is_open {
         app.model_dialog.height(size.width, size.height)
     } else if app.rewind_dialog.is_open {
@@ -1231,13 +1233,20 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         composer_content_lines as u16 + 2
     };
 
-    let status_height = u16::from(!(app.model_dialog.is_open || app.session_dialog.is_open || app.tasks_dialog.is_open));
+    let pending_rows = pending_lines(app, size.width as usize);
+    let pending_height = pending_rows.len() as u16;
+    let status_height = u16::from(!(app.model_dialog.is_open
+        || app.session_dialog.is_open
+        || app.tasks_dialog.is_open
+        || app.settings_dialog.is_open
+        || app.auth_dialog.is_open));
     let chunks = if popup_height > 0 {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),               // Chat Feed
                 Constraint::Length(popup_height), // Autocomplete Popup Slot
+                Constraint::Length(pending_height),
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(composer_height), // Input Composer
                 Constraint::Length(status_height), // Status Footer Bar
@@ -1248,6 +1257,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),               // Chat Feed
+                Constraint::Length(pending_height),
                 Constraint::Length(activity_height), // Fixed Activity / Status Bar
                 Constraint::Length(composer_height), // Input Composer
                 Constraint::Length(status_height), // Status Footer Bar
@@ -1256,11 +1266,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     };
 
     let chat_chunk = chunks[0];
-    let (popup_chunk, activity_chunk, composer_chunk, status_chunk) = if popup_height > 0 {
-        (Some(chunks[1]), chunks[2], chunks[3], chunks[4])
+    let (popup_chunk, pending_chunk, activity_chunk, composer_chunk, status_chunk) = if popup_height > 0 {
+        (Some(chunks[1]), chunks[2], chunks[3], chunks[4], chunks[5])
     } else {
-        (None, chunks[1], chunks[2], chunks[3])
+        (None, chunks[1], chunks[2], chunks[3], chunks[4])
     };
+    if pending_height > 0 {
+        frame.render_widget(Paragraph::new(pending_rows), pending_chunk);
+    }
 
     let content_max_width = (chat_chunk.width as usize).saturating_sub(2).max(20);
 
@@ -1610,37 +1623,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         app.streaming_md_cache_len = 0;
     }
 
-    if app.has_pending_messages() {
-        tail_lines.push(Line::from(""));
-        // "Send now" messages come first: that is the order in which the model will read them.
-        for steer_msg in &app.steer_messages {
-            let spans = vec![
-                Span::styled("  ", Style::default()),
-                Span::styled("[sending] ", Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(steer_msg.clone(), Style::default().fg(app.theme.foreground)),
-                Span::styled(" (next step)", Style::default().fg(app.theme.dark_gray)),
-            ];
-            tail_lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "              "));
-        }
-        for (i, queued_msg) in app.message_queue.iter().enumerate() {
-            let label = if app.message_queue.len() == 1 {
-                "[queued] ".to_string()
-            } else {
-                format!("[queued #{}] ", i + 1)
-            };
-            let spans = vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(label, Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(queued_msg.clone(), Style::default().fg(app.theme.foreground)),
-                Span::styled(
-                    if app.user_shell_rx.is_some() { " (after the command)" } else { " (after the answer)" },
-                    Style::default().fg(app.theme.dark_gray),
-                ),
-            ];
-            tail_lines.extend(crate::markdown::wrap_spans_with_indent(spans, content_max_width, "", "              "));
-        }
-        tail_lines.push(Line::from(""));
-    }
 
     app.chat_header_lines = header_lines.len();
     if let Some((msg, within)) = app.scroll_anchor.take() {
@@ -1750,17 +1732,11 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
         let queue_count = app.message_queue.len();
         if queue_count > 0 {
-            left_spans.push(Span::styled(
-                format!(" · [{} queued]", queue_count),
-                Style::default().fg(app.theme.accent_yellow).add_modifier(Modifier::BOLD),
-            ));
+            left_spans.push(Span::styled(format!(" · {} queued", queue_count), Style::default().fg(app.theme.gray)));
         }
         let steer_count = app.steer_messages.len();
         if steer_count > 0 {
-            left_spans.push(Span::styled(
-                " · [sending at next step]",
-                Style::default().fg(app.theme.accent_cyan).add_modifier(Modifier::BOLD),
-            ));
+            left_spans.push(Span::styled(" · sending at next step", Style::default().fg(app.theme.gray)));
         }
 
         // Key hints, longest first: the status text on the left varies in length, and a hint that
@@ -1768,11 +1744,11 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         let is_mobile = is_mobile_portrait(size.width, size.height);
         // A `!command` takes Esc for itself, and Enter waits for its report.
         let right_options: &[&str] = if app.user_shell_rx.is_some() {
-            &["(Enter: queue · Esc: stop the command) ", "(Esc: stop the command) "]
+            &["Enter queue · Esc stop the command ", "Esc stop the command "]
         } else if steer_count > 0 {
-            &["(Alt+Enter: interrupt now · Esc: undo) ", "(Alt+Enter: interrupt) ", "(Esc: undo) "]
+            &["Alt+Enter interrupt · Alt+E edit · Ctrl+X delete · Esc stop ", "Alt+Enter interrupt · Ctrl+X delete ", "Ctrl+X delete "]
         } else if queue_count > 0 {
-            &["(Alt+Enter: send now · Esc: undo) ", "(Alt+Enter: send now) ", "(Esc: undo) "]
+            &["Alt+Enter send now · Alt+E edit · Ctrl+X delete · Esc stop ", "Alt+Enter send now · Ctrl+X delete ", "Ctrl+X delete "]
         } else if !app.input_buffer.trim().is_empty() && !is_mobile {
             &[
                 "(Enter: queue · Alt+Enter: send now · Esc: cancel) ",
@@ -1899,6 +1875,9 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         let mgr = corex_tools::background::get_task_manager();
         let guard = mgr.lock().unwrap_or_else(|e| e.into_inner());
         crate::tasks_dialog::render_tasks_dialog(frame, composer_chunk, &mut app.tasks_dialog, &guard, &app.theme);
+    } else if app.settings_dialog.is_open {
+        let cfg = app.llm_client.get_config();
+        crate::settings_dialog::render_settings_dialog(frame, composer_chunk, &app.settings_dialog, &cfg, &app.theme);
     } else if app.model_dialog.is_open {
         render_model_dialog(frame, composer_chunk, &app.model_dialog, &app.theme);
     } else if app.rewind_dialog.is_open {
@@ -1964,6 +1943,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 
     let model_style = Style::default().fg(app.theme.muted);
     let sep_style = Style::default().fg(app.theme.border_dim);
+    let effort_style = Style::default().fg(app.theme.gray);
     let temp_color = if cfg.temperature > 1.2 {
         app.theme.warning
     } else {
@@ -1973,34 +1953,19 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     if is_flash {
         let effort = cfg.reasoning_effort.as_str();
 
-        let r_color = match effort {
-            "none" | "off" => app.theme.muted,
-            "low" => app.theme.effort_low,
-            "high" => app.theme.effort_high,
-            "xhigh" | "max" => app.theme.effort_max,
-            _ => app.theme.effort_high,
-        };
-
         right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4.1-Flash".to_string()), model_style));
-        if !is_mobile && crate::model_dialog::flash_thinking_off(effort) {
+        if !is_mobile && cfg.temperature_enabled && crate::model_dialog::flash_thinking_off(effort) {
             right_spans.push(Span::styled(" · ", sep_style));
             right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         }
         right_spans.push(Span::styled(" · ", sep_style));
-        right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
+        right_spans.push(Span::styled(format!("{} ", effort), effort_style));
     } else if is_pro {
         let effort = &cfg.pro_settings.reasoning_effort;
-        let r_color = match effort.as_str() {
-            "low" => app.theme.effort_low,
-            "medium" => app.theme.effort_high,
-            "high" | "max" => app.theme.effort_max,
-            _ => app.theme.effort_high,
-        };
-
         // No temperature here: the reasoning engine ignores it, so showing one would mislead.
         right_spans.push(Span::styled(display_name.unwrap_or_else(|| "DeepSeek-V4-Pro".to_string()), model_style));
         right_spans.push(Span::styled(" · ", sep_style));
-        right_spans.push(Span::styled(format!("{} ", effort), Style::default().fg(r_color)));
+        right_spans.push(Span::styled(format!("{} ", effort), effort_style));
     } else if cfg.model.starts_with("local") {
         right_spans.push(Span::styled(format!("Local: {}", cfg.local_llm_model), model_style));
         right_spans.push(Span::styled(" · ", sep_style));
@@ -2008,22 +1973,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     } else {
         let display_name = display_name.unwrap_or_else(|| cfg.model.clone());
 
-        let r_color = match cfg.reasoning_effort.as_str() {
-            "none" => app.theme.muted,
-            "low" => app.theme.effort_low,
-            "high" => app.theme.effort_high,
-            "xhigh" | "max" => app.theme.effort_max,
-            _ => app.theme.effort_high,
-        };
-
         right_spans.push(Span::styled(display_name, model_style));
-        if !is_mobile && corex_core::providers::applies_temperature(&cfg.model) {
+        if !is_mobile && cfg.temperature_active() {
             right_spans.push(Span::styled(" · ", sep_style));
             right_spans.push(Span::styled(format!("{:.1}", cfg.temperature), Style::default().fg(temp_color)));
         }
         if !cfg.reasoning_effort.is_empty() {
             right_spans.push(Span::styled(" · ", sep_style));
-            right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), Style::default().fg(r_color)));
+            right_spans.push(Span::styled(format!("{} ", cfg.reasoning_effort), effort_style));
         } else {
             right_spans.push(Span::raw(" "));
         }
@@ -2193,6 +2150,39 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
 }
 
 
+
+// Messages waiting to be sent, pinned above the activity bar next to the composer: steer
+// messages first, as the model will read them.
+fn pending_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    const MAX_ROWS: usize = 5;
+    let queued_note = if app.user_shell_rx.is_some() { "after the command" } else { "queued" };
+    let items: Vec<(&str, &str)> = app
+        .steer_messages
+        .iter()
+        .map(|m| (m.as_str(), "next step"))
+        .chain(app.message_queue.iter().map(|m| (m.as_str(), queued_note)))
+        .collect();
+    let shown = if items.len() > MAX_ROWS { MAX_ROWS - 1 } else { items.len() };
+    let mut lines: Vec<Line<'static>> = items[..shown]
+        .iter()
+        .map(|(text, note)| {
+            let first = text.lines().next().unwrap_or("");
+            let budget = width.saturating_sub(6 + note.len()).max(8);
+            Line::from(vec![
+                Span::styled("  ◦ ", Style::default().fg(app.theme.dark_gray)),
+                Span::styled(corex_core::truncate_ellipsis(first, budget), Style::default().fg(app.theme.gray)),
+                Span::styled(format!("  {note}"), Style::default().fg(app.theme.dark_gray)),
+            ])
+        })
+        .collect();
+    if items.len() > shown {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more", items.len() - shown),
+            Style::default().fg(app.theme.dark_gray),
+        )));
+    }
+    lines
+}
 
 fn footer_model(app: &mut App, cfg: &corex_core::config::Config) -> super::state::FooterModel {
     let limits = (cfg.context_window_tokens, cfg.compact_threshold_tokens);

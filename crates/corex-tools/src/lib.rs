@@ -1,6 +1,7 @@
 pub mod apply_patch;
 pub mod background;
 pub mod browser_tool;
+pub mod document;
 pub mod fs_tools;
 pub mod grep;
 pub mod policy;
@@ -11,7 +12,10 @@ pub mod web;
 pub mod web_content;
 pub mod extra_tools;
 pub mod mcp;
+pub mod mcp_index;
+pub mod grouped;
 pub mod memory_tool;
+pub mod settings_tool;
 pub mod subagent;
 
 pub use apply_patch::ApplyPatchTool;

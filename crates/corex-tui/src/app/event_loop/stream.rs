@@ -68,7 +68,7 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
             }
             if app.fleet_dialog.is_open {
                 app.fleet_dialog.status_msg = Some(summary.clone());
-                if name == "fleet_run_command" {
+                if name == "fleet_run_command" || name == "fleet" {
                     super::fleet::echo_remote_command(app, &call_id);
                 }
             }
@@ -86,7 +86,8 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
             }
         }
         StreamEvent::Completed { finish_reason } => on_completed(app, finish_reason.as_deref(), event_tx),
-        StreamEvent::ContextCompacted { compacted_messages, notice } => {
+        StreamEvent::ContextCompacted { mut compacted_messages, notice } => {
+            corex_core::session_images::restore_left_out_images(&mut compacted_messages);
             let before = std::mem::replace(&mut app.session.messages, compacted_messages);
             app.session.keep_history_before_compaction(&before);
             app.session.add_message(Message::system(notice));
@@ -98,9 +99,28 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
             app.session.add_message(Message::system(notice));
             app.invalidate_message_cache();
         }
+        StreamEvent::ServerToolCalls(calls) => {
+            app.streaming_server_tool_calls = Some(calls);
+        }
+        StreamEvent::Title(title) => {
+            if app.session.messages.iter().filter(|m| m.role == "user").count() <= 1 {
+                app.session.title = title.chars().take(50).collect();
+                app.session.save_async();
+            }
+        }
+        StreamEvent::ServerTool { done, summary, .. } => {
+            if done {
+                app.session.add_message(Message::system(summary));
+                app.invalidate_message_cache();
+            } else {
+                app.set_status(&format!("{summary}…"));
+            }
+        }
         StreamEvent::Error(err) => {
             app.is_streaming = false;
             app.in_flight_tool_calls = 0;
+            app.retried_unexpected_stop = false;
+            keep_partial_answer(app);
             app.thinking_state.reset();
             app.clear_status();
             app.session.add_message(Message::system(format!("Error: {}", err)));
@@ -117,12 +137,56 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
     }
 }
 
+fn keep_partial_answer(app: &mut App) {
+    let text = app.streaming_text.trim_end();
+    if text.is_empty() {
+        return;
+    }
+    let reasoning = (!app.thinking_state.content.is_empty()).then(|| app.thinking_state.content.clone());
+    app.session.add_message(Message::assistant(format!("{text} *(interrupted)*"), reasoning));
+}
+
+const REFUSED_NOTICE: &str = "The provider's content filter refused this answer.";
+
+fn unexpected_stop_notice(finish_reason: &str) -> Option<&'static str> {
+    Some(match finish_reason {
+        "content_filter" | "refusal" | "safety" | "SAFETY" | "blocklist" | "prohibited_content" => REFUSED_NOTICE,
+        "malformed_function_call" | "MALFORMED_FUNCTION_CALL" => "The model wrote a tool call the provider could not parse.",
+        "insufficient_system_resource" => "The provider ran out of capacity and cut the answer.",
+        "recitation" | "RECITATION" => "The provider stopped the answer for repeating source material.",
+        _ => return None,
+    })
+}
+
+fn is_retryable_stop(finish_reason: &str) -> bool {
+    matches!(finish_reason, "malformed_function_call" | "MALFORMED_FUNCTION_CALL" | "insufficient_system_resource")
+}
+
 /// True while a dialog waits for the user's answer before the turn can go on.
 pub(super) fn waiting_for_user(app: &App) -> bool {
     app.pending_confirmation.is_some()
         || app.sudo_dialog.is_open
         || app.user_dialog.is_open
         || app.fleet_dialog.pending_approval.is_some()
+}
+
+async fn apply_saved_setting(app: &mut App, args: &str) {
+    let Ok(args) = corex_core::parse_lenient_json(args) else { return };
+    let Some(key) = args.get("key").and_then(|k| k.as_str()) else { return };
+    let mut cfg = app.llm_client.get_config();
+    if cfg.set_agent_setting(key, args.get("value").cloned().unwrap_or_default()).is_err() {
+        return;
+    }
+    app.wheel_acceleration = cfg.wheel_acceleration;
+    let yolo = cfg.yolo_mode;
+    app.llm_client.update_config(cfg);
+    match key {
+        "yolo_mode" => app.set_yolo_mode(yolo),
+        "mcp_servers" => {
+            app.reload_mcp_servers().await;
+        }
+        _ => {}
+    }
 }
 
 async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: &EventTx) {
@@ -142,6 +206,12 @@ async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: 
         .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id))
         .map(|c| (c.function.name.clone(), c.function.arguments.clone()));
     let tool_name = called.as_ref().map(|(name, _)| name.clone());
+    let member_name = called.as_ref().map(|(name, args)| corex_tools::grouped::canonical_name_raw(name, args));
+    if let Some(("corex_settings", args)) = called.as_ref().map(|(n, a)| (n.as_str(), a)) {
+        if output.starts_with(corex_tools::settings_tool::SAVED_PREFIX) {
+            apply_saved_setting(app, args).await;
+        }
+    }
     // Huge output is cut to head + tail; the full text stays readable from a file.
     let output = corex_core::spill_large_output(tool_name.as_deref().unwrap_or("tool"), output);
     // Advisory nudge when the model keeps repeating the exact same call.
@@ -163,7 +233,7 @@ async fn on_tool_done(app: &mut App, call_id: String, output: String, event_tx: 
     }
 
     if app.fleet_dialog.is_open {
-        super::fleet::show_tool_output(app, tool_name.as_deref(), &output).await;
+        super::fleet::show_tool_output(app, member_name.as_deref(), &output).await;
     }
     if waiting_for_user(app) {
         if app.in_flight_tool_calls == 0 {
@@ -205,9 +275,33 @@ fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) 
         .collect();
 
     if valid_calls.is_empty() {
+        if let Some(notice) = finish_reason.and_then(unexpected_stop_notice) {
+            let reason = finish_reason.unwrap_or_default();
+            let retry = is_retryable_stop(reason) && !app.retried_unexpected_stop;
+            // A refused answer must not stay on screen; DeepSeek asks clients to remove it.
+            let refused = notice == REFUSED_NOTICE;
+            if let Some(txt) = assistant_text.filter(|_| !retry && !refused) {
+                app.session.add_message(Message::assistant(format!("{} *(interrupted)*", txt.trim_end()), reasoning));
+            }
+            app.streaming_text.clear();
+            let next = if retry { "Retrying once." } else { "Send a message to continue." };
+            app.session.add_message(Message::system(format!("{notice} (finish_reason: {reason}) {next}")));
+            app.invalidate_message_cache();
+            app.session.save_async();
+            if retry {
+                app.retried_unexpected_stop = true;
+                app.start_stream_turn(event_tx.clone());
+            } else {
+                app.retried_unexpected_stop = false;
+                pause_for_user(app);
+            }
+            return;
+        }
+        app.retried_unexpected_stop = false;
         finish_answer(app, assistant_text, reasoning, event_tx);
         return;
     }
+    app.retried_unexpected_stop = false;
 
     for call in &mut valid_calls {
         if call.extra_content.is_none() {
@@ -225,7 +319,9 @@ fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) 
             .and_then(|m| m.text_content())
             .is_some_and(|t| t == corex_core::TRUNCATED_TOOL_CALL_ERROR);
         let call_ids: Vec<String> = valid_calls.iter().map(|c| c.id.clone()).collect();
-        app.session.add_message(Message::assistant_with_tools(assistant_text, reasoning, valid_calls));
+        let mut msg = Message::assistant_with_tools(assistant_text, reasoning, valid_calls);
+        msg.server_tool_calls = app.streaming_server_tool_calls.take();
+        app.session.add_message(msg);
         for id in call_ids {
             app.session.add_message(Message::tool_response(
                 id,
@@ -247,9 +343,13 @@ fn on_completed(app: &mut App, finish_reason: Option<&str>, event_tx: &EventTx) 
     }
 
     let calls = valid_calls;
-    app.session.add_message(Message::assistant_with_tools(assistant_text, reasoning, calls.clone()));
+    let mut msg = Message::assistant_with_tools(assistant_text, reasoning, calls.clone());
+    msg.server_tool_calls = app.streaming_server_tool_calls.take();
+    app.session.add_message(msg);
     app.streaming_text.clear();
     app.streaming_extra_content = None;
+    app.thinking_state.reset();
+    app.thinking_state.is_streaming = true;
     app.session.save_async();
     dispatch_tool_calls(app, calls, event_tx);
 }
@@ -309,6 +409,7 @@ fn finish_answer(app: &mut App, assistant_text: Option<String>, reasoning: Optio
             txt = corex_core::language::clean_cjk_drift_from_text(&txt);
         }
         let mut assistant_msg = Message::assistant(txt, reasoning);
+        assistant_msg.server_tool_calls = app.streaming_server_tool_calls.take();
         assistant_msg.extra_content = app.streaming_extra_content.take();
         app.session.add_message(assistant_msg);
     }
@@ -330,5 +431,121 @@ fn finish_answer(app: &mut App, assistant_text: Option<String>, reasoning: Optio
         app.session.add_message(message);
         app.scroll_to_bottom();
         app.start_stream_turn(event_tx.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corex_core::client::LlmClient;
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn the_thought_moves_into_the_message_once_its_tool_calls_run() {
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        app.is_streaming = true;
+        app.thinking_state.content = "the button is there".to_string();
+        app.streaming_tool_calls.push(ToolCall::new("a", "missing_tool", "{}"));
+
+        handle_stream_event(&mut app, StreamEvent::Completed { finish_reason: Some("tool_calls".to_string()) }, &tx).await;
+
+        assert!(app.thinking_state.content.is_empty());
+        let last = app.session.messages.last().unwrap();
+        assert_eq!(last.reasoning_content.as_deref(), Some("the button is there"));
+    }
+
+    fn test_app() -> (App, EventTx) {
+        let app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        (app, tx)
+    }
+
+    #[tokio::test]
+    async fn an_error_mid_answer_keeps_what_was_written() {
+        let (mut app, tx) = test_app();
+        app.is_streaming = true;
+        app.streaming_text = "Half of the answer".to_string();
+
+        handle_stream_event(&mut app, StreamEvent::Error("closed early".to_string()), &tx).await;
+
+        let texts: Vec<String> = app.session.messages.iter().filter_map(|m| m.text_content().map(str::to_string)).collect();
+        assert!(texts.iter().any(|t| t == "Half of the answer *(interrupted)*"), "{texts:?}");
+        assert!(texts.last().unwrap().contains("closed early"), "{texts:?}");
+        assert!(!app.is_streaming);
+    }
+
+    #[tokio::test]
+    async fn a_content_filter_stop_says_why_the_answer_ended() {
+        let (mut app, tx) = test_app();
+        app.is_streaming = true;
+        app.streaming_text = "Partial".to_string();
+
+        handle_stream_event(&mut app, StreamEvent::Completed { finish_reason: Some("content_filter".to_string()) }, &tx).await;
+
+        let notice = app.session.messages.last().and_then(|m| m.text_content()).unwrap().to_string();
+        assert!(notice.contains("content filter") && notice.contains("content_filter"), "{notice}");
+        assert!(!app.is_streaming);
+        assert!(!app.retried_unexpected_stop);
+    }
+
+    #[tokio::test]
+    async fn the_answer_keeps_its_server_tool_calls_and_names_the_session() {
+        let (mut app, tx) = test_app();
+        app.session.add_message(Message::user("explícame un mutex"));
+        app.is_streaming = true;
+        app.streaming_text = "Un mutex protege un dato.".to_string();
+
+        handle_stream_event(&mut app, StreamEvent::ServerToolCalls(serde_json::json!([{"calls": [{"signature": "abc"}]}])), &tx).await;
+        handle_stream_event(&mut app, StreamEvent::Title("Mutex en Rust".to_string()), &tx).await;
+        handle_stream_event(&mut app, StreamEvent::Completed { finish_reason: Some("stop".to_string()) }, &tx).await;
+
+        assert_eq!(app.session.title, "Mutex en Rust");
+        let answer = app.session.messages.last().unwrap();
+        assert_eq!(answer.server_tool_calls.as_ref().unwrap()[0]["calls"][0]["signature"], "abc");
+    }
+
+    #[tokio::test]
+    async fn a_refused_answer_leaves_the_screen() {
+        let (mut app, tx) = test_app();
+        app.is_streaming = true;
+        app.streaming_text = "Something unsafe".to_string();
+
+        handle_stream_event(&mut app, StreamEvent::Completed { finish_reason: Some("content_filter".to_string()) }, &tx).await;
+
+        assert!(!app.session.messages.iter().any(|m| m.text_content().is_some_and(|t| t.contains("Something unsafe"))));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_tool_call_is_retried_once() {
+        let (mut app, tx) = test_app();
+        app.is_streaming = true;
+        let stop = || StreamEvent::Completed { finish_reason: Some("malformed_function_call".to_string()) };
+
+        handle_stream_event(&mut app, stop(), &tx).await;
+        assert!(app.retried_unexpected_stop);
+        assert!(app.is_streaming);
+
+        handle_stream_event(&mut app, stop(), &tx).await;
+        assert!(!app.retried_unexpected_stop);
+        assert!(!app.is_streaming);
+        let notice = app.session.messages.last().and_then(|m| m.text_content()).unwrap().to_string();
+        assert!(notice.contains("Send a message to continue"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn saving_providers_via_corex_settings_updates_model_dialog_live() {
+        let (mut app, _tx) = test_app();
+        let args = serde_json::json!({
+            "action": "set",
+            "key": "providers",
+            "value": [{"name": "nvidia", "models": [{"id": "moonshotai/kimi-k3.1-pro", "label": "Kimi K3.1 Pro"}]}]
+        }).to_string();
+        apply_saved_setting(&mut app, &args).await;
+        let cfg = app.llm_client.get_config();
+        app.model_dialog.open(&cfg);
+        let nv = app.model_dialog.providers.iter().find(|p| p.is_nvidia()).expect("nvidia");
+        assert_eq!(nv.models.len(), 1);
+        assert_eq!(nv.models[0].id, "moonshotai/kimi-k3.1-pro");
     }
 }

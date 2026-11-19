@@ -382,7 +382,7 @@ impl App {
                     let _ = self.session.save();
                     self.session.add_message(Message::system(format!("Switched and saved active model to '{}'.", new_model)));
                 } else {
-                    let cfg = self.llm_client.get_config();
+                    let cfg = self.refresh_providers_from_disk();
                     self.slash_popup_height_current = 0.0;
                     self.model_dialog.open(&cfg);
                 }
@@ -540,6 +540,61 @@ impl App {
                         • https://github.com/sluisr/corex/releases",
                         current
                     )
+                };
+                self.session.add_message(Message::system(msg));
+                true
+            }
+            "/settings" | "/config" => {
+                self.settings_dialog.open();
+                true
+            }
+            "/context-limit" => {
+                let mut cfg = self.llm_client.get_config();
+                if let Some(arg) = parts.get(1) {
+                    match parse_token_count(arg) {
+                        Some(0) => cfg.context_limit_tokens = None,
+                        Some(n) if n >= MIN_CONTEXT_LIMIT => cfg.context_limit_tokens = Some(n),
+                        _ => {
+                            self.session.add_message(Message::system(
+                                "Usage: /context-limit [auto|64k|128k|256k|512k|1m|<tokens>] (32k at least)",
+                            ));
+                            return true;
+                        }
+                    }
+                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
+                    self.llm_client.update_config(cfg.clone());
+                }
+                let (model_window, _) = cfg.model_context_window_with_source();
+                let limit = match cfg.context_limit_tokens {
+                    Some(n) => format!("limit {}", short_tokens(n)),
+                    None => "no limit".to_string(),
+                };
+                self.session.add_message(Message::system(format!(
+                    "Context: {limit} · this model takes {} · each request now carries up to {} and compacts at {}.",
+                    short_tokens(model_window),
+                    short_tokens(cfg.effective_history_limit()),
+                    short_tokens(cfg.effective_compact_threshold()),
+                )));
+                true
+            }
+            "/server-tools" => {
+                let mut cfg = self.llm_client.get_config();
+                let on = match parts.get(1).map(|a| a.to_lowercase()) {
+                    Some(a) if a == "on" => true,
+                    Some(a) if a == "off" => false,
+                    Some(_) => {
+                        self.session.add_message(Message::system("Usage: /server-tools [on|off]"));
+                        return true;
+                    }
+                    None => !cfg.deepseek_web_tools,
+                };
+                cfg.deepseek_web_tools = on;
+                let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
+                self.llm_client.update_config(cfg);
+                let msg = if on {
+                    "DeepSeek server search on: with deepseek-flash and thinking on, the model searches the web and reads the links you send on DeepSeek's side instead of calling web_search and web_fetch. With thinking off, Corex keeps its own tools: DeepSeek takes both kinds of tools together only in thinking mode. Each query and page is billed like the Search and Fetch APIs ($0.75 per 1,000)."
+                } else {
+                    "DeepSeek server search off: the model uses Corex's web_search and web_fetch tools."
                 };
                 self.session.add_message(Message::system(msg));
                 true
@@ -1109,7 +1164,8 @@ pub(crate) fn shortcuts_help() -> String {
         "  !command         run a shell command yourself; the agent sees its output next turn",
         "  Enter            send (queues while the agent works) · Alt+Enter: send now",
         "  Shift+Tab        cycle modes: normal · edits · plan · auto · full auto (red)",
-        "  Esc              take back a queued message, then cancel the reply",
+        "  Alt+E / Ctrl+X   on an empty prompt: edit / delete the newest queued message (also Alt+Up / Alt+Backspace)",
+        "  Esc              stop the reply (with text typed, a double Esc clears it)",
         "  Up / Down        prompt history (also Ctrl+P / Ctrl+N)",
         "  Ctrl+V           paste an image (or a copied image file) from the clipboard, or its text",
         "  Alt+V            paste the clipboard's text only, even if it is the path of an image",
@@ -1313,3 +1369,47 @@ mod stats_tests {
     }
 }
 
+const MIN_CONTEXT_LIMIT: usize = 32_000;
+
+fn parse_token_count(arg: &str) -> Option<usize> {
+    let arg = arg.trim().to_lowercase();
+    if matches!(arg.as_str(), "auto" | "off" | "none" | "max") {
+        return Some(0);
+    }
+    let (number, scale) = match arg.strip_suffix('k') {
+        Some(n) => (n, 1_000.0),
+        None => match arg.strip_suffix('m') {
+            Some(n) => (n, 1_000_000.0),
+            None => (arg.as_str(), 1.0),
+        },
+    };
+    let value: f64 = number.replace('_', "").parse().ok()?;
+    (value > 0.0).then(|| (value * scale) as usize)
+}
+
+fn short_tokens(n: usize) -> String {
+    if n >= 1_000_000 && n % 1_000_000 == 0 {
+        format!("{}M tokens", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k tokens", n / 1_000)
+    } else {
+        format!("{n} tokens")
+    }
+}
+
+#[cfg(test)]
+mod context_limit_tests {
+    use super::*;
+
+    #[test]
+    fn token_counts_take_k_and_m_suffixes() {
+        assert_eq!(parse_token_count("256k"), Some(256_000));
+        assert_eq!(parse_token_count("1M"), Some(1_000_000));
+        assert_eq!(parse_token_count("1.5m"), Some(1_500_000));
+        assert_eq!(parse_token_count("200000"), Some(200_000));
+        assert_eq!(parse_token_count("auto"), Some(0));
+        assert_eq!(parse_token_count("lots"), None);
+        assert_eq!(short_tokens(256_000), "256k tokens");
+        assert_eq!(short_tokens(1_000_000), "1M tokens");
+    }
+}

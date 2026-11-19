@@ -54,6 +54,9 @@ const YOLO_ON_MESSAGE: &str = "YOLO on: tools run without asking, except shell c
 const YOLO_ALL_ON_MESSAGE: &str = "YOLO ALL on: tools run without asking for ANY confirmation (all permissions bypassed).";
 const YOLO_OFF_MESSAGE: &str = "YOLO off: anything that changes files or runs a command asks first.";
 
+const MAX_PENDING_SCROLL: i32 = 120;
+const WHEEL_WINDOW: Duration = Duration::from_millis(120);
+
 impl App {
     pub fn new(llm_client: LlmClient, workspace_dir: PathBuf, yolo: bool) -> Self {
         let yolo_mode = if yolo { YoloMode::Normal } else { YoloMode::Off };
@@ -94,6 +97,7 @@ impl App {
             streaming_text: String::new(),
             streaming_tool_calls: Vec::new(),
             streaming_extra_content: None,
+            streaming_server_tool_calls: None,
 
             pending_confirmation: None,
             user_dialog: UserDialogState::new(),
@@ -101,6 +105,7 @@ impl App {
             model_dialog: ModelDialogState::new(),
             session_dialog: SessionDialogState::new(),
             tasks_dialog: Default::default(),
+            settings_dialog: Default::default(),
             auth_dialog,
             sudo_dialog: SudoDialogState::new(),
             fleet_dialog: FleetDialogState::new(),
@@ -128,6 +133,10 @@ impl App {
             inside_tmux: std::env::var_os("TMUX").is_some(),
             app_start_time: Instant::now(),
             last_focus_gained: None,
+            pending_full_repaint: false,
+            pending_scroll: 0,
+            wheel_events: Default::default(),
+            wheel_acceleration: cfg.wheel_acceleration,
             mouse_down_time: None,
             mouse_down_pos: None,
             last_url_open: None,
@@ -174,6 +183,7 @@ impl App {
             footer_model: None,
             active_background_pids: std::collections::HashSet::new(),
             pending_task_wakeup: false,
+            retried_unexpected_stop: false,
             current_generation_id: 0,
             update_available: Arc::new(std::sync::Mutex::new(corex_core::update::check_cached_update(env!("CARGO_PKG_VERSION")))),
             active_status: None,
@@ -255,8 +265,8 @@ impl App {
     /// Routes a mouse event: the wheel scrolls the feed, the left button selects text or opens links.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_selection(-wheel_lines()),
-            MouseEventKind::ScrollDown => self.scroll_selection(wheel_lines()),
+            MouseEventKind::ScrollUp => self.wheel(-1, Instant::now()),
+            MouseEventKind::ScrollDown => self.wheel(1, Instant::now()),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_down_time = Some(Instant::now());
                 self.mouse_down_pos = Some((mouse.column, mouse.row));
@@ -279,6 +289,51 @@ impl App {
     /// With the button held the pointer stays on the same screen row, so scrolling swaps the line
     /// underneath it. Moving the endpoint by the applied delta keeps the selection anchored to the
     /// text rather than to the screen, which is how a terminal behaves.
+    pub(crate) fn wheel(&mut self, direction: i32, now: Instant) {
+        let gap = self.wheel_events.back().map(|(t, _)| now.duration_since(*t));
+        if self.wheel_events.back().is_some_and(|(_, d)| *d != direction) {
+            self.wheel_events.clear();
+        }
+        self.wheel_events.push_back((now, direction));
+        while self.wheel_events.front().is_some_and(|(t, _)| now.duration_since(*t) > WHEEL_WINDOW) {
+            self.wheel_events.pop_front();
+        }
+        let rate = self.wheel_events.len();
+        let lines = match self.wheel_acceleration.thresholds() {
+            Some((_, three)) if rate >= three => 3,
+            Some((two, _)) if rate >= two => 2,
+            _ => 1,
+        };
+        crate::app::mobile::log_wheel(gap, rate, lines);
+        self.queue_scroll(direction * lines);
+    }
+
+    pub(crate) fn queue_scroll(&mut self, delta: i32) {
+        if crate::app::mobile::is_android_or_termux() {
+            self.scroll_selection(delta);
+            return;
+        }
+        if self.pending_scroll.signum() != delta.signum() {
+            self.pending_scroll = 0;
+        }
+        self.pending_scroll = (self.pending_scroll + delta).clamp(-MAX_PENDING_SCROLL, MAX_PENDING_SCROLL);
+    }
+
+    pub fn step_scroll(&mut self) -> bool {
+        if self.pending_scroll == 0 {
+            return false;
+        }
+        let step = ((self.pending_scroll.abs() + 2) / 3).max(1) * self.pending_scroll.signum();
+        let before = self.scroll_offset;
+        self.scroll_selection(step);
+        if self.scroll_offset == before {
+            self.pending_scroll = 0;
+            return false;
+        }
+        self.pending_scroll -= step;
+        true
+    }
+
     fn scroll_selection(&mut self, delta: i32) {
         let before = self.scroll_offset;
         self.scroll_chat(delta);
@@ -755,6 +810,7 @@ impl App {
             || self.auth_dialog.is_open
             || self.session_dialog.is_open
             || self.tasks_dialog.is_open
+            || self.settings_dialog.is_open
             || self.user_dialog.is_open;
 
         if is_modal_open {
@@ -1098,6 +1154,7 @@ impl App {
             || self.model_dialog.is_open
             || self.session_dialog.is_open
             || self.tasks_dialog.is_open
+            || self.settings_dialog.is_open
             || self.auth_dialog.is_open
             || self.user_dialog.is_open
             || self.rewind_dialog.is_open
@@ -1418,6 +1475,7 @@ impl App {
         self.streaming_text.clear();
         self.streaming_tool_calls.clear();
         self.streaming_extra_content = None;
+        self.streaming_server_tool_calls = None;
         self.thinking_state.reset();
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
@@ -1517,6 +1575,25 @@ impl App {
 
 
 impl App {
+    pub fn refresh_providers_from_disk(&mut self) -> Config {
+        let mut cfg = self.llm_client.get_config();
+        let disk = Config::load_with_workspace(Some(&self.workspace_dir));
+        if cfg.providers != disk.providers {
+            cfg.providers = disk.providers;
+            self.llm_client.update_config(cfg.clone());
+        }
+        cfg
+    }
+
+    /// Reopens `/model` on `provider`, where the key panel was opened from.
+    pub fn reopen_model_dialog_at(&mut self, provider: &str) {
+        let cfg = self.refresh_providers_from_disk();
+        self.model_dialog.open(&cfg);
+        if let Some(idx) = self.model_dialog.providers.iter().position(|p| p.name == provider) {
+            self.model_dialog.focus_provider(idx);
+        }
+    }
+
     /// Applies what the model dialog asked for after a key press.
     pub fn apply_model_dialog_action(&mut self, action: DialogAction) {
         match action {
@@ -1536,6 +1613,7 @@ impl App {
                     &p.api_key_env,
                     p.portal_url(),
                 );
+                self.auth_dialog.from_model_dialog = true;
             }
         }
     }
@@ -1604,6 +1682,7 @@ impl App {
                 &provider.api_key_env,
                 portal,
             );
+            self.auth_dialog.from_model_dialog = true;
             return;
         }
 
@@ -1647,7 +1726,7 @@ impl App {
                     if !generic_reasoning.is_empty() {
                         cfg.reasoning_effort = generic_reasoning.clone();
                     }
-                    if corex_core::providers::applies_temperature(&profile.id) {
+                    if cfg.temperature_enabled && corex_core::providers::applies_temperature(&profile.id) {
                         format!("- Temperature: {:.1}\n- Endpoint: {}", cfg.temperature, provider.base_url)
                     } else {
                         format!("- Endpoint: {}", provider.base_url)

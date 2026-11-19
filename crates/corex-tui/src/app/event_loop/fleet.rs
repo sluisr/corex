@@ -473,8 +473,15 @@ fn approval_key(app: &mut App, mut pending: PendingRemoteApproval, key: KeyEvent
 
 /// Answers the model's `fleet_run_command` call `call_id` with `output`.
 fn answer_remote_call(app: &mut App, call_id: String, output: String) {
+    let name = app
+        .session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| m.tool_calls.as_ref()?.iter().find(|c| c.id == call_id))
+        .map_or_else(|| "fleet_run_command".to_string(), |c| c.function.name.clone());
     let mut tool_msg = Message::tool_response(call_id, output);
-    tool_msg.name = Some("fleet_run_command".to_string());
+    tool_msg.name = Some(name);
     app.session.add_message(tool_msg);
 }
 
@@ -625,6 +632,9 @@ pub(super) fn echo_remote_command(app: &App, call_id: &str) {
         return;
     };
     let args = corex_core::parse_lenient_json(&call.function.arguments).unwrap_or(serde_json::Value::Null);
+    if corex_tools::grouped::canonical_name(&call.function.name, &args) != "fleet_run_command" {
+        return;
+    }
     let Some(command) = args.get("command").and_then(|c| c.as_str()) else {
         return;
     };

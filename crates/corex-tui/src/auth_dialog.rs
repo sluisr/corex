@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::overlay::{docked_height, docked_panel, key_hints, rail, Row};
+use crate::overlay::{docked_height, docked_panel_open_bottom, key_hints, rail, Row};
 use crate::theme::Theme;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,8 @@ pub struct AuthDialogState {
     pub api_key_env: String,
     pub portal_url: String,
     pub pending_activation: Option<(usize, usize)>,
+    // Opened from `/model`: closing it goes back there instead of to the chat.
+    pub from_model_dialog: bool,
 }
 
 impl Default for AuthDialogState {
@@ -36,6 +38,7 @@ impl AuthDialogState {
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             portal_url: "https://platform.deepseek.com".to_string(),
             pending_activation: None,
+            from_model_dialog: false,
         }
     }
 
@@ -59,6 +62,7 @@ impl AuthDialogState {
         self.api_key_env = env_var.to_string();
         self.portal_url = portal_url.to_string();
         self.pending_activation = pending;
+        self.from_model_dialog = false;
     }
 
     pub fn close(&mut self) {
@@ -66,6 +70,7 @@ impl AuthDialogState {
         self.input_buffer.clear();
         self.error_msg = None;
         self.pending_activation = None;
+        self.from_model_dialog = false;
     }
 }
 
@@ -88,7 +93,7 @@ pub fn env_override_note(provider: &str, new_key: &str) -> Option<String> {
 const BODY_ROWS: usize = 4;
 
 pub fn dialog_height(screen_height: u16) -> u16 {
-    docked_height(BODY_ROWS, screen_height)
+    docked_height(BODY_ROWS, screen_height).saturating_sub(1)
 }
 
 pub fn render_auth_dialog(
@@ -101,7 +106,7 @@ pub fn render_auth_dialog(
         return;
     }
 
-    let inner = docked_panel(frame, area, theme);
+    let inner = docked_panel_open_bottom(frame, area, theme);
     let dim = Style::default().fg(theme.dark_gray);
 
     // Fully masked: no character of the key is ever drawn.
