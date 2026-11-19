@@ -1443,6 +1443,26 @@ impl Config {
         }
     }
 
+    pub fn providers_from_disk() -> Option<Vec<crate::providers::ProviderConfig>> {
+        let path = Self::resolve_settings_path(None, "settings.json")?;
+        let content = fs::read_to_string(path).ok()?;
+        Self::providers_in(&content)
+    }
+
+    fn providers_in(content: &str) -> Option<Vec<crate::providers::ProviderConfig>> {
+        let value: serde_json::Value = serde_json::from_str(content).ok()?;
+        match value.get("providers") {
+            Some(list) => serde_json::from_value(list.clone()).ok(),
+            None => Some(Vec::new()),
+        }
+    }
+
+    fn keep_providers_from(&mut self, on_disk: Option<Vec<crate::providers::ProviderConfig>>) {
+        if let Some(list) = on_disk {
+            self.providers = list;
+        }
+    }
+
     /// True when `key` is the value of a provider API-key environment variable. Such keys are
     /// injected at load time (env > file) and must never be written into `settings.json`.
     fn is_env_supplied_key(key: &str) -> bool {
@@ -1465,17 +1485,20 @@ impl Config {
     }
 
     pub fn save_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
-        self.save_settings(workspace, false)
+        self.save_settings(workspace, false, false)
     }
 
     /// `write_mcp_servers` is true only from `/mcp add` and `/mcp remove`, the two edits made to
     /// the map in memory that must reach the file. Every other save keeps the map the file holds,
     /// so a process that started before `settings.json` was edited cannot write the old copy
     /// — an outdated key included — back over it.
-    fn save_settings(&self, workspace: Option<&Path>, write_mcp_servers: bool) -> anyhow::Result<()> {
+    fn save_settings(&self, workspace: Option<&Path>, write_mcp_servers: bool, write_providers: bool) -> anyhow::Result<()> {
         let mut to_save = self.clone();
         if !write_mcp_servers {
             to_save.keep_mcp_servers_from(Self::mcp_servers_from_disk());
+        }
+        if !write_providers {
+            to_save.keep_providers_from(Self::providers_from_disk());
         }
         // `-y` / Shift+Tab are per run; only a hand edit of the file makes YOLO stick.
         to_save.yolo_mode = Self::yolo_mode_from_disk();
@@ -1496,7 +1519,7 @@ impl Config {
     }
 
     pub fn save_agent_setting(&self, key: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
-        self.save_settings(workspace, key == "mcp_servers")
+        self.save_settings(workspace, key == "mcp_servers", key == "providers")
     }
 
     pub fn add_mcp_server(
@@ -1510,7 +1533,7 @@ impl Config {
         let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
         servers.insert(name, server);
         self.mcp_servers = servers;
-        self.save_settings(workspace, true)
+        self.save_settings(workspace, true, false)
     }
 
     pub fn remove_mcp_server(
@@ -1522,7 +1545,7 @@ impl Config {
         let existed = servers.remove(name).is_some();
         if existed {
             self.mcp_servers = servers;
-            self.save_settings(workspace, true)?;
+            self.save_settings(workspace, true, false)?;
         }
         Ok(existed)
     }
@@ -1770,6 +1793,25 @@ mod tests {
         let mut first_run = memory.clone();
         first_run.keep_mcp_servers_from(None);
         assert_eq!(first_run.mcp_servers["stitch"].headers["X-Goog-Api-Key"], "${STITCH_API_KEY}");
+    }
+
+    #[test]
+    fn a_save_keeps_the_providers_list_the_file_holds() {
+        let memory = Config::default();
+        let on_disk_json = r#"{
+            "providers": [
+                {
+                    "name": "nvidia",
+                    "models": [{ "id": "nvidia/nemotron-3.5-super-vl-120b-a12b" }]
+                }
+            ]
+        }"#;
+        let on_disk = Config::providers_in(on_disk_json);
+        let mut saved = memory.clone();
+        saved.keep_providers_from(on_disk);
+        assert_eq!(saved.providers.len(), 1);
+        assert_eq!(saved.providers[0].name, "nvidia");
+        assert_eq!(saved.providers[0].models[0].id, "nvidia/nemotron-3.5-super-vl-120b-a12b");
     }
 
 

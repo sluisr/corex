@@ -251,6 +251,9 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
                 .unwrap_or(raw_args);
             format!("Loading skill: {}", skill_name)
         }
+        "browser" => {
+            format!("Browser: {}", super::browser_run::describe(raw_args))
+        }
         _ => format!("Executing: {}", name),
     }
 }

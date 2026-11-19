@@ -51,6 +51,7 @@ fn joins_run(msg: &Message) -> bool {
 
 fn speaks(msg: &Message) -> bool {
     msg.text_content().is_some_and(|text| !text.trim().is_empty())
+        || msg.reasoning_content.as_deref().is_some_and(|cot| !cot.trim().is_empty())
 }
 
 pub fn run_start(messages: &[Message], idx: usize) -> Option<usize> {
@@ -265,6 +266,24 @@ mod tests {
         assert_eq!(run_start(&messages, 3), Some(3));
         assert_eq!(run_start(&messages, 6), Some(3));
         assert_eq!(run_end(&messages, 3, messages.len()), 7);
+    }
+
+    #[test]
+    fn a_step_with_reasoning_starts_its_own_group() {
+        let messages = vec![
+            Message::user("check the page"),
+            step(r#"{"action":"click","ref":"e1"}"#),
+            result("Clicked"),
+            Message {
+                reasoning_content: Some("Let me check another button".to_string()),
+                ..step(r#"{"action":"click","ref":"e2"}"#)
+            },
+            result("Clicked"),
+        ];
+        assert_eq!(run_start(&messages, 2), Some(1));
+        assert_eq!(run_end(&messages, 1, messages.len()), 3);
+        assert_eq!(run_start(&messages, 3), Some(3));
+        assert_eq!(run_end(&messages, 3, messages.len()), 5);
     }
 
     #[test]

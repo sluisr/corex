@@ -2124,6 +2124,41 @@ async fn test_rewind_reverts_files_and_returns_the_prompt() {
         assert!(!expanded.contains("✓ Browser · 1 step"), "{expanded}");
     }
 
+    #[tokio::test]
+    async fn browser_run_keeps_intermediate_thoughts_visible() {
+        let step = |id: &str, args: &str| Message {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall::new(id, "browser", args)]),
+            ..Default::default()
+        };
+        let result = |id: &str, text: &str| Message::tool_response(id, text);
+
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        app.is_streaming = true;
+        app.thinking_state.is_expanded = true;
+        app.session.add_message(Message::user("check colab".to_string()));
+        app.session.add_message(step("a", r#"{"action":"click","ref":"e1"}"#));
+        app.session.add_message(result("a", "Clicked"));
+        app.session.add_message(Message {
+            reasoning_content: Some("Need to click e2 next".to_string()),
+            ..step("b", r#"{"action":"click","ref":"e2"}"#)
+        });
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| crate::app::render::render_ui(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..40)
+            .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Need to click e2 next"), "{rendered}");
+        assert!(rendered.contains("✓ Browser · 1 step — clicking e1"), "{rendered}");
+        assert!(rendered.contains("● Browser · 1 step · 0s — clicking e2…"), "{rendered}");
+        assert_eq!(format_tool_call_summary("browser", r#"{"action":"click","ref":"e2"}"#), "Browser: clicking e2");
+    }
+
     #[test]
     fn a_batch_of_calls_keeps_each_output_under_its_own_call() {
         let theme = Theme::default();

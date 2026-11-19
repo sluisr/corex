@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.1] - 2026-11-19
+
+### Fixed
+- **Browser steps hid every `Thought` and reply that came after the first one**: when the model thought before each step of a `browser` run (`● Browser · 14 steps · 1m 04s`), the live `Thought` was drawn while it streamed and then vanished as soon as the step became part of the run, and the intermediate thoughts and any text they carried stayed hidden for good once the run was cached. `browser_run::speaks` only looked at visible text, so a step that only reasoned never closed the block it belonged to: a step carrying `reasoning_content` now ends the previous block and starts its own, so each thought stays on screen above the step it led to.
+- **`providers` was wiped by any save from a session that started without them**: `save_settings` re-read `mcp_servers` and `yolo_mode` from `settings.json` before writing (so an old copy could never be written back over a newer file) but not `providers`. A second `cx` window opened before the models were added wrote its empty list over `settings.json` the next time it saved anything, silently deleting every custom provider and its NVIDIA NIM models. `providers` is now re-read from disk like the MCP map, and is only written from memory by the `corex_settings` call that changes it.
+
+### Changed
+- **Browser steps name their action in the activity line**: a `browser` call now shows `Browser: clicking e2` instead of the generic `Executing: browser`.
+
 ## [0.13.0] - 2026-11-19
 
 ### Added
