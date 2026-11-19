@@ -2327,7 +2327,8 @@ mod tests {
 
         fs::write(ws.join("report.pdf"), [0x25u8, 0x50, 0x44, 0x46, 0x00, 0xff]).unwrap();
         let out = ReadFileTool.execute(json!({ "file_path": "report.pdf" }), &ctx).await.unwrap();
-        assert!(out.output.contains("ocr=true"), "{}", out.output);
+        let expected = if crate::web::resolve_api_key(&ctx).is_some() { "ocr=true" } else { "pdftotext" };
+        assert!(out.output.contains("It is a document:") && out.output.contains(expected), "{}", out.output);
         let _ = fs::remove_dir_all(&ws);
     }
 
