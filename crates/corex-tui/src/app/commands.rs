@@ -501,7 +501,7 @@ impl App {
                 true
             }
             "/settings" | "/config" => {
-                self.settings_dialog.open();
+                self.settings_dialog.open(&self.llm_client.get_config());
                 true
             }
             "/context-limit" => {

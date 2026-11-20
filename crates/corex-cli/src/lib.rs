@@ -972,7 +972,8 @@ async fn run_headless(
 
         if !assistant_text.is_empty() || !reasoning_text.is_empty() {
             let cot_opt = if reasoning_text.is_empty() { None } else { Some(reasoning_text) };
-            let final_msg = Message::assistant(assistant_text, cot_opt);
+            let mut final_msg = Message::assistant(assistant_text, cot_opt);
+            final_msg.extra_content = current_extra_content.take();
             session.add_message(final_msg);
         }
         break;

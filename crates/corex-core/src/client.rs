@@ -1348,7 +1348,7 @@ impl LlmClient {
         }
         let uses_responses_api = crate::responses_api::uses_responses_api(provider_kind, &cfg.model);
         if !uses_responses_api {
-            Self::strip_extra_key(&mut messages, crate::responses_api::REASONING_EXTRA_KEY);
+            Self::strip_extra_key(&mut messages, crate::responses_api::REPLAY_EXTRA_KEY);
         }
         if !cfg.can_see_images() {
             Self::replace_images_with_notes(&mut messages);
@@ -2010,12 +2010,7 @@ impl LlmClient {
         cancel_token: CancellationToken,
         auto_compact_event: Option<(Vec<Message>, String)>,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        let base_url = endpoint_url.trim_end_matches('/');
-        let url = if base_url.ends_with("/v1") {
-            format!("{}/responses", base_url)
-        } else {
-            format!("{}/v1/responses", base_url)
-        };
+        let url = crate::responses_api::responses_url(endpoint_url);
 
         let cfg = self.get_config();
         let request_body = crate::responses_api::build_responses_request(

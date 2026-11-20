@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] - 2026-11-20
+
+### Added
+- **Azure models search the web with Azure's Bing search**: GPT-5/6 and o-series deployments on Azure AI Foundry always get Azure's own `web_search` tool, so the model searches Bing on Azure's side inside the same request and answers with its sources cited, instead of calling Corex's `web_search`, which leaves their tool list (`web_fetch` stays). Each search shows as a line in the conversation (`Web search: rust 1.100 — 13 sources`), and its call is kept with the answer and sent back on the next turn. Azure bills every search (`tool_usage.web_search.num_requests`). There is no setting: it is how these models are served. DeepSeek deployments on Azure stay on Chat Completions, the only API where they reason and take a reasoning level, and Corex's `web_search` searches for them through Azure: with Azure active it sends a short search-only Responses request with the same `web_search` tool and hands the model the findings and their source URLs, instead of querying DuckDuckGo.
+
+### Changed
+- **`/settings` shows DeepSeek web tools only with DeepSeek**: the "DeepSeek web tools" row appeared with every provider although it only does something with DeepSeek. It now shows only while DeepSeek is active.
+
+### Fixed
+- **`cx -p` dropped what Azure needs on the next turn**: a headless answer without tool calls was saved without its encrypted reasoning, so resuming it with `cx -r` sent the model nothing of what it had thought. It is now kept with the answer, as in the TUI.
+
 ## [0.13.3] - 2026-11-20
 
 ### Fixed

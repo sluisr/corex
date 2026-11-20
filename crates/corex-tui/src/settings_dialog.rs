@@ -41,6 +41,7 @@ pub struct SettingsDialogState {
     pub is_open: bool,
     pub selected: usize,
     pub notice: Option<String>,
+    rows: Vec<Setting>,
 }
 
 pub enum SettingsAction {
@@ -49,13 +50,25 @@ pub enum SettingsAction {
     Change(Setting, bool),
 }
 
-pub fn dialog_height(screen_height: u16) -> u16 {
-    docked_height(SETTINGS.len(), screen_height).saturating_sub(2)
+pub fn visible_settings(cfg: &Config) -> Vec<Setting> {
+    let deepseek = cfg.provider_kind() == corex_core::providers::ProviderKind::DeepSeek;
+    SETTINGS
+        .into_iter()
+        .filter(|setting| deepseek || *setting != Setting::DeepseekWebTools)
+        .collect()
 }
 
 impl SettingsDialogState {
-    pub fn open(&mut self) {
-        *self = Self { is_open: true, ..Self::default() };
+    pub fn open(&mut self, cfg: &Config) {
+        *self = Self { is_open: true, rows: visible_settings(cfg), ..Self::default() };
+    }
+
+    pub fn dialog_height(&self, screen_height: u16) -> u16 {
+        docked_height(self.rows.len(), screen_height).saturating_sub(2)
+    }
+
+    fn selected_setting(&self) -> Option<Setting> {
+        self.rows.get(self.selected.min(self.rows.len().saturating_sub(1))).copied()
     }
 
     pub fn close(&mut self) {
@@ -64,7 +77,9 @@ impl SettingsDialogState {
 
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
-        let setting = SETTINGS[self.selected.min(SETTINGS.len() - 1)];
+        let Some(setting) = self.selected_setting() else {
+            return if code == KeyCode::Esc { SettingsAction::Close } else { SettingsAction::None };
+        };
         match code {
             KeyCode::Esc => SettingsAction::Close,
             KeyCode::Up => {
@@ -72,7 +87,7 @@ impl SettingsDialogState {
                 SettingsAction::None
             }
             KeyCode::Down => {
-                self.selected = (self.selected + 1).min(SETTINGS.len() - 1);
+                self.selected = (self.selected + 1).min(self.rows.len() - 1);
                 SettingsAction::None
             }
             KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => SettingsAction::Change(setting, true),
@@ -200,10 +215,11 @@ pub fn render_settings_dialog(frame: &mut Frame, area: Rect, state: &SettingsDia
         rows[0],
     );
 
-    let selected = state.selected.min(SETTINGS.len() - 1);
+    let selected = state.selected.min(state.rows.len().saturating_sub(1));
     let visible = (rows[1].height as usize).max(1);
     let offset = (selected + 1).saturating_sub(visible);
-    let lines: Vec<Line<'static>> = SETTINGS
+    let lines: Vec<Line<'static>> = state
+        .rows
         .iter()
         .enumerate()
         .skip(offset)
@@ -224,8 +240,8 @@ pub fn render_settings_dialog(frame: &mut Frame, area: Rect, state: &SettingsDia
         .collect();
     frame.render_widget(Paragraph::new(lines), rows[1]);
 
-    if compact {
-        let text = fit_text(&hint(cfg, SETTINGS[selected]), width.saturating_sub(4));
+    if let Some(setting) = state.selected_setting().filter(|_| compact) {
+        let text = fit_text(&hint(cfg, setting), width.saturating_sub(4));
         frame.render_widget(Paragraph::new(Span::styled(format!("   {text}"), dim)), rows[2]);
     }
 
@@ -262,30 +278,38 @@ mod tests {
     #[test]
     fn keys_move_and_change() {
         let mut state = SettingsDialogState::default();
-        state.open();
+        state.open(&Config::default());
         state.handle_key(KeyCode::Down);
         assert!(matches!(state.handle_key(KeyCode::Right), SettingsAction::Change(Setting::AutoCompact, true)));
         assert!(matches!(state.handle_key(KeyCode::Left), SettingsAction::Change(Setting::AutoCompact, false)));
         for _ in 0..10 {
             state.handle_key(KeyCode::Down);
         }
-        assert_eq!(state.selected, SETTINGS.len() - 1);
+        assert_eq!(state.selected, state.rows.len() - 1);
         assert!(matches!(state.handle_key(KeyCode::Esc), SettingsAction::Close));
     }
 
     #[test]
-    fn panel_lists_every_setting() {
+    fn panel_lists_every_setting_of_the_active_provider() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
-        let cfg = Config::default();
-        let mut state = SettingsDialogState::default();
-        state.open();
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|f| render_settings_dialog(f, Rect::new(0, 20 - dialog_height(20), 100, dialog_height(20)), &state, &cfg, &Theme::default())).unwrap();
-        let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        for setting in SETTINGS {
+        let draw = |cfg: &Config| {
+            let mut state = SettingsDialogState::default();
+            state.open(cfg);
+            let h = state.dialog_height(20);
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal.draw(|f| render_settings_dialog(f, Rect::new(0, 20 - h, 100, h), &state, cfg, &Theme::default())).unwrap();
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+        let deepseek = Config { active_provider: Some("deepseek".into()), ..Config::default() };
+        let screen = draw(&deepseek);
+        for setting in visible_settings(&deepseek) {
             assert!(screen.contains(label(setting)), "{}", label(setting));
         }
+        assert!(screen.contains(label(Setting::DeepseekWebTools)));
+
+        let azure = Config { active_provider: Some("azure".into()), ..Config::default() };
+        assert!(!draw(&azure).contains(label(Setting::DeepseekWebTools)));
     }
 
     #[test]
@@ -294,11 +318,12 @@ mod tests {
         use ratatui::Terminal;
         let cfg = Config::default();
         let mut state = SettingsDialogState::default();
-        state.open();
-        state.selected = SETTINGS.len() - 1;
+        state.open(&cfg);
+        state.selected = state.rows.len() - 1;
         let h = 14;
+        let height = state.dialog_height(h);
         let mut terminal = Terminal::new(TestBackend::new(100, h)).unwrap();
-        terminal.draw(|f| render_settings_dialog(f, Rect::new(0, h - dialog_height(h), 100, dialog_height(h)), &state, &cfg, &Theme::default())).unwrap();
+        terminal.draw(|f| render_settings_dialog(f, Rect::new(0, h - height, 100, height), &state, &cfg, &Theme::default())).unwrap();
         let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
         assert!(screen.contains(label(Setting::LocalPromptLite)));
     }

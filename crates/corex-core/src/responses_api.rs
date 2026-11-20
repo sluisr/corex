@@ -2,18 +2,84 @@ use crate::client::StreamEvent;
 use crate::types::{Message, MessageContent, ToolDefinition, Usage};
 use serde_json::{json, Value};
 
-pub const REASONING_EXTRA_KEY: &str = "responses_reasoning";
+pub const REPLAY_EXTRA_KEY: &str = "responses_reasoning";
 
+// DeepSeek on Azure only reasons through Chat Completions, so it stays there.
 pub fn uses_responses_api(kind: crate::providers::ProviderKind, model: &str) -> bool {
-    if kind != crate::providers::ProviderKind::Azure {
-        return false;
-    }
+    kind == crate::providers::ProviderKind::Azure && is_openai_reasoning_model(model)
+}
+
+// Other models served through Responses (DeepSeek) reject the `reasoning` parameter.
+fn is_openai_reasoning_model(model: &str) -> bool {
     let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
-    m.starts_with("gpt-6")
-        || m.starts_with("gpt-5")
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
+    ["gpt-6", "gpt-5", "o1", "o3", "o4"].iter().any(|prefix| m.starts_with(prefix))
+}
+
+pub fn responses_url(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/responses")
+    } else {
+        format!("{base}/v1/responses")
+    }
+}
+
+// DeepSeek on Azure must stay on Chat Completions to reason, so its searches go through this.
+pub fn web_search_request(model: &str, queries: &[String]) -> Value {
+    let list: Vec<String> = queries.iter().map(|q| format!("- {q}")).collect();
+    json!({
+        "model": model,
+        "input": format!(
+            "Search the web for each of these queries. Reply only with the facts found, each with its source URL: no greeting, no preamble, no description of the search, nothing from memory.\n{}",
+            list.join("\n")
+        ),
+        "tools": [{ "type": "web_search" }],
+        "include": ["web_search_call.action.sources"],
+        "store": false,
+    })
+}
+
+pub fn web_search_results(response: &Value) -> Option<String> {
+    let output = response.get("output")?.as_array()?;
+    let mut text = String::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut add = |line: String| {
+        if !sources.contains(&line) {
+            sources.push(line);
+        }
+    };
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item["content"].as_array().into_iter().flatten() {
+                    text.push_str(part["text"].as_str().unwrap_or_default());
+                    for a in part["annotations"].as_array().into_iter().flatten() {
+                        if let Some(url) = a["url"].as_str() {
+                            add(match a["title"].as_str().filter(|t| !t.is_empty()) {
+                                Some(title) => format!("- {title} — {url}"),
+                                None => format!("- {url}"),
+                            });
+                        }
+                    }
+                }
+            }
+            Some("web_search_call") => {
+                for source in item["action"]["sources"].as_array().into_iter().flatten() {
+                    if let Some(url) = source["url"].as_str() {
+                        add(format!("- {url}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if text.trim().is_empty() && sources.is_empty() {
+        return None;
+    }
+    if sources.is_empty() {
+        return Some(text.trim().to_string());
+    }
+    Some(format!("{}\n\nSources:\n{}", text.trim(), sources.join("\n")))
 }
 
 pub fn build_responses_request(
@@ -72,7 +138,7 @@ pub fn build_responses_request(
                 input.push(json!({ "role": "user", "content": parts }));
             }
             "assistant" => {
-                input.extend(reasoning_items(msg, model));
+                input.extend(replay_items(msg, model));
                 if let Some(text) = msg.text_content() {
                     if !text.is_empty() {
                         input.push(json!({
@@ -106,61 +172,60 @@ pub fn build_responses_request(
         }
     }
 
-    let effort = match reasoning_effort.to_ascii_lowercase().as_str() {
-        "none" | "off" | "false" | "minimal" | "low" => "low",
-        "high" => "high",
-        "xhigh" | "max" => "xhigh",
-        _ => "medium",
-    };
-
     let mut body = json!({
         "model": model,
         "input": input,
         "stream": true,
         "store": false,
-        "include": ["reasoning.encrypted_content"],
-        "reasoning": {
-            "effort": effort,
-            "summary": "auto"
-        }
     });
+    let mut include = vec!["web_search_call.action.sources"];
+    if is_openai_reasoning_model(model) {
+        let effort = match reasoning_effort.to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "minimal" | "low" => "low",
+            "high" => "high",
+            "xhigh" | "max" => "xhigh",
+            _ => "medium",
+        };
+        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        include.insert(0, "reasoning.encrypted_content");
+    }
+    body["include"] = json!(include);
 
     if !system_parts.is_empty() {
         body["instructions"] = json!(system_parts.join("\n\n"));
     }
 
-    if let Some(tool_list) = tools {
-        if !tool_list.is_empty() {
-            let mapped: Vec<Value> = tool_list
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "name": t.function.name,
-                        "description": t.function.description,
-                        "parameters": t.function.parameters,
-                        "strict": false
-                    })
-                })
-                .collect();
-            body["tools"] = json!(mapped);
-        }
-    }
+    let mut mapped: Vec<Value> = tools
+        .unwrap_or_default()
+        .iter()
+        .filter(|t| t.function.name != "web_search")
+        .map(|t| {
+            json!({
+                "type": "function",
+                "name": t.function.name,
+                "description": t.function.description,
+                "parameters": t.function.parameters,
+                "strict": false
+            })
+        })
+        .collect();
+    mapped.push(json!({ "type": "web_search" }));
+    body["tools"] = json!(mapped);
 
     body
 }
 
 // Encrypted reasoning only decodes for the model that wrote it.
-fn reasoning_items(msg: &Message, model: &str) -> Vec<Value> {
+fn replay_items(msg: &Message, model: &str) -> Vec<Value> {
     let saved = msg
         .extra_content
         .as_ref()
-        .and_then(|ec| ec.get(REASONING_EXTRA_KEY))
+        .and_then(|ec| ec.get(REPLAY_EXTRA_KEY))
         .or_else(|| {
             msg.tool_calls
                 .as_ref()?
                 .iter()
-                .find_map(|tc| tc.extra_content.as_ref()?.get(REASONING_EXTRA_KEY))
+                .find_map(|tc| tc.extra_content.as_ref()?.get(REPLAY_EXTRA_KEY))
         });
     match saved {
         Some(saved) if saved.get("model").and_then(Value::as_str) == Some(model) => saved
@@ -178,7 +243,7 @@ use std::collections::HashMap;
 pub struct ResponsesStreamState {
     tool_indices: HashMap<usize, usize>,
     next_tool_index: usize,
-    reasoning: Vec<Value>,
+    replay: Vec<Value>,
     model: String,
 }
 
@@ -238,15 +303,26 @@ pub fn parse_responses_sse_data(data: &str, state: &mut ResponsesStreamState) ->
                 }
             }
         }
+        "response.web_search_call.searching" => {
+            let id = v.get("item_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            events.push(StreamEvent::ServerTool { id, done: false, summary: "Web search".to_string() });
+        }
         "response.output_item.done" => {
-            if let Some(item) = v.get("item").filter(|i| i.get("type").and_then(Value::as_str) == Some("reasoning")) {
-                if item.get("encrypted_content").and_then(Value::as_str).is_some_and(|c| !c.is_empty()) {
-                    let mut item = item.clone();
+            let item = v.get("item").cloned().unwrap_or_default();
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") if item.get("encrypted_content").and_then(Value::as_str).is_some_and(|c| !c.is_empty()) => {
+                    let mut item = item;
                     if let Some(obj) = item.as_object_mut() {
                         obj.remove("status");
                     }
-                    state.reasoning.push(item);
+                    state.replay.push(item);
                 }
+                Some("web_search_call") => {
+                    let id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    events.push(StreamEvent::ServerTool { id, done: true, summary: describe_web_search(&item) });
+                    state.replay.push(item);
+                }
+                _ => {}
             }
         }
         "response.function_call_arguments.delta" => {
@@ -267,9 +343,9 @@ pub fn parse_responses_sse_data(data: &str, state: &mut ResponsesStreamState) ->
                 if let Some(u) = resp.get("usage") {
                     events.push(StreamEvent::UsageUpdate(usage_from(u)));
                 }
-                if !state.reasoning.is_empty() {
+                if !state.replay.is_empty() {
                     events.push(StreamEvent::ExtraContentDelta(json!({
-                        REASONING_EXTRA_KEY: { "model": state.model, "items": std::mem::take(&mut state.reasoning) }
+                        REPLAY_EXTRA_KEY: { "model": state.model, "items": std::mem::take(&mut state.replay) }
                     })));
                 }
                 events.push(StreamEvent::Completed { finish_reason: Some(finish_reason(ev_type, resp).to_string()) });
@@ -290,6 +366,28 @@ pub fn parse_responses_sse_data(data: &str, state: &mut ResponsesStreamState) ->
     }
 
     events
+}
+
+fn describe_web_search(item: &Value) -> String {
+    let action = &item["action"];
+    let url = action["url"].as_str().unwrap_or_default();
+    let what = match action["type"].as_str() {
+        Some("open_page") => format!("Opened {url}"),
+        Some("find_in_page") => format!("Searched \"{}\" in {url}", action["pattern"].as_str().unwrap_or_default()),
+        _ => {
+            let mut queries: Vec<&str> = action["queries"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            if queries.is_empty() {
+                queries.extend(action["query"].as_str());
+            }
+            format!("Web search: {}", queries.join(" · "))
+        }
+    };
+    let failed = item["status"].as_str() == Some("failed");
+    match action["sources"].as_array().map(Vec::len) {
+        _ if failed => format!("{what} — failed"),
+        Some(n) if n > 0 => format!("{what} — {n} sources"),
+        _ => what,
+    }
 }
 
 fn usage_from(u: &Value) -> Usage {
@@ -421,5 +519,61 @@ mod tests {
         let filtered = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#;
         let evs = parse_responses_sse_data(filtered, &mut state);
         assert!(matches!(evs.last(), Some(StreamEvent::Completed { finish_reason: Some(r) }) if r == "content_filter"));
+    }
+
+    #[test]
+    fn web_search_replaces_corex_search_and_skips_reasoning_for_deepseek() {
+        let tool = |name: &str| ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition { name: name.into(), description: String::new(), parameters: json!({"type": "object"}) },
+        };
+        let tools = vec![tool("web_search"), tool("read_file")];
+        let messages = vec![Message::user("hi")];
+
+        let req = build_responses_request("DeepSeek-V4.1-Flash-1017", &messages, Some(&tools), "high");
+        let names: Vec<&str> = req["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap_or(t["type"].as_str().unwrap())).collect();
+        assert_eq!(names, ["read_file", "web_search"]);
+        assert_eq!(req["tools"][1]["type"], "web_search");
+        assert!(req.get("reasoning").is_none());
+        assert_eq!(req["include"], json!(["web_search_call.action.sources"]));
+
+        let gpt = build_responses_request("gpt-6.2-astra", &messages, Some(&tools), "high");
+        assert_eq!(gpt["reasoning"]["effort"], "high");
+        assert_eq!(gpt["include"], json!(["reasoning.encrypted_content", "web_search_call.action.sources"]));
+
+        assert!(uses_responses_api(crate::providers::ProviderKind::Azure, "gpt-6.2-astra"));
+        assert!(!uses_responses_api(crate::providers::ProviderKind::Azure, "DeepSeek-V4.1-Flash-1017"));
+    }
+
+    #[test]
+    fn a_web_search_shows_as_a_line_and_is_kept_for_the_next_turn() {
+        let mut state = ResponsesStreamState::new("gpt-6.2-astra");
+        let searching = r#"{"type":"response.web_search_call.searching","item_id":"ws_1"}"#;
+        assert!(matches!(&parse_responses_sse_data(searching, &mut state)[0], StreamEvent::ServerTool { done: false, .. }));
+        let done = r#"{"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","queries":["rust 1.95"],"sources":[{"type":"url","url":"https://blog.rust-lang.org"}]}}}"#;
+        let evs = parse_responses_sse_data(done, &mut state);
+        assert!(matches!(&evs[0], StreamEvent::ServerTool { done: true, summary, .. } if summary == "Web search: rust 1.95 — 1 sources"), "{evs:?}");
+        let completed = r#"{"type":"response.completed","response":{"output":[]}}"#;
+        let evs = parse_responses_sse_data(completed, &mut state);
+        let StreamEvent::ExtraContentDelta(extra) = &evs[0] else { panic!("{evs:?}") };
+        assert_eq!(extra[REPLAY_EXTRA_KEY]["items"][0]["type"], "web_search_call");
+    }
+
+    #[test]
+    fn a_search_only_request_comes_back_as_text_with_its_sources() {
+        let req = web_search_request("DeepSeek-V4.1-Flash-1017", &["rust 1.100".to_string()]);
+        assert_eq!(req["tools"][0]["type"], "web_search");
+        assert!(req["input"].as_str().unwrap().contains("- rust 1.100"));
+        assert!(req.get("reasoning").is_none());
+
+        let response = json!({"output": [
+            {"type": "web_search_call", "action": {"type": "search", "sources": [{"type": "url", "url": "https://blog.rust-lang.org/a"}, {"type": "url", "url": "https://x.dev"}]}},
+            {"type": "message", "content": [{"type": "output_text", "text": "Rust 1.100 shipped.", "annotations": [{"type": "url_citation", "url": "https://blog.rust-lang.org/a", "title": "Announcing"}]}]}
+        ]});
+        let text = web_search_results(&response).unwrap();
+        assert!(text.starts_with("Rust 1.100 shipped.\n\nSources:\n"), "{text}");
+        assert!(text.contains("- https://blog.rust-lang.org/a") && text.contains("- Announcing — https://blog.rust-lang.org/a") && text.contains("- https://x.dev"));
+        assert_eq!(responses_url("https://r.services.ai.azure.com/openai/v1/"), "https://r.services.ai.azure.com/openai/v1/responses");
+        assert!(web_search_results(&json!({"output": []})).is_none());
     }
 }

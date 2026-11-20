@@ -1222,7 +1222,7 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
     } else if app.tasks_dialog.is_open {
         crate::tasks_dialog::dialog_height(size.height)
     } else if app.settings_dialog.is_open {
-        crate::settings_dialog::dialog_height(size.height)
+        app.settings_dialog.dialog_height(size.height)
     } else if app.model_dialog.is_open {
         app.model_dialog.height(size.width, size.height)
     } else if app.rewind_dialog.is_open {
