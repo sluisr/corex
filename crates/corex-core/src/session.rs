@@ -216,6 +216,11 @@ impl Session {
         self.rewind_to_turn(last)
     }
 
+    pub fn existing_workspace(&self) -> Option<PathBuf> {
+        let dir = PathBuf::from(self.workspace_dir.as_deref()?.trim());
+        dir.is_dir().then_some(dir)
+    }
+
     pub fn sessions_dir() -> PathBuf {
         crate::config::corex_home().join("sessions")
     }

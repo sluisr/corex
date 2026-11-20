@@ -215,27 +215,7 @@ impl App {
                         if parts.len() > 2 {
                             let target = parts[2..].join(" ");
                             match Session::load_by_id_or_tag(&target) {
-                                Ok(mut loaded) => {
-                                    let mut cfg = self.llm_client.get_config();
-                                    cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
-                                    if let Some(t) = loaded.temperature {
-                                        cfg.temperature = t;
-                                    }
-                                    if let Some(ref r) = loaded.reasoning_effort {
-                                        cfg.reasoning_effort = r.clone();
-                                    }
-                                    loaded.provider = cfg.active_provider.clone();
-                                    self.llm_client.update_config(cfg);
-                                    corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
-                                    let title = loaded.title.clone();
-                                    let model = loaded.model.clone();
-                                    self.session = loaded;
-                                    self.cached_session_id.clear();
-                                    self.invalidate_message_cache();
-                                    self.clear_selection();
-                                    self.scroll_to_bottom();
-                                    self.session.add_message(Message::system(format!("Resumed session '{}' (Model: {}).", title, model)));
-                                }
+                                Ok(loaded) => self.resume_into(loaded, false),
                                 Err(e) => {
                                     self.session.add_message(Message::system(format!("Error: {}", e)));
                                 }
@@ -284,31 +264,7 @@ impl App {
                 if parts.len() > 1 {
                     let target = parts[1..].join(" ");
                     match Session::load_by_id_or_tag(&target) {
-                        Ok(mut loaded) => {
-                            let mut cfg = self.llm_client.get_config();
-                            cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
-                            if let Some(t) = loaded.temperature {
-                                cfg.temperature = t;
-                            }
-                            if let Some(ref r) = loaded.reasoning_effort {
-                                cfg.reasoning_effort = r.clone();
-                            }
-                            loaded.provider = cfg.active_provider.clone();
-                            self.llm_client.update_config(cfg);
-                            corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
-                            let title = loaded.title.clone();
-                            let model = loaded.model.clone();
-                            if is_fleet {
-                                loaded.tag = Some("fleet".to_string());
-                            }
-                            self.session = loaded;
-                            self.cached_session_id.clear();
-                            self.invalidate_message_cache();
-                            self.clear_selection();
-                            self.scroll_to_bottom();
-                            let label = if is_fleet { "Fleet session" } else { "session" };
-                            self.session.add_message(Message::system(format!("Resumed {} '{}' (Model: {}).", label, title, model)));
-                        }
+                        Ok(loaded) => self.resume_into(loaded, is_fleet),
                         Err(e) => {
                             self.session.add_message(Message::system(format!("Error: {}", e)));
                         }

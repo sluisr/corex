@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.13.3] - 2026-11-20
+
+### Fixed
+- **Resuming a session left you in the wrong folder**: a session remembers the folder it was started in, but `cx --resume`, `/resume`, `/chat resume` and the session picker kept the folder `cx` was opened from, so a session from `~/proyects/cx` resumed in `~/proyects` ran its commands, read its files and completed `@path` there. Resuming now moves to the session's folder (the shell, file tools, `@path`, the git branch, the status bar and the window title follow it) and says so in the resume notice; a folder that no longer exists is reported and the current one kept. `cx --resume` starts there from the first frame, and `-C`/`--directory` still wins when given.
+
 ## [0.13.2] - 2026-11-20
 
 ### Added

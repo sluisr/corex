@@ -34,7 +34,7 @@ pub fn project_key(workspace: &Path) -> String {
         .collect()
 }
 
-/// The model a directory last used, kept in the user's home so it may name the provider too.
+// Lives outside the repository, so unlike `.corex/settings.json` it may set the provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +79,6 @@ impl ProjectState {
         Ok(())
     }
 
-    /// Ignored when its provider is gone or no longer serves the model.
     pub fn apply_to(&self, cfg: &mut Config) -> bool {
         let known = match self.active_provider.as_deref() {
             Some(name) => cfg.all_providers().into_iter().any(|p| {

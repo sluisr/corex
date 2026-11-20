@@ -297,32 +297,9 @@ pub(super) fn session_key(app: &mut App, key: KeyEvent) -> Flow {
 /// Loads the session `session_id` picked in the dialog, with its model settings.
 fn resume_session(app: &mut App, session_id: &str) {
     match Session::load_by_id_or_tag(session_id) {
-        Ok(mut loaded) => {
-            let mut cfg = app.llm_client.get_config();
-            cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
-            if let Some(t) = loaded.temperature {
-                cfg.temperature = t;
-            }
-            if let Some(ref r) = loaded.reasoning_effort {
-                cfg.reasoning_effort = r.clone();
-            }
-            loaded.provider = cfg.active_provider.clone();
-            app.llm_client.update_config(cfg);
-            corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(app.llm_client.clone()));
+        Ok(loaded) => {
             let is_fleet = app.session_dialog.is_fleet;
-            if is_fleet {
-                loaded.tag = Some("fleet".to_string());
-            }
-            app.session = loaded;
-            app.cached_session_id.clear();
-            app.invalidate_message_cache();
-            app.clear_selection();
-            app.scroll_to_bottom();
-            let label = if is_fleet { "Fleet session" } else { "session" };
-            app.session.add_message(Message::system(format!(
-                "Resumed {} '{}' (Model: {}).",
-                label, app.session.title, app.session.model
-            )));
+            app.resume_into(loaded, is_fleet);
         }
         Err(e) => {
             app.session.add_message(Message::system(format!("Failed to load session: {}", e)));

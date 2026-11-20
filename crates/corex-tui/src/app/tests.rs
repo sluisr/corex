@@ -2390,3 +2390,23 @@ mod smooth_scroll {
         assert_eq!(lines(&mut app, base + Duration::from_millis(500)), 1, "a pause resets the speed");
     }
 }
+
+    #[tokio::test]
+    async fn resuming_a_session_moves_to_the_folder_it_worked_in() {
+        let worked_in = std::env::temp_dir().join(format!("corex-resume-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&worked_in).unwrap();
+        let mut app = App::new(LlmClient::new(corex_core::config::Config::default()), PathBuf::from("/"), false);
+        let mut saved = Session::new_with_params("deepseek-flash", 1.0, "high", Some(&worked_in));
+        saved.add_message(Message::user("hola"));
+
+        app.resume_into(saved, false);
+        assert_eq!(app.workspace_dir, worked_in);
+        assert!(app.session.messages.last().unwrap().text_content().unwrap().contains(&worked_in.display().to_string()));
+
+        let mut gone = Session::new_with_params("deepseek-flash", 1.0, "high", Some(&worked_in.join("missing")));
+        gone.add_message(Message::user("hola"));
+        app.resume_into(gone, false);
+        assert_eq!(app.workspace_dir, worked_in);
+        assert!(app.session.messages.last().unwrap().text_content().unwrap().contains("no longer exists"));
+        let _ = std::fs::remove_dir_all(&worked_in);
+    }

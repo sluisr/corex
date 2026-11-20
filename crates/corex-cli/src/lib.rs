@@ -125,7 +125,8 @@ pub async fn run() -> Result<()> {
         corex_core::update::disable_update_check();
     }
 
-    let workspace_dir = cli
+    let explicit_directory = cli.directory.is_some();
+    let mut workspace_dir = cli
         .directory
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -241,6 +242,14 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    let resume_result = cli.resume.as_deref().map(Session::load_by_id_or_tag);
+    if !explicit_directory {
+        let saved_dir = resume_result.as_ref().and_then(|r| r.as_ref().ok()).and_then(Session::existing_workspace);
+        if let Some(dir) = saved_dir.filter(|dir| std::env::set_current_dir(dir).is_ok()) {
+            workspace_dir = dir;
+        }
+    }
+
     let log_path = corex_core::ForensicLogger::init(Some(&workspace_dir));
     tracing::debug!("Session logger initialized at {:?}", log_path);
 
@@ -289,8 +298,8 @@ pub async fn run() -> Result<()> {
     }
 
     let mut resumed_session: Option<Session> = None;
-    if let Some(ref session_id) = cli.resume {
-        match Session::load_by_id_or_tag(session_id) {
+    if let (Some(session_id), Some(result)) = (cli.resume.as_ref(), resume_result) {
+        match result {
             Ok(mut loaded) => {
                 if !explicit_model {
                     config.adopt_session_model(&loaded.model, loaded.provider.as_deref());

@@ -1999,7 +1999,6 @@ impl LlmClient {
         Ok(rx)
     }
 
-    /// Handles streaming requests to OpenAI / Azure AI Foundry `/v1/responses` endpoint.
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_responses(
         &self,

@@ -2,7 +2,6 @@ use crate::client::StreamEvent;
 use crate::types::{Message, MessageContent, ToolDefinition, Usage};
 use serde_json::{json, Value};
 
-/// Encrypted reasoning items kept in `extra_content`, sent back so a tool loop keeps its reasoning.
 pub const REASONING_EXTRA_KEY: &str = "responses_reasoning";
 
 pub fn uses_responses_api(kind: crate::providers::ProviderKind, model: &str) -> bool {
@@ -151,7 +150,7 @@ pub fn build_responses_request(
     body
 }
 
-/// Items saved under another model are dropped: their encrypted content only decodes for the model that wrote it.
+// Encrypted reasoning only decodes for the model that wrote it.
 fn reasoning_items(msg: &Message, model: &str) -> Vec<Value> {
     let saved = msg
         .extra_content

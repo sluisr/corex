@@ -1256,6 +1256,55 @@ impl App {
         }
     }
 
+    pub fn resume_into(&mut self, mut loaded: Session, is_fleet: bool) {
+        let mut cfg = self.llm_client.get_config();
+        cfg.adopt_session_model(&loaded.model, loaded.provider.as_deref());
+        if let Some(t) = loaded.temperature {
+            cfg.temperature = t;
+        }
+        if let Some(ref r) = loaded.reasoning_effort {
+            cfg.reasoning_effort = r.clone();
+        }
+        loaded.provider = cfg.active_provider.clone();
+        self.llm_client.update_config(cfg);
+        corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
+        if is_fleet {
+            loaded.tag = Some("fleet".to_string());
+        }
+        let moved = if is_fleet { None } else { loaded.existing_workspace().filter(|dir| self.enter_workspace(dir)) };
+        let missing = !is_fleet && loaded.workspace_dir.is_some() && loaded.existing_workspace().is_none();
+        self.session = loaded;
+        self.cached_session_id.clear();
+        self.invalidate_message_cache();
+        self.clear_selection();
+        self.scroll_to_bottom();
+        let label = if is_fleet { "Fleet session" } else { "session" };
+        let mut notice = format!("Resumed {} '{}' (Model: {}).", label, self.session.title, self.session.model);
+        if let Some(dir) = moved {
+            notice.push_str(&format!("\nWorkspace: {}", dir.display()));
+        } else if missing {
+            notice.push_str(&format!(
+                "\nIts folder {} no longer exists; staying in {}.",
+                self.session.workspace_dir.as_deref().unwrap_or_default(),
+                self.workspace_dir.display()
+            ));
+        }
+        self.session.add_message(Message::system(notice));
+    }
+
+    fn enter_workspace(&mut self, dir: &Path) -> bool {
+        let same = |a: &Path, b: &Path| std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok();
+        // Tests run in parallel in one process, so they must not move its working directory.
+        if same(dir, &self.workspace_dir) || (!cfg!(test) && std::env::set_current_dir(dir).is_err()) {
+            return false;
+        }
+        self.workspace_dir = dir.to_path_buf();
+        self.git_branch = Self::detect_git_branch(dir);
+        self.file_index = None;
+        self.file_index_rx = None;
+        true
+    }
+
     fn detect_git_branch(dir: &Path) -> String {
         let head_file = dir.join(".git").join("HEAD");
         if head_file.exists() {
