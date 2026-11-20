@@ -15,6 +15,7 @@ pub const GROQ_ID: &str = "groq";
 pub const OPENROUTER_ID: &str = "openrouter";
 pub const MISTRAL_ID: &str = "mistral";
 pub const NVIDIA_ID: &str = "nvidia";
+pub const AZURE_ID: &str = "azure";
 pub const LOCAL_ID: &str = "local";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub enum ProviderKind {
     Groq,
     OpenRouter,
     Mistral,
+    Azure,
     Local,
     GenericOpenAi,
 }
@@ -44,6 +46,7 @@ pub fn default_context_window(kind: ProviderKind) -> usize {
         | ProviderKind::Groq
         | ProviderKind::OpenRouter
         | ProviderKind::Mistral
+        | ProviderKind::Azure
         | ProviderKind::GenericOpenAi => 128_000,
     }
 }
@@ -105,6 +108,29 @@ impl ModelProfile {
     pub fn display_name(&self) -> &str {
         if self.label.is_empty() { &self.id } else { &self.label }
     }
+
+    pub fn effective_reasoning(&self) -> Vec<String> {
+        if !self.reasoning.is_empty() {
+            return self.reasoning.clone();
+        }
+        let id = bare_model_id(&self.id);
+        let levels: &[&str] = if id.contains("deepseek") && id.contains("flash") {
+            &["off", "low", "high", "max"]
+        } else if id.contains("deepseek") && (id.contains("pro") || id.contains("reasoner") || id.contains("-r1")) {
+            &["max", "high", "low"]
+        } else if id.starts_with("gpt-6") || id.starts_with("gpt-5") {
+            &["low", "medium", "high", "xhigh"]
+        } else if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+            &["low", "medium", "high"]
+        } else if id.starts_with("claude-") {
+            &["low", "medium", "high", "xhigh", "max"]
+        } else if id.starts_with("kimi-k3") || id.starts_with("grok-4") || id.starts_with("qwen3") {
+            &["low", "medium", "high"]
+        } else {
+            &[]
+        };
+        levels.iter().map(|s| s.to_string()).collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -130,6 +156,8 @@ impl ProviderConfig {
     pub fn empty_models_note(&self) -> &'static str {
         if self.is_nvidia() {
             "hundreds of models at build.nvidia.com/models · add the ones you want under `providers` in settings.json"
+        } else if self.is_azure() {
+            "set your Foundry `base_url` and deployed `models` under `providers` in settings.json"
         } else {
             "no models · add them under `providers` in settings.json"
         }
@@ -171,6 +199,10 @@ impl ProviderConfig {
         self.name == NVIDIA_ID
     }
 
+    pub fn is_azure(&self) -> bool {
+        self.name == AZURE_ID
+    }
+
     pub fn is_local(&self) -> bool {
         self.name == LOCAL_ID
     }
@@ -185,6 +217,7 @@ impl ProviderConfig {
             GROQ_ID => ProviderKind::Groq,
             OPENROUTER_ID => ProviderKind::OpenRouter,
             MISTRAL_ID => ProviderKind::Mistral,
+            AZURE_ID => ProviderKind::Azure,
             LOCAL_ID => ProviderKind::Local,
             _ => ProviderKind::GenericOpenAi,
         }
@@ -200,6 +233,7 @@ impl ProviderConfig {
             OPENROUTER_ID => "https://openrouter.ai/keys",
             MISTRAL_ID => "https://console.mistral.ai/api-keys",
             NVIDIA_ID => "https://build.nvidia.com/models",
+            AZURE_ID => "https://ai.azure.com",
             DEEPSEEK_ID => "https://platform.deepseek.com",
             _ => "https://platform.deepseek.com",
         }
@@ -350,6 +384,13 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             label: "NVIDIA NIM".into(),
             base_url: "https://integrate.api.nvidia.com/v1".into(),
             api_key_env: "NVIDIA_API_KEY".into(),
+            models: Vec::new(),
+        },
+        ProviderConfig {
+            name: AZURE_ID.into(),
+            label: "Azure AI Foundry".into(),
+            base_url: String::new(),
+            api_key_env: "AZURE_AI_API_KEY".into(),
             models: Vec::new(),
         },
         ProviderConfig {
@@ -552,5 +593,30 @@ mod tests {
         assert_eq!(nv.models.len(), 1);
         assert_eq!(nv.models[0].id, "meta/llama-3.3-70b-instruct");
         assert_eq!(all.last().unwrap().name, LOCAL_ID);
+    }
+
+    #[test]
+    fn azure_provider_merges_user_base_url_and_deployments() {
+        let all = builtin_providers();
+        let az = all.iter().find(|p| p.is_azure()).expect("azure provider");
+        assert_eq!(az.api_key_env, "AZURE_AI_API_KEY");
+        assert_eq!(az.portal_url(), "https://ai.azure.com");
+        assert!(az.empty_models_note().contains("base_url"));
+
+        let custom: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "azure",
+            "base_url": "https://example.services.ai.azure.com/openai/v1",
+            "models": [
+                { "id": "gpt-6.2-astra", "label": "GPT-6.2 Astra" },
+                { "id": "DeepSeek-V4.1-Flash-1017", "label": "DeepSeek V4.1 Flash" }
+            ]
+        }))
+        .unwrap();
+        let merged = merge_providers(&[custom]);
+        let az_merged = merged.iter().find(|p| p.is_azure()).unwrap();
+        assert_eq!(az_merged.label, "Azure AI Foundry");
+        assert_eq!(az_merged.api_key_env, "AZURE_AI_API_KEY");
+        assert_eq!(az_merged.base_url, "https://example.services.ai.azure.com/openai/v1");
+        assert_eq!(az_merged.models.len(), 2);
     }
 }

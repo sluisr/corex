@@ -127,12 +127,7 @@ impl Memory {
     /// Notes about this project that stay out of the repository, like deepseek-cli's project
     /// memory: `~/.corex/projects/<workspace path>/MEMORY.md`.
     pub fn private_project_file(&self) -> Option<PathBuf> {
-        let workspace = fs::canonicalize(&self.workspace_dir).unwrap_or_else(|_| self.workspace_dir.clone());
-        let key: String = workspace
-            .to_string_lossy()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '-' })
-            .collect();
+        let key = crate::config::project_key(&self.workspace_dir);
         let dirs = BaseDirs::new()?;
         Some(dirs.home_dir().join(".corex").join("projects").join(key).join("MEMORY.md"))
     }

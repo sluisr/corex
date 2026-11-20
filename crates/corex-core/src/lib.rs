@@ -17,6 +17,7 @@ pub mod model_info;
 pub mod providers;
 pub mod reasoning_cache;
 pub mod repeat_guard;
+pub mod responses_api;
 pub mod secure_fs;
 pub mod session;
 pub mod session_images;

@@ -127,8 +127,8 @@ fn lookup_targets(kind: ProviderKind, base_url: &str, model: &str) -> Vec<(Url, 
             (join(base_url, &["models", model]), Shape::Single),
             (join(base_url, &["models"]), Shape::List),
         ],
-        // These APIs return no window for a model (OpenAI, GitHub) or are not remote.
-        ProviderKind::OpenAi | ProviderKind::GitHub | ProviderKind::Local => Vec::new(),
+        // These APIs return no window for a model (OpenAI, GitHub, Azure) or are not remote.
+        ProviderKind::OpenAi | ProviderKind::GitHub | ProviderKind::Azure | ProviderKind::Local => Vec::new(),
     };
     targets
         .into_iter()

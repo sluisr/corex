@@ -1651,7 +1651,7 @@ impl App {
         if persist {
             let _ = Config::save_flash_settings(&flash);
             let _ = Config::save_pro_settings(&pro);
-            let _ = cfg.save();
+            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
         }
         self.llm_client.update_config(cfg);
     }
@@ -1736,7 +1736,7 @@ impl App {
         };
 
         if persist {
-            let _ = cfg.save();
+            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
         }
         self.llm_client.update_config(cfg.clone());
         self.session.model = cfg.model.clone();

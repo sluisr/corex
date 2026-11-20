@@ -383,6 +383,8 @@ pub(crate) fn should_scrub_mcp_env_var(var_name: &str) -> bool {
             | "GROQ_API_KEY"
             | "OPENROUTER_API_KEY"
             | "MISTRAL_API_KEY"
+            | "AZURE_AI_API_KEY"
+            | "AZURE_OPENAI_API_KEY"
             | "GITHUB_TOKEN"
             | "GH_TOKEN"
             | "GITHUB_PERSONAL_ACCESS_TOKEN"

@@ -472,20 +472,26 @@ impl LlmClient {
 
     /// Removes Anthropic thinking blocks stored in tool calls' `extra_content`.
     pub fn strip_anthropic_thinking(messages: &mut [Message]) {
-        for call in messages
-            .iter_mut()
-            .filter_map(|m| m.tool_calls.as_mut())
-            .flat_map(|calls| calls.iter_mut())
-        {
-            let now_empty = match call.extra_content.as_mut().and_then(|ec| ec.as_object_mut()) {
+        Self::strip_extra_key(messages, crate::anthropic::THINKING_EXTRA_KEY);
+    }
+
+    fn strip_extra_key(messages: &mut [Message], key: &str) {
+        let strip = |extra: &mut Option<serde_json::Value>| {
+            let now_empty = match extra.as_mut().and_then(|ec| ec.as_object_mut()) {
                 Some(obj) => {
-                    obj.remove(crate::anthropic::THINKING_EXTRA_KEY);
+                    obj.remove(key);
                     obj.is_empty()
                 }
                 None => false,
             };
             if now_empty {
-                call.extra_content = None;
+                *extra = None;
+            }
+        };
+        for message in messages.iter_mut() {
+            strip(&mut message.extra_content);
+            for call in message.tool_calls.iter_mut().flatten() {
+                strip(&mut call.extra_content);
             }
         }
     }
@@ -1340,11 +1346,26 @@ impl LlmClient {
             // them to OpenAI-compatible endpoints after a mid-session provider switch.
             Self::strip_anthropic_thinking(&mut messages);
         }
+        let uses_responses_api = crate::responses_api::uses_responses_api(provider_kind, &cfg.model);
+        if !uses_responses_api {
+            Self::strip_extra_key(&mut messages, crate::responses_api::REASONING_EXTRA_KEY);
+        }
         if !cfg.can_see_images() {
             Self::replace_images_with_notes(&mut messages);
         }
         if provider_kind == crate::providers::ProviderKind::Anthropic {
             return self.stream_chat_anthropic(
+                &endpoint_url,
+                api_key,
+                &cfg.model,
+                messages,
+                tools,
+                cancel_token,
+                auto_compact_event,
+            ).await;
+        }
+        if uses_responses_api {
+            return self.stream_chat_responses(
                 &endpoint_url,
                 api_key,
                 &cfg.model,
@@ -1466,7 +1487,10 @@ impl LlmClient {
             })
         };
 
-        let effective_reasoning_effort = if is_deepseek {
+        let effective_reasoning_effort = if is_deepseek
+            || (provider_kind == crate::providers::ProviderKind::Azure
+                && api_model.to_ascii_lowercase().contains("deepseek"))
+        {
             if is_thinking_disabled {
                 Some("none".to_string())
             } else {
@@ -1541,6 +1565,7 @@ impl LlmClient {
             crate::providers::ProviderKind::Groq => "Groq Cloud",
             crate::providers::ProviderKind::OpenRouter => "OpenRouter",
             crate::providers::ProviderKind::Mistral => "Mistral AI",
+            crate::providers::ProviderKind::Azure => "Azure AI Foundry",
             crate::providers::ProviderKind::Local => "Local LLM",
             crate::providers::ProviderKind::Anthropic => "Anthropic Claude",
             crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
@@ -1566,12 +1591,15 @@ impl LlmClient {
 
         debug!("[REQUEST] POST {} (api_model: {})", url, api_model);
 
-        let req_builder = self
+        let mut req_builder = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .body(body_bytes);
+            .header("Content-Type", "application/json");
+        if provider_kind == crate::providers::ProviderKind::Azure {
+            req_builder = req_builder.header("api-key", api_key.as_str());
+        }
+        let req_builder = req_builder.body(body_bytes);
 
         let mut event_source = req_builder.eventsource()?;
         let (tx, rx) = mpsc::channel::<StreamEvent>(100);
@@ -1958,6 +1986,180 @@ impl LlmClient {
                                     first_token_time,
                                     final_reason.as_deref(),
                                     Some(&stream_state.usage),
+                                );
+                                let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Handles streaming requests to OpenAI / Azure AI Foundry `/v1/responses` endpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_chat_responses(
+        &self,
+        endpoint_url: &str,
+        api_key: &str,
+        model: &str,
+        messages: Vec<Message>,
+        tools: Option<Vec<ToolDefinition>>,
+        cancel_token: CancellationToken,
+        auto_compact_event: Option<(Vec<Message>, String)>,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        let base_url = endpoint_url.trim_end_matches('/');
+        let url = if base_url.ends_with("/v1") {
+            format!("{}/responses", base_url)
+        } else {
+            format!("{}/v1/responses", base_url)
+        };
+
+        let cfg = self.get_config();
+        let request_body = crate::responses_api::build_responses_request(
+            model,
+            &messages,
+            tools.as_deref(),
+            &cfg.reasoning_effort,
+        );
+        let body_bytes = serde_json::to_vec(&request_body)?;
+        if crate::forensic::ForensicLogger::is_enabled() {
+            crate::forensic::ForensicLogger::log_llm_request_bytes(
+                "Azure AI Foundry",
+                model,
+                &url,
+                messages.len(),
+                tools.as_ref().map(|t| t.len()).unwrap_or(0),
+                &body_bytes,
+            );
+        }
+
+        let req_builder = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("api-key", api_key)
+            .header("Content-Type", "application/json")
+            .body(body_bytes);
+
+        let mut event_source = req_builder.eventsource()?;
+        let (tx, rx) = mpsc::channel::<StreamEvent>(100);
+        let model_clone = model.to_string();
+
+        tokio::spawn(async move {
+            if let Some((compacted_messages, notice)) = auto_compact_event {
+                let _ = tx.send(StreamEvent::ContextCompacted { compacted_messages, notice }).await;
+            }
+            let start_time = std::time::Instant::now();
+            let mut first_token_time = None;
+            let timeout_duration = std::time::Duration::from_secs(180);
+            let mut total_content_chars = 0;
+            let mut total_reasoning_chars = 0;
+            let mut stream_state = crate::responses_api::ResponsesStreamState::new(&model_clone);
+            let mut final_usage: Option<Usage> = None;
+            let mut final_reason: Option<String> = None;
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        crate::forensic::ForensicLogger::log_error("stream_chat_responses", "Request cancelled by user");
+                        let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
+                        break;
+                    }
+                    _ = tokio::time::sleep(timeout_duration) => {
+                        crate::forensic::ForensicLogger::log_error("stream_chat_responses", "Stream idle timeout: Responses API did not respond for 180 seconds.");
+                        let _ = tx.send(StreamEvent::Error("Stream idle timeout: Responses API did not respond for 180 seconds.".to_string())).await;
+                        break;
+                    }
+                    event = event_source.next() => {
+                        match event {
+                            Some(Ok(Event::Open)) => {
+                                debug!("[RESPONSES SSE] Stream opened");
+                            }
+                            Some(Ok(Event::Message(msg))) => {
+                                let evs = crate::responses_api::parse_responses_sse_data(&msg.data, &mut stream_state);
+                                for ev in evs {
+                                    match &ev {
+                                        StreamEvent::ContentDelta(text) => {
+                                            if first_token_time.is_none() {
+                                                first_token_time = Some(start_time.elapsed().as_millis());
+                                            }
+                                            total_content_chars += text.len();
+                                        }
+                                        StreamEvent::ReasoningDelta(cot) => {
+                                            if first_token_time.is_none() {
+                                                first_token_time = Some(start_time.elapsed().as_millis());
+                                            }
+                                            total_reasoning_chars += cot.len();
+                                        }
+                                        StreamEvent::UsageUpdate(u) => {
+                                            final_usage = Some(u.clone());
+                                        }
+                                        StreamEvent::Error(msg) => {
+                                            crate::forensic::ForensicLogger::log_error("stream_chat_responses", msg);
+                                            let _ = tx.send(ev).await;
+                                            return;
+                                        }
+                                        StreamEvent::Completed { finish_reason } => {
+                                            final_reason = finish_reason.clone();
+                                            let duration_ms = start_time.elapsed().as_millis();
+                                            crate::forensic::ForensicLogger::log_llm_response(
+                                                "Azure AI Foundry",
+                                                &model_clone,
+                                                total_content_chars,
+                                                total_reasoning_chars,
+                                                duration_ms,
+                                                first_token_time,
+                                                final_reason.as_deref().or(Some("stop")),
+                                                final_usage.as_ref(),
+                                            );
+                                            let _ = tx.send(ev).await;
+                                            return;
+                                        }
+                                        _ => {}
+                                    }
+                                    if tx.send(ev).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Some(Err(err)) => {
+                                error!("[RESPONSES SSE] Error: {}", err);
+                                crate::forensic::ForensicLogger::log_error("stream_chat_responses_sse", &err.to_string());
+                                let friendly_err = match err {
+                                    reqwest_eventsource::Error::InvalidStatusCode(status, resp) => {
+                                        let retry_header = retry_after_header(resp.headers());
+                                        let body_text = resp.text().await.unwrap_or_default();
+                                        crate::forensic::ForensicLogger::log_error("stream_chat_responses_sse_body", &body_text);
+                                        if status == reqwest::StatusCode::UNAUTHORIZED {
+                                            "Authentication error (401 Unauthorized): Invalid or missing Azure API key. Run /key to enter a new one.".to_string()
+                                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                                            rate_limit_message("Azure AI Foundry", retry_header.or_else(|| retry_delay_in_body(&body_text)))
+                                        } else if !body_text.is_empty() {
+                                            format!("Azure AI Foundry API error ({}): {}", status, body_text)
+                                        } else {
+                                            format!("Azure AI Foundry Stream error: Invalid status code {}", status)
+                                        }
+                                    }
+                                    other => format!("Azure AI Foundry Stream error: {}", other),
+                                };
+                                let _ = tx.send(StreamEvent::Error(friendly_err)).await;
+                                break;
+                            }
+                            None => {
+                                let duration_ms = start_time.elapsed().as_millis();
+                                crate::forensic::ForensicLogger::log_llm_response(
+                                    "Azure AI Foundry",
+                                    &model_clone,
+                                    total_content_chars,
+                                    total_reasoning_chars,
+                                    duration_ms,
+                                    first_token_time,
+                                    final_reason.as_deref(),
+                                    final_usage.as_ref(),
                                 );
                                 let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
                                 break;
@@ -2460,6 +2662,13 @@ mod tests {
         let (url_mis, _) = cfg.endpoint();
         assert!(url_mis.contains("api.mistral.ai"));
         assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Mistral);
+
+        cfg.active_provider = Some("azure".to_string());
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Azure);
+
+        cfg.active_provider = None;
+        cfg.base_url = "https://example.services.ai.azure.com/openai/v1".to_string();
+        assert_eq!(cfg.provider_kind(), crate::providers::ProviderKind::Azure);
     }
 
     #[test]

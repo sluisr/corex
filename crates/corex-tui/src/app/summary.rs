@@ -111,18 +111,22 @@ fn format_summary(app: &App, spend: &Spend, elapsed: u64, color: bool) -> String
         text
     };
 
-    let rows = [
+    let mut rows = vec![
         ("Model", model_display),
         ("Session", format!("{} · {} {}", duration_label(elapsed), prompts, if prompts == 1 { "prompt" } else { "prompts" })),
         ("Tokens", tokens),
         ("Cost", cost_label(spend)),
-        ("Resume", format!("cx --resume {}", app.session.id)),
     ];
+    // A session without messages is never written, so its id cannot be resumed.
+    let resumable = !app.session.messages.is_empty();
+    if resumable {
+        rows.push(("Resume", format!("cx --resume {}", app.session.id)));
+    }
 
     let mut out = String::new();
     for (idx, (label, value)) in rows.iter().enumerate() {
         // A blank line sets the way back into the session apart from the numbers above it.
-        if idx == rows.len() - 1 {
+        if resumable && idx == rows.len() - 1 {
             out.push('\n');
         }
         let label = format!("{:<width$}", label, width = LABEL_WIDTH);
@@ -166,6 +170,7 @@ mod tests {
     async fn the_summary_is_plain_aligned_rows() {
         let mut app = app().await;
         app.prompts_this_run = 3;
+        app.session.add_message(corex_core::types::Message::user("hola".to_string()));
         let mut spend = Spend::default();
         spend.add(&usage(30_623, 28_416, 2_778), Some(deepseek_rates_at("deepseek-flash", off_peak())));
 
@@ -189,6 +194,7 @@ mod tests {
         assert!(text.contains("Tokens   none"), "{text}");
         assert!(text.contains("Cost     $0.00"), "{text}");
         assert!(text.contains("0s · 0 prompts"), "{text}");
+        assert!(!text.contains("--resume"), "{text}");
     }
 
     #[tokio::test]

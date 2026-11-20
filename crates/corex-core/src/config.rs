@@ -25,6 +25,82 @@ pub fn isolated_home() -> bool {
         .unwrap_or(false)
 }
 
+pub fn project_key(workspace: &Path) -> String {
+    let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    workspace
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' { c } else { '-' })
+        .collect()
+}
+
+/// The model a directory last used, kept in the user's home so it may name the provider too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_provider: Option<String>,
+    pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default)]
+    pub flash_settings: FlashSettings,
+    #[serde(default)]
+    pub pro_settings: ProSettings,
+}
+
+impl ProjectState {
+    pub fn path(workspace: &Path) -> PathBuf {
+        corex_home().join("projects").join(project_key(workspace)).join("state.json")
+    }
+
+    pub fn capture(cfg: &Config) -> Self {
+        Self {
+            active_provider: cfg.active_provider.clone(),
+            model: cfg.model.clone(),
+            reasoning_effort: cfg.reasoning_effort.clone(),
+            temperature: cfg.temperature,
+            flash_settings: cfg.flash_settings.clone(),
+            pro_settings: cfg.pro_settings.clone(),
+        }
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        let state: Self = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+        (!state.model.trim().is_empty()).then_some(state)
+    }
+
+    fn write(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            crate::secure_fs::ensure_private_dir(dir)?;
+        }
+        crate::secure_fs::write_private_atomic(path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+
+    /// Ignored when its provider is gone or no longer serves the model.
+    pub fn apply_to(&self, cfg: &mut Config) -> bool {
+        let known = match self.active_provider.as_deref() {
+            Some(name) => cfg.all_providers().into_iter().any(|p| {
+                p.name == name && (p.is_local() || p.models.is_empty() || p.models.iter().any(|m| m.id == self.model))
+            }),
+            None => !self.model.starts_with("local"),
+        };
+        if !known {
+            return false;
+        }
+        cfg.adopt_session_model(&self.model, self.active_provider.as_deref());
+        if !self.reasoning_effort.trim().is_empty() {
+            cfg.reasoning_effort = self.reasoning_effort.clone();
+        }
+        cfg.temperature = self.temperature;
+        cfg.flash_settings = self.flash_settings.clone();
+        cfg.pro_settings = self.pro_settings.clone();
+        true
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlashSettings {
@@ -934,6 +1010,7 @@ impl Config {
                 crate::providers::GROQ_ID => return crate::providers::ProviderKind::Groq,
                 crate::providers::OPENROUTER_ID => return crate::providers::ProviderKind::OpenRouter,
                 crate::providers::MISTRAL_ID => return crate::providers::ProviderKind::Mistral,
+                crate::providers::AZURE_ID => return crate::providers::ProviderKind::Azure,
                 crate::providers::LOCAL_ID => return crate::providers::ProviderKind::Local,
                 _ => {}
             }
@@ -948,6 +1025,8 @@ impl Config {
             crate::providers::ProviderKind::Google
         } else if url_lower.contains("models.inference.ai.azure.com") {
             crate::providers::ProviderKind::GitHub
+        } else if url_lower.contains(".services.ai.azure.com") || url_lower.contains(".openai.azure.com") {
+            crate::providers::ProviderKind::Azure
         } else if url_lower.contains("groq.com") {
             crate::providers::ProviderKind::Groq
         } else if url_lower.contains("openrouter.ai") {
@@ -1320,6 +1399,12 @@ impl Config {
             }
         }
 
+        if let Some(state) = workspace.and_then(|ws| ProjectState::read(&ProjectState::path(ws))) {
+            if !state.apply_to(&mut config) {
+                tracing::warn!("Ignoring saved model {} for this directory: its provider no longer serves it", state.model);
+            }
+        }
+
         if let Ok(k) = std::env::var("COREX_API_KEY")
             .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
         {
@@ -1485,7 +1570,17 @@ impl Config {
     }
 
     pub fn save_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
+        if let Some(ws) = workspace {
+            self.save_project_state(ws)?;
+        }
         self.save_settings(workspace, false, false)
+    }
+
+    pub fn save_project_state(&self, workspace: &Path) -> anyhow::Result<()> {
+        if cfg!(test) && !isolated_home() {
+            return Ok(());
+        }
+        ProjectState::capture(self).write(&ProjectState::path(workspace))
     }
 
     /// `write_mcp_servers` is true only from `/mcp add` and `/mcp remove`, the two edits made to
@@ -1519,6 +1614,9 @@ impl Config {
     }
 
     pub fn save_agent_setting(&self, key: &str, workspace: Option<&Path>) -> anyhow::Result<()> {
+        if let Some(ws) = workspace {
+            self.save_project_state(ws)?;
+        }
         self.save_settings(workspace, key == "mcp_servers", key == "providers")
     }
 
@@ -1564,6 +1662,26 @@ mod tests {
         cfg.model = "o3-mini".into();
         assert!(!cfg.temperature_active());
     }
+    #[test]
+    fn a_directory_keeps_its_own_model_and_reasoning() {
+        let dir = std::env::temp_dir().join(format!("corex-project-state-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let mut used = Config { model: "o3-mini".into(), active_provider: Some("openai".into()), ..Config::default() };
+        used.reasoning_effort = "high".into();
+        ProjectState::capture(&used).write(&path).unwrap();
+
+        let mut cfg = config_for("anthropic");
+        assert!(ProjectState::read(&path).unwrap().apply_to(&mut cfg));
+        assert_eq!((cfg.model.as_str(), cfg.active_provider.as_deref()), ("o3-mini", Some("openai")));
+        assert_eq!(cfg.reasoning_effort, "high");
+
+        let stale = ProjectState { active_provider: Some("gone".into()), ..ProjectState::capture(&used) };
+        let mut cfg = config_for("anthropic");
+        assert!(!stale.apply_to(&mut cfg));
+        assert_eq!(cfg.model, "some-model");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn config_for(provider: &str) -> Config {
         Config {
             model: "some-model".to_string(),
