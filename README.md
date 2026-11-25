@@ -70,7 +70,7 @@ Corex is built with full optimization (`opt-level = 3`), Link-Time Optimization 
 | Metric | Result |
 | :--- | :--- |
 | **Binary size** | 15,762,376 bytes (15.76 MB) |
-| **Download** (`.tar.gz`) | ~12.7 MB |
+| **Download** (`.tar.gz`, `cx` + `corex`) | ~13.7 MB |
 | **Startup**, `cx --version` | median 1.7 ms (min 1.5, max 2.3; 50 runs) |
 | **First frame** of the interactive TUI | median 11.6 ms (min 11.2, max 12.0; 10 runs) |
 | **Session listing**, `cx -l` (450+ sessions) | median 7.7 ms (min 7.4, max 7.9; 10 runs) |
@@ -78,20 +78,20 @@ Corex is built with full optimization (`opt-level = 3`), Link-Time Optimization 
 | **CPU**, TUI idle | 0.00% over 10 s |
 | **Linking** | Dynamic: `libc`, `libm`, `libpthread`, `libdl` and `libutil`. The official Linux builds are linked against glibc 2.17 with `cargo-zigbuild` and run on Debian, Ubuntu, Linux Mint and Fedora out of the box. |
 
-### Binaries by platform (v0.12.0-beta.1)
+### Release archives by platform (`v0.14.0`)
 
-| Platform | Download | Binary | Notes |
-| :--- | ---: | ---: | :--- |
-| Linux x86_64 | 12.72 MB | 14.60 MB | glibc 2.17 or newer |
-| Linux ARM64 | 11.91 MB | 12.68 MB | glibc 2.17 or newer |
-| macOS Apple Silicon | 9.74 MB | 9.85 MB | |
-| macOS Intel | 10.62 MB | 11.28 MB | |
-| Windows x86_64 | 10.50 MB | 11.11 MB | |
-| Android Termux (aarch64) | 10.47 MB | 11.32 MB | |
+| Platform | Archive | Notes |
+| :--- | ---: | :--- |
+| Linux x86_64 | 13.23 MB | glibc 2.17 or newer |
+| Linux ARM64 | 12.38 MB | glibc 2.17 or newer |
+| macOS Apple Silicon | 10.20 MB | |
+| macOS Intel | 11.13 MB | |
+| Windows x86_64 | 11.02 MB | |
+| Android Termux (aarch64) | 10.95 MB | |
 
-Sizes are in MB of 1,000,000 bytes.
+Sizes are in MB of 1,000,000 bytes (each archive bundles `cx` and `corex`).
 
-*Methodology:* Measured on 2026-11-25 on an AMD Ryzen 5 7430U, Linux 7.3.4 (CachyOS), with a `v0.15.0` x86_64 release build (`cx -l` was measured earlier on `v0.12.0-beta.1` against a live store of 450+ saved sessions using the sidecar index). The TUI ran on a pseudo-terminal with an empty `HOME` and no API key, and sat idle with no input. Reproduce the Linux figures with [`scripts/benchmark.sh`](scripts/benchmark.sh) (`./scripts/benchmark.sh path/to/cx` measures any binary). The run-time measurements were taken on Linux x86_64 only.
+*Methodology:* Measured on 2026-11-25 on an AMD Ryzen 5 7430U, Linux 7.3.4 (CachyOS), with a `v0.15.0` x86_64 release build (`cx -l` was measured against a live store of 450+ saved sessions using the sidecar index). The TUI ran on a pseudo-terminal with an empty `HOME` and no API key, and sat idle with no input. Reproduce the Linux figures with [`scripts/benchmark.sh`](scripts/benchmark.sh) (`./scripts/benchmark.sh path/to/cx` measures any binary). The run-time measurements were taken on Linux x86_64 only.
 
 *Not measured in the static benchmark:* memory while streaming a model response, the footprint of other tools, and run-time behaviour on macOS, Windows, ARM64 and Android.
 
