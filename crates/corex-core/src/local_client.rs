@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -7,8 +9,17 @@ use reqwest_eventsource::{Event, RequestBuilderExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
-use crate::types::{ChatCompletionChunk, Message, ToolDefinition};
+use crate::types::{ChatCompletionChunk, Message, StreamOptions, ToolDefinition};
 use crate::StreamEvent;
+
+const HEALTH_CACHE_TTL_SECS: u64 = 15;
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalChatMessage {
@@ -27,6 +38,8 @@ pub struct LocalChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,13 +57,17 @@ pub struct LocalLlmClient {
     http: Client,
     base_url: String,
     model_name: String,
+    last_healthy_epoch: Arc<AtomicU64>,
 }
 
 impl LocalLlmClient {
     pub fn new(base_url: impl Into<String>, model_name: impl Into<String>) -> Self {
         let http = Client::builder()
-            .timeout(Duration::from_secs(60))
+            // Use read_timeout rather than a total wall-clock timeout so active local token
+            // streams longer than 60s are never killed mid-generation.
+            .read_timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_millis(600))
+            .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(4)
@@ -61,6 +78,7 @@ impl LocalLlmClient {
             http,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model_name: model_name.into(),
+            last_healthy_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -68,10 +86,26 @@ impl LocalLlmClient {
     /// Uses a tight 600ms connect timeout so it never blocks normal execution.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/models", self.base_url);
-        match self.http.get(&url).send().await {
+        let ok = match self.http.get(&url).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
+        };
+        if ok {
+            self.last_healthy_epoch.store(now_epoch_secs(), Ordering::Relaxed);
+        } else {
+            self.last_healthy_epoch.store(0, Ordering::Relaxed);
         }
+        ok
+    }
+
+    /// Returns true without a network round-trip if a health check succeeded within the TTL.
+    pub async fn ensure_healthy(&self) -> bool {
+        let last = self.last_healthy_epoch.load(Ordering::Relaxed);
+        let now = now_epoch_secs();
+        if last > 0 && now.saturating_sub(last) < HEALTH_CACHE_TTL_SECS {
+            return true;
+        }
+        self.health_check().await
     }
 
     /// Streaming chat completion against the local LLM with optional tools support.
@@ -90,6 +124,7 @@ impl LocalLlmClient {
             temperature: Some(0.7),
             max_tokens: Some(4096),
             stream: true,
+            stream_options: Some(StreamOptions { include_usage: true }),
         };
 
         let msg_count = request_body.messages.len();
@@ -123,9 +158,11 @@ impl LocalLlmClient {
             let timeout_duration = Duration::from_secs(45);
             let mut total_chars = 0;
             let mut final_usage: Option<crate::types::Usage> = None;
-            let final_reason: Option<String> = None;
+            let mut final_reason: Option<String> = None;
             let mut active_zero_tc_slot: Option<usize> = None;
             let mut next_tc_slot: usize = 0;
+            let idle_sleep = tokio::time::sleep(timeout_duration);
+            tokio::pin!(idle_sleep);
 
             loop {
                 tokio::select! {
@@ -134,12 +171,13 @@ impl LocalLlmClient {
                         let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
                         break;
                     }
-                    _ = tokio::time::sleep(timeout_duration) => {
+                    _ = &mut idle_sleep => {
                         crate::forensic::ForensicLogger::log_error("local_stream_chat", "Stream idle timeout: Local LLM did not respond.");
                         let _ = tx.send(StreamEvent::Error("Stream idle timeout: Local LLM did not respond.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + timeout_duration);
                         match event {
                             Some(Ok(Event::Open)) => {
                                 debug!("[LOCAL_SSE] Stream opened");
@@ -147,6 +185,7 @@ impl LocalLlmClient {
                             Some(Ok(Event::Message(msg))) => {
                                 if msg.data.trim() == "[DONE]" {
                                     let duration_ms = start_time.elapsed().as_millis();
+                                    let reason = final_reason.clone().or_else(|| Some("stop".to_string()));
                                     crate::forensic::ForensicLogger::log_llm_response(
                                         "Local LLM (llama-server)",
                                         &model_name_clone,
@@ -154,10 +193,10 @@ impl LocalLlmClient {
                                         0,
                                         duration_ms,
                                         first_token_time,
-                                        final_reason.as_deref().or(Some("stop")),
+                                        reason.as_deref(),
                                         final_usage.as_ref(),
                                     );
-                                    let _ = tx.send(StreamEvent::Completed { finish_reason: Some("stop".to_string()) }).await;
+                                    let _ = tx.send(StreamEvent::Completed { finish_reason: reason }).await;
                                     break;
                                 }
 
@@ -225,19 +264,9 @@ impl LocalLlmClient {
                                         }
 
                                         if let Some(ref reason) = choice.finish_reason {
-                                            let duration_ms = start_time.elapsed().as_millis();
-                                            crate::forensic::ForensicLogger::log_llm_response(
-                                                "Local LLM (llama-server)",
-                                                &model_name_clone,
-                                                total_chars,
-                                                0,
-                                                duration_ms,
-                                                first_token_time,
-                                                Some(reason),
-                                                final_usage.as_ref(),
-                                            );
-                                            let _ = tx.send(StreamEvent::Completed { finish_reason: Some(reason.clone()) }).await;
-                                            break;
+                                            // Remember finish_reason and keep reading until `[DONE]` or EOF so
+                                            // trailing `usage` chunks (OpenAI `stream_options.include_usage`) arrive.
+                                            final_reason = Some(reason.clone());
                                         }
                                     }
                                 }
@@ -271,7 +300,7 @@ impl LocalLlmClient {
                                     final_reason.as_deref(),
                                     final_usage.as_ref(),
                                 );
-                                let _ = tx.send(StreamEvent::Completed { finish_reason: None }).await;
+                                let _ = tx.send(StreamEvent::Completed { finish_reason: final_reason }).await;
                                 break;
                             }
                         }
@@ -296,6 +325,7 @@ impl LocalLlmClient {
             temperature: Some(0.2), // Low temperature for high fidelity and determinism
             max_tokens: Some(1024),
             stream: false,
+            stream_options: None,
         };
 
         debug!("[LOCAL_LLM] POST {} (model: {})", url, self.model_name);
@@ -419,6 +449,7 @@ Rule: Reply with ONLY the single word 'CHAT', 'INSPECT', or 'CODE'."#;
             temperature: Some(0.0),
             max_tokens: Some(4),
             stream: false,
+            stream_options: None,
         };
 
         if let Ok(resp) = self.http.post(&url).json(&request_body).send().await {

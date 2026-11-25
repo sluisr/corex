@@ -65,6 +65,14 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         subcommands: &[],
     },
     CommandItem {
+        name: "/fork",
+        args: "[tag]",
+        description: "Fork this conversation into an independent branch",
+        aliases: &[],
+        group: SESSION,
+        subcommands: &[],
+    },
+    CommandItem {
         name: "/export",
         args: "[md|txt|html] [full] [path]",
         description: "Save this chat to ~/.corex/exports as Markdown, text or HTML (print the HTML to get a PDF)",
@@ -105,7 +113,7 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         name: "/model",
         args: "[name]",
         description: "Pick provider, model and reasoning settings",
-        aliases: &[],
+        aliases: &["/models"],
         group: MODEL,
         subcommands: &[],
     },
@@ -216,17 +224,31 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
         subcommands: &[],
     },
     CommandItem {
-        name: "/mcp",
-        args: "[status|catalog|add|remove|reload]",
-        description: "Manage MCP servers, discover catalog templates, or add tools",
+        name: "/browser",
+        args: "[status|repair]",
+        description: "Check Corex Browser Bridge extension status, version and host logs",
         aliases: &[],
         group: TOOLS,
         subcommands: &[
-            sub("status", "", "Configured servers and their tools"),
+            sub("status", "", "Inspect detected browsers, extension version, native host and socket"),
+            CommandItem { aliases: &["install"], ..sub("repair", "", "Reinstall Native Messaging host manifests and re-check status") },
+        ],
+    },
+    CommandItem {
+        name: "/mcp",
+        args: "[status|on|off|toggle|catalog|add|remove|reload]",
+        description: "Manage MCP servers, toggle them on/off, or add tools",
+        aliases: &[],
+        group: TOOLS,
+        subcommands: &[
+            sub("status", "", "Configured servers, their ON/OFF state and tools"),
+            CommandItem { aliases: &["enable", "start"], ..sub("on", "<name|all>", "Enable an MCP server (or all) and load its tools") },
+            CommandItem { aliases: &["disable", "stop"], ..sub("off", "<name|all>", "Disable an MCP server (or all) without deleting it") },
+            sub("toggle", "<name>", "Switch an MCP server between enabled and disabled"),
             sub("catalog", "", "Browse vetted server templates"),
             sub("add", "<id|name cmd>", "Add a catalog or custom server"),
             sub("remove", "<name>", "Remove a server"),
-            sub("reload", "", "Reconnect all servers"),
+            sub("reload", "", "Reconnect all enabled servers"),
         ],
     },
     CommandItem {
@@ -357,6 +379,52 @@ pub const ALL_COMMANDS: &[CommandItem] = &[
     },
 ];
 
+/// Suggests the closest valid slash command when the user makes a typo (e.g. `/modle` -> `/model`).
+pub fn suggest_slash_command(input: &str) -> Option<&'static str> {
+    let token = input.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if !token.starts_with('/') || token.len() < 2 {
+        return None;
+    }
+    let extra = ["/sudo", "/exit"];
+    let candidates = ALL_COMMANDS
+        .iter()
+        .flat_map(|c| std::iter::once(c.name).chain(c.aliases.iter().copied()))
+        .chain(extra);
+
+    // 1. Unique or shortest prefix match (e.g. `/mod` -> `/model`)
+    if let Some(prefix_hit) = candidates
+        .clone()
+        .filter(|c| c.starts_with(&token) && *c != token)
+        .min_by_key(|c| c.len())
+    {
+        return Some(prefix_hit);
+    }
+
+    // 2. Closest Levenshtein edit distance within threshold
+    let max_dist = if token.len() <= 4 { 1 } else { 2 };
+    candidates
+        .map(|cand| (cand, edit_distance(&token, cand)))
+        .filter(|(_, dist)| *dist > 0 && *dist <= max_dist)
+        .min_by_key(|(cand, dist)| (*dist, cand.len()))
+        .map(|(cand, _)| cand)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
+}
+
 /// What the menu is completing: top-level commands, or the subcommands of a command
 /// followed by a space. Returns the candidates, the text typed for them, and the parent command.
 fn completion_scope(input: &str) -> Option<(&'static [CommandItem], &str, Option<&'static CommandItem>)> {
@@ -375,10 +443,12 @@ fn completion_scope(input: &str) -> Option<(&'static [CommandItem], &str, Option
 
 /// Commands, or subcommands once a command and a space are typed, best matches first.
 ///
-/// Rank 0: name or alias starts with the query. Rank 1: name or alias contains it
-/// (so `/sess` finds nothing noisy, but `/ume` finds `/resume`). A bare `/` returns everything
-/// in group order. Free-form arguments (a second space, or a command without subcommands)
-/// never match, which closes the menu.
+/// Rank 0: primary name starts with the query (e.g. `/w` → `/web`, `/se` → `/settings`).
+/// Rank 1: an alias starts with the query (e.g. `/w` → `/balance` via `/wallet`).
+/// Rank 2: primary name contains the query (e.g. `/ume` → `/resume`).
+/// Rank 3: an alias contains the query.
+/// A bare `/` returns everything in group order. Free-form arguments (a second space, or a
+/// command without subcommands) never match, which closes the menu.
 pub fn match_commands(input: &str) -> Vec<&'static CommandItem> {
     let Some((candidates, typed, _)) = completion_scope(input) else {
         return Vec::new();
@@ -389,14 +459,20 @@ pub fn match_commands(input: &str) -> Vec<&'static CommandItem> {
     }
 
     let rank = |c: &CommandItem| -> Option<u8> {
-        let names = std::iter::once(c.name).chain(c.aliases.iter().copied());
-        let mut best: Option<u8> = None;
-        for n in names {
-            let n = n.trim_start_matches('/').to_lowercase();
-            let r = if n.starts_with(&query) {
-                0
-            } else if n.contains(&query) {
+        let primary = c.name.trim_start_matches('/').to_lowercase();
+        let mut best: Option<u8> = if primary.starts_with(&query) {
+            Some(0)
+        } else if primary.contains(&query) {
+            Some(2)
+        } else {
+            None
+        };
+        for alias in c.aliases {
+            let a = alias.trim_start_matches('/').to_lowercase();
+            let r = if a.starts_with(&query) {
                 1
+            } else if a.contains(&query) {
+                3
             } else {
                 continue;
             };
@@ -441,6 +517,75 @@ fn highlighted(text: &str, query: &str, base: Style, hit: Style) -> Vec<Span<'st
     }
 }
 
+/// A command entry matched by the `/` popup — either a static built-in or a custom `.corex/commands/*.md`.
+#[derive(Debug, Clone)]
+pub struct MatchedCommand {
+    pub name: String,
+    pub args: String,
+    pub description: String,
+    pub aliases: &'static [&'static str],
+    pub group: &'static str,
+}
+
+impl From<&'static CommandItem> for MatchedCommand {
+    fn from(c: &'static CommandItem) -> Self {
+        Self {
+            name: c.name.to_string(),
+            args: c.args.to_string(),
+            description: c.description.to_string(),
+            aliases: c.aliases,
+            group: c.group,
+        }
+    }
+}
+
+/// Matches both built-in commands and user-defined custom commands from `.corex/commands/*.md`.
+pub fn match_commands_with_custom(
+    input: &str,
+    custom: &[crate::custom_commands::CustomCommand],
+) -> Vec<MatchedCommand> {
+    let mut results: Vec<MatchedCommand> = match_commands(input).into_iter().map(MatchedCommand::from).collect();
+    if input.contains(char::is_whitespace) || custom.is_empty() {
+        return results;
+    }
+    let Some(typed) = input.strip_prefix('/') else {
+        return results;
+    };
+    let query = typed.to_lowercase();
+    let mut custom_ranked: Vec<(u8, usize, MatchedCommand)> = Vec::new();
+    for (i, c) in custom.iter().enumerate() {
+        if ALL_COMMANDS.iter().any(|b| b.name == c.name || b.aliases.contains(&c.name.as_str())) {
+            continue;
+        }
+        let stem = c.name.trim_start_matches('/').to_lowercase();
+        let rank = if query.is_empty() {
+            Some(0)
+        } else if stem.starts_with(&query) {
+            Some(0)
+        } else if stem.contains(&query) {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(r) = rank {
+            custom_ranked.push((
+                r,
+                i,
+                MatchedCommand {
+                    name: c.name.clone(),
+                    args: if c.body.contains("$ARGUMENTS") { "[args]".to_string() } else { String::new() },
+                    description: c.description.clone(),
+                    aliases: &[],
+                    group: "Custom",
+                },
+            ));
+        }
+    }
+    custom_ranked.sort_by_key(|(r, i, _)| (*r, *i));
+    results.extend(custom_ranked.into_iter().map(|(_, _, item)| item));
+    results
+}
+
 pub fn render_command_popup(
     frame: &mut Frame,
     input: &str,
@@ -448,11 +593,22 @@ pub fn render_command_popup(
     area: Rect,
     theme: &Theme,
 ) {
+    render_command_popup_with_custom(frame, input, selected_idx, area, theme, &[]);
+}
+
+pub fn render_command_popup_with_custom(
+    frame: &mut Frame,
+    input: &str,
+    selected_idx: usize,
+    area: Rect,
+    theme: &Theme,
+    custom: &[crate::custom_commands::CustomCommand],
+) {
     if !input.starts_with('/') || area.height < 3 {
         return;
     }
 
-    let matching = match_commands(input);
+    let matching = match_commands_with_custom(input, custom);
     if matching.is_empty() {
         return;
     }
@@ -519,12 +675,12 @@ pub fn render_command_popup(
         let name_text = format!("{:<w$}", cmd.name, w = name_w);
         spans.extend(highlighted(&name_text, &needle, style, hit));
         spans.push(Span::styled(
-            format!("{}  ", pad_right(cmd.args, args_w)),
+            format!("{}  ", pad_right(&cmd.args, args_w)),
             Style::default().fg(theme.dark_gray),
         ));
         let desc = match alias_hit {
             Some(a) => format!("{} (alias {})", cmd.description, a),
-            None => cmd.description.to_string(),
+            None => cmd.description.clone(),
         };
         spans.push(Span::styled(pad_right(&fit_text(&desc, desc_w), desc_w + 1), Style::default().fg(theme.gray)));
         lines.push(Line::from(spans));
@@ -601,6 +757,10 @@ mod tests {
         // Prefix matches rank above substring matches (`/s` is a prefix of /save, /search-alias web...).
         let s = names("/s");
         assert!(s.iter().position(|n| *n == "/save").unwrap() < s.iter().position(|n| *n == "/clear").unwrap_or(usize::MAX));
+        // Primary name prefix always ranks above alias prefix (`/w` puts `/web` before `/balance` via `/wallet`).
+        let w = names("/w");
+        assert_eq!(w.first(), Some(&"/web"));
+        assert_eq!(names("/se").first(), Some(&"/settings"));
     }
 
     #[test]

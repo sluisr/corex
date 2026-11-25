@@ -110,84 +110,126 @@ impl Tool for GrepTool {
         let pattern_owned = pattern.to_string();
         let workspace_dir = context.workspace_dir.clone();
         let output = tokio::task::spawn_blocking(move || {
-            let mut output = Vec::new();
-            let mut total_matches = 0;
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(12))
+                .unwrap_or(4);
+            let total_matches_atomic = std::sync::atomic::AtomicUsize::new(0);
+            let file_results: std::sync::Mutex<Vec<(String, Vec<(usize, Vec<String>)>)>> =
+                std::sync::Mutex::new(Vec::new());
 
             let walker = WalkBuilder::new(&root_dir)
                 .hidden(false)
                 .git_ignore(true)
+                .threads(num_threads)
                 .filter_entry(|entry| {
                     let name = entry.file_name().to_string_lossy();
                     name != ".git"
                 })
-                .build();
+                .build_parallel();
 
-            for entry in walker.flatten() {
-                if !is_valid_walk_file(&entry, &root_dir) {
-                    continue;
-                }
-                let path = entry.path();
-                let rel_display = path
-                    .strip_prefix(&workspace_dir)
-                    .unwrap_or(path)
-                    .to_string_lossy();
-
-                if let Some(ref filter) = include_filter {
-                    if !filter.matches(&rel_display) {
-                        continue;
+            walker.run(|| {
+                let regex = &regex;
+                let include_filter = &include_filter;
+                let root_dir = &root_dir;
+                let workspace_dir = &workspace_dir;
+                let total_matches_atomic = &total_matches_atomic;
+                let file_results = &file_results;
+                Box::new(move |entry_res| {
+                    if total_matches_atomic.load(std::sync::atomic::Ordering::Relaxed) >= max_matches {
+                        return ignore::WalkState::Quit;
                     }
-                }
+                    let Ok(entry) = entry_res else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if !is_valid_walk_file(&entry, root_dir) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let path = entry.path();
+                    let rel_display = path
+                        .strip_prefix(workspace_dir)
+                        .unwrap_or(path)
+                        .to_string_lossy();
 
-                // Skip files larger than 10 MB to prevent memory exhaustion / OOM crashes
-                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                if file_size > 10 * 1024 * 1024 {
-                    continue;
-                }
-
-                let bytes = match fs::read(path) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                if bytes[..bytes.len().min(1024)].contains(&0) {
-                    continue;
-                }
-                let content = match String::from_utf8(bytes) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if !regex.is_match(&content) {
-                    continue;
-                }
-
-                let lines: Vec<&str> = content.lines().collect();
-                for (idx, line) in lines.iter().enumerate() {
-                    if regex.is_match(line) {
-                        total_matches += 1;
-                        let start = idx.saturating_sub(context_lines);
-                        let end = (idx + context_lines + 1).min(lines.len());
-
-                        output.push(format!("--- {} ---", rel_display));
-                        for (i, l) in lines[start..end].iter().enumerate() {
-                            let line_num = start + i + 1;
-                            let marker = if line_num == idx + 1 { ">" } else { " " };
-                            let display_line = if l.len() > 350 {
-                                format!("{}... [truncated]", safe_truncate_str(l, 350))
-                            } else {
-                                l.to_string()
-                            };
-                            output.push(format!("{}{:4} | {}", marker, line_num, display_line));
-                        }
-                        output.push(String::new());
-
-                        if total_matches >= max_matches {
-                            output.push(format!("(Max matches limit {} reached)", max_matches));
-                            break;
+                    if let Some(ref filter) = include_filter {
+                        if !filter.matches(&rel_display) {
+                            return ignore::WalkState::Continue;
                         }
                     }
-                }
 
-                if total_matches >= max_matches {
-                    break;
+                    // Skip files larger than 10 MB to prevent memory exhaustion / OOM crashes
+                    let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if file_size > 10 * 1024 * 1024 {
+                        return ignore::WalkState::Continue;
+                    }
+
+                    let Ok(bytes) = fs::read(path) else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if bytes[..bytes.len().min(1024)].contains(&0) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let Ok(content) = String::from_utf8(bytes) else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if !regex.is_match(&content) {
+                        return ignore::WalkState::Continue;
+                    }
+
+                    let lines: Vec<&str> = content.lines().collect();
+                    let mut snippets: Vec<(usize, Vec<String>)> = Vec::new();
+                    for (idx, line) in lines.iter().enumerate() {
+                        if regex.is_match(line) {
+                            let start = idx.saturating_sub(context_lines);
+                            let end = (idx + context_lines + 1).min(lines.len());
+                            let mut block = Vec::with_capacity(end - start + 2);
+                            block.push(format!("--- {} ---", rel_display));
+                            for (i, l) in lines[start..end].iter().enumerate() {
+                                let line_num = start + i + 1;
+                                let marker = if line_num == idx + 1 { ">" } else { " " };
+                                let display_line = if l.len() > 350 {
+                                    format!("{}... [truncated]", safe_truncate_str(l, 350))
+                                } else {
+                                    l.to_string()
+                                };
+                                block.push(format!("{}{:4} | {}", marker, line_num, display_line));
+                            }
+                            block.push(String::new());
+                            snippets.push((idx, block));
+
+                            let prev = total_matches_atomic.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if prev + 1 >= max_matches {
+                                break;
+                            }
+                        }
+                    }
+
+                    if !snippets.is_empty() {
+                        if let Ok(mut guard) = file_results.lock() {
+                            guard.push((rel_display.into_owned(), snippets));
+                        }
+                    }
+
+                    if total_matches_atomic.load(std::sync::atomic::Ordering::Relaxed) >= max_matches {
+                        ignore::WalkState::Quit
+                    } else {
+                        ignore::WalkState::Continue
+                    }
+                })
+            });
+
+            let mut collected = file_results.into_inner().unwrap_or_default();
+            collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut output = Vec::new();
+            let mut total_matches = 0;
+            'outer: for (_, snippets) in collected {
+                for (_, block) in snippets {
+                    total_matches += 1;
+                    output.extend(block);
+                    if total_matches >= max_matches {
+                        output.push(format!("(Max matches limit {} reached)", max_matches));
+                        break 'outer;
+                    }
                 }
             }
             output

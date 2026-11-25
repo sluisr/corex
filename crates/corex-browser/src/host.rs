@@ -14,8 +14,9 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 pub const HOST_NAME: &str = "com.corex.bridge";
-const EXTENSION_ID: &str = "pgbencaoenigjeekljfindfeaolenaip";
+const EXTENSION_ID: &str = crate::diagnostics::EXTENSION_ID;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
+const MAX_HOST_LOG_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn data_dir() -> PathBuf {
     directories::ProjectDirs::from("", "", "corex")
@@ -25,6 +26,28 @@ pub(crate) fn data_dir() -> PathBuf {
 
 pub(crate) fn hosts_dir() -> PathBuf {
     data_dir().join("hosts")
+}
+
+pub(crate) fn host_log_path() -> PathBuf {
+    data_dir().join("browser-host.log")
+}
+
+pub(crate) fn append_host_log(message: &str) {
+    use std::io::Write;
+    let path = host_log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_HOST_LOG_BYTES) {
+        let _ = std::fs::write(&path, "");
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[ts={secs} pid={}] {message}", std::process::id());
+    }
 }
 
 #[derive(Default)]
@@ -108,7 +131,13 @@ impl Router {
 type Shared = Arc<Mutex<Router>>;
 
 pub async fn run_native_host() -> Result<()> {
-    run_host(tokio::io::stdin(), tokio::io::stdout(), &hosts_dir()).await
+    append_host_log("native host started");
+    let res = run_host(tokio::io::stdin(), tokio::io::stdout(), &hosts_dir()).await;
+    match &res {
+        Ok(()) => append_host_log("native host exited cleanly (browser closed stdio)"),
+        Err(e) => append_host_log(&format!("native host error: {e}")),
+    }
+    res
 }
 
 pub async fn run_host<R, W>(mut stdin: R, stdout: W, dir: &Path) -> Result<()>
@@ -220,38 +249,43 @@ fn set_mode(path: &Path, mode: u32) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
-fn browser_config_dirs() -> Vec<PathBuf> {
+pub(crate) fn browser_config_dirs_named() -> Vec<(String, PathBuf)> {
     let Some(base) = directories::BaseDirs::new() else {
         return Vec::new();
     };
-    let (root, names): (PathBuf, &[&str]) = if cfg!(target_os = "macos") {
-        (
-            base.home_dir().join("Library/Application Support"),
-            &[
-                "Google/Chrome",
-                "Chromium",
-                "BraveSoftware/Brave-Browser",
-                "Microsoft Edge",
-                "Vivaldi",
-            ],
-        )
+    let mut candidates: Vec<(&str, PathBuf)> = if cfg!(target_os = "macos") {
+        let root = base.home_dir().join("Library/Application Support");
+        vec![
+            ("Google Chrome", root.join("Google/Chrome")),
+            ("Chromium", root.join("Chromium")),
+            ("Brave", root.join("BraveSoftware/Brave-Browser")),
+            ("Microsoft Edge", root.join("Microsoft Edge")),
+            ("Vivaldi", root.join("Vivaldi")),
+        ]
     } else {
-        (
-            base.home_dir().join(".config"),
-            &[
-                "google-chrome",
-                "chromium",
-                "BraveSoftware/Brave-Browser",
-                "microsoft-edge",
-                "vivaldi",
-            ],
-        )
+        let cfg = base.home_dir().join(".config");
+        let flatpak = base.home_dir().join(".var/app");
+        vec![
+            ("Google Chrome", cfg.join("google-chrome")),
+            ("Chromium", cfg.join("chromium")),
+            ("Brave", cfg.join("BraveSoftware/Brave-Browser")),
+            ("Microsoft Edge", cfg.join("microsoft-edge")),
+            ("Vivaldi", cfg.join("vivaldi")),
+            ("Google Chrome (Flatpak)", flatpak.join("com.google.Chrome/config/google-chrome")),
+            ("Chromium (Flatpak)", flatpak.join("org.chromium.Chromium/config/chromium")),
+            ("Brave (Flatpak)", flatpak.join("com.brave.Browser/config/BraveSoftware/Brave-Browser")),
+            ("Microsoft Edge (Flatpak)", flatpak.join("com.microsoft.Edge/config/microsoft-edge")),
+        ]
     };
-    names
-        .iter()
-        .map(|name| root.join(name))
-        .filter(|dir| dir.is_dir())
+    candidates
+        .drain(..)
+        .filter(|(_, dir)| dir.is_dir())
+        .map(|(name, dir)| (name.to_string(), dir))
         .collect()
+}
+
+pub(crate) fn launcher_path() -> PathBuf {
+    data_dir().join("corex-browser-host")
 }
 
 fn write_if_changed(path: &Path, content: &str, mode: u32) -> Result<()> {
@@ -267,7 +301,7 @@ pub fn install_native_host() -> Result<()> {
     let exe = std::env::current_exe()?;
     let root = data_dir();
     std::fs::create_dir_all(&root)?;
-    let launcher = root.join("corex-browser-host");
+    let launcher = launcher_path();
     write_if_changed(
         &launcher,
         &format!(
@@ -283,7 +317,7 @@ pub fn install_native_host() -> Result<()> {
         "type": "stdio",
         "allowed_origins": [format!("chrome-extension://{EXTENSION_ID}/")],
     }))?;
-    for config in browser_config_dirs() {
+    for (_, config) in browser_config_dirs_named() {
         let hosts = config.join("NativeMessagingHosts");
         std::fs::create_dir_all(&hosts)?;
         write_if_changed(&hosts.join(format!("{HOST_NAME}.json")), &manifest, 0o644)?;

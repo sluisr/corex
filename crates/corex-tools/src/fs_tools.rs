@@ -590,9 +590,14 @@ impl Tool for ReadFileTool {
         let mut output = String::new();
         let mut shown_end = s;
         for (i, line) in lines[s..e].iter().enumerate() {
-            let rendered = if line.chars().count() > READ_MAX_LINE_CHARS {
-                let head: String = line.chars().take(READ_MAX_LINE_CHARS).collect();
-                format!("{}… [line truncated, {} chars total]", head, line.chars().count())
+            let rendered = if line.len() > READ_MAX_LINE_CHARS {
+                let char_count = line.chars().count();
+                if char_count > READ_MAX_LINE_CHARS {
+                    let head: String = line.chars().take(READ_MAX_LINE_CHARS).collect();
+                    format!("{}… [line truncated, {} chars total]", head, char_count)
+                } else {
+                    (*line).to_string()
+                }
             } else {
                 (*line).to_string()
             };
@@ -1382,40 +1387,68 @@ impl Tool for GlobTool {
 
         let workspace_dir = context.workspace_dir.clone();
         let matches = tokio::task::spawn_blocking(move || {
-            let mut matches: Vec<(String, Option<std::time::SystemTime>)> = Vec::new();
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(12))
+                .unwrap_or(4);
+            let collected_count = std::sync::atomic::AtomicUsize::new(0);
+            let matches_mutex: std::sync::Mutex<Vec<(String, Option<std::time::SystemTime>)>> =
+                std::sync::Mutex::new(Vec::new());
+
             let walker = WalkBuilder::new(&root_dir)
                 .hidden(false)
                 .git_ignore(true)
+                .threads(num_threads)
                 .filter_entry(|entry| {
                     let name = entry.file_name().to_string_lossy();
                     name != ".git"
                 })
-                .build();
+                .build_parallel();
 
-            for entry in walker.flatten() {
-                if entry.depth() == 0 || !is_valid_walk_file(&entry, &root_dir) {
-                    continue;
-                }
-                let path = entry.path();
-                let rel_to_root = path.strip_prefix(&root_dir).unwrap_or(path);
-                let rel_root_str = rel_to_root.to_string_lossy();
-                let display_rel = path
-                    .strip_prefix(&workspace_dir)
-                    .unwrap_or(path)
-                    .to_string_lossy();
-                let file_name = entry.file_name().to_string_lossy();
-                if glob_pattern.matches(&rel_root_str)
-                    || glob_pattern.matches(&display_rel)
-                    || glob_pattern.matches(path.to_str().unwrap_or(""))
-                    || glob_pattern.matches(&file_name)
-                {
-                    let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
-                    matches.push((display_rel.into_owned(), mtime));
-                    if matches.len() >= GLOB_COLLECT_LIMIT {
-                        break;
+            walker.run(|| {
+                let root_dir = &root_dir;
+                let workspace_dir = &workspace_dir;
+                let glob_pattern = &glob_pattern;
+                let collected_count = &collected_count;
+                let matches_mutex = &matches_mutex;
+                Box::new(move |entry_res| {
+                    if collected_count.load(std::sync::atomic::Ordering::Relaxed) >= GLOB_COLLECT_LIMIT {
+                        return ignore::WalkState::Quit;
                     }
-                }
-            }
+                    let Ok(entry) = entry_res else {
+                        return ignore::WalkState::Continue;
+                    };
+                    if entry.depth() == 0 || !is_valid_walk_file(&entry, root_dir) {
+                        return ignore::WalkState::Continue;
+                    }
+                    let path = entry.path();
+                    let rel_to_root = path.strip_prefix(root_dir).unwrap_or(path);
+                    let rel_root_str = rel_to_root.to_string_lossy();
+                    let display_rel = path
+                        .strip_prefix(workspace_dir)
+                        .unwrap_or(path)
+                        .to_string_lossy();
+                    let file_name = entry.file_name().to_string_lossy();
+                    if glob_pattern.matches(&rel_root_str)
+                        || glob_pattern.matches(&display_rel)
+                        || glob_pattern.matches(path.to_str().unwrap_or(""))
+                        || glob_pattern.matches(&file_name)
+                    {
+                        let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+                        let prev = collected_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if prev < GLOB_COLLECT_LIMIT {
+                            if let Ok(mut guard) = matches_mutex.lock() {
+                                guard.push((display_rel.into_owned(), mtime));
+                            }
+                        }
+                        if prev + 1 >= GLOB_COLLECT_LIMIT {
+                            return ignore::WalkState::Quit;
+                        }
+                    }
+                    ignore::WalkState::Continue
+                })
+            });
+
+            let mut matches = matches_mutex.into_inner().unwrap_or_default();
             // Most recently modified first: that is the part of a big result worth seeing.
             matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             matches

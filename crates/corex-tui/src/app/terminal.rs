@@ -53,6 +53,63 @@ pub fn title_sequence(title: &str) -> String {
     format!("\x1b]0;{clean}\x07")
 }
 
+/// Terminal and desktop notifications are enabled unless `COREX_NOTIFY` is `0`, `false` or `off`.
+pub fn notifications_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("COREX_NOTIFY").is_ok_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off")
+        })
+    })
+}
+
+/// Builds an OSC 9 terminal notification sequence (+ BEL for tmux/tab urgency), stripping control chars.
+pub fn notification_sequence(title: &str, body: &str) -> String {
+    let clean_title: String = title.chars().filter(|c| !c.is_control()).collect();
+    let clean_body: String = body.chars().filter(|c| !c.is_control()).collect();
+    format!("\x1b]9;{clean_title}: {clean_body}\x07\x07")
+}
+
+/// Sends a non-blocking terminal notification (OSC 9 + BEL) and, on desktop Linux/macOS,
+/// fires a best-effort native notification (`notify-send` / `osascript`) in the background.
+pub fn notify_user(out: &mut impl Write, title: &str, body: &str) {
+    if !notifications_enabled() {
+        return;
+    }
+    let seq = notification_sequence(title, body);
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let t = title.chars().filter(|c| !c.is_control()).take(80).collect::<String>();
+        let b = body.chars().filter(|c| !c.is_control()).take(160).collect::<String>();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("notify-send")
+                .args(["-a", "Corex", "-u", "normal", &t, &b])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let t = title.chars().filter(|c| !c.is_control() && *c != '"' && *c != '\\').take(80).collect::<String>();
+        let b = body.chars().filter(|c| !c.is_control() && *c != '"' && *c != '\\').take(160).collect::<String>();
+        std::thread::spawn(move || {
+            let script = format!("display notification \"{b}\" with title \"{t}\"");
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+}
+
 /// Restores the terminal to its standard state by disabling raw mode,
 /// leaving alternate screen, disabling mouse capture/bracketed paste, and showing the cursor.
 pub fn restore_terminal() {

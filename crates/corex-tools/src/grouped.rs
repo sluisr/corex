@@ -24,12 +24,23 @@ pub const FLEET_ACTIONS: [(&str, &str); 4] = [
 
 // Lets code keyed on member names (`fleet_run_command`) recognise the grouped call.
 pub fn canonical_name(name: &str, args: &Value) -> String {
+    let action = args.get("action").or_else(|| args.get("Action")).and_then(Value::as_str).unwrap_or("");
+    if name == "subagent" {
+        return if matches!(action.to_ascii_lowercase().as_str(), "delegate" | "spawn" | "run")
+            || (action.is_empty() && args.get("prompt").is_some())
+        {
+            "delegate_subagent".to_string()
+        } else if !action.is_empty() {
+            "manage_subagents".to_string()
+        } else {
+            "subagent".to_string()
+        };
+    }
     let table: &[(&str, &str)] = match name {
         "tracker" => &TRACKER_ACTIONS,
         "fleet" => &FLEET_ACTIONS,
         _ => return name.to_string(),
     };
-    let action = args.get("action").or_else(|| args.get("Action")).and_then(Value::as_str).unwrap_or("");
     table
         .iter()
         .find(|(a, _)| a.eq_ignore_ascii_case(action))
@@ -39,7 +50,9 @@ pub fn canonical_name(name: &str, args: &Value) -> String {
 
 pub fn canonical_name_raw(name: &str, raw_args: &str) -> String {
     match name {
-        "tracker" | "fleet" => canonical_name(name, &serde_json::from_str(raw_args).unwrap_or(Value::Null)),
+        "tracker" | "fleet" | "subagent" => {
+            canonical_name(name, &serde_json::from_str(raw_args).unwrap_or(Value::Null))
+        }
         _ => name.to_string(),
     }
 }
@@ -190,6 +203,9 @@ mod tests {
     fn canonical_name_maps_grouped_calls_to_members() {
         assert_eq!(canonical_name("fleet", &json!({"action": "run_command"})), "fleet_run_command");
         assert_eq!(canonical_name_raw("tracker", r#"{"action":"create"}"#), "tracker_create_task");
+        assert_eq!(canonical_name("subagent", &json!({"action": "delegate", "role": "scout", "prompt": "x"})), "delegate_subagent");
+        assert_eq!(canonical_name("subagent", &json!({"role": "scout", "prompt": "x"})), "delegate_subagent");
+        assert_eq!(canonical_name("subagent", &json!({"action": "status", "task_id": "s1"})), "manage_subagents");
         assert_eq!(canonical_name("fleet", &json!({})), "fleet");
         assert_eq!(canonical_name("read_file", &json!({"action": "x"})), "read_file");
     }

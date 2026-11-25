@@ -2410,3 +2410,80 @@ mod smooth_scroll {
         assert!(app.session.messages.last().unwrap().text_content().unwrap().contains("no longer exists"));
         let _ = std::fs::remove_dir_all(&worked_in);
     }
+
+    #[tokio::test]
+    async fn manual_compact_runs_non_blocking_cancels_cleanly_and_preserves_render_cache() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((_sock, _)) = listener.accept().await else { return };
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let cfg = corex_core::config::Config {
+            base_url: addr,
+            api_key: "test-key".to_string(),
+            model: "some-model".to_string(),
+            context_window_tokens: Some(128_000),
+            ..corex_core::config::Config::default()
+        };
+        let mut app = App::new(LlmClient::new(cfg), PathBuf::from("/tmp"), false);
+        for i in 0..8 {
+            app.session.add_message(Message::user(format!("user turn {i}")));
+            app.session.add_message(Message::assistant(format!("assistant turn {i}"), None));
+        }
+        // Simulate already-cached rendered lines in TUI
+        app.cached_message_count = 10;
+        app.cached_message_line_offsets = (0..=10).map(|i| i * 2).collect();
+        app.cached_message_lines = (0..20).map(|_| ratatui::text::Line::default()).collect();
+
+        let started = Instant::now();
+        assert!(app.handle_slash_command("/compact").await);
+        assert!(started.elapsed() < Duration::from_millis(200), "/compact must never block the UI loop");
+        assert!(app.is_compacting());
+        assert_eq!(app.active_status.as_deref(), Some("Compacting context..."));
+
+        // Cancelling aborts immediately and leaves a clear notice
+        app.cancel_compaction("Context compaction cancelled.");
+        assert!(!app.is_compacting());
+        assert!(app.session.messages.last().unwrap().text_content().unwrap().contains("cancelled"));
+
+        // Applying compaction preserves cached_message_count when no >8KB tool output was shortened
+        app.apply_compaction(
+            vec![
+                Message::user("user turn 0"),
+                Message::system("<CONTEXT_SUMMARY>\nsummary\n</CONTEXT_SUMMARY>"),
+                Message::user("user turn 7"),
+                Message::assistant("assistant turn 7", None),
+            ],
+            "Context compacted.".to_string(),
+        );
+        assert_eq!(app.cached_message_count, 10, "render cache of unchanged history must stay intact");
+        assert_eq!(app.session.messages.len(), 5);
+        assert!(app.session.display_messages().len() > 15);
+    }
+
+    #[tokio::test]
+    async fn active_tool_definitions_includes_fleet_when_nodes_are_available_even_with_dialog_closed() {
+        let client = LlmClient::new(corex_core::config::Config::default());
+        let mut app = App::new(client, PathBuf::from("/tmp"), false);
+
+        assert!(!app.fleet_dialog.is_open);
+        assert!(app.fleet_dialog.items.is_empty());
+        assert!(
+            !app.active_tool_definitions().iter().any(|d| d.function.name == "fleet"),
+            "fleet tool stays hidden when no nodes are available and Fleet UI is closed"
+        );
+
+        app.fleet_nodes_available.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            app.active_tool_definitions().iter().any(|d| d.function.name == "fleet"),
+            "fleet tool must be exposed when nodes are configured even before /fleet is opened"
+        );
+
+        app.fleet_nodes_available.store(false, std::sync::atomic::Ordering::Relaxed);
+        app.fleet_dialog.is_open = true;
+        assert!(
+            app.active_tool_definitions().iter().any(|d| d.function.name == "fleet"),
+            "fleet tool must be exposed when Fleet console is open"
+        );
+    }

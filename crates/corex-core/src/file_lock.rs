@@ -31,21 +31,27 @@ pub struct PathGuard {
     _os: Option<std::fs::File>,
 }
 
-/// Directory holding the sidecar lock files, following the `~/.corex` convention.
+/// Directory holding the sidecar lock files, following the `~/.corex` convention (falling back
+/// to a private per-UID temp dir when `~/.corex` is on a read-only filesystem or unavailable).
 fn locks_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".corex").join("locks"))
-        .unwrap_or_else(|| {
-            #[cfg(unix)]
-            {
-                let uid = unsafe { libc::getuid() };
-                std::env::temp_dir().join(format!("corex-locks-{}", uid))
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Some(dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".corex").join("locks")) {
+            if crate::secure_fs::ensure_private_dir(&dir).is_ok() {
+                return dir;
             }
-            #[cfg(not(unix))]
-            {
-                std::env::temp_dir().join("corex-locks")
-            }
-        })
+        }
+        #[cfg(unix)]
+        {
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("corex-locks-{}", uid))
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::temp_dir().join("corex-locks")
+        }
+    })
+    .clone()
 }
 
 /// FNV-1a, inlined so the path-to-lock-file mapping stays identical across releases. A collision

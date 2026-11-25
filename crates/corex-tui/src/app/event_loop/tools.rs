@@ -16,11 +16,12 @@ pub fn format_call_preview(call: &ToolCall, registry: &corex_tools::ToolRegistry
     let args_json = corex_core::parse_lenient_json(&call.function.arguments)
         .unwrap_or(serde_json::Value::Null);
     let tool = registry.get(&call.function.name);
+    let canon_name = corex_tools::grouped::canonical_name(&call.function.name, &args_json);
     if call.function.name == "run_shell_command" {
         if let Some(cmd) = args_json.get("command").and_then(|c| c.as_str()) {
             return cmd.to_string();
         }
-    } else if call.function.name == "delegate_subagent" {
+    } else if canon_name == "delegate_subagent" {
         // The whole instruction is what gets approved, so the dialog shows all of it.
         let role = args_json.get("role").and_then(|r| r.as_str()).unwrap_or("worker");
         let prompt = args_json.get("prompt").and_then(|p| p.as_str()).unwrap_or("").trim();
@@ -208,6 +209,9 @@ async fn run_one_tool(registry: &corex_tools::ToolRegistry, call: ToolCall, ctx:
     };
     let duration_ms = start_tool.elapsed().as_millis();
     corex_core::ForensicLogger::log_tool_call(&tool_name, &call_id, &args_str, &output, duration_ms, success);
+    // Spill oversized outputs on the background worker task so the main TUI event loop thread
+    // never blocks on synchronous `/tmp/corex-spill-*` file writes inside `on_tool_done`.
+    let output = corex_core::spill_large_output(&tool_name, output);
     let _ = tx.send((gen, StreamEvent::ToolExecutionDone { call_id, output })).await;
 }
 

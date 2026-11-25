@@ -138,7 +138,15 @@ impl Tool for ReadDocumentTool {
             .text("purpose", purpose)
             .part("file", reqwest::multipart::Part::bytes(bytes).file_name(file_name.clone()));
 
-        let res = match reqwest::Client::new()
+        static OCR_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = OCR_HTTP_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .unwrap_or_default()
+        });
+        let res = match client
             .post(OCR_URL)
             .bearer_auth(api_key)
             .multipart(form)

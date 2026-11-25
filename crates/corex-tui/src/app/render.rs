@@ -17,7 +17,7 @@ use crate::fleet_dialog::render_fleet_dialog;
 use crate::model_dialog::render_model_dialog;
 use crate::session_dialog::render_session_dialog;
 use crate::file_completion::{render_file_popup, IndexState};
-use crate::slash_commands::render_command_popup;
+use crate::slash_commands::render_command_popup_with_custom;
 use crate::sudo_dialog::render_sudo_dialog;
 use crate::theme::Theme;
 use crate::user_dialog::render_user_dialog;
@@ -1547,18 +1547,50 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 if app.thinking_state.cached_len != app.thinking_state.content.len()
                     || app.thinking_state.cached_width != content_max_width
                 {
-                    app.thinking_state.cached_lines.clear();
-                    for cot_line in app.thinking_state.content.trim().lines() {
-                        let clean = cot_line.replace('\t', "    ");
-                        let spans = vec![Span::styled(clean, Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC))];
-                        app.thinking_state.cached_lines.extend(
-                            crate::markdown::wrap_spans(spans, content_max_width, "    │ "),
-                        );
+                    let trimmed = app.thinking_state.content.trim_start();
+                    let trim_offset = app.thinking_state.content.len() - trimmed.len();
+                    if app.thinking_state.cached_width != content_max_width
+                        || app.thinking_state.content.len() < app.thinking_state.committed_len
+                        || app.thinking_state.committed_len < trim_offset
+                    {
+                        app.thinking_state.cached_lines.clear();
+                        app.thinking_state.tail_lines.clear();
+                        app.thinking_state.committed_len = trim_offset;
+                    }
+                    let unparsed = &app.thinking_state.content[app.thinking_state.committed_len..];
+                    if let Some(rel_nl) = unparsed.rfind('\n') {
+                        let newly_complete = &unparsed[..rel_nl];
+                        for cot_line in newly_complete.lines() {
+                            let clean = cot_line.replace('\t', "    ");
+                            let spans = vec![Span::styled(
+                                clean,
+                                Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC),
+                            )];
+                            app.thinking_state.cached_lines.extend(
+                                crate::markdown::wrap_spans(spans, content_max_width, "    │ "),
+                            );
+                        }
+                        app.thinking_state.committed_len += rel_nl + 1;
+                    }
+                    app.thinking_state.tail_lines.clear();
+                    let active_tail = app.thinking_state.content[app.thinking_state.committed_len..].trim_end();
+                    if !active_tail.is_empty() {
+                        for cot_line in active_tail.lines() {
+                            let clean = cot_line.replace('\t', "    ");
+                            let spans = vec![Span::styled(
+                                clean,
+                                Style::default().fg(app.theme.gray).add_modifier(Modifier::ITALIC),
+                            )];
+                            app.thinking_state.tail_lines.extend(
+                                crate::markdown::wrap_spans(spans, content_max_width, "    │ "),
+                            );
+                        }
                     }
                     app.thinking_state.cached_len = app.thinking_state.content.len();
                     app.thinking_state.cached_width = content_max_width;
                 }
                 tail_lines.extend(app.thinking_state.cached_lines.iter().cloned());
+                tail_lines.extend(app.thinking_state.tail_lines.iter().cloned());
                 tail_lines.push(Line::from(""));
             } else {
                 tail_lines.push(Line::from(vec![
@@ -1584,11 +1616,14 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                     app.streaming_md_committed_lines.clear();
                     app.streaming_md_committed_len = 0;
                 }
-                let split = crate::markdown::safe_markdown_split_point(&app.streaming_text);
+                let split = app.streaming_md_committed_len
+                    + crate::markdown::safe_markdown_split_point(
+                        &app.streaming_text[app.streaming_md_committed_len..],
+                    );
                 if split > app.streaming_md_committed_len {
                     let delta = &app.streaming_text[app.streaming_md_committed_len..split];
                     app.streaming_md_committed_lines.extend(
-                        crate::markdown::render_markdown(delta, &app.theme, content_max_width),
+                        crate::markdown::render_markdown_with_copy(delta, &app.theme, content_max_width, true),
                     );
                     app.streaming_md_committed_len = split;
                 }
@@ -1597,6 +1632,13 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
                 app.streaming_md_cache_len = app.streaming_text.len();
                 app.streaming_md_cache_width = content_max_width;
             }
+            let committed_messages = app.session.display_messages();
+            let first_stream_block = super::copy::blocks_before(committed_messages, committed_messages.len()) + 1;
+            app.copy_headers.tail.extend(super::copy::number_headers(
+                &app.streaming_md_committed_lines,
+                tail_lines.len(),
+                first_stream_block,
+            ));
             tail_lines.extend(app.streaming_md_committed_lines.iter().cloned());
             tail_lines.extend(app.streaming_md_cache.iter().cloned());
             tail_lines.push(Line::from(""));
@@ -1876,7 +1918,6 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         let guard = mgr.lock().unwrap_or_else(|e| e.into_inner());
         crate::tasks_dialog::render_tasks_dialog(frame, composer_chunk, &mut app.tasks_dialog, &guard, &app.theme);
     } else if app.settings_dialog.is_open {
-        let cfg = app.llm_client.get_config();
         crate::settings_dialog::render_settings_dialog(frame, composer_chunk, &app.settings_dialog, &cfg, &app.theme);
     } else if app.model_dialog.is_open {
         render_model_dialog(frame, composer_chunk, &app.model_dialog, &app.theme);
@@ -1915,7 +1956,8 @@ fn render_chat_ui(frame: &mut Frame, app: &mut App, size: Rect) {
         } else {
             &app.last_slash_filter
         };
-        render_command_popup(frame, filter_text, app.slash_selected_idx, p_chunk, &app.theme);
+        let custom_cmds = crate::custom_commands::discover_custom_commands_cached(&app.workspace_dir);
+        render_command_popup_with_custom(frame, filter_text, app.slash_selected_idx, p_chunk, &app.theme, &custom_cmds);
     }
 
 

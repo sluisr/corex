@@ -290,24 +290,53 @@ async fn submit(app: &mut App, cmd_to_run: String, send_now: bool, event_tx: &Ev
     if app.is_streaming && replaces_conversation(&user_prompt_clean) {
         app.cancel_generation("Generation cancelled to run the command.");
     }
+    if app.is_compacting()
+        && replaces_conversation(&user_prompt_clean)
+        && !matches!(user_prompt_clean.split_whitespace().next().unwrap_or(""), "/compact" | "/compress")
+    {
+        app.cancel_compaction_silent();
+    }
 
-    app.finish_mcp_startup_load().await;
-    if user_prompt_clean.starts_with('/') && app.handle_slash_command(&user_prompt_clean).await {
-        // Slash commands never expand paste tags; release the buffers.
-        app.pastes.clear();
-        app.images.clear();
-        if user_prompt_clean.starts_with("/fim")
-            && app.session.messages.last().is_some_and(|m| m.role == "user")
-        {
-            app.scroll_to_bottom();
-            app.start_stream_turn(event_tx.clone());
+    if user_prompt_clean.starts_with('/') {
+        // Check user-defined custom commands in `.corex/commands/*.md` and `~/.corex/commands/*.md`
+        // before built-in slash dispatch (built-ins always take precedence on name match).
+        let (cmd_token, cmd_args) = match user_prompt_clean.split_once(char::is_whitespace) {
+            Some((c, rest)) => (c, rest.trim()),
+            None => (user_prompt_clean.as_str(), ""),
+        };
+        let is_builtin = crate::slash_commands::ALL_COMMANDS
+            .iter()
+            .any(|c| c.name == cmd_token || c.aliases.contains(&cmd_token))
+            || matches!(cmd_token, "/sudo" | "/exit" | "/quit");
+        if !is_builtin {
+            if let Some(custom) = crate::custom_commands::find_custom_command(&app.workspace_dir, cmd_token) {
+                user_prompt_clean = custom.expand(cmd_args);
+            }
         }
-        return Flow::Handled;
+    }
+
+    if user_prompt_clean.starts_with('/') {
+        if user_prompt_clean.starts_with("/mcp") {
+            app.finish_mcp_startup_load().await;
+        }
+        if app.handle_slash_command(&user_prompt_clean).await {
+            // Slash commands never expand paste tags; release the prompt's buffers while
+            // keeping any images attached to already-queued messages.
+            app.pastes.clear();
+            app.prune_unreferenced_images();
+            if user_prompt_clean.starts_with("/fim")
+                && app.session.messages.last().is_some_and(|m| m.role == "user")
+            {
+                app.scroll_to_bottom();
+                app.start_stream_turn(event_tx.clone());
+            }
+            return Flow::Handled;
+        }
     }
 
     if user_prompt_clean.is_empty() {
         app.pastes.clear();
-        app.images.clear();
+        app.prune_unreferenced_images();
         return Flow::Handled;
     }
 
@@ -315,14 +344,20 @@ async fn submit(app: &mut App, cmd_to_run: String, send_now: bool, event_tx: &Ev
     app.pastes.clear();
 
     if let Some(command) = user_prompt_clean.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
-        app.images.clear();
+        app.prune_unreferenced_images();
         super::tools::run_user_shell(app, command.to_string());
         app.scroll_to_bottom();
         return Flow::Handled;
     }
 
-    // A message sent while a `!command` runs waits for its report, so the agent reads both.
-    if app.is_streaming || app.user_shell_rx.is_some() {
+    // Poll any ready startup MCP tools without blocking the UI thread: if slow MCP servers
+    // (e.g. 3+ seconds of stdio/remote handshakes) are still connecting when the user presses
+    // Enter on their first message, the prompt submits immediately with zero UI freeze and
+    // `poll_mcp_tools()` registers the MCP tools in the background as soon as they finish.
+    let _ = app.poll_mcp_tools();
+
+    // A message sent while a `!command` or `/compact` runs waits for it to finish.
+    if app.is_streaming || app.is_compacting() || app.user_shell_rx.is_some() {
         if send_now && app.is_streaming {
             app.steer_messages.push(user_prompt_clean);
         } else {
@@ -402,12 +437,12 @@ fn expand_paste_tags(app: &App, prompt: &mut String) {
     }
 }
 
-/// Empties the prompt together with its pastes and images.
+/// Empties the prompt together with its pastes and any unqueued images.
 fn clear_prompt(app: &mut App) {
     app.input_buffer.clear();
     app.cursor_idx = 0;
     app.pastes.clear();
-    app.images.clear();
+    app.prune_unreferenced_images();
     app.slash_selected_idx = 0;
     app.last_esc_press = None;
 }
@@ -1073,5 +1108,68 @@ mod tests {
         assert_eq!(prev_char_start("añ"), 1);
         assert_eq!(next_char_len("ñx"), 2);
         assert_eq!(next_char_len(""), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_message_with_pasted_image_preserves_image_pixels() {
+        let mut app = App::new(
+            corex_core::client::LlmClient::new(corex_core::config::Config::default()),
+            std::path::PathBuf::from("/tmp"),
+            false,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        app.is_streaming = true;
+        app.images.insert(
+            1,
+            crate::clipboard::ClipboardImage {
+                media_type: "image/png",
+                data: vec![0x89, b'P', b'N', b'G'],
+            },
+        );
+        app.next_image_id = 2;
+        app.input_buffer = "[Image #1] quien es esta persona?".to_string();
+        app.cursor_idx = app.input_buffer.len();
+
+        let before = (app.input_buffer.clone(), app.cursor_idx);
+        let cmd = app.input_buffer.trim().to_string();
+        submit(&mut app, cmd, false, &tx).await;
+        if app.input_buffer != before.0 {
+            app.record_prompt_edit(before);
+        }
+
+        assert_eq!(app.message_queue.len(), 1);
+        assert!(app.images.contains_key(&1), "queued image must not be cleared when composer empties");
+
+        let queued = app.message_queue.pop_front().unwrap();
+        let msg = app.user_message(queued);
+        match msg.content {
+            Some(corex_core::types::MessageContent::Parts(parts)) => {
+                assert!(parts.iter().any(|p| p.image_url.is_some()), "image part must be attached");
+            }
+            other => panic!("expected multipart message with image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn misclicked_slash_command_reports_command_not_found_without_starting_session() {
+        let mut app = App::new(
+            corex_core::client::LlmClient::new(corex_core::config::Config::default()),
+            std::path::PathBuf::from("/tmp"),
+            false,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        submit(&mut app, "/modle".to_string(), false, &tx).await;
+        assert!(!app.is_streaming, "unknown slash command must NOT start a stream turn");
+        assert_eq!(app.prompts_this_run, 0, "unknown slash command must NOT count as a prompt");
+        assert!(
+            !app.session.messages.iter().any(|m| m.role == "user"),
+            "unknown slash command must NOT be sent as a user message"
+        );
+        let last = app.session.messages.last().and_then(|m| m.text_content()).unwrap_or("");
+        assert!(
+            last.contains("Command not found: '/modle'") && last.contains("Did you mean /model?"),
+            "got: {last}"
+        );
     }
 }

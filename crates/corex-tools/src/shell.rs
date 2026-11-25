@@ -42,17 +42,18 @@ use crate::types::{Tool, ToolContext, ToolOutput};
 const BASH_SHOPT_GUARD: &str = r#"sudo() { local -a _a=(); for _x in "$@"; do [ "$_x" != "-n" ] && [ "$_x" != "--non-interactive" ] && _a+=("$_x"); done; if [ -n "$SUDO_ASKPASS" ]; then command sudo -A "${_a[@]}"; else command sudo "${_a[@]}"; fi; }; "#;
 
 fn askpass_dir() -> PathBuf {
-    BaseDirs::new()
-        .map(|d| d.home_dir().join(".corex"))
-        .unwrap_or_else(|| {
-            #[cfg(unix)]
-            // SAFETY: `libc::getuid()` is a POSIX system call that returns the real user ID
-            // of the calling process. It has no memory preconditions and cannot cause undefined behavior.
-            let uid = unsafe { libc::getuid() };
-            #[cfg(not(unix))]
-            let uid = std::process::id();
-            PathBuf::from(format!("/tmp/corex-askpass-{}", uid))
-        })
+    if let Some(dir) = BaseDirs::new().map(|d| d.home_dir().join(".corex")) {
+        if corex_core::ensure_private_dir(&dir).is_ok() {
+            return dir;
+        }
+    }
+    #[cfg(unix)]
+    // SAFETY: `libc::getuid()` is a POSIX system call that returns the real user ID
+    // of the calling process. It has no memory preconditions and cannot cause undefined behavior.
+    let uid = unsafe { libc::getuid() };
+    #[cfg(not(unix))]
+    let uid = std::process::id();
+    PathBuf::from(format!("/tmp/corex-askpass-{}", uid))
 }
 
 pub fn get_or_create_askpass_script() -> PathBuf {
@@ -1866,13 +1867,28 @@ impl Tool for ShellTool {
                         }
                     }
                     wait_res = child.wait() => {
-                        if let Some(ref mut r) = reader_stdout {
-                            // A child left in the background keeps the pipe open: never wait for EOF.
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut pending_out)).await;
-                        }
-                        if let Some(ref mut r) = reader_stderr {
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), r.take(200_000).read_to_end(&mut pending_err)).await;
-                        }
+                        // A child left in the background keeps the pipe open: never wait for EOF.
+                        // Drain both stdout and stderr concurrently so background grandchildren
+                        // do not stack 500ms + 500ms = 1000ms of sequential wait latency.
+                        let drain_out = async {
+                            if let Some(ref mut r) = reader_stdout {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(500),
+                                    r.take(200_000).read_to_end(&mut pending_out),
+                                )
+                                .await;
+                            }
+                        };
+                        let drain_err = async {
+                            if let Some(ref mut r) = reader_stderr {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(500),
+                                    r.take(200_000).read_to_end(&mut pending_err),
+                                )
+                                .await;
+                            }
+                        };
+                        tokio::join!(drain_out, drain_err);
                         for rest_bytes in [&pending_out, &pending_err] {
                             if !rest_bytes.is_empty() {
                                 let rest = String::from_utf8_lossy(rest_bytes);

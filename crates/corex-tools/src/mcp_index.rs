@@ -11,7 +11,7 @@ pub const SEARCH_TOOL: &str = "mcp_search_tools";
 pub const CALL_TOOL: &str = "mcp_call_tool";
 
 // Above this many MCP tools their schemas stay out of every request.
-pub const INLINE_LIMIT: usize = 24;
+pub const INLINE_LIMIT: usize = 12;
 
 const MAX_RESULTS: usize = 8;
 

@@ -208,15 +208,18 @@ pub(super) fn settings_key(app: &mut App, key: KeyEvent) -> Flow {
         SettingsAction::Change(setting, forward) => {
             let mut cfg = app.llm_client.get_config();
             apply(&mut cfg, setting, forward);
-            let saved = cfg.save_with_workspace(Some(&app.workspace_dir)).is_ok();
             let shown = value(&cfg, setting);
             app.wheel_acceleration = cfg.wheel_acceleration;
-            app.llm_client.update_config(cfg);
-            app.settings_dialog.notice = Some(if saved {
-                format!("{} → {shown}", label(setting))
+            app.llm_client.update_config(cfg.clone());
+            let ws = app.workspace_dir.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || {
+                    let _ = cfg.save_preferences_with_workspace(Some(&ws));
+                });
             } else {
-                format!("{} → {shown} (not saved, this session only)", label(setting))
-            });
+                let _ = cfg.save_preferences_with_workspace(Some(&ws));
+            }
+            app.settings_dialog.notice = Some(format!("{} → {shown}", label(setting)));
         }
     }
     Flow::Handled
@@ -448,7 +451,7 @@ fn deny_current_call(app: &mut App, event_tx: &EventTx) {
     let mut tool_msg = Message::tool_response(call.id, "Tool execution denied by user.".to_string());
     tool_msg.name = Some(call.function.name);
     app.session.add_message(tool_msg);
-    let _ = app.session.save();
+    app.session.save_async();
 
     if pending_batch.calls.is_empty() {
         if app.in_flight_tool_calls == 0 && !app.sudo_dialog.is_open {

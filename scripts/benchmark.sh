@@ -28,6 +28,7 @@ if [[ "$BUILD" == 1 ]] || [[ ! -f "$BIN_PATH" ]]; then
     cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml" --bin cx
     BIN_PATH="${ROOT_DIR}/target/release/cx"
 fi
+BIN_PATH="$(cd "$(dirname "$BIN_PATH")" && pwd)/$(basename "$BIN_PATH")"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "python3 is required for the timing and idle measurements." >&2

@@ -109,15 +109,23 @@ impl ModelProfile {
         if self.label.is_empty() { &self.id } else { &self.label }
     }
 
-    pub fn effective_reasoning(&self) -> Vec<String> {
+    pub fn effective_reasoning(&self, kind: ProviderKind) -> Vec<String> {
         if !self.reasoning.is_empty() {
             return self.reasoning.clone();
         }
         let id = bare_model_id(&self.id);
         let levels: &[&str] = if id.contains("deepseek") && id.contains("flash") {
-            &["off", "low", "high", "max"]
+            if kind == ProviderKind::Azure {
+                &["off", "high", "max"]
+            } else {
+                &["off", "low", "high", "max"]
+            }
         } else if id.contains("deepseek") && (id.contains("pro") || id.contains("reasoner") || id.contains("-r1")) {
-            &["max", "high", "low"]
+            if kind == ProviderKind::Azure {
+                &["max", "high"]
+            } else {
+                &["max", "high", "low"]
+            }
         } else if id.starts_with("gpt-6") || id.starts_with("gpt-5") {
             &["low", "medium", "high", "xhigh"]
         } else if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
@@ -286,121 +294,126 @@ fn model(id: &str, label: &str, tags: &[&str], reasoning: &[&str], family: Model
 }
 
 pub fn builtin_providers() -> Vec<ProviderConfig> {
-    vec![
-        ProviderConfig {
-            name: DEEPSEEK_ID.into(),
-            label: "DeepSeek".into(),
-            base_url: "https://api.deepseek.com".into(),
-            api_key_env: "DEEPSEEK_API_KEY".into(),
-            models: vec![
-                // `deepseek-v4.1-flash-1017` is not listed: it is the same Flash model, and the
-                // client still accepts it by name (`-m`, saved settings resolve to this entry).
-                model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["off", "low", "high", "max"], ModelFamily::Flash),
-                model("deepseek-pro", "DeepSeek-V4-Pro", &["thinking"], &["max", "high", "medium", "low"], ModelFamily::Pro),
-            ],
-        },
-        ProviderConfig {
-            name: OPENAI_ID.into(),
-            label: "OpenAI".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            api_key_env: "OPENAI_API_KEY".into(),
-            models: vec![
-                model("gpt-4o", "GPT-4o (Omni)", &["flagship", "multimodal", "tools"], &[], ModelFamily::Generic),
-                model("gpt-4o-mini", "GPT-4o Mini", &["fast", "cheap", "tools"], &[], ModelFamily::Generic),
-                model("o3-mini", "o3-mini", &["reasoning", "coding", "fast"], &["low", "medium", "high"], ModelFamily::Generic),
-                model("o1", "o1", &["reasoning", "deep", "complex"], &["low", "medium", "high"], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: ANTHROPIC_ID.into(),
-            label: "Anthropic (Claude)".into(),
-            base_url: "https://api.anthropic.com/v1".into(),
-            api_key_env: "ANTHROPIC_API_KEY".into(),
-            models: vec![
-                model("claude-opus-5-5", "Claude Opus 5.5", &["thinking", "coding", "agentic", "tools", "recommended"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-                model("claude-sonnet-5-5", "Claude Sonnet 5.5", &["thinking", "coding", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-                model("claude-haiku-5-5", "Claude Haiku 5.5", &["fast", "cheap", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-                model("claude-fable-5-1", "Claude Fable 5.1", &["thinking", "deep", "complex", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: GOOGLE_ID.into(),
-            label: "Google (Gemini)".into(),
-            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
-            api_key_env: "GEMINI_API_KEY".into(),
-            models: vec![
-                model("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", &["recommended", "free-tier", "fastest", "tools"], &[], ModelFamily::Generic),
-                model("gemini-3.5-flash", "Gemini 3.5 Flash", &["free-tier", "multimodal", "tools"], &[], ModelFamily::Generic),
-                model("gemini-3.8-flash", "Gemini 3.8 Flash", &["latest", "flagship", "tools"], &[], ModelFamily::Generic),
-                model("gemini-flash-latest", "Gemini Flash (Latest)", &["auto-updating"], &[], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: GITHUB_ID.into(),
-            label: "GitHub Models (Free)".into(),
-            base_url: "https://models.inference.ai.azure.com".into(),
-            api_key_env: "GITHUB_TOKEN".into(),
-            models: vec![
-                model("gpt-4o", "GitHub - GPT-4o", &["free", "flagship", "tools"], &[], ModelFamily::Generic),
-                model("gpt-4o-mini", "GitHub - GPT-4o Mini", &["free", "fast", "tools"], &[], ModelFamily::Generic),
-                model("o3-mini", "GitHub - o3-mini", &["free", "reasoning", "coding"], &["low", "medium", "high"], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: GROQ_ID.into(),
-            label: "Groq (Free / Ultra-Fast)".into(),
-            base_url: "https://api.groq.com/openai/v1".into(),
-            api_key_env: "GROQ_API_KEY".into(),
-            models: vec![
-                model("llama-3.3-70b-versatile", "Groq - Llama 3.3 70B", &["free-tier", "ultra-fast", "tools"], &[], ModelFamily::Generic),
-                model("llama-3.1-8b-instant", "Groq - Llama 3.1 8B", &["free-tier", "fastest", "tools"], &[], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: OPENROUTER_ID.into(),
-            label: "OpenRouter".into(),
-            base_url: "https://openrouter.ai/api/v1".into(),
-            api_key_env: "OPENROUTER_API_KEY".into(),
-            models: vec![
-                model("openai/gpt-4o", "GPT-4o (Router)", &["flagship", "tools"], &[], ModelFamily::Generic),
-                model("deepseek/deepseek-chat", "DeepSeek-V3 (Router)", &["cheap", "fast", "tools"], &[], ModelFamily::Generic),
-                model("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B (Router)", &["open-weights", "tools"], &[], ModelFamily::Generic),
-            ],
-        },
-        ProviderConfig {
-            name: MISTRAL_ID.into(),
-            label: "Mistral AI".into(),
-            base_url: "https://api.mistral.ai/v1".into(),
-            api_key_env: "MISTRAL_API_KEY".into(),
-            models: vec![
-                model("codestral-latest", "Codestral (Coding)", &["coding", "tools", "recommended"], &[], ModelFamily::Generic),
-                model("mistral-large-latest", "Mistral Large", &["flagship", "reasoning", "tools"], &[], ModelFamily::Generic),
-            ],
-        },
-        // The NIM catalog has hundreds of models that come and go, so none is shipped: the ones
-        // worth having are listed by hand under `providers` in settings.json.
-        ProviderConfig {
-            name: NVIDIA_ID.into(),
-            label: "NVIDIA NIM".into(),
-            base_url: "https://integrate.api.nvidia.com/v1".into(),
-            api_key_env: "NVIDIA_API_KEY".into(),
-            models: Vec::new(),
-        },
-        ProviderConfig {
-            name: AZURE_ID.into(),
-            label: "Azure AI Foundry".into(),
-            base_url: String::new(),
-            api_key_env: "AZURE_AI_API_KEY".into(),
-            models: Vec::new(),
-        },
-        ProviderConfig {
-            name: LOCAL_ID.into(),
-            label: "Local".into(),
-            base_url: String::new(),
-            api_key_env: String::new(),
-            models: vec![model("local-assistant", "Local Offline Assistant", &["private", "$0.00"], &[], ModelFamily::Generic)],
-        },
-    ]
+    static CACHE: std::sync::OnceLock<Vec<ProviderConfig>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            vec![
+                ProviderConfig {
+                    name: DEEPSEEK_ID.into(),
+                    label: "DeepSeek".into(),
+                    base_url: "https://api.deepseek.com".into(),
+                    api_key_env: "DEEPSEEK_API_KEY".into(),
+                    models: vec![
+                        // `deepseek-v4.1-flash-1017` is not listed: it is the same Flash model, and the
+                        // client still accepts it by name (`-m`, saved settings resolve to this entry).
+                        model("deepseek-flash", "DeepSeek-V4.1-Flash", &["fast", "tools", "recommended"], &["off", "low", "high", "max"], ModelFamily::Flash),
+                        model("deepseek-v4-pro", "DeepSeek-V4-Pro", &["thinking"], &["max", "high", "low"], ModelFamily::Pro),
+                    ],
+                },
+                ProviderConfig {
+                    name: OPENAI_ID.into(),
+                    label: "OpenAI".into(),
+                    base_url: "https://api.openai.com/v1".into(),
+                    api_key_env: "OPENAI_API_KEY".into(),
+                    models: vec![
+                        model("gpt-4o", "GPT-4o (Omni)", &["flagship", "multimodal", "tools"], &[], ModelFamily::Generic),
+                        model("gpt-4o-mini", "GPT-4o Mini", &["fast", "cheap", "tools"], &[], ModelFamily::Generic),
+                        model("o3-mini", "o3-mini", &["reasoning", "coding", "fast"], &["low", "medium", "high"], ModelFamily::Generic),
+                        model("o1", "o1", &["reasoning", "deep", "complex"], &["low", "medium", "high"], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: ANTHROPIC_ID.into(),
+                    label: "Anthropic (Claude)".into(),
+                    base_url: "https://api.anthropic.com/v1".into(),
+                    api_key_env: "ANTHROPIC_API_KEY".into(),
+                    models: vec![
+                        model("claude-opus-5-5", "Claude Opus 5.5", &["thinking", "coding", "agentic", "tools", "recommended"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                        model("claude-sonnet-5-5", "Claude Sonnet 5.5", &["thinking", "coding", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                        model("claude-haiku-5-5", "Claude Haiku 5.5", &["fast", "cheap", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                        model("claude-fable-5-1", "Claude Fable 5.1", &["thinking", "deep", "complex", "tools"], &["low", "medium", "high", "xhigh", "max"], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: GOOGLE_ID.into(),
+                    label: "Google (Gemini)".into(),
+                    base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                    api_key_env: "GEMINI_API_KEY".into(),
+                    models: vec![
+                        model("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", &["recommended", "free-tier", "fastest", "tools"], &[], ModelFamily::Generic),
+                        model("gemini-3.5-flash", "Gemini 3.5 Flash", &["free-tier", "multimodal", "tools"], &[], ModelFamily::Generic),
+                        model("gemini-3.8-flash", "Gemini 3.8 Flash", &["latest", "flagship", "tools"], &[], ModelFamily::Generic),
+                        model("gemini-flash-latest", "Gemini Flash (Latest)", &["auto-updating"], &[], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: GITHUB_ID.into(),
+                    label: "GitHub Models (Free)".into(),
+                    base_url: "https://models.inference.ai.azure.com".into(),
+                    api_key_env: "GITHUB_TOKEN".into(),
+                    models: vec![
+                        model("gpt-4o", "GitHub - GPT-4o", &["free", "flagship", "tools"], &[], ModelFamily::Generic),
+                        model("gpt-4o-mini", "GitHub - GPT-4o Mini", &["free", "fast", "tools"], &[], ModelFamily::Generic),
+                        model("o3-mini", "GitHub - o3-mini", &["free", "reasoning", "coding"], &["low", "medium", "high"], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: GROQ_ID.into(),
+                    label: "Groq (Free / Ultra-Fast)".into(),
+                    base_url: "https://api.groq.com/openai/v1".into(),
+                    api_key_env: "GROQ_API_KEY".into(),
+                    models: vec![
+                        model("llama-3.3-70b-versatile", "Groq - Llama 3.3 70B", &["free-tier", "ultra-fast", "tools"], &[], ModelFamily::Generic),
+                        model("llama-3.1-8b-instant", "Groq - Llama 3.1 8B", &["free-tier", "fastest", "tools"], &[], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: OPENROUTER_ID.into(),
+                    label: "OpenRouter".into(),
+                    base_url: "https://openrouter.ai/api/v1".into(),
+                    api_key_env: "OPENROUTER_API_KEY".into(),
+                    models: vec![
+                        model("openai/gpt-4o", "GPT-4o (Router)", &["flagship", "tools"], &[], ModelFamily::Generic),
+                        model("deepseek/deepseek-chat", "DeepSeek-V3 (Router)", &["cheap", "fast", "tools"], &[], ModelFamily::Generic),
+                        model("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B (Router)", &["open-weights", "tools"], &[], ModelFamily::Generic),
+                    ],
+                },
+                ProviderConfig {
+                    name: MISTRAL_ID.into(),
+                    label: "Mistral AI".into(),
+                    base_url: "https://api.mistral.ai/v1".into(),
+                    api_key_env: "MISTRAL_API_KEY".into(),
+                    models: vec![
+                        model("codestral-latest", "Codestral (Coding)", &["coding", "tools", "recommended"], &[], ModelFamily::Generic),
+                        model("mistral-large-latest", "Mistral Large", &["flagship", "reasoning", "tools"], &[], ModelFamily::Generic),
+                    ],
+                },
+                // The NIM catalog has hundreds of models that come and go, so none is shipped: the ones
+                // worth having are listed by hand under `providers` in settings.json.
+                ProviderConfig {
+                    name: NVIDIA_ID.into(),
+                    label: "NVIDIA NIM".into(),
+                    base_url: "https://integrate.api.nvidia.com/v1".into(),
+                    api_key_env: "NVIDIA_API_KEY".into(),
+                    models: Vec::new(),
+                },
+                ProviderConfig {
+                    name: AZURE_ID.into(),
+                    label: "Azure AI Foundry".into(),
+                    base_url: String::new(),
+                    api_key_env: "AZURE_AI_API_KEY".into(),
+                    models: Vec::new(),
+                },
+                ProviderConfig {
+                    name: LOCAL_ID.into(),
+                    label: "Local".into(),
+                    base_url: String::new(),
+                    api_key_env: String::new(),
+                    models: vec![model("local-assistant", "Local Offline Assistant", &["private", "$0.00"], &[], ModelFamily::Generic)],
+                },
+            ]
+        })
+        .clone()
 }
 
 /// Built-ins merged with user-defined providers. A user provider with the same `name`
@@ -618,5 +631,13 @@ mod tests {
         assert_eq!(az_merged.api_key_env, "AZURE_AI_API_KEY");
         assert_eq!(az_merged.base_url, "https://example.services.ai.azure.com/openai/v1");
         assert_eq!(az_merged.models.len(), 2);
+        assert_eq!(
+            az_merged.models[1].effective_reasoning(ProviderKind::Azure),
+            vec!["off", "high", "max"]
+        );
+        assert_eq!(
+            az_merged.models[1].effective_reasoning(ProviderKind::DeepSeek),
+            vec!["off", "low", "high", "max"]
+        );
     }
 }

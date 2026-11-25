@@ -53,12 +53,26 @@ pub fn reminder_text(date: NaiveDate, language: &str) -> String {
     format!("{},{weekday},,App,{name}", date.format("%Y-%m-%d"))
 }
 
-/// Puts today's date before the newest user message, the way DeepSeek Chat tells its model.
+/// Puts today's date before the newest real user message, the way DeepSeek Chat tells its model.
+/// Ignores synthetic tool-image user messages so loading an image mid-turn never shifts the
+/// reminder (which would invalidate DeepSeek's KV prefix cache and misdetect the language).
 pub fn insert_latest_reminder(messages: &mut Vec<Message>, today: NaiveDate) {
-    let Some(idx) = messages.iter().rposition(|m| m.role == "user") else {
+    let Some(idx) = messages
+        .iter()
+        .rposition(|m| {
+            m.role == "user"
+                && !crate::tool_images::is_tool_image_message(m)
+                && !m
+                    .text_content()
+                    .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
+        })
+    else {
         return;
     };
-    let language = messages[idx].text_content().map_or("English", language_of);
+    let language = messages[idx]
+        .display_text()
+        .as_deref()
+        .map_or("English", language_of);
     messages.insert(
         idx,
         Message {
@@ -110,5 +124,25 @@ mod tests {
         let mut none = vec![Message::system("sys")];
         insert_latest_reminder(&mut none, day(18));
         assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn synthetic_tool_image_messages_do_not_move_reminder_or_reset_language() {
+        use crate::types::ContentPart;
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user_parts(vec![
+                ContentPart::text("mira esta foto por favor [Image #1]"),
+                ContentPart::image_url("data:image/png;base64,AAAA"),
+            ]),
+            Message::assistant("Voy a comparar".to_string(), None),
+            Message::user_parts(vec![
+                ContentPart::text("[Image(s) loaded by the read_image tool: /tmp/a.png]"),
+                ContentPart::image_url("data:image/png;base64,BBBB"),
+            ]),
+        ];
+        insert_latest_reminder(&mut messages, day(18));
+        assert_eq!(messages[1].role, "latest_reminder");
+        assert_eq!(messages[1].text_content(), Some("2026-11-18,Miércoles,,App,español"));
     }
 }

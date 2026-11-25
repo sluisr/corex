@@ -135,8 +135,20 @@ impl Default for ProSettings {
 }
 
 
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+fn is_mcp_enabled(enabled: &bool) -> bool {
+    *enabled
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpServerConfig {
+    /// Whether this MCP server is active. Disabled servers stay in `settings.json` with their
+    /// full configuration and credentials intact, but are not spawned or queried at startup.
+    #[serde(default = "default_mcp_enabled", skip_serializing_if = "is_mcp_enabled")]
+    pub enabled: bool,
     /// Local servers are spawned as a subprocess and talked to over stdio.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
@@ -159,6 +171,7 @@ impl McpServerConfig {
     /// A local server launched as a subprocess and spoken to over stdio.
     pub fn stdio(command: impl Into<String>, args: Vec<String>) -> Self {
         Self {
+            enabled: true,
             command: command.into(),
             args,
             env: HashMap::new(),
@@ -171,6 +184,7 @@ impl McpServerConfig {
     /// A remote server spoken to over Streamable HTTP.
     pub fn remote(url: impl Into<String>, headers: HashMap<String, String>) -> Self {
         Self {
+            enabled: true,
             command: String::new(),
             args: Vec::new(),
             env: HashMap::new(),
@@ -230,6 +244,7 @@ const SETTINGS_ORDER: &[&str] = &[
     "local_prompt_lite",
     "providers",
     "mcp_servers",
+    "hooks",
 ];
 
 /// Keys `settings.json` no longer carries; they are still read from files that have them.
@@ -387,6 +402,47 @@ impl<'de> Deserialize<'de> for YoloMode {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookRule {
+    /// Tool name matcher: `"*"` (or empty) matches all tools, or comma-separated names like `"edit,apply_patch"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub matcher: String,
+    /// Shell command executed when the hook fires.
+    pub command: String,
+    /// Optional timeout in seconds (default: 10s, capped at 60s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl HookRule {
+    pub fn matches_tool(&self, tool_name: &str) -> bool {
+        let m = self.matcher.trim();
+        if m.is_empty() || m == "*" {
+            return true;
+        }
+        m.split(',').any(|part| {
+            let p = part.trim();
+            p == "*" || p.eq_ignore_ascii_case(tool_name)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HooksConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_tool_use: Vec<HookRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_tool_use: Vec<HookRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_stop: Vec<HookRule>,
+}
+
+impl HooksConfig {
+    pub fn is_empty(&self) -> bool {
+        self.pre_tool_use.is_empty() && self.post_tool_use.is_empty() && self.on_stop.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_api_key")]
@@ -405,6 +461,10 @@ pub struct Config {
     pub pro_settings: ProSettings,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// Lifecycle hooks (`pre_tool_use`, `post_tool_use`, `on_stop`). Global-only: never overridden
+    /// by workspace `.corex/settings.json` so untrusted repositories cannot execute shell hooks.
+    #[serde(default, skip_serializing_if = "HooksConfig::is_empty")]
+    pub hooks: HooksConfig,
     #[serde(default, skip)]
     pub sudo_password: Option<String>,
     #[serde(default)]
@@ -429,6 +489,9 @@ pub struct Config {
     pub recent_images: usize,
     #[serde(default)]
     pub wheel_acceleration: WheelAcceleration,
+    /// Terminal (OSC 9 + BEL) and desktop notifications on approvals or long turns (default: true).
+    #[serde(default = "default_notifications")]
+    pub notifications: bool,
     /// Estimated prompt size that triggers auto-compaction. Unset: 80% of the context window.
     /// (`95000`, the old fixed default that earlier versions wrote to `settings.json`, also
     /// counts as unset.)
@@ -475,6 +538,10 @@ pub struct Config {
 }
 
 fn default_auto_compact() -> bool {
+    true
+}
+
+fn default_notifications() -> bool {
     true
 }
 
@@ -616,6 +683,7 @@ impl Default for Config {
             flash_settings: FlashSettings::default(),
             pro_settings: ProSettings::default(),
             mcp_servers: HashMap::new(),
+            hooks: HooksConfig::default(),
             sudo_password: None,
             yolo_mode: YoloMode::Off,
             target_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -627,6 +695,7 @@ impl Default for Config {
             temperature_enabled: false,
             recent_images: default_recent_images(),
             wheel_acceleration: WheelAcceleration::default(),
+            notifications: default_notifications(),
             compact_threshold_tokens: None,
             history_token_limit: None,
             context_window_tokens: None,
@@ -653,6 +722,7 @@ pub const AGENT_SETTABLE: &[&str] = &[
     "temperature_enabled",
     "recent_images",
     "wheel_acceleration",
+    "notifications",
     "compact_threshold_tokens",
     "history_token_limit",
     "context_window_tokens",
@@ -668,6 +738,7 @@ pub const AGENT_SETTABLE: &[&str] = &[
     "allowed_commands",
     "providers",
     "mcp_servers",
+    "hooks",
 ];
 
 pub const AGENT_SETTABLE_ALWAYS_ASK: &[&str] = &["yolo_mode", "allowed_commands", "providers", "mcp_servers"];
@@ -726,6 +797,7 @@ impl Config {
             "temperature_enabled" => self.temperature_enabled = new.temperature_enabled,
             "recent_images" => self.recent_images = new.recent_images,
             "wheel_acceleration" => self.wheel_acceleration = new.wheel_acceleration,
+            "notifications" => self.notifications = new.notifications,
             "compact_threshold_tokens" => self.compact_threshold_tokens = new.compact_threshold_tokens,
             "history_token_limit" => self.history_token_limit = new.history_token_limit,
             "context_window_tokens" => self.context_window_tokens = new.context_window_tokens,
@@ -886,17 +958,42 @@ impl Config {
         }
         // Match by model prefix so snapshots absent from the built-in catalog still route to their vendor.
         let model_lower = self.model.to_ascii_lowercase();
-        let family_provider = if model_lower.starts_with("claude-") {
-            Some(crate::providers::ANTHROPIC_ID)
+        let family_candidates: &[&str] = if model_lower.starts_with("claude-") {
+            &[crate::providers::ANTHROPIC_ID]
         } else if model_lower.starts_with("gemini-") {
-            Some(crate::providers::GOOGLE_ID)
+            &[crate::providers::GOOGLE_ID]
+        } else if model_lower.starts_with("gpt-")
+            || model_lower.starts_with("o1")
+            || model_lower.starts_with("o3")
+            || model_lower.starts_with("o4")
+        {
+            &[
+                crate::providers::OPENAI_ID,
+                crate::providers::AZURE_ID,
+                crate::providers::GITHUB_ID,
+            ]
         } else {
-            None
+            &[]
         };
-        if let Some(name) = family_provider {
+        for &name in family_candidates {
             if let Some(p) = all
                 .iter()
                 .find(|p| p.name == name && validate_base_url(&p.base_url).is_ok())
+            {
+                let has_key = self
+                    .provider_api_keys
+                    .get(&p.name)
+                    .is_some_and(|k| !k.trim().is_empty())
+                    || !p.api_key().trim().is_empty();
+                if has_key || family_candidates.len() == 1 {
+                    return Some(p.clone());
+                }
+            }
+        }
+        if let Some(&first_name) = family_candidates.first() {
+            if let Some(p) = all
+                .iter()
+                .find(|p| p.name == first_name && validate_base_url(&p.base_url).is_ok())
             {
                 return Some(p.clone());
             }
@@ -973,11 +1070,34 @@ impl Config {
             .find(|key| !key.trim().is_empty())
     }
 
-    /// False for the models known to read only text, which reject image parts: DeepSeek Pro.
-    /// DeepSeek Flash sees images, like the other vendors' models; one that turns out not to is
-    /// handled when the request is rejected (see `LlmClient::stream_chat`).
+    /// False for models known to read only text, which reject image parts (e.g. DeepSeek Pro,
+    /// DeepSeek R1/V3/Coder, Codestral, o1-mini, Llama 3.1/3.3 text-only, Qwen2.5-Coder).
+    /// Unknown or custom models default to `true`; if a provider still rejects `image_url`,
+    /// `LlmClient::stream_chat` automatically retries with a text note.
     pub fn can_see_images(&self) -> bool {
-        !(self.is_deepseek_endpoint() && is_pro_model(&self.model))
+        if self.is_deepseek_endpoint() && is_pro_model(&self.model) {
+            return false;
+        }
+        let m = if self.local_llm_enabled || self.model.starts_with("local") {
+            self.local_llm_model.to_ascii_lowercase()
+        } else {
+            self.model.to_ascii_lowercase()
+        };
+        if m.contains("vision") || m.contains("-vl") || m.contains("_vl") || m.contains("pixtral") || m.contains("llava") {
+            return true;
+        }
+        let known_text_only = m.contains("deepseek-r1")
+            || m.contains("deepseek-reasoner")
+            || m.contains("deepseek-v3")
+            || m.contains("deepseek-coder")
+            || m.contains("codestral")
+            || m == "o1-mini"
+            || m.starts_with("o1-mini-")
+            || m.contains("llama-3.1")
+            || m.contains("llama-3.3")
+            || m.contains("qwen2.5-coder")
+            || m.contains("qwen-2.5-coder");
+        !known_text_only
     }
 
     /// True when requests go to DeepSeek (enables DeepSeek-only request fields and model aliases).
@@ -1160,6 +1280,29 @@ impl Config {
         keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()
     }
 
+    /// In-memory cache of the raw keyring payload so repeated `Config::load` / `credentials_location`
+    /// calls do not block for ~115ms on synchronous D-Bus Secret Service IPC every time.
+    fn keyring_cache() -> &'static std::sync::Mutex<Option<Option<String>>> {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Option<String>>>> = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    fn read_keyring_cached() -> Option<String> {
+        if cfg!(test) {
+            return None;
+        }
+        if let Ok(guard) = Self::keyring_cache().lock() {
+            if let Some(ref cached) = *guard {
+                return cached.clone();
+            }
+        }
+        let fetched = Self::keyring_entry().and_then(|e| e.get_password().ok());
+        if let Ok(mut guard) = Self::keyring_cache().lock() {
+            *guard = Some(fetched.clone());
+        }
+        fetched
+    }
+
     /// The keys from `credentials.json` (when present on disk) or the system keyring.
     /// Checking the file first avoids a blocking D-Bus IPC round-trip on every startup when
     /// credentials are stored on disk (`save_credentials` removes `credentials.json` whenever
@@ -1172,7 +1315,7 @@ impl Config {
                 }
             }
         }
-        if let Some(stored) = Self::keyring_entry().and_then(|e| e.get_password().ok()) {
+        if let Some(stored) = Self::read_keyring_cached() {
             if let Ok(credentials) = serde_json::from_str(&stored) {
                 return Some(credentials);
             }
@@ -1189,10 +1332,16 @@ impl Config {
         }
         let path = Self::credentials_path();
         if Self::keyring_entry().is_some_and(|e| e.set_password(content).is_ok()) {
+            if let Ok(mut guard) = Self::keyring_cache().lock() {
+                *guard = Some(Some(content.to_string()));
+            }
             if let Some(path) = path.filter(|p| p.exists()) {
                 fs::remove_file(path)?;
             }
             return Ok(());
+        }
+        if let Ok(mut guard) = Self::keyring_cache().lock() {
+            *guard = Some(None);
         }
         if let Some(path) = path {
             if let Some(dir) = path.parent() {
@@ -1205,7 +1354,7 @@ impl Config {
 
     /// Where the keys are kept, for messages to the user.
     pub fn credentials_location() -> &'static str {
-        if Self::keyring_entry().is_some_and(|e| e.get_password().is_ok()) {
+        if Self::read_keyring_cached().is_some() {
             "the system keyring"
         } else {
             "~/.corex/credentials.json"
@@ -1497,13 +1646,6 @@ impl Config {
         Self::mcp_servers_in(&content)
     }
 
-    fn yolo_mode_from_disk() -> YoloMode {
-        Self::resolve_settings_path(None, "settings.json")
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|content| Self::yolo_mode_in(&content))
-            .unwrap_or_default()
-    }
-
     fn yolo_mode_in(content: &str) -> Option<YoloMode> {
         let value: serde_json::Value = serde_json::from_str(content).ok()?;
         serde_json::from_value(value.get("yolo_mode")?.clone()).ok()
@@ -1572,7 +1714,22 @@ impl Config {
         if let Some(ws) = workspace {
             self.save_project_state(ws)?;
         }
-        self.save_settings(workspace, false, false)
+        self.save_settings(workspace, false, false, true)
+    }
+
+    /// Saves model/tuning preferences (`state.json` + `settings.json`) without touching the
+    /// OS keyring or credentials file. Used by `/model` and tuning toggles so changing models
+    /// or reasoning effort never triggers a blocking D-Bus Secret Service round-trip.
+    pub fn save_preferences_with_workspace(&self, workspace: Option<&Path>) -> anyhow::Result<()> {
+        static SAVE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = SAVE_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ws) = workspace {
+            self.save_project_state(ws)?;
+        }
+        self.save_settings(workspace, false, false, false)
     }
 
     pub fn save_project_state(&self, workspace: &Path) -> anyhow::Result<()> {
@@ -1586,27 +1743,42 @@ impl Config {
     /// the map in memory that must reach the file. Every other save keeps the map the file holds,
     /// so a process that started before `settings.json` was edited cannot write the old copy
     /// — an outdated key included — back over it.
-    fn save_settings(&self, workspace: Option<&Path>, write_mcp_servers: bool, write_providers: bool) -> anyhow::Result<()> {
+    fn save_settings(
+        &self,
+        workspace: Option<&Path>,
+        write_mcp_servers: bool,
+        write_providers: bool,
+        write_credentials: bool,
+    ) -> anyhow::Result<()> {
         let mut to_save = self.clone();
+        // Read global settings.json once instead of three separate disk reads.
+        let disk_settings = Self::resolve_settings_path(None, "settings.json")
+            .and_then(|path| fs::read_to_string(path).ok());
         if !write_mcp_servers {
-            to_save.keep_mcp_servers_from(Self::mcp_servers_from_disk());
+            to_save.keep_mcp_servers_from(disk_settings.as_deref().and_then(Self::mcp_servers_in));
         }
         if !write_providers {
-            to_save.keep_providers_from(Self::providers_from_disk());
+            to_save.keep_providers_from(disk_settings.as_deref().and_then(Self::providers_in));
         }
         // `-y` / Shift+Tab are per run; only a hand edit of the file makes YOLO stick.
-        to_save.yolo_mode = Self::yolo_mode_from_disk();
-        if to_save.api_key.trim().is_empty() || Self::is_env_supplied_key(&to_save.api_key) {
-            // Keep whatever key the file already had; an environment key stays in the environment.
-            to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
-        }
+        to_save.yolo_mode = disk_settings
+            .as_deref()
+            .and_then(Self::yolo_mode_in)
+            .unwrap_or_default();
 
-        // Keys first: if they cannot be written, settings.json keeps the ones it may still hold.
-        match Self::credentials_document(&to_save) {
-            Some(credentials) => Self::save_credentials(&credentials, workspace)?,
-            // Every key was removed: empty the store instead of leaving the old ones in it.
-            None if Self::load_credentials().is_some() => Self::save_credentials("{}\n", workspace)?,
-            None => {}
+        if write_credentials {
+            if to_save.api_key.trim().is_empty() || Self::is_env_supplied_key(&to_save.api_key) {
+                // Keep whatever key the file already had; an environment key stays in the environment.
+                to_save.api_key = Self::load_existing_api_key(workspace).unwrap_or_default();
+            }
+
+            // Keys first: if they cannot be written, settings.json keeps the ones it may still hold.
+            match Self::credentials_document(&to_save) {
+                Some(credentials) => Self::save_credentials(&credentials, workspace)?,
+                // Every key was removed: empty the store instead of leaving the old ones in it.
+                None if Self::load_credentials().is_some() => Self::save_credentials("{}\n", workspace)?,
+                None => {}
+            }
         }
         let content = Self::settings_document(&to_save)?;
         Self::save_to_destinations(&content, "settings.json", workspace)
@@ -1616,7 +1788,7 @@ impl Config {
         if let Some(ws) = workspace {
             self.save_project_state(ws)?;
         }
-        self.save_settings(workspace, key == "mcp_servers", key == "providers")
+        self.save_settings(workspace, key == "mcp_servers", key == "providers", false)
     }
 
     pub fn add_mcp_server(
@@ -1630,7 +1802,7 @@ impl Config {
         let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
         servers.insert(name, server);
         self.mcp_servers = servers;
-        self.save_settings(workspace, true, false)
+        self.save_settings(workspace, true, false, false)
     }
 
     pub fn remove_mcp_server(
@@ -1642,9 +1814,71 @@ impl Config {
         let existed = servers.remove(name).is_some();
         if existed {
             self.mcp_servers = servers;
-            self.save_settings(workspace, true, false)?;
+            self.save_settings(workspace, true, false, false)?;
         }
         Ok(existed)
+    }
+
+    /// Enables or disables an MCP server (or `"all"` / `"*"` for every configured server)
+    /// in `settings.json` without removing its configuration or credentials.
+    /// Returns the list of matched server names whose `enabled` state was updated.
+    pub fn set_mcp_server_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        workspace: Option<&Path>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
+        let mut matched = Vec::new();
+        if name.eq_ignore_ascii_case("all") || name == "*" {
+            let mut names: Vec<String> = servers.keys().cloned().collect();
+            names.sort();
+            for k in names {
+                if let Some(s) = servers.get_mut(&k) {
+                    s.enabled = enabled;
+                    matched.push(k);
+                }
+            }
+        } else if let Some(s) = servers.get_mut(name) {
+            s.enabled = enabled;
+            matched.push(name.to_string());
+        } else if let Some(key) = servers.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
+            if let Some(s) = servers.get_mut(&key) {
+                s.enabled = enabled;
+                matched.push(key);
+            }
+        }
+        if !matched.is_empty() {
+            self.mcp_servers = servers;
+            self.save_settings(workspace, true, false, false)?;
+        }
+        Ok(matched)
+    }
+
+    /// Flips an MCP server between enabled and disabled, returning `(canonical_name, new_enabled)`.
+    pub fn toggle_mcp_server(
+        &mut self,
+        name: &str,
+        workspace: Option<&Path>,
+    ) -> anyhow::Result<Option<(String, bool)>> {
+        let mut servers = Self::mcp_servers_from_disk().unwrap_or_else(|| self.mcp_servers.clone());
+        let key = if servers.contains_key(name) {
+            Some(name.to_string())
+        } else {
+            servers.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned()
+        };
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let new_state = if let Some(s) = servers.get_mut(&key) {
+            s.enabled = !s.enabled;
+            s.enabled
+        } else {
+            return Ok(None);
+        };
+        self.mcp_servers = servers;
+        self.save_settings(workspace, true, false, false)?;
+        Ok(Some((key, new_state)))
     }
 }
 
@@ -1977,6 +2211,28 @@ mod tests {
         assert!(same_host("https://proxy.example.com/v1", "https://proxy.example.com/other"));
         assert!(!same_host("https://proxy.example.com/v1", "https://evil.example.com/v1"));
         assert!(!same_host("not a url", "https://proxy.example.com"));
+    }
+
+    #[test]
+    fn external_provider_routes_unlisted_gpt_and_o_series_by_prefix() {
+        let mut cfg = Config {
+            model: "gpt-6.2-astra".to_string(),
+            active_provider: None,
+            ..Config::default()
+        };
+        // Falls back to OpenAI when no custom Azure key is configured.
+        assert_eq!(cfg.external_provider().map(|p| p.name), Some("openai".to_string()));
+
+        // Prefers a configured Azure provider with key when OpenAI has no key.
+        cfg.providers.push(crate::providers::ProviderConfig {
+            name: "azure".into(),
+            label: "Azure".into(),
+            base_url: "https://example.services.ai.azure.com/openai/v1".into(),
+            api_key_env: String::new(),
+            models: Vec::new(),
+        });
+        cfg.provider_api_keys.insert("azure".into(), "az-test-key".into());
+        assert_eq!(cfg.external_provider().map(|p| p.name), Some("azure".to_string()));
     }
 
     #[test]

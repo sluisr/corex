@@ -194,11 +194,14 @@ impl App {
             balance_rx,
             is_checking_balance: false,
             pending_balance_msg_index: None,
+            compact_rx: None,
+            compact_cancel: None,
             message_queue: VecDeque::new(),
             steer_messages: Vec::new(),
             start_time: Instant::now(),
             last_interaction: Instant::now(),
             mcp_startup_rx: None,
+            fleet_nodes_available: Arc::new(AtomicBool::new(false)),
         };
         corex_fleet::register_fleet_tools(&mut app.tool_registry);
         crate::app::render::set_user_label(cfg.user_name.as_deref());
@@ -638,9 +641,13 @@ impl App {
             return Vec::new();
         }
 
-        crate::slash_commands::match_commands(&self.input_buffer)
+        let custom = crate::custom_commands::discover_custom_commands_cached(&self.workspace_dir);
+        crate::slash_commands::match_commands_with_custom(&self.input_buffer, &custom)
             .into_iter()
-            .map(|c| crate::slash_commands::completion(&self.input_buffer, c))
+            .map(|c| match self.input_buffer.split_once(char::is_whitespace) {
+                Some((cmd, _)) => format!("{} {}", cmd, c.name),
+                None => c.name,
+            })
             .collect()
     }
 
@@ -707,7 +714,10 @@ impl App {
             || self.sudo_dialog.is_open
             || self.user_dialog.is_open
             || self.fleet_dialog.pending_approval.is_some();
-        let working = self.is_streaming || self.in_flight_tool_calls > 0 || self.user_shell_rx.is_some();
+        let working = self.is_streaming
+            || self.is_compacting()
+            || self.in_flight_tool_calls > 0
+            || self.user_shell_rx.is_some();
         let state = if waiting {
             "Action required!"
         } else if working {
@@ -948,7 +958,7 @@ impl App {
 
         self.streaming_text.clear();
         self.streaming_tool_calls.clear();
-        let _ = self.session.save();
+        self.session.save_async();
     }
 
     pub fn toggle_logs(&mut self) {
@@ -1051,6 +1061,45 @@ impl App {
         self.copy_headers.cached.retain(|(line, _)| *line < keep_lines);
         self.cached_message_line_offsets.truncate(msg_idx + 1);
         self.cached_message_count = msg_idx;
+    }
+
+    pub fn is_compacting(&self) -> bool {
+        self.compact_rx.is_some()
+    }
+
+    pub fn cancel_compaction_silent(&mut self) {
+        if let Some(ct) = self.compact_cancel.take() {
+            ct.cancel();
+        }
+        self.compact_rx = None;
+    }
+
+    pub fn cancel_compaction(&mut self, reason: &str) {
+        self.cancel_compaction_silent();
+        self.clear_status();
+        self.session.add_message(Message::system(reason));
+    }
+
+    /// Applies compacted messages to `session.messages` while keeping `session.history`
+    /// (`display_messages`) intact and avoiding a full O(N) markdown cache rebuild across
+    /// hundreds of unchanged historical turns.
+    pub fn apply_compaction(&mut self, compacted_messages: Vec<Message>, notice: String) {
+        let already_split = self.session.has_compacted_history();
+        let before = std::mem::replace(&mut self.session.messages, compacted_messages);
+        if !already_split {
+            let first_shortened = before.iter().position(|m| {
+                m.role == "tool"
+                    && m.text_content()
+                        .is_some_and(|t| t.len() > corex_core::session::HISTORY_TOOL_OUTPUT_MAX_BYTES)
+            });
+            if let Some(idx) = first_shortened {
+                self.invalidate_message_cache_from(idx);
+            }
+        }
+        self.session.keep_history_before_compaction(&before);
+        self.session.add_message(Message::system(notice));
+        self.session.save_async();
+        corex_core::trim_memory();
     }
 
     /// Height (in rendered lines) of the chat feed as of the last drawn frame.
@@ -1165,6 +1214,13 @@ impl App {
         if self.plan_mode {
             defs.retain(|d| !corex_tools::policy::hidden_in_plan_mode(&d.function.name));
         }
+        // Only send the remote-server `fleet` tool schema when Fleet mode is open or nodes are configured.
+        if !self.fleet_dialog.is_open
+            && self.fleet_dialog.items.is_empty()
+            && !self.fleet_nodes_available.load(Ordering::Relaxed)
+        {
+            defs.retain(|d| d.function.name != "fleet");
+        }
         defs
     }
 
@@ -1177,11 +1233,19 @@ impl App {
         });
     }
 
-    /// Spawns initial MCP server connections in the background so `run_tui` can paint the first
-    /// frame immediately without blocking on remote HTTP or stdio handshakes.
+    /// Spawns initial MCP server connections and pre-warms the `PromptBuilder` disk cache
+    /// (`SKILL.md` and `MEMORY.md` files) in the background so `run_tui` paints the first frame
+    /// immediately and the user's first `Enter` never blocks on cold filesystem scans or MCP handshakes.
     pub fn start_mcp_background_load(&mut self) {
+        let ws = self.workspace_dir.clone();
+        let fleet_flag = self.fleet_nodes_available.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = PromptBuilder::new(&ws).build();
+            let has_fleet = !corex_fleet::FleetConfig::load_fast(Some(&ws)).all_nodes().is_empty();
+            fleet_flag.store(has_fleet, Ordering::Relaxed);
+        });
         let servers = self.llm_client.get_config().mcp_servers;
-        if servers.is_empty() {
+        if !servers.values().any(|s| s.enabled) {
             return;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1199,9 +1263,7 @@ impl App {
             Ok(tools) => {
                 self.mcp_startup_rx = None;
                 self.tool_registry.unregister_prefix("mcp_");
-                for t in tools {
-                    self.tool_registry.register(t);
-                }
+                self.tool_registry.register_many(tools);
                 true
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
@@ -1212,14 +1274,22 @@ impl App {
         }
     }
 
-    /// Waits for any in-flight startup MCP load to finish before the first prompt or `/mcp` command.
+    /// Waits briefly for any in-flight startup MCP load before the first prompt or `/mcp` command.
+    /// Capped at 2.5s so an unreachable or hung MCP server (60s timeout) never freezes the TUI
+    /// on the user's first Enter; if still pending after 2.5s, `poll_mcp_tools()` finishes it in the background.
     pub async fn finish_mcp_startup_load(&mut self) {
-        if let Some(rx) = self.mcp_startup_rx.take() {
-            if let Ok(tools) = rx.await {
+        let Some(mut rx) = self.mcp_startup_rx.take() else {
+            return;
+        };
+        match tokio::time::timeout(Duration::from_millis(2500), &mut rx).await {
+            Ok(Ok(tools)) => {
                 self.tool_registry.unregister_prefix("mcp_");
-                for t in tools {
-                    self.tool_registry.register(t);
-                }
+                self.tool_registry.register_many(tools);
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                // Keep receiver alive so `poll_mcp_tools` registers the tools once they arrive.
+                self.mcp_startup_rx = Some(rx);
             }
         }
     }
@@ -1235,15 +1305,15 @@ impl App {
         let cfg = self.llm_client.get_config();
         self.tool_registry.unregister_prefix("mcp_");
         let (tools, statuses) = corex_tools::load_mcp_servers(&cfg.mcp_servers).await;
-        for t in tools {
-            self.tool_registry.register(t);
-        }
+        self.tool_registry.register_many(tools);
         statuses
     }
 
     pub fn poll_local_health_check(&mut self) {
-        let cfg = self.llm_client.get_config();
-        if !cfg.local_llm_enabled && !cfg.model.starts_with("local") {
+        let is_local = self
+            .llm_client
+            .with_config(|cfg| cfg.local_llm_enabled || cfg.model.starts_with("local"));
+        if !is_local {
             return;
         }
         let should_check = match self.last_local_check {
@@ -1357,13 +1427,33 @@ impl App {
         Message::user_parts(parts)
     }
 
+    /// Drops any pasted image whose `[Image #N]` tag is no longer present in the composer,
+    /// the undo history, or any queued/steered message waiting to be delivered.
+    pub fn prune_unreferenced_images(&mut self) {
+        if self.images.is_empty() {
+            return;
+        }
+        let mut kept: std::collections::HashSet<usize> = image_tag_ids(&self.input_buffer).into_iter().collect();
+        for text in self.undo.texts() {
+            kept.extend(image_tag_ids(text));
+        }
+        for msg in &self.message_queue {
+            kept.extend(image_tag_ids(msg));
+        }
+        for msg in &self.steer_messages {
+            kept.extend(image_tag_ids(msg));
+        }
+        self.images.retain(|id, _| kept.contains(id));
+    }
+
     /// Notes a prompt edit for Ctrl+Z. Paste contents are kept while their tag may still come
     /// back through undo, and released once the prompt is empty and no tag can.
+    /// Images referenced by queued or steered messages remain alive until delivered.
     pub fn record_prompt_edit(&mut self, before: (String, usize)) {
         self.undo.record(before, &self.input_buffer);
         if self.input_buffer.is_empty() {
             self.pastes.clear();
-            self.images.clear();
+            self.prune_unreferenced_images();
         }
     }
 
@@ -1383,7 +1473,7 @@ impl App {
         if self.input_buffer.is_empty() {
             self.undo.clear();
             self.pastes.clear();
-            self.images.clear();
+            self.prune_unreferenced_images();
         }
     }
 
@@ -1529,7 +1619,20 @@ impl App {
         self.thinking_state.is_streaming = true;
         self.is_streaming = true;
         self.pending_task_wakeup = false;
-        self.active_status = Some("Generating...".to_string());
+        let llm_cfg = self.llm_client.get_config();
+        let compact_threshold = if llm_cfg.model.starts_with("local") {
+            llm_cfg.effective_compact_threshold().min(24_000)
+        } else {
+            llm_cfg.effective_compact_threshold()
+        };
+        let likely_compacting = llm_cfg.auto_compact
+            && self.session.messages.len() >= 7
+            && self.session.context_tokens() > compact_threshold;
+        self.set_status(if likely_compacting {
+            "Compacting context..."
+        } else {
+            "Generating..."
+        });
         // Preserve user scroll: only follow stream if user has not scrolled up to read
         if self.auto_scroll {
             self.auto_scroll = true;
@@ -1538,45 +1641,36 @@ impl App {
         self.latency.current_turn_first_token_ms = None;
         self.tool_starts.clear();
 
-        let prompt_builder = PromptBuilder::new(&self.workspace_dir)
-            .with_sudo_password(get_sudo_password().is_some())
-            .with_plan_mode(self.plan_mode)
-            .with_extra_dirs(&self.extra_dirs);
-
-        let llm_cfg = self.llm_client.get_config();
-        let is_local = llm_cfg.local_llm_enabled || llm_cfg.model.starts_with("local");
-        let mut system_prompt = if self.fleet_dialog.is_open {
+        let workspace_dir = self.workspace_dir.clone();
+        let has_sudo = get_sudo_password().is_some();
+        let plan_mode = self.plan_mode;
+        let extra_dirs = self.extra_dirs.clone();
+        let fleet_open = self.fleet_dialog.is_open;
+        let fleet_nodes: Option<(Option<(String, String, String)>, Vec<(String, String, String)>)> = if fleet_open {
             let active_node = self.fleet_dialog.active_session.as_ref()
                 .filter(|s| s.is_connected)
-                .map(|s| (s.node.id.as_str(), s.node.user.as_str(), s.node.host.as_str()))
+                .map(|s| (s.node.id.clone(), s.node.user.clone(), s.node.host.clone()))
                 .or_else(|| {
                     self.fleet_dialog.pty_session.as_ref()
                         .filter(|p| p.is_alive())
                         .and_then(|p| {
                             self.fleet_dialog.items.iter()
                                 .find(|it| it.config.id == p.node_id)
-                                .map(|it| (it.config.id.as_str(), it.config.user.as_str(), it.config.host.as_str()))
+                                .map(|it| (it.config.id.clone(), it.config.user.clone(), it.config.host.clone()))
                         })
                 });
-            let available_nodes: Vec<(&str, &str, &str)> = self.fleet_dialog.items.iter()
-                .map(|it| (it.config.id.as_str(), it.config.user.as_str(), it.config.host.as_str()))
+            let available_nodes: Vec<(String, String, String)> = self.fleet_dialog.items.iter()
+                .map(|it| (it.config.id.clone(), it.config.user.clone(), it.config.host.clone()))
                 .collect();
-            prompt_builder.build_fleet(active_node, &available_nodes)
-        } else if is_local && llm_cfg.local_prompt_lite {
-            prompt_builder.build_lite()
+            Some((active_node, available_nodes))
         } else {
-            prompt_builder.build()
+            None
         };
 
-        if let Some(ref pfx) = self.response_prefix {
-            system_prompt.push_str(&format!(
-                "\n\n[RESPONSE PREFIX REQUIREMENT]: You MUST begin your final text response immediately with the exact prefix: {}",
-                pfx
-            ));
-        }
+        let is_local_lite = (llm_cfg.local_llm_enabled || llm_cfg.model.starts_with("local")) && llm_cfg.local_prompt_lite;
+        let response_prefix = self.response_prefix.clone();
 
-        let mut messages = Vec::with_capacity(self.session.messages.len() + 1);
-        messages.push(Message::system(system_prompt));
+        let mut conversation_messages = Vec::with_capacity(self.session.messages.len());
         for m in &self.session.messages {
             // Keep UI-only system notices ("Copied to clipboard", model switches, etc.) out of
             // the LLM payload so they never mutate Anthropic's hoisted system prompt.
@@ -1588,11 +1682,21 @@ impl App {
                         || c.starts_with("USER_SHELL|")
                 });
             if m.role != "system" || is_preserved_system {
-                messages.push(m.clone());
+                conversation_messages.push(m.clone());
             }
         }
 
-        let tools = self.active_tool_definitions();
+        let mut tools = self.active_tool_definitions();
+        let missing_fleet_def = if !tools.iter().any(|t| t.function.name == "fleet") {
+            self.tool_registry
+                .list_definitions()
+                .into_iter()
+                .find(|d| d.function.name == "fleet")
+        } else {
+            None
+        };
+        let fleet_flag = self.fleet_nodes_available.clone();
+        let probe_fleet = missing_fleet_def.is_some();
         let cancel_token = CancellationToken::new();
         self.cancel_token = Some(cancel_token.clone());
 
@@ -1600,7 +1704,55 @@ impl App {
         let recent_images = llm_cfg.recent_images;
         let images_dir = self.session.images_dir();
         tokio::spawn(async move {
-            let mut messages = messages;
+            // Build the system prompt off the UI thread so periodic 60s cache refreshes never stall Enter.
+            let (mut system_prompt, discovered_fleet) = tokio::task::spawn_blocking(move || {
+                let has_fleet = if probe_fleet {
+                    let found = !corex_fleet::FleetConfig::load_fast(Some(&workspace_dir)).all_nodes().is_empty();
+                    if found {
+                        fleet_flag.store(true, Ordering::Relaxed);
+                    }
+                    found
+                } else {
+                    false
+                };
+                let prompt_builder = PromptBuilder::new(&workspace_dir)
+                    .with_sudo_password(has_sudo)
+                    .with_plan_mode(plan_mode)
+                    .with_extra_dirs(&extra_dirs);
+                let prompt = if let Some((active, available)) = fleet_nodes {
+                    let active_ref = active.as_ref().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()));
+                    let avail_refs: Vec<(&str, &str, &str)> = available
+                        .iter()
+                        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+                        .collect();
+                    prompt_builder.build_fleet(active_ref, &avail_refs)
+                } else if is_local_lite {
+                    prompt_builder.build_lite()
+                } else {
+                    prompt_builder.build()
+                };
+                (prompt, has_fleet)
+            })
+            .await
+            .unwrap_or_default();
+
+            if discovered_fleet {
+                if let Some(fleet_def) = missing_fleet_def {
+                    tools.push(fleet_def);
+                }
+            }
+
+            if let Some(ref pfx) = response_prefix {
+                system_prompt.push_str(&format!(
+                    "\n\n[RESPONSE PREFIX REQUIREMENT]: You MUST begin your final text response immediately with the exact prefix: {}",
+                    pfx
+                ));
+            }
+
+            let mut messages = Vec::with_capacity(conversation_messages.len() + 1);
+            messages.push(Message::system(system_prompt));
+            messages.extend(conversation_messages);
+
             corex_core::session_images::keep_recent_images(&mut messages, recent_images, images_dir.as_deref());
             match client.stream_chat(messages, Some(tools), cancel_token.clone()).await {
                 Ok(mut rx) => {
@@ -1626,10 +1778,11 @@ impl App {
 impl App {
     pub fn refresh_providers_from_disk(&mut self) -> Config {
         let mut cfg = self.llm_client.get_config();
-        let disk = Config::load_with_workspace(Some(&self.workspace_dir));
-        if cfg.providers != disk.providers {
-            cfg.providers = disk.providers;
-            self.llm_client.update_config(cfg.clone());
+        if let Some(disk_providers) = Config::providers_from_disk() {
+            if cfg.providers != disk_providers {
+                cfg.providers = disk_providers;
+                self.llm_client.update_config(cfg.clone());
+            }
         }
         cfg
     }
@@ -1697,12 +1850,21 @@ impl App {
                 }
             }
         }
+        self.llm_client.update_config(cfg.clone());
         if persist {
-            let _ = Config::save_flash_settings(&flash);
-            let _ = Config::save_pro_settings(&pro);
-            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
+            let ws = self.workspace_dir.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || {
+                    let _ = Config::save_flash_settings(&flash);
+                    let _ = Config::save_pro_settings(&pro);
+                    let _ = cfg.save_preferences_with_workspace(Some(&ws));
+                });
+            } else {
+                let _ = Config::save_flash_settings(&flash);
+                let _ = Config::save_pro_settings(&pro);
+                let _ = cfg.save_preferences_with_workspace(Some(&ws));
+            }
         }
-        self.llm_client.update_config(cfg);
     }
 
     /// Makes `provider`/`model` (dialog indices) the active model.
@@ -1784,10 +1946,19 @@ impl App {
             }
         };
 
-        if persist {
-            let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
-        }
         self.llm_client.update_config(cfg.clone());
+        corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
+        if persist {
+            let ws = self.workspace_dir.clone();
+            let cfg_to_save = cfg.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(move || {
+                    let _ = cfg_to_save.save_preferences_with_workspace(Some(&ws));
+                });
+            } else {
+                let _ = cfg_to_save.save_preferences_with_workspace(Some(&ws));
+            }
+        }
         self.session.model = cfg.model.clone();
         self.session.provider = cfg.active_provider.clone();
         self.session.temperature = Some(cfg.temperature);
@@ -1812,7 +1983,7 @@ impl App {
     /// Transitions into Fleet / SysAdmin mode with its own isolated conversation session.
     pub fn enter_fleet_mode(&mut self) {
         if self.normal_session_stash.is_none() {
-            let _ = self.session.save();
+            self.session.save_async();
             self.normal_session_stash = Some(self.session.clone());
 
             if let Some(fs) = self.fleet_session.take() {
@@ -1845,7 +2016,7 @@ impl App {
 
     pub fn exit_fleet_mode(&mut self) {
         if let Some(normal) = self.normal_session_stash.take() {
-            let _ = self.session.save();
+            self.session.save_async();
             self.fleet_session = Some(self.session.clone());
             self.session = normal;
             self.clear_render_cache();
@@ -1907,7 +2078,7 @@ impl App {
             self.cursor_idx = self.input_buffer.len();
             report.push("Rewound the conversation; your message is back in the prompt to edit.".to_string());
         }
-        let _ = self.session.save();
+        self.session.save_async();
         self.session.add_message(Message::system(report.join("\n")));
         self.scroll_to_bottom();
     }

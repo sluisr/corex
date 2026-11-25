@@ -91,106 +91,116 @@ impl Tool for ReadManyFilesTool {
             max_depth = Some(1);
         }
 
-        let mut walker = WalkBuilder::new(&context.workspace_dir);
-        walker.hidden(false).git_ignore(true).filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            name != ".git" && name != "node_modules" && name != "target"
-        });
-        if let Some(depth) = max_depth {
-            walker.max_depth(Some(depth));
-        }
+        let workspace_dir = context.workspace_dir.clone();
+        let extra_dirs = context.extra_dirs.clone();
+        let concatenated = tokio::task::spawn_blocking(move || {
+            let mut walker = WalkBuilder::new(&workspace_dir);
+            walker.hidden(false).git_ignore(true).filter_entry(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                name != ".git" && name != "node_modules" && name != "target"
+            });
+            if let Some(depth) = max_depth {
+                walker.max_depth(Some(depth));
+            }
 
-        let mut matched_files = Vec::new();
-        for entry in walker.build().flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(rel) = path.strip_prefix(&context.workspace_dir) {
-                    let rel_str = rel.to_string_lossy();
-                    
-                    let mut matched = false;
-                    for inc in &includes {
-                        if inc.matches(&rel_str) || inc.matches(path.to_str().unwrap_or("")) {
-                            matched = true;
-                            break;
-                        }
-                    }
+            let mut matched_files = Vec::new();
+            for entry in walker.build().flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(rel) = path.strip_prefix(&workspace_dir) {
+                        let rel_str = rel.to_string_lossy();
 
-                    if matched {
-                        let mut excluded = false;
-                        for exc in &excludes {
-                            if exc.matches(&rel_str) || exc.matches(path.to_str().unwrap_or("")) {
-                                excluded = true;
+                        let mut matched = false;
+                        for inc in &includes {
+                            if inc.matches(&rel_str) || inc.matches(path.to_str().unwrap_or("")) {
+                                matched = true;
                                 break;
                             }
                         }
-                        if !excluded {
-                            matched_files.push(path.to_path_buf());
+
+                        if matched {
+                            let mut excluded = false;
+                            for exc in &excludes {
+                                if exc.matches(&rel_str) || exc.matches(path.to_str().unwrap_or("")) {
+                                    excluded = true;
+                                    break;
+                                }
+                            }
+                            if !excluded {
+                                matched_files.push(path.to_path_buf());
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if matched_files.is_empty() {
-            return Ok(ToolOutput::success("No matching files found."));
-        }
-
-        let mut concatenated = String::new();
-        let max_total_bytes = 256_000; // 256 KB total limit (tool outputs are truncated before reaching the LLM anyway)
-        let max_file_bytes = 64_000; // 64 KB per file limit
-
-        for file in matched_files.iter().take(20) { // Limit to 20 files to avoid context blowout
-            if concatenated.len() >= max_total_bytes {
-                concatenated.push_str("\n[Output capped: Reached 256KB multi-file content limit]\n");
-                break;
+            if matched_files.is_empty() {
+                return "No matching files found.".to_string();
             }
 
-            let rel = file.strip_prefix(&context.workspace_dir).unwrap_or(file);
-            concatenated.push_str(&format!("=== FILE: {} ===\n", rel.display()));
+            let mut concatenated = String::new();
+            let max_total_bytes = 256_000; // 256 KB total limit (tool outputs are truncated before reaching the LLM anyway)
+            let max_file_bytes = 64_000; // 64 KB per file limit
 
-            let readable = std::iter::once(&context.workspace_dir)
-                .chain(&context.extra_dirs)
-                .any(|root| crate::fs_tools::is_within_workspace(file, root));
-            if !readable {
-                concatenated.push_str("(Skipped symlink escaping workspace)\n\n");
-                continue;
+            for file in matched_files.iter().take(20) {
+                // Limit to 20 files to avoid context blowout
+                if concatenated.len() >= max_total_bytes {
+                    concatenated.push_str("\n[Output capped: Reached 256KB multi-file content limit]\n");
+                    break;
+                }
+
+                let rel = file.strip_prefix(&workspace_dir).unwrap_or(file);
+                concatenated.push_str(&format!("=== FILE: {} ===\n", rel.display()));
+
+                let readable = std::iter::once(&workspace_dir)
+                    .chain(&extra_dirs)
+                    .any(|root| crate::fs_tools::is_within_workspace(file, root));
+                if !readable {
+                    concatenated.push_str("(Skipped symlink escaping workspace)\n\n");
+                    continue;
+                }
+
+                if crate::fs_tools::is_sensitive_system_path(file) {
+                    concatenated.push_str("(Skipped sensitive system/credential file)\n\n");
+                    continue;
+                }
+
+                if crate::fs_tools::is_binary_file(file) {
+                    concatenated.push_str("(Skipped binary file)\n\n");
+                    continue;
+                }
+
+                let file_size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+                if file_size > max_file_bytes as u64 {
+                    concatenated.push_str(&format!(
+                        "(Skipped: file size {} exceeds {} per-file limit)\n\n",
+                        crate::fs_tools::format_size(file_size),
+                        crate::fs_tools::format_size(max_file_bytes as u64)
+                    ));
+                    continue;
+                }
+
+                match fs::read_to_string(file) {
+                    Ok(content) => {
+                        crate::fs_tools::observe_file(file);
+                        concatenated.push_str(&content);
+                    }
+                    Err(e) => {
+                        concatenated.push_str(&format!("(Error reading file: {})\n", e));
+                    }
+                }
+                concatenated.push_str("\n\n");
             }
 
-            if crate::fs_tools::is_sensitive_system_path(file) {
-                concatenated.push_str("(Skipped sensitive system/credential file)\n\n");
-                continue;
-            }
-
-            if crate::fs_tools::is_binary_file(file) {
-                concatenated.push_str("(Skipped binary file)\n\n");
-                continue;
-            }
-
-            let file_size = fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-            if file_size > max_file_bytes as u64 {
+            if matched_files.len() > 20 {
                 concatenated.push_str(&format!(
-                    "(Skipped: file size {} exceeds {} per-file limit)\n\n",
-                    crate::fs_tools::format_size(file_size),
-                    crate::fs_tools::format_size(max_file_bytes as u64)
+                    "... and {} more files matching the pattern.",
+                    matched_files.len() - 20
                 ));
-                continue;
             }
-
-            match fs::read_to_string(file) {
-                Ok(content) => {
-                    crate::fs_tools::observe_file(file);
-                    concatenated.push_str(&content);
-                }
-                Err(e) => {
-                    concatenated.push_str(&format!("(Error reading file: {})\n", e));
-                }
-            }
-            concatenated.push_str("\n\n");
-        }
-
-        if matched_files.len() > 20 {
-            concatenated.push_str(&format!("... and {} more files matching the pattern.", matched_files.len() - 20));
-        }
+            concatenated
+        })
+        .await?;
 
         Ok(ToolOutput::success(concatenated))
     }
@@ -533,7 +543,7 @@ impl Tool for TrackerCreateTaskTool {
     }
 
     fn description(&self) -> &'static str {
-        "Creates a new task in the tracker to monitor progress."
+        "Create a tracked task."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -541,8 +551,7 @@ impl Tool for TrackerCreateTaskTool {
             "type": "object",
             "properties": {
                 "title": { "type": "string" },
-                "description": { "type": "string" },
-                "type": { "type": "string" }
+                "description": { "type": "string" }
             },
             "required": ["title", "description"]
         })
@@ -679,16 +688,14 @@ impl Tool for TrackerListTasksTool {
     }
 
     fn description(&self) -> &'static str {
-        "Lists all tasks currently being tracked."
+        "List tracked tasks."
     }
 
     fn parameters(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "status": { "type": "string" },
-                "type": { "type": "string" },
-                "parentId": { "type": "string" }
+                "status": { "type": "string" }
             }
         })
     }

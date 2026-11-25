@@ -17,6 +17,7 @@ use crate::types::{Tool, ToolContext, ToolOutput};
 pub struct McpServerStatus {
     pub name: String,
     pub command: String,
+    pub enabled: bool,
     pub is_connected: bool,
     pub tools_count: usize,
     pub tools: Vec<String>,
@@ -51,14 +52,17 @@ const REMOTE_PROTOCOL_VERSION: &str = "2025-06-18";
 /// How Corex talks to a server: a spawned subprocess over stdio, or a remote endpoint over
 /// Streamable HTTP.
 enum McpTransport {
-    Stdio(StdioTransport),
-    Http(HttpTransport),
+    Stdio(Arc<Mutex<StdioTransport>>),
+    Http(Arc<HttpTransport>),
 }
 
 impl McpTransport {
-    async fn request(&mut self, request: &Value) -> Result<Value> {
+    async fn request(&self, request: &Value) -> Result<Value> {
         match self {
-            McpTransport::Stdio(stdio) => stdio.request(request).await,
+            McpTransport::Stdio(stdio) => {
+                let mut guard = stdio.lock().await;
+                guard.request(request).await
+            }
             McpTransport::Http(http) => http.request(request).await,
         }
     }
@@ -139,12 +143,12 @@ struct HttpTransport {
     server_name: String,
     url: String,
     headers: Vec<(String, String)>,
-    session_id: Option<String>,
-    protocol_version: Option<String>,
+    session_id: std::sync::RwLock<Option<String>>,
+    protocol_version: std::sync::RwLock<Option<String>>,
 }
 
 impl HttpTransport {
-    async fn request(&mut self, request: &Value) -> Result<Value> {
+    async fn request(&self, request: &Value) -> Result<Value> {
         let is_notification = request.get("id").is_none();
         let expected_id = request.get("id").and_then(|v| v.as_u64());
 
@@ -157,11 +161,15 @@ impl HttpTransport {
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
         }
-        if let Some(session) = &self.session_id {
-            builder = builder.header("mcp-session-id", session);
+        if let Ok(guard) = self.session_id.read() {
+            if let Some(session) = guard.as_deref() {
+                builder = builder.header("mcp-session-id", session);
+            }
         }
-        if let Some(version) = &self.protocol_version {
-            builder = builder.header("mcp-protocol-version", version);
+        if let Ok(guard) = self.protocol_version.read() {
+            if let Some(version) = guard.as_deref() {
+                builder = builder.header("mcp-protocol-version", version);
+            }
         }
 
         let mut response = builder
@@ -174,7 +182,9 @@ impl HttpTransport {
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
         {
-            self.session_id = Some(session.to_string());
+            if let Ok(mut guard) = self.session_id.write() {
+                *guard = Some(session.to_string());
+            }
         }
 
         let status = response.status();
@@ -357,7 +367,7 @@ pub fn parse_header_args(tokens: &[String]) -> Result<HashMap<String, String>> {
 
 pub struct McpClient {
     pub server_name: String,
-    transport: Arc<Mutex<McpTransport>>,
+    transport: McpTransport,
     request_id: AtomicU64,
     request_timeout: Duration,
     /// Only local servers have a process to keep alive (and to kill on drop).
@@ -455,19 +465,21 @@ impl McpClient {
         // No overall timeout: the event stream of a long generation must be allowed to stay open.
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .context("Failed to build the HTTP client for the remote MCP server")?;
 
         let client = Self {
             server_name: server_name.to_string(),
-            transport: Arc::new(Mutex::new(McpTransport::Http(HttpTransport {
+            transport: McpTransport::Http(Arc::new(HttpTransport {
                 client,
                 server_name: server_name.to_string(),
                 url: url.to_string(),
                 headers: resolve_headers(headers)?,
-                session_id: None,
-                protocol_version: None,
-            }))),
+                session_id: std::sync::RwLock::new(None),
+                protocol_version: std::sync::RwLock::new(None),
+            })),
             request_id: AtomicU64::new(1),
             request_timeout,
             _child: None,
@@ -505,7 +517,7 @@ impl McpClient {
 
         let client = Self {
             server_name: server_name.to_string(),
-            transport: Arc::new(Mutex::new(McpTransport::Stdio(StdioTransport {
+            transport: McpTransport::Stdio(Arc::new(Mutex::new(StdioTransport {
                 stdin,
                 stdout_reader: reader,
                 read_buf: Vec::new(),
@@ -521,8 +533,7 @@ impl McpClient {
     }
 
     async fn send_raw(&self, request: &Value) -> Result<Value> {
-        let mut transport = self.transport.lock().await;
-        match tokio::time::timeout(self.request_timeout, transport.request(request)).await {
+        match tokio::time::timeout(self.request_timeout, self.transport.request(request)).await {
             Ok(res) => res,
             Err(_) => bail!(
                 "Timeout waiting for MCP server response ({}s; raise timeout_secs in its config if it needs longer)",
@@ -558,11 +569,11 @@ impl McpClient {
             .and_then(|r| r.get("protocolVersion"))
             .and_then(|v| v.as_str())
         {
-            let mut transport = self.transport.lock().await;
-            if let McpTransport::Http(http) = &mut *transport {
-                http.protocol_version = Some(negotiated.to_string());
+            if let McpTransport::Http(http) = &self.transport {
+                if let Ok(mut guard) = http.protocol_version.write() {
+                    *guard = Some(negotiated.to_string());
+                }
             }
-            drop(transport);
         }
 
         // Send notifications/initialized
@@ -707,6 +718,20 @@ async fn load_single_mcp_server(
     cfg: McpServerConfig,
 ) -> (Vec<Arc<dyn Tool>>, McpServerStatus) {
     let cmd_display = cfg.display_target();
+    if !cfg.enabled {
+        return (
+            Vec::new(),
+            McpServerStatus {
+                name,
+                command: cmd_display,
+                enabled: false,
+                is_connected: false,
+                tools_count: 0,
+                tools: Vec::new(),
+                error: None,
+            },
+        );
+    }
     match McpClient::connect(&name, &cfg).await {
         Ok(client) => {
             let client_arc = Arc::new(client);
@@ -733,6 +758,7 @@ async fn load_single_mcp_server(
                     let status = McpServerStatus {
                         name,
                         command: cmd_display,
+                        enabled: true,
                         is_connected: true,
                         tools_count: count,
                         tools: tool_names,
@@ -745,6 +771,7 @@ async fn load_single_mcp_server(
                     McpServerStatus {
                         name,
                         command: cmd_display,
+                        enabled: true,
                         is_connected: false,
                         tools_count: 0,
                         tools: Vec::new(),
@@ -758,6 +785,7 @@ async fn load_single_mcp_server(
             McpServerStatus {
                 name,
                 command: cmd_display,
+                enabled: true,
                 is_connected: false,
                 tools_count: 0,
                 tools: Vec::new(),
@@ -1131,8 +1159,33 @@ for line in sys.stdin:
     fn timeout_secs_is_optional_in_settings() {
         let plain: McpServerConfig = serde_json::from_str(r#"{"command":"node"}"#).unwrap();
         assert_eq!(plain.timeout_secs, None);
+        assert!(plain.enabled, "enabled defaults to true");
         let slow: McpServerConfig = serde_json::from_str(r#"{"command":"node","timeout_secs":450}"#).unwrap();
         assert_eq!(slow.timeout_secs, Some(450));
         assert!(!serde_json::to_string(&plain).unwrap().contains("timeout_secs"));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("enabled"), "enabled=true is omitted");
+
+        let mut off = plain.clone();
+        off.enabled = false;
+        let serialized = serde_json::to_string(&off).unwrap();
+        assert!(serialized.contains("\"enabled\":false"), "{serialized}");
+        let round_trip: McpServerConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(!round_trip.enabled);
+    }
+
+    #[tokio::test]
+    async fn disabled_servers_are_skipped_without_spawning() {
+        let mut off = fake_server(None);
+        off.enabled = false;
+        let mut map = HashMap::new();
+        map.insert("disabled_srv".to_string(), off);
+        let (tools, statuses) = load_mcp_servers(&map).await;
+        assert!(tools.is_empty());
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].name, "disabled_srv");
+        assert!(!statuses[0].enabled);
+        assert!(!statuses[0].is_connected);
+        assert_eq!(statuses[0].tools_count, 0);
+        assert!(statuses[0].error.is_none());
     }
 }

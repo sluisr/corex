@@ -27,6 +27,10 @@ pub(super) fn poll_background_work(app: &mut App, event_tx: &EventTx) -> bool {
         changed = true;
     }
 
+    if poll_compaction(app) {
+        changed = true;
+    }
+
     if is_idle(app) {
         if app.deliver_steer() {
             // A "send now" message that waited for a dialog to close.
@@ -65,6 +69,7 @@ fn is_idle(app: &App) -> bool {
         && !app.sudo_dialog.is_open
         && app.fleet_dialog.pending_approval.is_none()
         && !app.is_checking_balance
+        && !app.is_compacting()
         && app.user_shell_rx.is_none()
 }
 
@@ -169,4 +174,42 @@ fn poll_balance(app: &mut App) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Applies the result of a background `/compact` (`/compress`) command.
+pub(crate) fn poll_compaction(app: &mut App) -> bool {
+    let Some(rx) = &mut app.compact_rx else {
+        return false;
+    };
+    match rx.try_recv() {
+        Ok((compacted_messages, res)) => {
+            app.compact_rx = None;
+            app.compact_cancel = None;
+            app.clear_status();
+            match res {
+                Ok(Some(notice)) => {
+                    app.apply_compaction(compacted_messages, notice);
+                }
+                Ok(None) => {
+                    app.session.add_message(Message::system(
+                        "Conversation history is too short to require compaction.",
+                    ));
+                }
+                Err(e) => {
+                    app.session.add_message(Message::system(format!(
+                        "Failed to compact conversation: {}",
+                        e
+                    )));
+                }
+            }
+            true
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            app.compact_rx = None;
+            app.compact_cancel = None;
+            app.clear_status();
+            true
+        }
+    }
 }

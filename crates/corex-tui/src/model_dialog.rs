@@ -1,5 +1,5 @@
 use corex_core::config::{Config, FlashSettings, ProSettings};
-use corex_core::providers::{applies_temperature, locate_active, temperature_range, ModelFamily, ModelProfile, ProviderConfig};
+use corex_core::providers::{applies_temperature, locate_active, temperature_range, ModelFamily, ModelProfile, ProviderConfig, ProviderKind};
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -261,6 +261,11 @@ impl ModelDialogState {
         self.selected_provider().and_then(|p| p.models.get(self.model_idx))
     }
 
+    fn selected_reasoning_levels(&self) -> Vec<String> {
+        let kind = self.selected_provider().map(|p| p.kind()).unwrap_or(ProviderKind::GenericOpenAi);
+        self.selected_model().map(|m| m.effective_reasoning(kind)).unwrap_or_default()
+    }
+
     /// True when the highlighted model is the one currently running.
     pub fn selection_is_active(&self) -> bool {
         self.prov_idx == self.active_provider && self.model_idx == self.active_model
@@ -283,7 +288,7 @@ impl ModelDialogState {
                 if self.temperature_enabled && applies_temperature(&m.id) {
                     rows.push(SettingRow::Temperature);
                 }
-                if !m.effective_reasoning().is_empty() {
+                if !self.selected_reasoning_levels().is_empty() {
                     rows.push(SettingRow::Reasoning);
                 }
                 rows.push(SettingRow::Persist);
@@ -319,8 +324,9 @@ impl ModelDialogState {
     /// never displays "default" for a model that exposes a level.
     fn normalize_generic_reasoning(&mut self) {
         let Some(model) = self.selected_model() else { return };
-        let levels = model.effective_reasoning();
-        if model.family != ModelFamily::Generic || levels.is_empty() {
+        let family = model.family;
+        let levels = self.selected_reasoning_levels();
+        if family != ModelFamily::Generic || levels.is_empty() {
             return;
         }
         if levels.iter().any(|level| level == &self.generic_reasoning) {
@@ -358,7 +364,7 @@ impl ModelDialogState {
                     self.pro_reasoning = cycle_static(PRO_REASONING_LEVELS, &self.pro_reasoning, forward)
                 }
                 ModelFamily::Generic => {
-                    let levels = self.selected_model().map(|m| m.effective_reasoning()).unwrap_or_default();
+                    let levels = self.selected_reasoning_levels();
                     self.generic_reasoning = cycle_str(&levels, &self.generic_reasoning, forward);
                 }
             },
@@ -800,7 +806,7 @@ fn detail_lines(state: &ModelDialogState, w: usize, theme: &Theme) -> Vec<Line<'
 fn can_cycle_setting(row: SettingRow, family: ModelFamily, state: &ModelDialogState) -> bool {
     match row {
         SettingRow::Reasoning if family == ModelFamily::Generic => {
-            state.selected_model().is_some_and(|m| m.effective_reasoning().len() > 1)
+            state.selected_reasoning_levels().len() > 1
         }
         _ => true,
     }
@@ -821,7 +827,7 @@ fn setting_display(row: SettingRow, family: ModelFamily, state: &ModelDialogStat
                 ModelFamily::Generic => &state.generic_reasoning,
             };
             let fixed_generic = family == ModelFamily::Generic
-                && state.selected_model().is_some_and(|m| m.effective_reasoning().len() <= 1);
+                && state.selected_reasoning_levels().len() <= 1;
             let note = if fixed_generic {
                 "fixed for this model"
             } else if family == ModelFamily::Flash && flash_thinking_off(level) {

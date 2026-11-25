@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use base64::Engine;
 use corex_browser::{Browser, Gesture};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -36,23 +35,23 @@ fn action_properties() -> Value {
             "enum": ["navigate", "snapshot", "click", "double_click", "right_click", "hover", "type",
                      "select", "choose", "upload", "dialog", "press_key", "scroll", "back", "text",
                      "screenshot", "console", "wait", "tabs", "close"],
-            "description": "What to do."
+            "description": "Browser action."
         },
-        "url": { "type": "string", "description": "navigate: address to open." },
-        "ref": { "type": "string", "description": "Element ref from the latest snapshot, e.g. e7 (click, double_click, right_click, hover, type, select, choose, upload; scroll: the area to move)." },
-        "text": { "type": "string", "description": "type: text to enter. dialog: answer for a prompt(). wait: text to wait for on the page." },
-        "gone": { "type": "boolean", "description": "wait: wait until the text disappears instead." },
-        "query": { "type": "string", "description": "snapshot: only list elements whose line contains this text (searches the whole page)." },
-        "tab": { "type": "integer", "description": "tabs: id of the tab to switch to (or to close with close: true)." },
-        "close": { "type": "boolean", "description": "tabs: close the given tab instead of switching to it." },
-        "accept": { "type": "boolean", "description": "dialog: true to accept (OK), false to dismiss (default true)." },
-        "paths": { "type": "array", "items": { "type": "string" }, "description": "upload: absolute paths of local files to attach to the file input." },
-        "submit": { "type": "boolean", "description": "type: press Enter afterwards." },
-        "clear": { "type": "boolean", "description": "type: replace existing content (default true)." },
-        "value": { "type": "string", "description": "select: option value or visible label of a native <select>. choose: visible text of the entry to pick." },
-        "key": { "type": "string", "description": "press_key: Enter, Tab, Escape, Backspace, Delete, Space, arrows, PageUp, PageDown, Home, End, F1-F12, a single character, or a combination such as Control+A, Shift+Tab, Meta+S." },
-        "direction": { "type": "string", "enum": ["up", "down"], "description": "scroll: direction." },
-        "seconds": { "type": "number", "description": "wait: seconds to pause (max 15), or with text the longest to wait (default 10, max 30)." }
+        "url": { "type": "string", "description": "navigate: target URL." },
+        "ref": { "type": "string", "description": "Element ref from latest snapshot, e.g. e7 (click/double_click/right_click/hover/type/select/choose/upload, or area for scroll)." },
+        "text": { "type": "string", "description": "type: text to enter; dialog: prompt() answer; wait: page text to await." },
+        "gone": { "type": "boolean", "description": "wait: wait until text disappears." },
+        "query": { "type": "string", "description": "snapshot: filter elements matching text across full page (also shows link URLs)." },
+        "tab": { "type": "integer", "description": "tabs: tab id to switch to (or close with close:true)." },
+        "close": { "type": "boolean", "description": "tabs: close tab instead of switching." },
+        "accept": { "type": "boolean", "description": "dialog: accept (true, default) or dismiss (false)." },
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "upload: absolute local file paths." },
+        "submit": { "type": "boolean", "description": "type: press Enter after typing." },
+        "clear": { "type": "boolean", "description": "type: replace existing value (default true)." },
+        "value": { "type": "string", "description": "select: <select> value/label; choose: visible menu option text." },
+        "key": { "type": "string", "description": "press_key: key or chord (Enter, Escape, Tab, PageDown, Control+A, Shift+Tab, etc.)." },
+        "direction": { "type": "string", "enum": ["up", "down"], "description": "scroll direction." },
+        "seconds": { "type": "number", "description": "wait: pause seconds (max 15), or timeout with text (default 10, max 30)." }
     })
 }
 
@@ -79,23 +78,12 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Controls a tab in the user's own browser through the Corex Browser Bridge extension: open pages, read them, click and type. \
-         Workflow: navigate, then read the returned snapshot (an accessibility tree where interactive \
-         elements carry [ref=eN] and states such as [invalid=true] or description=\"error text\"), then act on a ref. \
-         Every action that changes the page returns a fresh snapshot; refs are only valid for the latest one. \
-         On long pages pass query to snapshot to list only the matching elements from the whole page; \
-         link addresses are shown only in query results, so use a query when you need a link's URL. \
-         After saving or submitting, use wait with text (or with gone: true for a spinner such as 'Saving') instead of fixed pauses. \
-         Links or buttons that open a new tab or popup switch to it automatically; use tabs to list, switch (tab) or close (tab + close) them. \
-         scroll moves the area under the mouse, so pass ref to scroll a side panel, table or list instead of the page. For a custom dropdown or menu (not a native <select>) use choose with the visible text of the entry: \
-         it opens the control and picks the entry in one step. Use hover for menus that open on mouse-over, \
-         upload to attach local files to a file input, and dialog to answer an alert/confirm/prompt \
-         (an open dialog is reported in the console output). The snapshot is text only: use screenshot to actually look at the page \
-         (images, charts, thumbnails, visual layout, a CAPTCHA, or to check that an action did what you expected), \
-         especially after landing on a new page and whenever the snapshot is ambiguous. \
-         Skip it when you are only reading text. Needs a vision model. \
-         The browser is the user's own, so their logins are already there. \
-         On a CAPTCHA, login wall or 2FA prompt, stop and ask the user to complete it in the browser tab."
+        "Drives a tab in the user's own logged-in browser via Corex Browser Bridge. \
+         Workflow: navigate -> read accessibility snapshot ([ref=eN], [invalid=true], error descriptions) -> act on ref. \
+         Mutating actions return a fresh snapshot (old refs expire). Pass query to snapshot on long pages or to reveal link URLs. \
+         Use wait with text (or gone:true for spinners) instead of fixed delays. New tabs/popups focus automatically; manage with tabs. \
+         Pass ref to scroll inner panels/lists; use choose for custom non-<select> dropdowns, hover for hover-menus, upload for file inputs, dialog for JS alerts/prompts, text for long copy. \
+         Use screenshot on vision models to inspect images/charts/layout or verify actions. Stop and ask the user on CAPTCHA, login wall, or 2FA."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -323,10 +311,7 @@ async fn run(browser: &mut Browser, action: &str, args: &Value) -> Result<ToolOu
         }
         "screenshot" => {
             let shot = browser.screenshot().await?;
-            let size = base64::engine::general_purpose::STANDARD
-                .decode(&shot.base64)
-                .map(|b| b.len())
-                .unwrap_or(0);
+            let size = shot.base64.trim_end_matches('=').len() * 3 / 4;
             corex_core::push_tool_image(
                 "browser screenshot",
                 format!("data:{};base64,{}", shot.media_type, shot.base64),

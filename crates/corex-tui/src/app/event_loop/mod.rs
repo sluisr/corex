@@ -92,6 +92,10 @@ pub async fn run_tui(mut app: App) -> Result<()> {
     let mut last_tick = Instant::now();
     let mut last_draw = Instant::now();
     let mut needs_redraw = true;
+    let mut stream_delta_pending = false;
+    let mut prev_streaming = false;
+    let mut prev_waiting_kind: Option<&'static str> = None;
+    let mut streaming_started_at: Option<Instant> = None;
 
     loop {
         #[cfg(unix)]
@@ -134,6 +138,59 @@ pub async fn run_tui(mut app: App) -> Result<()> {
                 title_applied = Some(title);
             }
         }
+
+        // Notify the user (OSC 9 + BEL + desktop notification) when Corex pauses for sudo,
+        // tool approval, or ask_user, or finishes a turn that ran for >= 10s (if enabled in /settings).
+        let notify_on = app.llm_client.with_config(|c| c.notifications);
+        let waiting_kind: Option<&'static str> = if app.sudo_dialog.is_open {
+            Some("sudo")
+        } else if app.user_dialog.is_open {
+            Some("ask_user")
+        } else if app.pending_confirmation.is_some() {
+            Some("approval")
+        } else {
+            None
+        };
+        if waiting_kind.is_some() && waiting_kind != prev_waiting_kind && notify_on {
+            let msg = match waiting_kind {
+                Some("sudo") => "Sudo password required".to_string(),
+                Some("ask_user") => "Waiting for your answer".to_string(),
+                Some("approval") => match app
+                    .pending_confirmation
+                    .as_ref()
+                    .and_then(|p| p.calls.get(p.current_idx.saturating_sub(1)).or_else(|| p.calls.first()))
+                {
+                    Some(call) => format!("Approval needed: {}", call.function.name),
+                    None => "Approval needed to run a tool".to_string(),
+                },
+                _ => "Action required".to_string(),
+            };
+            crate::app::terminal::notify_user(terminal.backend_mut(), "Corex", &msg);
+        }
+        let now_waiting_user = waiting_kind.is_some();
+        prev_waiting_kind = waiting_kind;
+
+        if app.is_streaming && !prev_streaming {
+            streaming_started_at = Some(Instant::now());
+        } else if !app.is_streaming && prev_streaming {
+            if !now_waiting_user && app.in_flight_tool_calls == 0 {
+                let outcome = turn_finish_notification(&app.session.messages);
+                if let Some(started) = streaming_started_at.take() {
+                    if notify_on && started.elapsed() >= Duration::from_secs(10) {
+                        if let Some(msg) = outcome {
+                            crate::app::terminal::notify_user(terminal.backend_mut(), "Corex", msg);
+                        }
+                    }
+                }
+                if outcome == Some("Turn completed") {
+                    corex_tools::hooks::spawn_stop_hooks(
+                        corex_tools::hooks::load_global_hooks(),
+                        app.workspace_dir.clone(),
+                    );
+                }
+            }
+        }
+        prev_streaming = app.is_streaming;
 
         if background::poll_background_work(&mut app, &event_tx) {
             needs_redraw = true;
@@ -184,11 +241,44 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             needs_redraw = true;
         }
 
+        // Apply any stream/tool events that already arrived BEFORE drawing so token deltas
+        // render on the very frame they arrive instead of waiting an extra tick cycle.
+        while let Ok((event_gen, event)) = event_rx.try_recv() {
+            if event_gen != app.current_generation_id {
+                continue;
+            }
+            let is_pure_delta = matches!(
+                event,
+                corex_core::client::StreamEvent::ContentDelta(_)
+                    | corex_core::client::StreamEvent::ReasoningDelta(_)
+                    | corex_core::client::StreamEvent::ToolCallDelta { .. }
+            );
+            if !is_pure_delta || last_draw.elapsed() >= Duration::from_millis(16) {
+                needs_redraw = true;
+            } else {
+                stream_delta_pending = true;
+            }
+            stream::handle_stream_event(&mut app, event, &event_tx).await;
+        }
+
         let pty_dirty = app.fleet_dialog.is_open && app.fleet_dialog.pty_session.as_ref().map(|p| p.is_alive() && p.take_dirty()).unwrap_or(false);
+        let is_transitioning = app.is_slash_animating() || app.status_transition.is_animating() || app.pending_scroll != 0;
+        let tick_rate = if pty_dirty || is_transitioning {
+            Duration::from_millis(16)
+        } else if app.is_streaming {
+            Duration::from_millis(33)
+        } else {
+            Duration::from_millis(250)
+        };
+        // Coalesce high-frequency SSE token deltas into 60 FPS (16ms) frames while drawing the
+        // first delta after a quiet period immediately (0ms delay).
+        let stream_tick = stream_delta_pending && last_draw.elapsed() >= Duration::from_millis(16);
         // A running task changes nothing on screen by itself; once a second covers what it may show.
         let task_tick = (has_active_tasks && last_draw.elapsed() >= Duration::from_secs(1))
             || (app.tasks_dialog.is_open && last_draw.elapsed() >= Duration::from_millis(250));
-        if needs_redraw || app.is_streaming || app.is_checking_balance || task_tick || is_animating || pty_dirty {
+        let anim_tick = (app.is_streaming || app.is_compacting() || app.is_checking_balance || is_animating)
+            && last_draw.elapsed() >= tick_rate;
+        if needs_redraw || stream_tick || anim_tick || task_tick || pty_dirty {
             // Synchronized output (DEC 2026) so the terminal never shows a half-drawn or cleared frame.
             queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
             if std::mem::take(&mut app.pending_full_repaint) {
@@ -198,31 +288,65 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             crate::app::mobile::clean_trailing_margins(app.last_chat_rect, &app.visible_line_widths, terminal.backend_mut());
             execute!(terminal.backend_mut(), EndSynchronizedUpdate)?;
             needs_redraw = false;
+            stream_delta_pending = false;
             last_draw = Instant::now();
         }
 
-        while let Ok((event_gen, event)) = event_rx.try_recv() {
-            if event_gen != app.current_generation_id {
-                // Drop stale/cancelled turn event to prevent concurrent interleaving
-                continue;
+        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+        let awaiting_async_events =
+            app.is_streaming || app.is_compacting() || app.in_flight_tool_calls > 0 || app.is_checking_balance || has_active_tasks;
+
+        // While streaming or waiting on async work, yield in `tokio::select!` so incoming LLM
+        // deltas and tool completions wake the loop in <1ms. When truly idle, block directly in
+        // `crossterm::event::poll(timeout)` (kernel `poll(2)`) so idle CPU stays ~0.1% while
+        // keypresses still wake the loop instantaneously.
+        if !event::poll(Duration::ZERO)? && !timeout.is_zero() {
+            if awaiting_async_events {
+                let poll_slice = Duration::from_millis(8).min(timeout);
+                tokio::select! {
+                    biased;
+                    maybe_ev = event_rx.recv() => {
+                        if let Some((event_gen, event)) = maybe_ev {
+                            if event_gen == app.current_generation_id {
+                                let is_pure_delta = matches!(
+                                    event,
+                                    corex_core::client::StreamEvent::ContentDelta(_)
+                                        | corex_core::client::StreamEvent::ReasoningDelta(_)
+                                        | corex_core::client::StreamEvent::ToolCallDelta { .. }
+                                );
+                                if !is_pure_delta || last_draw.elapsed() >= Duration::from_millis(16) {
+                                    needs_redraw = true;
+                                } else {
+                                    stream_delta_pending = true;
+                                }
+                                stream::handle_stream_event(&mut app, event, &event_tx).await;
+                            }
+                        }
+                        while let Ok((event_gen, event)) = event_rx.try_recv() {
+                            if event_gen == app.current_generation_id {
+                                let is_pure_delta = matches!(
+                                    event,
+                                    corex_core::client::StreamEvent::ContentDelta(_)
+                                        | corex_core::client::StreamEvent::ReasoningDelta(_)
+                                        | corex_core::client::StreamEvent::ToolCallDelta { .. }
+                                );
+                                if !is_pure_delta || last_draw.elapsed() >= Duration::from_millis(16) {
+                                    needs_redraw = true;
+                                } else {
+                                    stream_delta_pending = true;
+                                }
+                                stream::handle_stream_event(&mut app, event, &event_tx).await;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(poll_slice) => {}
+                }
+            } else {
+                let _ = event::poll(timeout)?;
             }
-            needs_redraw = true;
-            stream::handle_stream_event(&mut app, event, &event_tx).await;
         }
 
-        // Short transitions (popup slide, status wave) last ~200 ms, so they keep 60 FPS to look
-        // smooth; the long-running streaming only needs 30 FPS (the tool-preview beam is the
-        // fastest thing on screen). The live PTY keeps the tight tick for immediate remote output.
-        let is_transitioning = app.is_slash_animating() || app.status_transition.is_animating() || app.pending_scroll != 0;
-        let tick_rate = if pty_dirty || is_transitioning {
-            Duration::from_millis(16)
-        } else if app.is_streaming {
-            Duration::from_millis(33)
-        } else {
-            Duration::from_millis(80)
-        };
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
+        if event::poll(Duration::ZERO)? {
             needs_redraw = true;
             app.last_interaction = Instant::now();
             // Key repeat (holding Backspace) queues events faster than a frame draws; apply every
@@ -241,7 +365,7 @@ pub async fn run_tui(mut app: App) -> Result<()> {
             if quit {
                 break;
             }
-        } else if is_animating || app.is_streaming {
+        } else if last_tick.elapsed() >= tick_rate && (is_animating || app.is_streaming) {
             needs_redraw = true;
         }
 
@@ -282,6 +406,18 @@ async fn handle_terminal_event(app: &mut App, ev: Event, event_tx: &EventTx, ter
 fn is_ctrl_z(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z') | KeyCode::Char('\x1a'))
+}
+
+/// Classifies how a streaming turn ended so errors and user cancellations never fire a
+/// misleading "Turn completed" notification or `OnStop` hook.
+fn turn_finish_notification(messages: &[corex_core::types::Message]) -> Option<&'static str> {
+    let last = messages.last()?;
+    let text = last.text_content().unwrap_or("").trim();
+    match last.role.as_str() {
+        "assistant" if !text.ends_with("*(interrupted)*") => Some("Turn completed"),
+        "system" if text.starts_with("Error:") => Some("Turn failed"),
+        _ => None,
+    }
 }
 
 pub(super) fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -441,10 +577,23 @@ fn early_key(app: &mut App, key: KeyEvent) -> Flow {
         app.clear_selection();
     }
 
+    // When a modal panel (/settings, /model, /resume, /tasks, /key, /rewind, approval, sudo,
+    // ask_user) is open, Esc and Ctrl+C belong to that panel so pressing Esc closes the panel
+    // instead of cancelling the agent's in-flight generation behind it.
+    let modal_open = app.sudo_dialog.is_open
+        || app.auth_dialog.is_open
+        || app.session_dialog.is_open
+        || app.tasks_dialog.is_open
+        || app.settings_dialog.is_open
+        || app.model_dialog.is_open
+        || app.pending_confirmation.is_some()
+        || app.user_dialog.is_open
+        || app.rewind_dialog.is_open;
+
     // Cancel the generation on Esc or Ctrl+C. While something is typed, Esc belongs to the prompt
     // (a double Esc clears it), so it only cancels from an empty prompt.
     let esc_for_prompt = key.code == KeyCode::Esc && !app.input_buffer.trim().is_empty();
-    if app.is_streaming && !esc_for_prompt && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && is_ctrl)) {
+    if app.is_streaming && !modal_open && !esc_for_prompt && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && is_ctrl)) {
         // Cancelling must not eat what the user typed: whatever never reached
         // the model goes back to the composer.
         let undelivered = app.take_all_pending();
@@ -453,7 +602,14 @@ fn early_key(app: &mut App, key: KeyEvent) -> Flow {
         return Flow::Handled;
     }
 
-    if app.is_checking_balance && key.code == KeyCode::Esc {
+    if app.is_compacting() && !modal_open && !esc_for_prompt && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && is_ctrl)) {
+        let undelivered = app.take_all_pending();
+        app.cancel_compaction("Context compaction cancelled.");
+        app.restore_to_input(undelivered);
+        return Flow::Handled;
+    }
+
+    if app.is_checking_balance && !modal_open && key.code == KeyCode::Esc {
         app.is_checking_balance = false;
         app.clear_status();
         if let Some(idx) = app.pending_balance_msg_index.take() {
@@ -534,6 +690,26 @@ mod ctrl_c_tests {
         assert!(!app.session_dialog.is_open, "first Ctrl+C closes /resume");
         let flow4 = handle_key_inner(&mut app, ctrl_c, &tx, None).await.unwrap();
         assert!(matches!(flow4, Flow::Quit), "second Ctrl+C after /resume quits");
+    }
+
+    #[tokio::test]
+    async fn esc_closes_open_modal_instead_of_cancelling_streaming() {
+        let mut app = App::new(LlmClient::new(Config::default()), PathBuf::from("/tmp"), false);
+        app.auth_dialog.close();
+        let (tx, _rx) = mpsc::channel(4);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.is_streaming = true;
+        app.settings_dialog.open(&Config::default());
+        let flow1 = handle_key_inner(&mut app, esc, &tx, None).await.unwrap();
+        assert!(matches!(flow1, Flow::Handled));
+        assert!(!app.settings_dialog.is_open, "Esc must close /settings first");
+        assert!(app.is_streaming, "Esc in /settings must NOT cancel the active generation");
+
+        // Second Esc with no modal open cancels generation as expected.
+        let flow2 = handle_key_inner(&mut app, esc, &tx, None).await.unwrap();
+        assert!(matches!(flow2, Flow::Handled));
+        assert!(!app.is_streaming, "Esc with no modal open cancels generation");
     }
 }
 
@@ -711,6 +887,28 @@ mod narrow_screens {
         let col = middle.len() - middle.trim_start().len() + 2;
         assert_eq!(app.url_at(start + 1, col).as_deref(), Some(url));
         assert_eq!(app.url_at(start, 14).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn turn_finish_notification_distinguishes_success_error_and_cancellation() {
+        use corex_core::types::Message;
+        assert_eq!(
+            super::turn_finish_notification(&[Message::assistant("Done!".to_string(), None)]),
+            Some("Turn completed")
+        );
+        assert_eq!(
+            super::turn_finish_notification(&[Message::system("Error: 429 Too Many Requests".to_string())]),
+            Some("Turn failed")
+        );
+        assert_eq!(
+            super::turn_finish_notification(&[Message::system("Generation cancelled by user.".to_string())]),
+            None
+        );
+        assert_eq!(
+            super::turn_finish_notification(&[Message::assistant("partial *(interrupted)*".to_string(), None)]),
+            None
+        );
+        assert_eq!(super::turn_finish_notification(&[]), None);
     }
 
 }

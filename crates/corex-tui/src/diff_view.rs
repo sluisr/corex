@@ -121,7 +121,7 @@ pub fn build_tool_confirmation_lines(
 ) -> Vec<Line<'static>> {
     let is_shell = tool_name == "run_shell_command" || tool_name == "shell";
     let is_edit = tool_name == "replace" || tool_name == "edit" || tool_name == "write_file" || tool_name == "apply_patch";
-    let is_subagent = tool_name == "delegate_subagent";
+    let is_subagent = tool_name == "delegate_subagent" || tool_name == "subagent";
 
     // The rail's colour says what kind of action waits: a command, an edit, a delegation.
     let rail = if is_shell {
@@ -372,6 +372,124 @@ pub fn build_tool_confirmation_lines(
     result
 }
 
+/// Extracts a top-level string field (e.g. `"file_path": "..."`) from the first 2 KB of a
+/// streaming (possibly incomplete) JSON object in $O(1)$ time without scanning 50+ KB of
+/// trailing `"content"` / `"patch"` data on every token delta.
+fn extract_streaming_json_field(raw_args: &str, keys: &[&str]) -> Option<String> {
+    let trimmed = raw_args.trim();
+    if trimmed.len() <= 2048 && trimmed.ends_with('}') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            for &k in keys {
+                if let Some(s) = v.get(k).and_then(|val| val.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    let window = corex_core::types::safe_truncate_str(trimmed, 2048);
+    for &k in keys {
+        let pat = format!("\"{}\"", k);
+        let Some(pos) = window.find(&pat) else { continue };
+        let after_key = window[pos + pat.len()..].trim_start();
+        let Some(after_colon) = after_key.strip_prefix(':') else { continue };
+        let after_colon = after_colon.trim_start();
+        let Some(after_quote) = after_colon.strip_prefix('"') else { continue };
+        let mut out = String::new();
+        let mut chars = after_quote.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('n') | Some('r') => break,
+                    Some('t') => out.push(' '),
+                    Some(esc) => out.push(esc),
+                    None => break,
+                },
+                '\n' | '\r' => break,
+                other => out.push(other),
+            }
+            if out.len() >= 240 {
+                break;
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Extracts string items from a top-level JSON string array (e.g. `"queries": ["a", "b"]`)
+/// within the first 2 KB of a streaming (possibly incomplete) JSON object in $O(1)$ time.
+fn extract_streaming_json_string_array(raw_args: &str, key: &str) -> Vec<String> {
+    let trimmed = raw_args.trim();
+    if trimmed.len() <= 2048 && trimmed.ends_with('}') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(arr) = v.get(key).and_then(|val| val.as_array()) {
+                return arr
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+        }
+    }
+    let window = corex_core::types::safe_truncate_str(trimmed, 2048);
+    let pat = format!("\"{}\"", key);
+    let Some(pos) = window.find(&pat) else {
+        return Vec::new();
+    };
+    let after_key = window[pos + pat.len()..].trim_start();
+    let Some(after_colon) = after_key.strip_prefix(':') else {
+        return Vec::new();
+    };
+    let Some(after_bracket) = after_colon.trim_start().strip_prefix('[') else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    let mut chars = after_bracket.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ']' => break,
+            '"' => {
+                let mut item = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some('n') | Some('r') => break,
+                            Some('t') => item.push(' '),
+                            Some(esc) => item.push(esc),
+                            None => break,
+                        },
+                        '\n' | '\r' => break,
+                        other => item.push(other),
+                    }
+                    if item.len() >= 160 {
+                        break;
+                    }
+                }
+                let clean = item.trim();
+                if !clean.is_empty() {
+                    items.push(clean.to_string());
+                }
+                if items.len() >= 6 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+fn preview_fallback_arg(raw_args: &str) -> String {
+    let head = corex_core::types::safe_truncate_str(raw_args.trim(), 240);
+    head.lines().next().unwrap_or(head).to_string()
+}
+
 pub fn build_streaming_tool_preview_lines(
     calls: &[corex_core::types::ToolCall],
     elapsed_secs: f32,
@@ -399,44 +517,36 @@ pub fn build_streaming_tool_preview_lines(
 
         let (action_label, display_arg) = match tool_name.as_str() {
             "run_shell_command" | "shell" | "run_command" | "" => {
-                let parsed_cmd = serde_json::from_str::<serde_json::Value>(raw_args)
-                    .ok()
-                    .and_then(|v| v.get("command").or_else(|| v.get("CommandLine")).and_then(|c| c.as_str()).map(|s| s.to_string()));
+                let parsed_cmd = extract_streaming_json_field(raw_args, &["command", "CommandLine"]);
 
                 let cmd = parsed_cmd.unwrap_or_else(|| {
-                    if let Some(pos) = raw_args.find("\"command\":") {
-                        let after = raw_args[pos + 10..].trim();
-                        after.trim_start_matches('"').trim_end_matches('"').trim_end_matches('}').trim().to_string()
-                    } else if raw_args.trim().is_empty() {
+                    if raw_args.trim().is_empty() {
                         "analyzing...".to_string()
                     } else {
-                        raw_args.to_string()
+                        preview_fallback_arg(raw_args)
                     }
                 });
                 ("$ ", cmd)
             }
             "read_file" => {
-                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| raw_args.to_string());
+                let path = extract_streaming_json_field(raw_args, &["file_path", "path"])
+                    .unwrap_or_else(|| preview_fallback_arg(raw_args));
                 ("read ", crate::app::formatting::format_relative_path(&path))
             }
             "write_file" => {
-                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| raw_args.to_string());
+                let path = extract_streaming_json_field(raw_args, &["file_path", "path"])
+                    .unwrap_or_else(|| preview_fallback_arg(raw_args));
                 ("write ", crate::app::formatting::format_relative_path(&path))
             }
             "edit" | "apply_patch" => {
-                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("file_path").or_else(|| v.get("path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .or_else(|| crate::app::formatting::patch_target(raw_args))
+                let head_slice = corex_core::types::safe_truncate_str(raw_args, 2048);
+                let path = extract_streaming_json_field(raw_args, &["file_path", "path"])
+                    .or_else(|| crate::app::formatting::patch_target(head_slice))
                     .unwrap_or_else(|| "patch".to_string());
                 ("edit ", crate::app::formatting::format_relative_path(&path))
             }
             "list_directory" | "ls" => {
-                let path = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("path").or_else(|| v.get("dir_path")).and_then(|s| s.as_str()).map(|s| s.to_string()))
+                let path = extract_streaming_json_field(raw_args, &["path", "dir_path"])
                     .unwrap_or_else(|| ".".to_string());
                 let mut rel = crate::app::formatting::format_relative_path(&path);
                 if !rel.ends_with('/') && rel != "." {
@@ -444,24 +554,36 @@ pub fn build_streaming_tool_preview_lines(
                 }
                 ("ls ", rel)
             }
-            "web_search" => {
-                let q = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("query").and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| raw_args.to_string());
-                ("web ", format!("\"{}\"", q))
+            "web_search" | "google_web_search" => {
+                let mut queries = Vec::new();
+                if let Some(q) = extract_streaming_json_field(raw_args, &["query"]) {
+                    let q = q.trim();
+                    if !q.is_empty() {
+                        queries.push(q.to_string());
+                    }
+                }
+                for q in extract_streaming_json_string_array(raw_args, "queries") {
+                    if !queries.iter().any(|existing| existing == &q) {
+                        queries.push(q);
+                    }
+                }
+                let display = if !queries.is_empty() {
+                    crate::app::formatting::format_web_search_queries(&queries, 80, false)
+                } else {
+                    "...".to_string()
+                };
+                ("web ", display)
             }
             "web_fetch" => {
-                let url = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("url").and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| raw_args.to_string());
+                let url = extract_streaming_json_field(raw_args, &["url"])
+                    .unwrap_or_else(|| preview_fallback_arg(raw_args));
                 ("fetch ", url)
             }
             "grep_search" | "grep" => {
-                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-                let q = parsed.as_ref().and_then(|v| v.get("pattern").or_else(|| v.get("query")).and_then(|s| s.as_str())).unwrap_or("");
-                let path = parsed.as_ref().and_then(|v| v.get("path").or_else(|| v.get("dir_path")).and_then(|s| s.as_str())).unwrap_or("");
+                let q = extract_streaming_json_field(raw_args, &["pattern", "query"]).unwrap_or_default();
+                let path = extract_streaming_json_field(raw_args, &["path", "dir_path"]).unwrap_or_default();
                 let text = if !path.is_empty() && path != "." {
-                    let rel = crate::app::formatting::format_relative_path(path);
+                    let rel = crate::app::formatting::format_relative_path(&path);
                     if q.is_empty() {
                         format!("in {}", rel)
                     } else {
@@ -470,45 +592,47 @@ pub fn build_streaming_tool_preview_lines(
                 } else if !q.is_empty() {
                     format!("\"{}\"", q)
                 } else {
-                    raw_args.to_string()
+                    preview_fallback_arg(raw_args)
                 };
                 ("grep ", text)
             }
             "activate_skill" => {
-                let name = serde_json::from_str::<serde_json::Value>(raw_args).ok()
-                    .and_then(|v| v.get("name").and_then(|s| s.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| raw_args.to_string());
+                let name = extract_streaming_json_field(raw_args, &["name"])
+                    .unwrap_or_else(|| preview_fallback_arg(raw_args));
                 ("skill ", name)
             }
-            "delegate_subagent" => {
-                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-                let role = parsed.as_ref().and_then(|v| v.get("role").and_then(|s| s.as_str())).unwrap_or("worker");
-                let prompt = parsed.as_ref()
-                    .and_then(|v| v.get("prompt").or_else(|| v.get("task")).and_then(|s| s.as_str()))
-                    .unwrap_or("")
-                    .trim();
-                let first_line = prompt.lines().next().unwrap_or(prompt);
-                let display = if first_line.is_empty() {
-                    role.to_string()
+            "delegate_subagent" | "subagent" => {
+                let action = extract_streaming_json_field(raw_args, &["action"]).unwrap_or_default();
+                if !action.is_empty() && !matches!(action.to_ascii_lowercase().as_str(), "delegate" | "spawn" | "run") {
+                    let tid = extract_streaming_json_field(raw_args, &["task_id"]).unwrap_or_default();
+                    let display = if tid.is_empty() { action } else { format!("{action} {tid}") };
+                    ("agent ", display)
                 } else {
-                    format!("{} {}", role, corex_core::truncate_ellipsis(first_line, 50))
-                };
-                ("agent ", display)
+                    let role = extract_streaming_json_field(raw_args, &["role"]).unwrap_or_else(|| "worker".to_string());
+                    let prompt = extract_streaming_json_field(raw_args, &["prompt", "task"]).unwrap_or_default();
+                    let first_line = prompt.trim().lines().next().unwrap_or("");
+                    let display = if first_line.is_empty() {
+                        role
+                    } else {
+                        format!("{} {}", role, corex_core::truncate_ellipsis(first_line, 50))
+                    };
+                    ("agent ", display)
+                }
+            }
+            "ask_user" => {
+                let q = extract_streaming_json_field(raw_args, &["question", "header"])
+                    .unwrap_or_else(|| "...".to_string());
+                ("ask ", q)
             }
             other => {
-                let parsed = serde_json::from_str::<serde_json::Value>(raw_args).ok();
-                let primary_arg = parsed.as_ref().and_then(|v| {
-                    v.get("path")
-                        .or_else(|| v.get("dir_path"))
-                        .or_else(|| v.get("file_path"))
-                        .or_else(|| v.get("query"))
-                        .or_else(|| v.get("pattern"))
-                        .and_then(|s| s.as_str())
-                });
+                let primary_arg = extract_streaming_json_field(
+                    raw_args,
+                    &["path", "dir_path", "file_path", "query", "pattern"],
+                );
                 let arg = if let Some(arg) = primary_arg {
-                    crate::app::formatting::format_relative_path(arg)
+                    crate::app::formatting::format_relative_path(&arg)
                 } else if !raw_args.trim().is_empty() {
-                    raw_args.to_string()
+                    preview_fallback_arg(raw_args)
                 } else {
                     "...".to_string()
                 };
@@ -631,5 +755,59 @@ mod tests {
                 assert!(text.trim_end().ends_with(['y', 's', 'p', 'n', 'w', 'c']), "the shortcut must stay visible: {text:?}");
             }
         }
+    }
+
+    #[test]
+    fn streaming_web_search_formats_queries_array_and_partial_json() {
+        let theme = Theme::default();
+        let make_call = |args: &str| {
+            vec![corex_core::types::ToolCall {
+                id: "call_1".to_string(),
+                call_type: "function".to_string(),
+                function: corex_core::types::FunctionCall {
+                    name: "web_search".to_string(),
+                    arguments: args.to_string(),
+                },
+                extra_content: None,
+            }]
+        };
+        let render = |args: &str| -> String {
+            build_streaming_tool_preview_lines(&make_call(args), 0.0, 100, &theme)
+                .into_iter()
+                .map(|l| l.spans.into_iter().map(|s| s.content.into_owned()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let early = render(r#"{"queries": ["#);
+        assert!(early.contains("web ..."), "early partial JSON should show ellipsis: {early}");
+        assert!(!early.contains("{\"queries\""), "raw JSON must not leak: {early}");
+
+        let partial = render(r#"{"queries": ["sluisr deepseek cli", "sluisr github"#);
+        assert!(partial.contains("web \"sluisr deepseek cli\" · \"sluisr github\""), "{partial}");
+
+        let complete = render(r#"{"queries": ["sluisr deepseek cli", "sluisr github corex"]}"#);
+        assert!(complete.contains("web \"sluisr deepseek cli\" · \"sluisr github corex\""), "{complete}");
+    }
+
+    #[test]
+    fn streaming_ask_user_formats_question_without_raw_json() {
+        let theme = Theme::default();
+        let call = vec![corex_core::types::ToolCall {
+            id: "call_ask".to_string(),
+            call_type: "function".to_string(),
+            function: corex_core::types::FunctionCall {
+                name: "ask_user".to_string(),
+                arguments: r#"{"questions":[{"header":"Comandos","question":"¿De qué tipo quieres los comandos?","options":["Recon"]}]}"#.to_string(),
+            },
+            extra_content: None,
+        }];
+        let rendered: String = build_streaming_tool_preview_lines(&call, 0.0, 100, &theme)
+            .into_iter()
+            .map(|l| l.spans.into_iter().map(|s| s.content.into_owned()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("ask ¿De qué tipo quieres los comandos?"), "{rendered}");
+        assert!(!rendered.contains("{\"header\""), "{rendered}");
     }
 }

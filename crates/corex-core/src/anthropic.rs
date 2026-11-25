@@ -213,8 +213,12 @@ fn user_blocks(content: Option<&MessageContent>) -> Vec<AnthropicBlock> {
 pub const THINKING_EXTRA_KEY: &str = "anthropic_thinking";
 
 fn is_task_report(m: &Message) -> bool {
-    m.text_content()
-        .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|") || t.starts_with("USER_SHELL|"))
+    m.text_content().is_some_and(|t| {
+        t.starts_with("TASK_DONE|")
+            || t.starts_with("SUBAGENT_DONE|")
+            || t.starts_with("USER_SHELL|")
+            || t.contains("<CONTEXT_SUMMARY>")
+    })
 }
 
 /// Converts Corex messages and tool definitions into Anthropic's Messages API format.

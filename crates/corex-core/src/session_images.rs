@@ -7,7 +7,8 @@ use crate::types::{Message, MessageContent};
 
 const IMAGE_REF: &str = "corex-image:";
 const LEFT_OUT_PREFIX: &str = "[Earlier image left out of this request to save context. It is saved at ";
-const LEFT_OUT_SUFFIX: &str = "; call read_image on that path to look at it again.]";
+const LEFT_OUT_SUFFIX: &str = "; call read_file on that path to look at it again.]";
+const LEGACY_LEFT_OUT_SUFFIX: &str = "; call read_image on that path to look at it again.]";
 const MISSING_NOTE: &str = "[An image from earlier in this session is no longer stored on disk.]";
 
 const FORMATS: &[(&str, &str)] = &[
@@ -45,11 +46,42 @@ fn store(url: &str, dir: &Path) -> Option<String> {
 }
 
 // An image that cannot be written stays inline, so a full disk never loses it.
+#[allow(dead_code)]
 pub(crate) fn externalize(messages: &mut [Message], dir: &Path) {
+    let mut memo = std::collections::HashMap::new();
+    externalize_with_memo(messages, dir, &mut memo);
+}
+
+pub(crate) fn externalize_pair(messages: &mut [Message], history: &mut [Message], dir: &Path) {
+    let mut memo = std::collections::HashMap::new();
+    externalize_with_memo(messages, dir, &mut memo);
+    externalize_with_memo(history, dir, &mut memo);
+}
+
+fn externalize_with_memo(
+    messages: &mut [Message],
+    dir: &Path,
+    memo: &mut std::collections::HashMap<(usize, String), String>,
+) {
     for message in messages {
         let Some(MessageContent::Parts(parts)) = message.content.as_mut() else { continue };
         for image in parts.iter_mut().filter_map(|p| p.image_url.as_mut()) {
+            if !image.url.starts_with("data:") {
+                continue;
+            }
+            let len = image.url.len();
+            let sample = if len <= 128 {
+                image.url.clone()
+            } else {
+                format!("{}..{}", &image.url[..64], &image.url[len - 64..])
+            };
+            let key = (len, sample);
+            if let Some(name) = memo.get(&key) {
+                image.url = format!("{IMAGE_REF}{name}");
+                continue;
+            }
             if let Some(name) = store(&image.url, dir) {
+                memo.insert(key, name.clone());
                 image.url = format!("{IMAGE_REF}{name}");
             }
         }
@@ -88,7 +120,7 @@ pub fn restore_left_out_images(messages: &mut [Message]) {
                 .text
                 .as_deref()
                 .and_then(|t| t.strip_prefix(LEFT_OUT_PREFIX))
-                .and_then(|t| t.strip_suffix(LEFT_OUT_SUFFIX))
+                .and_then(|t| t.strip_suffix(LEFT_OUT_SUFFIX).or_else(|| t.strip_suffix(LEGACY_LEFT_OUT_SUFFIX)))
                 .map(PathBuf::from)
             else {
                 continue;
@@ -241,7 +273,7 @@ mod tests {
         assert_eq!(url_of(&messages[1]).as_deref(), Some(urls[1]));
         assert_eq!(url_of(&messages[2]).as_deref(), Some(urls[2]));
         let Some(MessageContent::Parts(parts)) = &messages[0].content else { panic!("parts expected") };
-        let note = parts.iter().find_map(|p| p.text.clone().filter(|t| t.contains("read_image"))).unwrap();
+        let note = parts.iter().find_map(|p| p.text.clone().filter(|t| t.contains("read_file"))).unwrap();
         let path = note.split("saved at ").nth(1).and_then(|r| r.split(';').next()).unwrap();
         assert!(std::path::Path::new(path).is_file(), "{note}");
         let _ = std::fs::remove_dir_all(&dir);

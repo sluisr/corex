@@ -24,7 +24,7 @@ use crate::extra_tools::{
     TrackerGetTaskTool, TrackerListTasksTool, TrackerAddDependencyTool,
     TrackerVisualizeTool, UpdateTopicTool,
 };
-use crate::subagent::{DelegateSubagentTool, ManageSubagentsTool};
+use crate::subagent::{DelegateSubagentTool, ManageSubagentsTool, SubagentTool};
 
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -96,11 +96,12 @@ impl ToolRegistry {
         registry.register_primary(write_todos);
         registry.register_primary(Arc::new(SaveMemoryTool));
         registry.register_primary(Arc::new(CorexSettingsTool));
+        registry.register_primary(Arc::new(crate::diagnostics::DiagnosticsTool));
         registry.register_primary(activate_skill);
-        registry.register_primary(get_internal_docs);
+        registry.register_alias("get_internal_docs", get_internal_docs);
         registry.register_group(ActionGroupTool::new(
             "tracker",
-            "Persistent task tracker for multi-step work (tasks, statuses, dependencies).",
+            "Persistent task graph (.corex/tasks.json).",
             vec![
                 (TRACKER_ACTIONS[0].0, tracker_create_task),
                 (TRACKER_ACTIONS[1].0, tracker_update_task),
@@ -111,8 +112,11 @@ impl ToolRegistry {
             ],
         ));
         registry.register_primary(update_topic);
-        registry.register_primary(delegate_subagent.clone());
-        registry.register_primary(manage_subagents.clone());
+        registry.register_primary(Arc::new(SubagentTool));
+        registry.register_alias("delegate_subagent", delegate_subagent.clone());
+        registry.register_alias("invoke_subagent", delegate_subagent);
+        registry.register_alias("manage_subagents", manage_subagents.clone());
+        registry.register_alias("subagents", manage_subagents);
 
         // Tool name aliases for compatibility across model families:
         registry.tools.insert("replace".to_string(), edit.clone());
@@ -129,9 +133,6 @@ impl ToolRegistry {
         registry.tools.insert("view_file".to_string(), read_file);
         registry.tools.insert("find_files".to_string(), glob.clone());
         registry.tools.insert("tasks".to_string(), manage_task);
-        registry.tools.insert("invoke_subagent".to_string(), delegate_subagent.clone());
-        registry.tools.insert("subagent".to_string(), delegate_subagent);
-        registry.tools.insert("subagents".to_string(), manage_subagents);
 
         registry
     }
@@ -162,6 +163,21 @@ impl ToolRegistry {
         let is_mcp = mcp_index::is_mcp_tool(tool.name());
         self.register_primary(tool);
         if is_mcp {
+            self.refresh_mcp_index();
+        }
+    }
+
+    /// Registers a batch of tools and refreshes the MCP index at most once at the end,
+    /// avoiding $O(N^2)$ index rebuilds when loading hundreds of MCP tools.
+    pub fn register_many(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
+        let mut any_mcp = false;
+        for tool in tools {
+            if mcp_index::is_mcp_tool(tool.name()) {
+                any_mcp = true;
+            }
+            self.register_primary(tool);
+        }
+        if any_mcp {
             self.refresh_mcp_index();
         }
     }
@@ -230,6 +246,10 @@ impl ToolRegistry {
         let Some(tool) = self.get(name) else {
             return Ok(ToolOutput::error(format!("Unknown tool: {}", name)));
         };
+        let hooks = crate::hooks::load_global_hooks();
+        if let Err(blocked) = crate::hooks::run_pre_tool_hooks(&hooks, tool.name(), &args, &context.workspace_dir).await {
+            return Ok(ToolOutput::error(blocked));
+        }
         let edited = edited_file(tool.name(), &args, context);
         // Edits to the same file run one at a time here, so each records the state the previous
         // one left instead of all of them claiming the original as their "before".
@@ -238,10 +258,18 @@ impl ToolRegistry {
             None => None,
         };
         let before = edited.as_deref().and_then(corex_core::file_history::snapshot);
-        let result = tool.execute(args, context).await;
+        let mut result = tool.execute(args.clone(), context).await;
         if let (Some(path), Some(before)) = (edited, before) {
             if let Some(after) = corex_core::file_history::snapshot(&path) {
                 corex_core::file_history::record(path, before, after);
+            }
+        }
+        if let Ok(ref mut out) = result {
+            if let Some(note) = crate::hooks::run_post_tool_hooks(&hooks, tool.name(), &args, &context.workspace_dir).await {
+                if !out.output.is_empty() {
+                    out.output.push_str("\n\n");
+                }
+                out.output.push_str(&note);
             }
         }
         result
@@ -413,10 +441,19 @@ mod tests {
     fn grouped_tools_replace_their_members_in_the_offered_list() {
         let reg = ToolRegistry::new();
         let offered: Vec<String> = reg.list_definitions().into_iter().map(|d| d.function.name).collect();
-        for name in ["read_file", "manage_task", "tracker"] {
+        for name in ["read_file", "manage_task", "tracker", "subagent"] {
             assert!(offered.contains(&name.to_string()), "{name} missing");
         }
-        for name in ["read_image", "read_document", "tracker_create_task", "kill_background_process", "list_background_processes"] {
+        for name in [
+            "read_image",
+            "read_document",
+            "tracker_create_task",
+            "kill_background_process",
+            "list_background_processes",
+            "delegate_subagent",
+            "manage_subagents",
+            "get_internal_docs",
+        ] {
             assert!(!offered.contains(&name.to_string()), "{name} still offered");
             assert!(reg.get(name).is_some(), "{name} no longer callable");
         }

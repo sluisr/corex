@@ -58,16 +58,23 @@ impl HistoryStore {
         lines
     }
 
-    /// Appends a new prompt to ~/.corex/history in O(1) without re-reading the file or blocking on fsync.
+    /// Appends a new prompt to ~/.corex/history in O(1) without blocking the TUI event loop thread.
     pub fn append(entry: &str) {
         let trimmed = entry.trim();
         if trimmed.is_empty() {
             return;
         }
-
-        let path = Self::history_file_path();
-        if let Ok(mut file) = crate::secure_fs::open_private(&path, true) {
-            let _ = writeln!(file, "{}", trimmed);
+        let line = trimmed.to_string();
+        let write_fn = move || {
+            let path = Self::history_file_path();
+            if let Ok(mut file) = crate::secure_fs::open_private(&path, true) {
+                let _ = writeln!(file, "{}", line);
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(write_fn);
+        } else {
+            write_fn();
         }
     }
 }

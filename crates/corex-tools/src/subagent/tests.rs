@@ -622,3 +622,82 @@ async fn a_report_returned_by_wait_is_not_delivered_a_second_time() {
         "the same output must not reach the model twice"
     );
 }
+
+#[tokio::test]
+async fn subagent_adopts_compacted_messages_instead_of_recompacting_every_turn() {
+    struct CompactingSubagentBackend {
+        seen_lengths: std::sync::Mutex<Vec<(usize, bool)>>,
+    }
+
+    #[async_trait]
+    impl SubagentChatBackend for CompactingSubagentBackend {
+        async fn stream_turn(
+            &self,
+            messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+            _cancel_token: tokio_util::sync::CancellationToken,
+        ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, String> {
+            let has_summary = messages
+                .iter()
+                .any(|m| m.text_content().is_some_and(|t| t.contains("<CONTEXT_SUMMARY>")));
+            let turn_idx = {
+                let mut g = self.seen_lengths.lock().unwrap();
+                g.push((messages.len(), has_summary));
+                g.len()
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                if turn_idx == 1 {
+                    let _ = tx
+                        .send(StreamEvent::ContextCompacted {
+                            compacted_messages: vec![
+                                Message::user("compacted root"),
+                                Message::system("<CONTEXT_SUMMARY>\nsummary\n</CONTEXT_SUMMARY>"),
+                            ],
+                            notice: "compacted".to_string(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(StreamEvent::ToolCallDelta {
+                            index: 0,
+                            id: Some("c1".to_string()),
+                            name: Some("__mock_noop_tool__".to_string()),
+                            arguments: Some("{}".to_string()),
+                            extra_content: None,
+                        })
+                        .await;
+                } else {
+                    let _ = tx
+                        .send(StreamEvent::ContentDelta("done after compaction".to_string()))
+                        .await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    let backend = CompactingSubagentBackend {
+        seen_lengths: std::sync::Mutex::new(Vec::new()),
+    };
+    let mut trace = ForensicTrace::new("sub_compact_test", SubagentRole::Scout, "check repo", Path::new("/tmp"));
+    let out = run_subagent_llm_loop_with(
+        "sub_compact_test",
+        SubagentRole::Scout,
+        "check repo",
+        Path::new("/tmp"),
+        &[],
+        &[],
+        &backend,
+        &mut trace,
+    )
+    .await
+    .expect("subagent loop should succeed");
+
+    assert_eq!(out, "done after compaction");
+    let seen = backend.seen_lengths.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[0].1, "turn 1 starts uncompacted");
+    assert!(seen[1].1, "turn 2 must carry the compacted summary instead of discarding ContextCompacted");
+    // Turn 2 should have: system(role) + user(compacted root) + system(summary) + assistant(call) + tool(res) = 5
+    assert_eq!(seen[1].0, 5);
+}

@@ -86,14 +86,15 @@ pub(super) async fn handle_stream_event(app: &mut App, event: StreamEvent, event
             }
         }
         StreamEvent::Completed { finish_reason } => on_completed(app, finish_reason.as_deref(), event_tx),
+        StreamEvent::Compacting => {
+            app.set_status("Compacting context...");
+        }
         StreamEvent::ContextCompacted { mut compacted_messages, notice } => {
             corex_core::session_images::restore_left_out_images(&mut compacted_messages);
-            let before = std::mem::replace(&mut app.session.messages, compacted_messages);
-            app.session.keep_history_before_compaction(&before);
-            app.session.add_message(Message::system(notice));
-            app.invalidate_message_cache();
-            app.session.save_async();
-            corex_core::trim_memory();
+            app.apply_compaction(compacted_messages, notice);
+            if app.is_streaming {
+                app.set_status("Generating...");
+            }
         }
         StreamEvent::Notice(notice) => {
             app.session.add_message(Message::system(notice));

@@ -36,6 +36,7 @@ MCP servers are configured inside **`~/.corex/settings.json`** under the `mcp_se
 ```
 
 Each entry under `mcp_servers` is a named server with:
+- **`enabled`** — optional boolean (`true` by default). Set to `false` (or run `/mcp off <name>`) to disable a server without deleting its configuration or credentials.
 - **`command`** — the executable to launch (e.g. `npx`, `uvx`, `python`, a binary path). Used by local servers.
 - **`args`** — list of arguments to pass
 - **`env`** — optional environment variables for the server process
@@ -177,13 +178,16 @@ The OAuth setup (`Authorization: Bearer <access token>` + `X-Goog-User-Project`)
 
 |Command | What it does |
 |:--- | :--- |
-|`/mcp` or `/mcp status` | List all configured servers, connection status, and discovered tools |
+|`/mcp` or `/mcp status` | List all configured servers, their `[ON]`/`[OFF]` state, connection status, and discovered tools |
+|`/mcp on <name\|all>` | Enable an MCP server (or all servers) and load its tools (alias: `/mcp enable`) |
+|`/mcp off <name\|all>` | Disable an MCP server (or all servers) without deleting its config/keys (alias: `/mcp disable`) |
+|`/mcp toggle <name>` | Switch an MCP server between enabled (`[ON]`) and disabled (`[OFF]`) |
 |`/mcp catalog` | Browse the built-in catalog of vetted community templates |
 |`/mcp add <catalog-id>` | Instantly add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
 |`/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |
 |`/mcp add <name> <url> [Header=value ...]` | Add a remote server; an `http(s)` target is taken as its URL |
 |`/mcp remove <name>` | Remove an MCP server from configuration and reload tools |
-|`/mcp reload` | Re-read `mcp_servers` from `~/.corex/settings.json`, reconnect and rediscover every server |
+|`/mcp reload` | Re-read `mcp_servers` from `~/.corex/settings.json`, reconnect and rediscover every enabled server |
 
 MCP servers can be added in one command via `/mcp add <id>` or configured manually in `~/.corex/settings.json`. Dynamic tool discovery registers tools immediately without needing a full restart, and `/mcp reload` picks up hand edits to that file.
 

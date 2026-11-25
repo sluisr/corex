@@ -91,9 +91,26 @@ pub fn spill_text(label: &str, text: &str) -> Option<PathBuf> {
 /// Keeps the first `head` and last `tail` characters of `text`, with a note between them that says
 /// where the complete text was saved (when saving worked).
 pub fn trim_with_spill(label: &str, text: &str, head: usize, tail: usize) -> String {
-    let total = text.chars().count();
-    let head_text: String = text.chars().take(head).collect();
-    let tail_text: String = text.chars().skip(total.saturating_sub(tail)).collect();
+    let mut total = 0usize;
+    let mut head_end_byte = text.len();
+    for (idx, (byte_pos, _)) in text.char_indices().enumerate() {
+        if idx == head {
+            head_end_byte = byte_pos;
+        }
+        total += 1;
+    }
+    let head_text = &text[..head_end_byte];
+    let tail_start_byte = if tail == 0 || total == 0 {
+        text.len()
+    } else if tail >= total {
+        0
+    } else {
+        text.char_indices()
+            .rev()
+            .nth(tail - 1)
+            .map_or(0, |(b, _)| b)
+    };
+    let tail_text = &text[tail_start_byte..];
     let note = match spill_text(label, text) {
         Some(path) => format!(
             "[... {} ({} characters in total); the full output is saved at {} — read it with read_file using start_line/end_line if you need the middle ...]",
@@ -108,7 +125,8 @@ pub fn trim_with_spill(label: &str, text: &str, head: usize, tail: usize) -> Str
 
 /// Cuts a freshly produced tool result when it is too large to send whole.
 pub fn spill_large_output(tool_name: &str, output: String) -> String {
-    if output.chars().count() <= SPILL_THRESHOLD_CHARS {
+    // Fast byte-length check avoids scanning UTF-8 chars on strings under 30 KB.
+    if output.len() <= SPILL_THRESHOLD_CHARS || output.chars().count() <= SPILL_THRESHOLD_CHARS {
         return output;
     }
     trim_with_spill(tool_name, &output, SPILL_HEAD_CHARS, SPILL_TAIL_CHARS)

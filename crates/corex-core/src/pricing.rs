@@ -99,18 +99,98 @@ impl Spend {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelSpend {
+    pub label: String,
+    pub requests: u32,
+    pub spend: Spend,
+}
+
+#[derive(Debug, Default)]
+struct MeterState {
+    total: Spend,
+    by_model: Vec<ModelSpend>,
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct UsageMeter(Arc<Mutex<Spend>>);
+pub struct UsageMeter(Arc<Mutex<MeterState>>);
 
 impl UsageMeter {
     pub fn record(&self, usage: &Usage, rates: Option<Rates>) {
-        if let Ok(mut spend) = self.0.lock() {
-            spend.add(usage, rates);
+        if let Ok(mut state) = self.0.lock() {
+            state.total.add(usage, rates);
+        }
+    }
+
+    pub fn record_for(&self, label: &str, usage: &Usage, rates: Option<Rates>) {
+        if let Ok(mut state) = self.0.lock() {
+            state.total.add(usage, rates);
+            if let Some(entry) = state.by_model.iter_mut().find(|m| m.label == label) {
+                entry.requests += 1;
+                entry.spend.add(usage, rates);
+            } else {
+                let mut spend = Spend::default();
+                spend.add(usage, rates);
+                state.by_model.push(ModelSpend {
+                    label: label.to_string(),
+                    requests: 1,
+                    spend,
+                });
+            }
         }
     }
 
     pub fn spend(&self) -> Spend {
-        self.0.lock().map(|s| s.clone()).unwrap_or_default()
+        self.0.lock().map(|s| s.total.clone()).unwrap_or_default()
+    }
+
+    pub fn model_spends(&self) -> Vec<ModelSpend> {
+        self.0.lock().map(|s| s.by_model.clone()).unwrap_or_default()
+    }
+}
+
+/// Human-readable `Provider · Model` display label for a config snapshot (used in exit summaries
+/// and per-model usage tracking).
+pub fn model_display_label(cfg: &Config) -> String {
+    let is_local = cfg.local_llm_enabled || cfg.model.starts_with("local");
+    let is_deepseek = cfg.is_deepseek_endpoint();
+    if is_local {
+        if !cfg.local_llm_model.is_empty() {
+            format!("Local ({})", cfg.local_llm_model)
+        } else {
+            "Local".to_string()
+        }
+    } else if is_deepseek
+        && (cfg.model == "deepseek-flash"
+            || cfg.model == "deepseek-v4.1-flash"
+            || cfg.model == "deepseek-v4.1-flash-1017"
+            || cfg.model == "deepseek-v4-flash"
+            || cfg.model == "deepseek-chat")
+    {
+        if cfg.model == "deepseek-v4.1-flash-1017" {
+            "DeepSeek-V4.1-Flash-1017".to_string()
+        } else {
+            "DeepSeek-V4.1-Flash".to_string()
+        }
+    } else if is_deepseek && (cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-pro" || cfg.model == "deepseek-reasoner") {
+        "DeepSeek-V4-Pro".to_string()
+    } else {
+        let all = cfg.all_providers();
+        let prov = cfg
+            .active_provider
+            .as_deref()
+            .and_then(|p_name| all.iter().find(|p| p.name == p_name));
+        if let Some(p) = prov {
+            let model_name = p
+                .models
+                .iter()
+                .find(|m| m.id == cfg.model)
+                .map(|m| m.display_name().to_string())
+                .unwrap_or_else(|| cfg.model.clone());
+            format!("{} · {}", p.display_name(), model_name)
+        } else {
+            cfg.model.clone()
+        }
     }
 }
 
@@ -190,5 +270,24 @@ mod tests {
         let meter = UsageMeter::default();
         meter.clone().record(&usage(10, 0, 5), None);
         assert_eq!(meter.spend().usage.total_tokens, 15);
+    }
+
+    #[test]
+    fn tracks_per_model_spend_and_openai_cached_tokens_format() {
+        let raw_json = r#"{"prompt_tokens":2000,"completion_tokens":300,"total_tokens":2300,"prompt_tokens_details":{"cached_tokens":1500}}"#;
+        let u: Usage = serde_json::from_str(raw_json).unwrap();
+        assert_eq!(u.prompt_cache_hit_tokens, 1500);
+        assert_eq!(u.prompt_cache_miss_tokens, 500);
+
+        let meter = UsageMeter::default();
+        meter.record_for("DeepSeek-V4.1-Flash", &usage(10_000, 8_000, 500), Some(deepseek_rates_at("deepseek-flash", off_peak())));
+        meter.record_for("Azure AI Foundry · DeepSeek V4.1 Flash", &u, None);
+        let breakdown = meter.model_spends();
+        assert_eq!(breakdown.len(), 2);
+        assert_eq!(breakdown[0].label, "DeepSeek-V4.1-Flash");
+        assert_eq!(breakdown[0].spend.usage.total_tokens, 10_500);
+        assert_eq!(breakdown[1].label, "Azure AI Foundry · DeepSeek V4.1 Flash");
+        assert_eq!(breakdown[1].spend.usage.prompt_cache_hit_tokens, 1500);
+        assert_eq!(breakdown[1].spend.unpriced_tokens, 2300);
     }
 }

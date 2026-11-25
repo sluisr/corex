@@ -9,6 +9,7 @@ impl App {
 
         match name {
             "/clear" => {
+                self.cancel_compaction_silent();
                 self.session.clear_messages();
                 self.invalidate_message_cache();
                 self.clear_selection();
@@ -296,6 +297,26 @@ impl App {
                 }
                 true
             }
+            "/fork" => {
+                let _ = self.session.save();
+                let tag = if parts.len() > 1 {
+                    Some(parts[1..].join(" "))
+                } else {
+                    None
+                };
+                let forked = self.session.fork(tag.clone());
+                let fork_id_short = forked.id.chars().take(8).collect::<String>();
+                self.session = forked;
+                self.cached_session_id.clear();
+                self.invalidate_message_cache();
+                self.session.save_async();
+                let note = match tag {
+                    Some(t) => format!("Forked session into '{}' (id: {}). Original session stays untouched.", t, fork_id_short),
+                    None => format!("Forked session (id: {}). Original session stays untouched.", fork_id_short),
+                };
+                self.session.add_message(Message::system(note));
+                true
+            }
             "/new" => {
                 let _ = self.session.save();
                 let cfg = self.llm_client.get_config();
@@ -311,7 +332,7 @@ impl App {
                 self.session.add_message(Message::system(format!("Started new chat session (Model: {}).", cfg.model)));
                 true
             }
-            "/model" => {
+            "/model" | "/models" => {
                 if parts.len() > 1 {
                     let new_model = parts[1];
                     let mut cfg = self.llm_client.get_config();
@@ -328,14 +349,22 @@ impl App {
                             .find(|p| !p.is_local() && p.models.iter().any(|m| m.id == new_model))
                             .map(|p| p.name);
                     }
-                    let _ = cfg.save_with_workspace(Some(&self.workspace_dir));
                     self.llm_client.update_config(cfg.clone());
                     corex_tools::subagent::set_subagent_llm_client(std::sync::Arc::new(self.llm_client.clone()));
+                    let ws = self.workspace_dir.clone();
+                    let cfg_to_save = cfg.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn_blocking(move || {
+                            let _ = cfg_to_save.save_preferences_with_workspace(Some(&ws));
+                        });
+                    } else {
+                        let _ = cfg_to_save.save_preferences_with_workspace(Some(&ws));
+                    }
                     self.session.model = new_model.to_string();
                     self.session.provider = cfg.active_provider.clone();
                     self.session.temperature = Some(cfg.temperature);
                     self.session.reasoning_effort = Some(cfg.reasoning_effort);
-                    let _ = self.session.save();
+                    self.session.save_async();
                     self.session.add_message(Message::system(format!("Switched and saved active model to '{}'.", new_model)));
                 } else {
                     let cfg = self.refresh_providers_from_disk();
@@ -401,25 +430,36 @@ impl App {
                 true
             }
             "/compact" | "/compress" => {
-                let before = self.session.messages.clone();
-                match self.llm_client.compact_messages(&mut self.session.messages, true).await {
-                    Ok(Some(notice)) => {
-                        self.session.keep_history_before_compaction(&before);
-                        self.invalidate_message_cache();
-                        let _ = self.session.save();
-                        self.session.add_message(Message::system(notice));
-                    }
-                    Ok(None) => {
-                        self.session.add_message(Message::system(
-                            "Conversation history is too short to require compaction."
-                        ));
-                    }
-                    Err(e) => {
-                        self.session.add_message(Message::system(format!(
-                            "Failed to compact conversation: {}", e
-                        )));
-                    }
+                if self.is_compacting() {
+                    self.set_status("Compacting context...");
+                    return true;
                 }
+                let has_oversized_tool = self.session.messages.iter().any(|m| {
+                    m.role == "tool"
+                        && m.text_content()
+                            .is_some_and(|t| t.len() > corex_core::context_prune::PRUNE_THRESHOLD_CHARS)
+                });
+                if self.session.messages.len() < 5 && !has_oversized_tool {
+                    self.session.add_message(Message::system(
+                        "Conversation history is too short to require compaction.",
+                    ));
+                    return true;
+                }
+                self.set_status("Compacting context...");
+                let cancel = CancellationToken::new();
+                let cancel_task = cancel.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let client = self.llm_client.clone();
+                let mut messages = self.session.messages.clone();
+                tokio::spawn(async move {
+                    let res = client
+                        .compact_messages_cancellable(&mut messages, true, Some(&cancel_task))
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send((messages, res));
+                });
+                self.compact_cancel = Some(cancel);
+                self.compact_rx = Some(rx);
                 true
             }
             "/info" | "/author" | "/credits" | "/about" => {
@@ -647,6 +687,29 @@ impl App {
                 }
                 true
             }
+            "/browser" => {
+                let sub = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| "status".to_string());
+                match sub.as_str() {
+                    "repair" | "install" => {
+                        let install_res = tokio::task::spawn_blocking(corex_tools::install_browser_host)
+                            .await
+                            .ok();
+                        let diag = corex_tools::diagnose_browser().await;
+                        let mut msg = match install_res {
+                            Some(Ok(())) => "✓ Reinstalled Corex Browser Bridge native host manifests.\n\n".to_string(),
+                            Some(Err(e)) => format!("Failed to reinstall native host: {e}\n\n"),
+                            None => String::new(),
+                        };
+                        msg.push_str(&diag.format_report());
+                        self.session.add_message(Message::system(msg));
+                    }
+                    _ => {
+                        let diag = corex_tools::diagnose_browser().await;
+                        self.session.add_message(Message::system(diag.format_report()));
+                    }
+                }
+                true
+            }
             "/mcp" => {
                 let sub = parts.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| "status".to_string());
                 match sub.as_str() {
@@ -768,6 +831,102 @@ impl App {
                             }
                         }
                     }
+                    "on" | "enable" | "start" | "off" | "disable" | "stop" => {
+                        let enable = matches!(sub.as_str(), "on" | "enable" | "start");
+                        let verb = if enable { "on" } else { "off" };
+                        if parts.len() < 3 {
+                            let mut cfg = self.llm_client.get_config();
+                            if let Some(on_disk) = Config::mcp_servers_from_disk() {
+                                cfg.mcp_servers = on_disk;
+                            }
+                            let mut msg = format!("Usage:\n  /mcp {} <name>  - Turn {} a specific MCP server\n  /mcp {} all     - Turn {} all configured MCP servers\n  /mcp toggle <name> - Toggle an MCP server on/off\n", verb, verb, verb, verb);
+                            if !cfg.mcp_servers.is_empty() {
+                                msg.push_str("\nConfigured servers:\n");
+                                let mut names: Vec<_> = cfg.mcp_servers.iter().collect();
+                                names.sort_by(|a, b| a.0.cmp(b.0));
+                                for (name, scfg) in names {
+                                    let badge = if scfg.enabled { "[ON] " } else { "[OFF]" };
+                                    msg.push_str(&format!("  {} {}\n", badge, name));
+                                }
+                            }
+                            self.session.add_message(Message::system(msg));
+                        } else {
+                            let target = parts[2];
+                            let mut cfg = self.llm_client.get_config();
+                            match cfg.set_mcp_server_enabled(target, enable, Some(&self.workspace_dir)) {
+                                Ok(matched) if !matched.is_empty() => {
+                                    self.llm_client.update_config(cfg);
+                                    let statuses = self.reload_mcp_servers().await;
+                                    let state_label = if enable { "ON (enabled)" } else { "OFF (disabled)" };
+                                    let mut msg = format!(
+                                        "✓ Turned {} MCP server{}: {}\n",
+                                        state_label,
+                                        if matched.len() == 1 { "" } else { "s" },
+                                        matched.join(", ")
+                                    );
+                                    if enable {
+                                        for name in &matched {
+                                            if let Some(s) = statuses.iter().find(|s| &s.name == name) {
+                                                let icon = if s.is_connected { "[Connected]" } else { "[ERR]" };
+                                                msg.push_str(&format!("  {} {}: {} tools loaded\n", icon, s.name, s.tools_count));
+                                                if let Some(ref err) = s.error {
+                                                    msg.push_str(&format!("    Warning: {}\n", err));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let active_tools: usize = statuses.iter().filter(|s| s.enabled).map(|s| s.tools_count).sum();
+                                        msg.push_str(&format!("  Unloaded its tools from the session ({} active MCP tools remaining).", active_tools));
+                                    }
+                                    self.session.add_message(Message::system(msg));
+                                }
+                                Ok(_) => {
+                                    self.session.add_message(Message::system(format!(
+                                        "MCP server '{}' was not found in config. Run `/mcp status` to see configured servers.",
+                                        target
+                                    )));
+                                }
+                                Err(e) => {
+                                    self.session.add_message(Message::system(format!("Failed to update MCP config: {}", e)));
+                                }
+                            }
+                        }
+                    }
+                    "toggle" => {
+                        if parts.len() < 3 {
+                            self.session.add_message(Message::system("Usage: /mcp toggle <name>"));
+                        } else {
+                            let target = parts[2];
+                            let mut cfg = self.llm_client.get_config();
+                            match cfg.toggle_mcp_server(target, Some(&self.workspace_dir)) {
+                                Ok(Some((name, enabled))) => {
+                                    self.llm_client.update_config(cfg);
+                                    let statuses = self.reload_mcp_servers().await;
+                                    let state_label = if enabled { "ON (enabled)" } else { "OFF (disabled)" };
+                                    let mut msg = format!("✓ Switched MCP server '{}' to {}.\n", name, state_label);
+                                    if enabled {
+                                        if let Some(s) = statuses.iter().find(|s| s.name == name) {
+                                            let icon = if s.is_connected { "[Connected]" } else { "[ERR]" };
+                                            msg.push_str(&format!("  Status: {} — {} tools discovered", icon, s.tools_count));
+                                            if let Some(ref err) = s.error {
+                                                msg.push_str(&format!("\n  Warning: {}", err));
+                                            }
+                                        }
+                                    }
+                                    self.session.add_message(Message::system(msg));
+                                }
+                                Ok(None) => {
+                                    self.session.add_message(Message::system(format!(
+                                        "MCP server '{}' was not found in config. Run `/mcp status` to see configured servers.",
+                                        target
+                                    )));
+                                }
+                                Err(e) => {
+                                    self.session.add_message(Message::system(format!("Failed to update MCP config: {}", e)));
+                                }
+                            }
+                        }
+                    }
                     "remove" | "delete" => {
                         if parts.len() < 3 {
                             self.session.add_message(Message::system("Usage: /mcp remove <name>"));
@@ -796,10 +955,14 @@ impl App {
                             msg.push_str("  No servers configured. Type `/mcp catalog` to see available servers or `/mcp add <id>`.\n");
                         }
                         for s in &statuses {
-                            let icon = if s.is_connected { "[OK]" } else { "[ERR]" };
-                            msg.push_str(&format!("{} {} ({}): {} tools discovered\n", icon, s.name, s.command, s.tools_count));
-                            if let Some(ref e) = s.error {
-                                msg.push_str(&format!("   Error: {}\n", e));
+                            if !s.enabled {
+                                msg.push_str(&format!("[OFF] {} ({}): disabled (run `/mcp on {}` to enable)\n", s.name, s.command, s.name));
+                            } else {
+                                let icon = if s.is_connected { "[OK] " } else { "[ERR]" };
+                                msg.push_str(&format!("{} {} ({}): {} tools discovered\n", icon, s.name, s.command, s.tools_count));
+                                if let Some(ref e) = s.error {
+                                    msg.push_str(&format!("   Error: {}\n", e));
+                                }
                             }
                         }
                         self.session.add_message(Message::system(msg));
@@ -822,12 +985,21 @@ impl App {
                                 All servers are persisted in ~/.corex/settings.json or .corex/settings.json.";
                             self.session.add_message(Message::system(help));
                         } else {
-                            let mut msg = format!("Configured MCP Servers ({}):\n", cfg.mcp_servers.len());
-                            for (name, scfg) in &cfg.mcp_servers {
+                            let enabled_count = cfg.mcp_servers.values().filter(|s| s.enabled).count();
+                            let mut msg = format!(
+                                "Configured MCP Servers ({} total · {} enabled, {} disabled):\n",
+                                cfg.mcp_servers.len(),
+                                enabled_count,
+                                cfg.mcp_servers.len() - enabled_count
+                            );
+                            let mut entries: Vec<_> = cfg.mcp_servers.iter().collect();
+                            entries.sort_by(|a, b| a.0.cmp(b.0));
+                            for (name, scfg) in entries {
                                 let kind = if scfg.url.is_some() { "remote" } else { "local" };
-                                msg.push_str(&format!("• {} ({}): {}\n", name, kind, scfg.display_target()));
+                                let state = if scfg.enabled { "[ON] " } else { "[OFF]" };
+                                msg.push_str(&format!("• {} {} ({}): {}\n", state, name, kind, scfg.display_target()));
                             }
-                            msg.push_str("\nCommands:\n  /mcp catalog        - Browse available templates\n  /mcp add <name>     - Add new MCP server\n  /mcp remove <name>  - Remove an MCP server\n  /mcp reload         - Re-read settings.json and reconnect servers");
+                            msg.push_str("\nCommands:\n  /mcp on <name|all>  - Enable an MCP server (or all) and load its tools\n  /mcp off <name|all> - Disable an MCP server (or all) without deleting it\n  /mcp toggle <name>  - Toggle an MCP server on or off\n  /mcp catalog        - Browse available templates\n  /mcp add <name>     - Add new MCP server\n  /mcp remove <name>  - Remove an MCP server\n  /mcp reload         - Re-read settings.json and reconnect active servers");
                             self.session.add_message(Message::system(msg));
                         }
                     }
@@ -1068,6 +1240,20 @@ impl App {
                 help.push('\n');
                 help.push_str(&shortcuts_help());
                 self.session.add_message(Message::system(help));
+                true
+            }
+            _ if name.starts_with('/') && !name[1..].contains('/') => {
+                let msg = match crate::slash_commands::suggest_slash_command(name) {
+                    Some(suggestion) => format!(
+                        "Command not found: '{}'. Did you mean {}? Type /help for available commands.",
+                        name, suggestion
+                    ),
+                    None => format!(
+                        "Command not found: '{}'. Type /help for available commands.",
+                        name
+                    ),
+                };
+                self.session.add_message(Message::system(msg));
                 true
             }
             _ => false,

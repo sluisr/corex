@@ -294,7 +294,55 @@ impl ResponseFormat {
 
 // ─── Usage ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UsageWire {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+impl From<UsageWire> for Usage {
+    fn from(w: UsageWire) -> Self {
+        let hit = w
+            .prompt_cache_hit_tokens
+            .filter(|&v| v > 0)
+            .or_else(|| w.prompt_tokens_details.map(|d| d.cached_tokens))
+            .unwrap_or(0);
+        let miss = w
+            .prompt_cache_miss_tokens
+            .unwrap_or_else(|| w.prompt_tokens.saturating_sub(hit));
+        let total = if w.total_tokens > 0 {
+            w.total_tokens
+        } else {
+            w.prompt_tokens + w.completion_tokens
+        };
+        Usage {
+            prompt_tokens: w.prompt_tokens,
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+            completion_tokens: w.completion_tokens,
+            total_tokens: total,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(from = "UsageWire")]
 pub struct Usage {
     pub prompt_tokens: u64,
     #[serde(default)]

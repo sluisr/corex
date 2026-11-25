@@ -95,8 +95,23 @@ pub fn build_responses_request(
         match msg.role.as_str() {
             "system" => {
                 if let Some(text) = msg.text_content() {
-                    if !text.trim().is_empty() {
-                        system_parts.push(text.to_string());
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        if trimmed.starts_with("TASK_DONE|")
+                            || trimmed.starts_with("SUBAGENT_DONE|")
+                            || trimmed.starts_with("USER_SHELL|")
+                            || trimmed.contains("<CONTEXT_SUMMARY>")
+                        {
+                            input.push(json!({
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": format!("<system-notification>\n{}\n</system-notification>", text.trim_end())
+                                }]
+                            }));
+                        } else {
+                            system_parts.push(text.to_string());
+                        }
                     }
                 }
             }
@@ -178,7 +193,11 @@ pub fn build_responses_request(
         "stream": true,
         "store": false,
     });
-    let mut include = vec!["web_search_call.action.sources"];
+    let has_tools = tools.is_some();
+    let mut include = Vec::new();
+    if has_tools {
+        include.push("web_search_call.action.sources");
+    }
     if is_openai_reasoning_model(model) {
         let effort = match reasoning_effort.to_ascii_lowercase().as_str() {
             "none" | "off" | "false" | "minimal" | "low" => "low",
@@ -189,28 +208,31 @@ pub fn build_responses_request(
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
         include.insert(0, "reasoning.encrypted_content");
     }
-    body["include"] = json!(include);
+    if !include.is_empty() {
+        body["include"] = json!(include);
+    }
 
     if !system_parts.is_empty() {
         body["instructions"] = json!(system_parts.join("\n\n"));
     }
 
-    let mut mapped: Vec<Value> = tools
-        .unwrap_or_default()
-        .iter()
-        .filter(|t| t.function.name != "web_search")
-        .map(|t| {
-            json!({
-                "type": "function",
-                "name": t.function.name,
-                "description": t.function.description,
-                "parameters": t.function.parameters,
-                "strict": false
+    if let Some(tool_defs) = tools {
+        let mut mapped: Vec<Value> = tool_defs
+            .iter()
+            .filter(|t| t.function.name != "web_search")
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.function.name,
+                    "description": t.function.description,
+                    "parameters": t.function.parameters,
+                    "strict": false
+                })
             })
-        })
-        .collect();
-    mapped.push(json!({ "type": "web_search" }));
-    body["tools"] = json!(mapped);
+            .collect();
+        mapped.push(json!({ "type": "web_search" }));
+        body["tools"] = json!(mapped);
+    }
 
     body
 }
@@ -575,5 +597,30 @@ mod tests {
         assert!(text.contains("- https://blog.rust-lang.org/a") && text.contains("- Announcing — https://blog.rust-lang.org/a") && text.contains("- https://x.dev"));
         assert_eq!(responses_url("https://r.services.ai.azure.com/openai/v1/"), "https://r.services.ai.azure.com/openai/v1/responses");
         assert!(web_search_results(&json!({"output": []})).is_none());
+    }
+
+    #[test]
+    fn tool_less_responses_requests_omit_hosted_web_search_and_use_low_minimum_effort() {
+        let messages = vec![Message::system("Summarize."), Message::user("hi")];
+        let req = build_responses_request("gpt-6.2-astra", &messages, None, "none");
+        assert!(req.get("tools").is_none(), "tool-less calls must not inject hosted web_search");
+        assert_eq!(req["reasoning"]["effort"], "low");
+        assert_eq!(req["include"], json!(["reasoning.encrypted_content"]));
+
+        let mut def = ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "corex_settings".into(),
+                description: "settings".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "value": { "description": "any json" } },
+                    "additionalProperties": false
+                }),
+            },
+        };
+        crate::client::LlmClient::sanitize_tools_for_google(std::slice::from_mut(&mut def));
+        assert!(def.function.parameters.get("additionalProperties").is_none());
+        assert_eq!(def.function.parameters["properties"]["value"]["type"], "string");
     }
 }

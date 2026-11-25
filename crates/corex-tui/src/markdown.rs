@@ -70,6 +70,9 @@ pub fn safe_markdown_split_point(text: &str) -> usize {
         let trimmed = line.trim();
         if is_fence(line) {
             in_code_block = !in_code_block;
+            if !in_code_block && line.ends_with('\n') {
+                split = offset;
+            }
         } else if !in_code_block && trimmed.is_empty() && line.ends_with('\n') {
             split = offset;
         }

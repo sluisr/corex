@@ -2,7 +2,7 @@
 
 use std::io::IsTerminal;
 
-use corex_core::pricing::Spend;
+use corex_core::pricing::{model_display_label, ModelSpend, Spend};
 
 use crate::app::App;
 use crate::text::group_thousands;
@@ -62,42 +62,8 @@ fn cost_label(spend: &Spend) -> String {
     text
 }
 
-/// The summary as the lines to print: dim labels, plain values, nothing decorative.
-pub fn format_session_summary(app: &App, color: bool) -> String {
-    format_summary(app, &app.llm_client.spend(), app.launched_at.elapsed().as_secs(), color)
-}
-
-fn format_summary(app: &App, spend: &Spend, elapsed: u64, color: bool) -> String {
-    let cfg = app.llm_client.get_config();
-    let is_local = cfg.local_llm_enabled;
-    let is_deepseek = cfg.is_deepseek_endpoint();
-
-    let model_display = if is_local {
-        if !cfg.local_llm_model.is_empty() {
-            format!("Local ({})", cfg.local_llm_model)
-        } else {
-            "Local".to_string()
-        }
-    } else if is_deepseek && (cfg.model == "deepseek-flash" || cfg.model == "deepseek-v4.1-flash" || cfg.model == "deepseek-v4.1-flash-1017" || cfg.model == "deepseek-v4-flash" || cfg.model == "deepseek-chat") {
-        if cfg.model == "deepseek-v4.1-flash-1017" {
-            "DeepSeek-V4.1-Flash-1017".to_string()
-        } else {
-            "DeepSeek-V4.1-Flash".to_string()
-        }
-    } else if is_deepseek && (cfg.model == "deepseek-v4-pro" || cfg.model == "deepseek-reasoner") {
-        "DeepSeek-V4-Pro".to_string()
-    } else {
-        let all = cfg.all_providers();
-        let prov = cfg.active_provider.as_deref().and_then(|p_name| all.iter().find(|p| p.name == p_name));
-        prov.and_then(|p| p.models.iter().find(|m| m.id == cfg.model))
-            .map(|m| format!("{} · {}", prov.map(|p| p.display_name()).unwrap_or(""), m.display_name()))
-            .unwrap_or_else(|| cfg.model.clone())
-    };
-
-    let prompts = app.prompts_this_run;
-    let u = &spend.usage;
-
-    let tokens = if u.total_tokens == 0 {
+fn tokens_label(u: &corex_core::types::Usage) -> String {
+    if u.total_tokens == 0 {
         "none".to_string()
     } else {
         let mut text = format!(
@@ -109,16 +75,74 @@ fn format_summary(app: &App, spend: &Spend, elapsed: u64, color: bool) -> String
             text.push_str(&format!(" · {:.1}% cached", u.cache_hit_percentage()));
         }
         text
+    }
+}
+
+/// The summary as the lines to print: dim labels, plain values, nothing decorative.
+pub fn format_session_summary(app: &App, color: bool) -> String {
+    format_summary_with_models(
+        app,
+        &app.llm_client.spend(),
+        &app.llm_client.model_spends(),
+        app.launched_at.elapsed().as_secs(),
+        color,
+    )
+}
+
+#[cfg(test)]
+fn format_summary(app: &App, spend: &Spend, elapsed: u64, color: bool) -> String {
+    format_summary_with_models(app, spend, &app.llm_client.model_spends(), elapsed, color)
+}
+
+fn format_summary_with_models(
+    app: &App,
+    spend: &Spend,
+    model_spends: &[ModelSpend],
+    elapsed: u64,
+    color: bool,
+) -> String {
+    let cfg = app.llm_client.get_config();
+    let active_display = model_display_label(&cfg);
+
+    let model_display = match model_spends {
+        [only] if only.label != active_display => format!("{} → {}", only.label, active_display),
+        [only] => only.label.clone(),
+        _ => active_display,
     };
 
-    let mut rows = vec![
-        ("Model", model_display),
-        ("Session", format!("{} · {} {}", duration_label(elapsed), prompts, if prompts == 1 { "prompt" } else { "prompts" })),
-        ("Tokens", tokens),
-        ("Cost", cost_label(spend)),
-    ];
-    // A session without messages is never written, so its id cannot be resumed.
-    let resumable = !app.session.messages.is_empty();
+    let prompts = app.prompts_this_run;
+    let tokens = tokens_label(&spend.usage);
+
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    if model_spends.len() > 1 {
+        for (idx, ms) in model_spends.iter().enumerate() {
+            let label = if idx == 0 { "Models" } else { "" };
+            rows.push((
+                label,
+                format!(
+                    "{} ({} · {})",
+                    ms.label,
+                    tokens_label(&ms.spend.usage),
+                    cost_label(&ms.spend)
+                ),
+            ));
+        }
+    } else {
+        rows.push(("Model", model_display));
+    }
+    rows.push((
+        "Session",
+        format!(
+            "{} · {} {}",
+            duration_label(elapsed),
+            prompts,
+            if prompts == 1 { "prompt" } else { "prompts" }
+        ),
+    ));
+    rows.push(("Tokens", tokens));
+    rows.push(("Cost", cost_label(spend)));
+    // A session without user turns is not worth offering as a resume target.
+    let resumable = app.session.messages.iter().any(|m| m.role == "user");
     if resumable {
         rows.push(("Resume", format!("cx --resume {}", app.session.id)));
     }
@@ -232,5 +256,28 @@ mod tests {
         assert_eq!(duration_label(45), "45s");
         assert_eq!(duration_label(260), "4m 20s");
         assert_eq!(duration_label(2 * 86_400 + 300), "48h 5m");
+    }
+
+    #[tokio::test]
+    async fn multi_provider_session_lists_each_model_used() {
+        let mut app = app().await;
+        app.prompts_this_run = 2;
+        app.session.add_message(corex_core::types::Message::user("hola".to_string()));
+        let mut total = Spend::default();
+        let mut ds = Spend::default();
+        ds.add(&usage(10_000, 8_000, 500), Some(deepseek_rates_at("deepseek-flash", off_peak())));
+        total.add(&usage(10_000, 8_000, 500), Some(deepseek_rates_at("deepseek-flash", off_peak())));
+        let mut az = Spend::default();
+        az.add(&usage(5_000, 2_500, 400), None);
+        total.add(&usage(5_000, 2_500, 400), None);
+
+        let models = vec![
+            ModelSpend { label: "DeepSeek-V4.1-Flash".to_string(), requests: 1, spend: ds },
+            ModelSpend { label: "Azure AI Foundry · DeepSeek V4.1 Flash".to_string(), requests: 1, spend: az },
+        ];
+        let text = format_summary_with_models(&app, &total, &models, 95, false);
+        assert!(text.contains("Models   DeepSeek-V4.1-Flash (10,000 in · 500 out · 80.0% cached"), "{text}");
+        assert!(text.contains("Azure AI Foundry · DeepSeek V4.1 Flash (5,000 in · 400 out · 50.0% cached · billed by the provider)"), "{text}");
+        assert!(text.contains("15,000 in · 900 out"), "{text}");
     }
 }

@@ -14,6 +14,14 @@ use corex_tui::{run_tui, App};
 
 mod fleet_cli;
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    StreamJson,
+}
+
 #[derive(Parser, Debug, PartialEq)]
 #[command(
     name = "cx",
@@ -105,6 +113,14 @@ struct Cli {
     /// Manage remote VPS servers and clusters (SysAdmin operations)
     #[arg(long = "fleet", alias = "sysadmin")]
     fleet: bool,
+
+    /// Output format for headless mode (-p): text, json, or stream-json (NDJSON)
+    #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]
+    output_format: OutputFormat,
+
+    /// Maximum agentic tool-call turns in headless mode (-p) (default: 35)
+    #[arg(long = "max-turns", default_value_t = 35)]
+    max_turns: usize,
 }
 
 pub async fn run() -> Result<()> {
@@ -144,7 +160,7 @@ pub async fn run() -> Result<()> {
                     "DeepSeek-V4.1-Flash"
                 } else if s.model == "deepseek-v4.1-flash-1017" {
                     "DeepSeek-V4.1-Flash-1017"
-                } else if s.model == "deepseek-v4-pro" || s.model == "deepseek-reasoner" {
+                } else if s.model == "deepseek-v4-pro" || s.model == "deepseek-pro" || s.model == "deepseek-reasoner" {
                     "DeepSeek-V4-Pro"
                 } else if s.model == "deepseek-v4-flash-vision-exp" {
                     "DeepSeek-V4.1-Flash (Vision)"
@@ -190,19 +206,10 @@ pub async fn run() -> Result<()> {
             cli.query.clone()
         };
 
-        let is_headless_subcommand = fleet_args.first().map(|s| {
-            matches!(
-                s.as_str(),
-                "status" | "list" | "ls" | "nodes" | "ping" | "top" | "telemetry" | "metrics" | "init" | "run" | "broadcast" | "all" | "help" | "--help" | "-h"
-            )
-        }).unwrap_or(false);
-
-        if is_headless_subcommand {
+        // Any `cx fleet <subcommand>` runs through the fleet CLI handler (which reports
+        // "Unknown fleet subcommand" on typos instead of starting an LLM chat session).
+        if cli.message.is_none() && !fleet_args.is_empty() {
             return fleet_cli::handle_fleet_cli(&workspace_dir, &fleet_args).await;
-        }
-
-        if !cli.query.is_empty() && (cli.query[0] == "fleet" || cli.query[0] == "sysadmin") {
-            cli.query.remove(0);
         }
     }
 
@@ -264,6 +271,14 @@ pub async fn run() -> Result<()> {
         } else {
             config.model = m;
             config.adopt_provider_for_model();
+            if config.is_deepseek_endpoint() && !config.local_llm_enabled {
+                if corex_core::config::is_pro_model(&config.model) {
+                    config.reasoning_effort = config.pro_settings.reasoning_effort.clone();
+                } else {
+                    config.temperature = config.flash_settings.temperature;
+                    config.reasoning_effort = config.flash_settings.reasoning_effort.clone();
+                }
+            }
             explicit_model = true;
         }
     }
@@ -357,7 +372,7 @@ pub async fn run() -> Result<()> {
         );
         let display = format!("/web {}", query);
         let session = make_session(resumed_session);
-        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session).await?;
+        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session, cli.output_format, cli.max_turns).await?;
         return Ok(());
     }
 
@@ -381,17 +396,24 @@ pub async fn run() -> Result<()> {
         );
         let display = format!("/fetch {}", url);
         let session = make_session(resumed_session);
-        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session).await?;
+        run_headless(llm_client, workspace_dir, prompt, Some(display), config.yolo_mode, session, cli.output_format, cli.max_turns).await?;
         return Ok(());
     }
 
     if headless_prompt.is_none() && !cli.query.is_empty() {
+        if let Some(err_msg) = check_misclicked_cli_command(&cli.query) {
+            anyhow::bail!("{}", err_msg);
+        }
         headless_prompt = Some(cli.query.join(" "));
     }
 
+    // Natural stdin pipe support: `git diff | cx -p "review this"` or `cat error.log | cx`.
+    let piped_stdin = read_piped_stdin();
+    let (headless_prompt, display_prompt) = combine_prompt_with_stdin(headless_prompt, piped_stdin);
+
     if let Some(prompt_text) = headless_prompt {
         let session = make_session(resumed_session);
-        run_headless(llm_client, workspace_dir, prompt_text, None, config.yolo_mode, session).await?;
+        run_headless(llm_client, workspace_dir, prompt_text, display_prompt, config.yolo_mode, session, cli.output_format, cli.max_turns).await?;
         return Ok(());
     }
 
@@ -408,6 +430,116 @@ pub async fn run() -> Result<()> {
 
     run_tui(app).await?;
     Ok(())
+}
+
+/// Detects mistyped CLI subcommands or TUI slash commands passed on the shell command line
+/// without `-p`, returning a "Command not found" error instead of starting an LLM session.
+fn check_misclicked_cli_command(query: &[String]) -> Option<String> {
+    let first = query.first()?.trim();
+    let lower = first.to_ascii_lowercase();
+
+    // 1. Any single-segment `/command` typed in the shell (other than `/web <q>`, `/search <q>`, `/fetch <url>`
+    // which were already handled above) is a TUI slash command or a typo of one.
+    if lower.starts_with('/') && !lower[1..].contains('/') {
+        return Some(format!(
+            "Command not found: '{}'. Start 'cx' to use slash commands inside the TUI, or run 'cx --help' for CLI options.",
+            first
+        ));
+    }
+
+    // 2. Multi-word or single-word typo of a top-level CLI subcommand (`update`, `upgrade`, `fleet`,
+    // `sysadmin`, `completions`, `browser-host`).
+    const CLI_SUBCOMMANDS: &[&str] = &[
+        "update",
+        "upgrade",
+        "fleet",
+        "sysadmin",
+        "completions",
+        "browser-host",
+    ];
+    for &sub in CLI_SUBCOMMANDS {
+        let dist = cli_edit_distance(&lower, sub);
+        if dist > 0 && dist <= 2 {
+            return Some(format!(
+                "Command not found: '{}'. Did you mean 'cx {}'?",
+                first, sub
+            ));
+        }
+    }
+
+    // 3. Single-token command name or typo (e.g. `cx model`, `cx stats`, `cx config`, `cx modle`, `cx status`).
+    if query.len() == 1 {
+        const TUI_AND_CLI_COMMANDS: &[(&str, &str)] = &[
+            ("model", "cx -m <model> (or /model inside cx)"),
+            ("models", "cx -m <model> (or /model inside cx)"),
+            ("resume", "cx --resume <id|tag> (or /resume inside cx)"),
+            ("sessions", "cx --list-sessions (or /chat list inside cx)"),
+            ("chat", "cx --list-sessions (or /chat inside cx)"),
+            ("web", "cx -w <query>"),
+            ("search", "cx -w <query>"),
+            ("fetch", "cx --fetch <url>"),
+            ("local", "cx --local (or /local inside cx)"),
+            ("yolo", "cx -y (or /yolo inside cx)"),
+            ("help", "cx --help (or /help inside cx)"),
+            ("version", "cx --version"),
+            ("stats", "/stats inside cx"),
+            ("context", "/context inside cx"),
+            ("balance", "/balance inside cx"),
+            ("wallet", "/wallet inside cx"),
+            ("config", "/settings inside cx"),
+            ("settings", "/settings inside cx"),
+            ("key", "/key inside cx"),
+            ("auth", "/auth inside cx"),
+            ("login", "/key inside cx"),
+            ("mcp", "/mcp inside cx"),
+            ("tasks", "/tasks inside cx"),
+            ("memory", "/memory inside cx"),
+            ("plan", "/plan inside cx"),
+            ("compact", "/compact inside cx"),
+            ("compress", "/compress inside cx"),
+            ("clear", "/clear inside cx"),
+            ("export", "/export inside cx"),
+            ("save", "/save inside cx"),
+            ("new", "/new inside cx"),
+            ("rewind", "/rewind inside cx"),
+            ("info", "/info inside cx"),
+            ("logs", "/logs inside cx"),
+            ("fim", "/fim inside cx"),
+            ("vps", "cx --fleet (or /fleet inside cx)"),
+            ("status", "cx fleet status (or /stats inside cx)"),
+            ("quit", "/quit inside cx"),
+            ("exit", "/exit inside cx"),
+        ];
+
+        for &(cmd, hint) in TUI_AND_CLI_COMMANDS {
+            let max_dist = if cmd.len() <= 4 { 1 } else { 2 };
+            let dist = cli_edit_distance(&lower, cmd);
+            if dist == 0 || dist <= max_dist {
+                return Some(format!(
+                    "Command not found: '{}'. Use {} — or pass '-p \"{}\"' to send it as a prompt.",
+                    first, hint, first
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+fn cli_edit_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0; b_chars.len() + 1];
+    for (i, &ca) in a_chars.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_chars.len()]
 }
 
 /// Puts the ask_user questions to whoever is on stdin and returns their answers. With nobody to
@@ -454,6 +586,47 @@ fn ask_user_on_stdin(args: &serde_json::Value) -> String {
     format!("The user answered:\n{}", answers.join("\n"))
 }
 
+/// Reads piped stdin when stdin is not a TTY (capped at 256 KB to keep prompts safe).
+fn read_piped_stdin() -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    const MAX_STDIN_BYTES: usize = 256 * 1024;
+    let mut buf = Vec::new();
+    let mut handle = std::io::stdin().take((MAX_STDIN_BYTES + 1) as u64);
+    if handle.read_to_end(&mut buf).is_err() || buf.is_empty() {
+        return None;
+    }
+    let truncated = buf.len() > MAX_STDIN_BYTES;
+    if truncated {
+        buf.truncate(MAX_STDIN_BYTES);
+    }
+    let text = String::from_utf8_lossy(&buf).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    if truncated {
+        Some(format!("{text}\n\n[stdin truncated at 256 KB]"))
+    } else {
+        Some(text)
+    }
+}
+
+fn combine_prompt_with_stdin(
+    prompt: Option<String>,
+    piped: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match (prompt, piped) {
+        (Some(p), Some(stdin_text)) => (
+            Some(format!("{p}\n\n<stdin>\n{stdin_text}\n</stdin>")),
+            Some(format!("{p} (+ piped stdin)")),
+        ),
+        (None, Some(stdin_text)) => (Some(stdin_text), Some("(piped stdin)".to_string())),
+        (p, None) => (p, None),
+    }
+}
+
 async fn run_headless(
     client: LlmClient,
     workspace_dir: PathBuf,
@@ -461,20 +634,45 @@ async fn run_headless(
     display_prompt: Option<String>,
     yolo: corex_core::config::YoloMode,
     mut session: Session,
+    output_format: OutputFormat,
+    max_turns: usize,
 ) -> Result<()> {
     let mut tool_registry = ToolRegistry::new();
     corex_fleet::register_fleet_tools(&mut tool_registry);
-    let (mcp_tools, _) = corex_tools::load_mcp_servers(&client.get_config().mcp_servers).await;
-    for t in mcp_tools {
-        tool_registry.register(t);
+    let mcp_cfg = client.get_config().mcp_servers;
+    let has_enabled_mcp = mcp_cfg.values().any(|s| s.enabled);
+    let has_sudo = get_sudo_password().is_some();
+    let ws_for_prompt = workspace_dir.clone();
+    let ws_for_fleet = workspace_dir.clone();
+
+    let (mcp_loaded, (system_prompt_text, has_fleet_nodes)) = tokio::join!(
+        async {
+            if has_enabled_mcp {
+                corex_tools::load_mcp_servers(&mcp_cfg).await.0
+            } else {
+                Vec::new()
+            }
+        },
+        async move {
+            tokio::task::spawn_blocking(move || {
+                let prompt = PromptBuilder::new(&ws_for_prompt)
+                    .with_sudo_password(has_sudo)
+                    .build();
+                let fleet_nodes = !corex_fleet::FleetConfig::load_fast(Some(&ws_for_fleet)).all_nodes().is_empty();
+                (prompt, fleet_nodes)
+            })
+            .await
+            .unwrap_or_default()
+        }
+    );
+    if !mcp_loaded.is_empty() {
+        tool_registry.register_many(mcp_loaded);
     }
-    let prompt_builder = PromptBuilder::new(&workspace_dir)
-        .with_sudo_password(get_sudo_password().is_some());
 
     session.add_message(Message::user(user_prompt.clone()));
 
     let mut messages = Vec::with_capacity(session.messages.len() + 1);
-    messages.push(Message::system(prompt_builder.build()));
+    messages.push(Message::system(system_prompt_text));
     for m in &session.messages {
         let is_preserved_system = m.role == "system"
             && m.content.as_ref().and_then(|c| c.as_text()).map_or(false, |c| {
@@ -487,16 +685,22 @@ async fn run_headless(
         }
     }
 
-    use colored::Colorize;
-    let you_badge = format!(
-        "{}{}{}",
-        "[".truecolor(95, 95, 95),
-        "You".bold().truecolor(130, 215, 160),
-        "]".truecolor(95, 95, 95),
-    );
-    println!("{} {}", you_badge, display_prompt.as_deref().unwrap_or(&user_prompt));
+    let structured = output_format != OutputFormat::Text;
+    if !structured {
+        use colored::Colorize;
+        let you_badge = format!(
+            "{}{}{}",
+            "[".truecolor(95, 95, 95),
+            "You".bold().truecolor(130, 215, 160),
+            "]".truecolor(95, 95, 95),
+        );
+        println!("{} {}", you_badge, display_prompt.as_deref().unwrap_or(&user_prompt));
+    }
 
-    let tools = tool_registry.list_definitions();
+    let mut tools = tool_registry.list_definitions();
+    if !has_fleet_nodes {
+        tools.retain(|d| d.function.name != "fleet");
+    }
     let tool_registry = std::sync::Arc::new(tool_registry);
     let context = ToolContext {
         workspace_dir: workspace_dir.clone(),
@@ -508,7 +712,7 @@ async fn run_headless(
     };
 
     use std::io::IsTerminal;
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = !structured && std::io::stdout().is_terminal();
     let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
 
     struct StatusSpinner {
@@ -546,42 +750,62 @@ async fn run_headless(
         }
 
         async fn stop(&mut self) {
+            let was_active = self.stop_tx.is_some() || self.handle.is_some();
             if let Some(tx) = self.stop_tx.take() {
                 let _ = tx.send(());
             }
             if let Some(handle) = self.handle.take() {
                 let _ = handle.await;
             }
-            print!("\r\x1b[2K");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+            if was_active {
+                print!("\r\x1b[2K");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
         }
     }
 
-    const MAX_HEADLESS_TURNS: usize = 35;
+    let max_headless_turns = max_turns.max(1);
     let mut turn_count = 0;
     let mut truncated_retries = 0u8;
+    let mut final_response_text = String::new();
+    let mut recorded_tool_calls: Vec<serde_json::Value> = Vec::new();
 
     loop {
         turn_count += 1;
-        if turn_count > MAX_HEADLESS_TURNS {
-            eprintln!("\n[WARNING] Maximum headless tool iteration limit ({}) reached. Terminating loop to protect budget.", MAX_HEADLESS_TURNS);
+        if turn_count > max_headless_turns {
+            if !structured {
+                eprintln!("\n[WARNING] Maximum headless tool iteration limit ({}) reached. Terminating loop to protect budget.", max_headless_turns);
+            }
             break;
         }
 
         let cancel_token = CancellationToken::new();
         let mut request = messages.clone();
         corex_core::session_images::keep_recent_images(&mut request, client.get_config().recent_images, session.images_dir().as_deref());
-        let mut rx = client
+        let mut active_spinner: Option<StatusSpinner> = Some(StatusSpinner::start(
+            is_tty,
+            "\x1b[90m",
+            "Thinking...".to_string(),
+        ));
+        let mut rx = match client
             .stream_chat(request, Some(tools.clone()), cancel_token.clone())
-            .await?;
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                if let Some(mut s) = active_spinner.take() {
+                    s.stop().await;
+                }
+                return Err(e);
+            }
+        };
 
         let mut current_tool_calls: Vec<ToolCall> = Vec::new();
         let mut assistant_text = String::new();
         let mut reasoning_text = String::new();
         let mut current_extra_content: Option<serde_json::Value> = None;
-        let mut active_spinner: Option<StatusSpinner> = None;
-        let mut current_stage: u8 = 0; // 0 = idle, 1 = reasoning, 2 = content
+        let mut current_stage: u8 = 1; // 0 = idle, 1 = reasoning/waiting, 2 = content
         let mut finish_reason: Option<String> = None;
 
         while let Some(event) = rx.recv().await {
@@ -601,6 +825,9 @@ async fn run_headless(
                     }
                 }
                 StreamEvent::ContentDelta(delta) => {
+                    if output_format == OutputFormat::StreamJson {
+                        println!("{}", serde_json::json!({ "type": "delta", "text": delta }));
+                    }
                     assistant_text.push_str(&delta);
                     if current_stage != 2 {
                         if let Some(mut s) = active_spinner.take() {
@@ -650,6 +877,17 @@ async fn run_headless(
                         s.stop().await;
                     }
                     println!("\n[INFO] {}\n", msg);
+                }
+                StreamEvent::Compacting => {
+                    if let Some(mut s) = active_spinner.take() {
+                        s.stop().await;
+                    }
+                    active_spinner = Some(StatusSpinner::start(
+                        is_tty,
+                        "\x1b[33m",
+                        "Compacting context...".to_string(),
+                    ));
+                    current_stage = 0;
                 }
                 StreamEvent::ContextCompacted { compacted_messages, notice } => {
                     if let Some(mut s) = active_spinner.take() {
@@ -707,12 +945,15 @@ async fn run_headless(
 
         if !assistant_text.trim().is_empty() {
             let safe_text = corex_core::sanitize_for_terminal(&assistant_text);
-            if is_tty {
-                let theme = corex_tui::Theme::default();
-                let rendered = corex_tui::render_markdown_to_ansi(&safe_text, &theme, term_width);
-                println!("{}\n", rendered);
-            } else {
-                println!("{}\n", safe_text);
+            final_response_text = assistant_text.clone();
+            if output_format == OutputFormat::Text {
+                if is_tty {
+                    let theme = corex_tui::Theme::default();
+                    let rendered = corex_tui::render_markdown_to_ansi(&safe_text, &theme, term_width);
+                    println!("{}\n", rendered);
+                } else {
+                    println!("{}\n", safe_text);
+                }
             }
         }
 
@@ -782,32 +1023,43 @@ async fn run_headless(
                 let args_json = corex_core::parse_lenient_json(&call.function.arguments)
                     .unwrap_or(serde_json::Value::Null);
 
-                let (action_label, target_detail) = if call.function.name == "run_shell_command" || call.function.name == "shell" || call.function.name == "run_command" {
+                let (action_label, target_detail): (&str, std::borrow::Cow<'_, str>) = if call.function.name == "run_shell_command" || call.function.name == "shell" || call.function.name == "run_command" {
                     let cmd = args_json.get("command").and_then(|c| c.as_str()).unwrap_or("").trim();
-                    ("Running command", cmd)
+                    ("Running command", std::borrow::Cow::Borrowed(cmd))
                 } else if call.function.name == "read_file" {
                     let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
-                    ("Reading file", p)
+                    ("Reading file", std::borrow::Cow::Borrowed(p))
                 } else if call.function.name == "write_file" {
                     let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
-                    ("Writing file", p)
+                    ("Writing file", std::borrow::Cow::Borrowed(p))
                 } else if call.function.name == "edit" || call.function.name == "apply_patch" {
                     let p = args_json.get("path").or_else(|| args_json.get("file_path")).and_then(|c| c.as_str()).unwrap_or("");
-                    ("Editing file", p)
+                    ("Editing file", std::borrow::Cow::Borrowed(p))
                 } else if call.function.name == "glob" || call.function.name == "ls" || call.function.name == "list_directory" {
                     let p = args_json.get("path").or_else(|| args_json.get("dir")).and_then(|c| c.as_str()).unwrap_or(".");
-                    ("Exploring directory", p)
+                    ("Exploring directory", std::borrow::Cow::Borrowed(p))
                 } else if call.function.name == "web_search" || call.function.name == "google_web_search" {
-                    let q = args_json.get("query").and_then(|c| c.as_str()).unwrap_or("");
-                    ("Searching web", q)
+                    let mut queries: Vec<&str> = Vec::new();
+                    if let Some(q) = args_json.get("query").and_then(|c| c.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                        queries.push(q);
+                    }
+                    if let Some(list) = args_json.get("queries").and_then(|v| v.as_array()) {
+                        for q in list.iter().filter_map(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                            if !queries.contains(&q) {
+                                queries.push(q);
+                            }
+                        }
+                    }
+                    let joined = queries.join(" · ");
+                    ("Searching web", std::borrow::Cow::Owned(joined))
                 } else if call.function.name == "web_fetch" {
                     let u = args_json.get("url").and_then(|c| c.as_str()).unwrap_or("");
-                    ("Fetching web page", u)
+                    ("Fetching web page", std::borrow::Cow::Borrowed(u))
                 } else {
-                    ("Running tool", call.function.name.as_str())
+                    ("Running tool", std::borrow::Cow::Borrowed(call.function.name.as_str()))
                 };
 
-                let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(target_detail), 70);
+                let display_detail = corex_core::truncate_ellipsis(&corex_core::sanitize_for_terminal(&target_detail), 70);
 
                 if let Some(tool) = tool_registry.get(&call.function.name) {
                     let must_ask = corex_tools::policy::verdict(&tool_registry, &call.function.name, &args_json, &context, false)
@@ -929,6 +1181,18 @@ async fn run_headless(
             }
 
             for done in ordered_results.into_iter().flatten() {
+                if structured {
+                    let ev = serde_json::json!({
+                        "type": "tool_done",
+                        "name": done.tool_name,
+                        "ok": done.ok,
+                        "detail": done.display_detail,
+                    });
+                    if output_format == OutputFormat::StreamJson {
+                        println!("{ev}");
+                    }
+                    recorded_tool_calls.push(ev);
+                }
                 if is_tty && done.tool_name != "ask_user" && done.output != "Execution denied by user." {
                     if done.ok {
                         println!("\x1b[32m✓\x1b[0m \x1b[1m{}\x1b[0m: \x1b[90m{}\x1b[0m", done.action_label, done.display_detail);
@@ -981,6 +1245,23 @@ async fn run_headless(
 
     corex_tools::background::shutdown_all_tasks();
     let _ = session.save();
+    if structured {
+        let cfg = client.get_config();
+        let payload = serde_json::json!({
+            "type": "done",
+            "response": final_response_text,
+            "model": cfg.model,
+            "provider": cfg.active_provider,
+            "turns": turn_count.min(max_headless_turns),
+            "tool_calls": recorded_tool_calls,
+            "usage": {
+                "prompt_tokens": session.total_usage.prompt_tokens,
+                "completion_tokens": session.total_usage.completion_tokens,
+                "total_tokens": session.total_usage.total_tokens,
+            }
+        });
+        println!("{payload}");
+    }
     Ok(())
 }
 
@@ -992,6 +1273,36 @@ mod tests {
     fn test_cli_command_factory_debug_assert() {
         // Validates clap internal consistency, non-colliding flags, and value parsers.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_cli_output_format_max_turns_and_stdin_combine() {
+        let cli = Cli::try_parse_from([
+            "cx",
+            "-p",
+            "review",
+            "--output-format",
+            "json",
+            "--max-turns",
+            "5",
+        ])
+        .unwrap();
+        assert_eq!(cli.output_format, OutputFormat::Json);
+        assert_eq!(cli.max_turns, 5);
+
+        let stream_cli = Cli::try_parse_from(["cx", "-p", "hi", "--output-format", "stream-json"]).unwrap();
+        assert_eq!(stream_cli.output_format, OutputFormat::StreamJson);
+
+        let (combined, display) = combine_prompt_with_stdin(
+            Some("review this".to_string()),
+            Some("diff --git a/x b/x".to_string()),
+        );
+        assert!(combined.unwrap().contains("<stdin>\ndiff --git a/x b/x\n</stdin>"));
+        assert_eq!(display.as_deref(), Some("review this (+ piped stdin)"));
+
+        let (stdin_only, display_only) = combine_prompt_with_stdin(None, Some("error log".to_string()));
+        assert_eq!(stdin_only.as_deref(), Some("error log"));
+        assert_eq!(display_only.as_deref(), Some("(piped stdin)"));
     }
 
     #[test]
@@ -1134,5 +1445,31 @@ mod tests {
         let update_alias = Cli::try_parse_from(["cx", "--update", "-f"]).unwrap();
         assert!(update_alias.upgrade);
         assert!(update_alias.force);
+    }
+
+    #[test]
+    fn test_misclicked_cli_commands_are_rejected_without_starting_session() {
+        assert!(
+            check_misclicked_cli_command(&["updte".to_string()])
+                .is_some_and(|m| m.contains("Command not found: 'updte'") && m.contains("cx update"))
+        );
+        assert!(
+            check_misclicked_cli_command(&["flet".to_string(), "status".to_string()])
+                .is_some_and(|m| m.contains("Command not found: 'flet'") && m.contains("cx fleet"))
+        );
+        assert!(
+            check_misclicked_cli_command(&["/modle".to_string()])
+                .is_some_and(|m| m.contains("Command not found: '/modle'"))
+        );
+        assert!(
+            check_misclicked_cli_command(&["model".to_string()])
+                .is_some_and(|m| m.contains("Command not found: 'model'"))
+        );
+        assert!(
+            check_misclicked_cli_command(&["modle".to_string()])
+                .is_some_and(|m| m.contains("Command not found: 'modle'"))
+        );
+        // Normal multi-word prompts still pass through
+        assert!(check_misclicked_cli_command(&["inspect".to_string(), "src/lib.rs".to_string()]).is_none());
     }
 }

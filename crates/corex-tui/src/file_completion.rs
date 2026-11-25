@@ -336,10 +336,39 @@ pub fn is_existing_folder(query: &str, workspace: &Path) -> bool {
     query != "~/" && corex_tools::fs_tools::resolve_path(workspace, query.trim_end_matches('/')).is_dir()
 }
 
-/// Folders whose name starts with what is typed after the last `/` of `query`, read from disk:
-/// `~/…`, absolute, or relative to the workspace. Hidden folders only when the name starts with
-/// `.`, and never ones that hold credentials, which `/directory add` refuses anyway. An empty
-/// query lists the home directory.
+fn collect_folder_hits(base: &Path, dir_prefix: &str, needle: &str, show_hidden: bool) -> Vec<(u8, String)> {
+    std::fs::read_dir(base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_str()?.to_string();
+                    let path = entry.path();
+                    let visible = !name.starts_with('.') || show_hidden;
+                    if !visible || !path.is_dir() || corex_tools::fs_tools::is_sensitive_system_path(&path) {
+                        return None;
+                    }
+                    let lower = name.to_lowercase();
+                    let rank = if needle.is_empty() || lower.starts_with(needle) {
+                        0u8
+                    } else if lower.contains(needle) {
+                        1u8
+                    } else {
+                        return None;
+                    };
+                    Some((rank, format!("{dir_prefix}{name}/")))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Folders matching what is typed after `/directory add`, read from disk: `~/…`, absolute,
+/// or relative to the workspace. Bare names (without `/` or `~`) search both the workspace
+/// and the user's home directory (`~/…`) so folders shown when `/directory add ` opens never
+/// disappear as soon as the user starts typing their name. Prefix matches rank ahead of
+/// substring matches. Hidden folders only appear when the typed name starts with `.`, and
+/// sensitive credential folders are always skipped.
 pub fn folder_matches(query: &str, workspace: &Path) -> Vec<String> {
     static CACHE: std::sync::Mutex<Option<(String, PathBuf, Instant, Vec<String>)>> = std::sync::Mutex::new(None);
     let query = normalize_folder_query(query);
@@ -354,26 +383,22 @@ pub fn folder_matches(query: &str, workspace: &Path) -> Vec<String> {
         Some(i) => (&query[..=i], &query[i + 1..]),
         None => ("", query.as_str()),
     };
-    let base = if dir.is_empty() { workspace.to_path_buf() } else { corex_tools::fs_tools::resolve_path(workspace, dir) };
     let needle = prefix.to_lowercase();
-    let mut hits: Vec<String> = std::fs::read_dir(&base)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_str()?.to_string();
-                    let path = entry.path();
-                    let visible = !name.starts_with('.') || prefix.starts_with('.');
-                    (visible
-                        && name.to_lowercase().starts_with(&needle)
-                        && path.is_dir()
-                        && !corex_tools::fs_tools::is_sensitive_system_path(&path))
-                    .then(|| format!("{dir}{name}/"))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    hits.sort_by_key(|h| h.to_lowercase());
+    let show_hidden = prefix.starts_with('.');
+    let mut ranked: Vec<(u8, String)> = if dir.is_empty() {
+        let mut combined = collect_folder_hits(workspace, "", &needle, show_hidden);
+        if let Some(home) = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()) {
+            if home != workspace {
+                combined.extend(collect_folder_hits(&home, "~/", &needle, show_hidden));
+            }
+        }
+        combined
+    } else {
+        let base = corex_tools::fs_tools::resolve_path(workspace, dir);
+        collect_folder_hits(&base, dir, &needle, show_hidden)
+    };
+    ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+    let mut hits: Vec<String> = ranked.into_iter().map(|(_, h)| h).collect();
     hits.truncate(MAX_MATCHES);
     if let Ok(mut cache) = CACHE.lock() {
         *cache = Some((query, workspace.to_path_buf(), Instant::now(), hits.clone()));
@@ -716,6 +741,24 @@ mod tests {
         assert_eq!(es, [format!("{root}Escritorio/"), format!("{root}escuela/")], "folders only, any case");
         assert_eq!(hidden, [format!("{root}.oculta/")], "hidden folders when the name starts with a dot");
         assert!(!all.iter().any(|f| f.contains(".oculta")) && all.len() == 3, "{all:?}");
+    }
+
+    #[test]
+    fn folder_matches_rank_prefix_before_substring() {
+        let base = std::env::temp_dir().join(format!("corex-folders-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["fiveplay-inspect", "inspect-tools", "other"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let root = format!("{}/", base.display());
+        let hits = folder_matches(&format!("{root}inspect"), Path::new("/"));
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            hits,
+            [format!("{root}inspect-tools/"), format!("{root}fiveplay-inspect/")],
+            "prefix match must rank ahead of substring match"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod ascii;
 pub mod auth_dialog;
 pub mod clipboard;
 pub mod cursor;
+pub mod custom_commands;
 pub mod diff_view;
 pub mod file_completion;
 pub mod fleet_dialog;

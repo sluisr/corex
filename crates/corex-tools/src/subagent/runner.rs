@@ -383,6 +383,15 @@ pub(super) async fn run_subagent_llm_loop_with<C: SubagentChatBackend>(
                 StreamEvent::Completed { finish_reason: Some(r) } => {
                     finish_reason = Some(r);
                 }
+                StreamEvent::ContextCompacted { compacted_messages, notice } => {
+                    trace.record_step(format!("Subagent context compacted: {}", notice));
+                    let sys = messages.first().cloned();
+                    messages.clear();
+                    if let Some(sys_msg) = sys {
+                        messages.push(sys_msg);
+                    }
+                    messages.extend(compacted_messages);
+                }
                 StreamEvent::Error(err) => {
                     trace.record_step(format!("Stream error: {}", err));
                     return Err(err);

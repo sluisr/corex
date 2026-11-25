@@ -44,8 +44,11 @@ pub fn prune_tool_results(messages: &mut [Message]) -> PruneStats {
         let Some(MessageContent::Text(text)) = &message.content else {
             continue;
         };
+        if text.len() <= PRUNE_THRESHOLD_CHARS || text.contains(TRIM_MARKER) {
+            continue;
+        }
         let total = text.chars().count();
-        if total <= PRUNE_THRESHOLD_CHARS || text.contains(TRIM_MARKER) {
+        if total <= PRUNE_THRESHOLD_CHARS {
             continue;
         }
         let trimmed = trim_with_spill("pruned", text, PRUNE_HEAD_CHARS, PRUNE_TAIL_CHARS);

@@ -16,7 +16,7 @@ pub async fn handle_fleet_cli(workspace: &Path, args: &[String]) -> Result<()> {
         "status" | "list" | "ls" => show_status(workspace, true).await,
         "nodes" => show_status(workspace, false).await,
         "ping" => ping_all(workspace).await,
-        "top" | "telemetry" | "metrics" => show_telemetry(workspace).await,
+        "top" | "telemetry" | "metrics" | "probe" => show_telemetry(workspace).await,
         "init" => init_fleet_config(workspace).await,
         "run" => {
             let mut sudo = false;

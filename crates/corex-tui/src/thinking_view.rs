@@ -6,6 +6,8 @@ pub struct ThinkingState {
     pub is_streaming: bool,
     pub is_expanded: bool,
     pub cached_lines: Vec<Line<'static>>,
+    pub tail_lines: Vec<Line<'static>>,
+    pub committed_len: usize,
     pub cached_len: usize,
     pub cached_width: usize,
 }
@@ -23,6 +25,8 @@ impl ThinkingState {
             is_streaming: false,
             is_expanded: false,
             cached_lines: Vec::new(),
+            tail_lines: Vec::new(),
+            committed_len: 0,
             cached_len: 0,
             cached_width: 0,
         }
@@ -32,6 +36,8 @@ impl ThinkingState {
         self.content.clear();
         self.is_streaming = false;
         self.cached_lines.clear();
+        self.tail_lines.clear();
+        self.committed_len = 0;
         self.cached_len = 0;
         self.cached_width = 0;
     }

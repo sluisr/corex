@@ -1,9 +1,11 @@
 pub mod apply_patch;
 pub mod background;
 pub mod browser_tool;
+pub mod diagnostics;
 pub mod document;
 pub mod fs_tools;
 pub mod grep;
+pub mod hooks;
 pub mod policy;
 pub mod registry;
 pub mod shell;
@@ -22,6 +24,9 @@ pub use apply_patch::ApplyPatchTool;
 pub use background::{get_task_manager, FinishedTask, ManageTaskTool, TaskManager};
 pub use fs_tools::{EditTool, GlobTool, LsTool, ReadFileTool, ReadImageTool, WriteFileTool};
 pub use browser_tool::BrowserTool;
+pub use corex_browser::{
+    diagnose as diagnose_browser, install_native_host as install_browser_host, BrowserDiagnostics,
+};
 pub use grep::GrepTool;
 pub use mcp::{
     find_catalog_item, get_mcp_catalog, load_mcp_servers, McpCatalogItem, McpClient,

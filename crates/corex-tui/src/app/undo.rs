@@ -48,6 +48,11 @@ impl ComposerUndo {
         self.steps.clear();
         self.last = None;
     }
+
+    /// Iterates over all stored undo buffer snapshots so referenced image tags stay alive while undoable.
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        self.steps.iter().map(|(t, _)| t.as_str())
+    }
 }
 
 #[cfg(test)]

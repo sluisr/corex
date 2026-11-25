@@ -69,6 +69,7 @@ pub fn hidden_in_plan_mode(name: &str) -> bool {
             | "write_background_input"
             | "kill_background_process"
             | "delegate_subagent"
+            | "subagent"
     ) || name.starts_with("mcp_")
 }
 

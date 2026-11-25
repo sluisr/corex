@@ -1,11 +1,44 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use chrono::Local;
 use directories::BaseDirs;
 
 static LOGGER: Mutex<Option<ForensicLogger>> = Mutex::new(None);
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+struct ForensicJob {
+    category: String,
+    title: String,
+    details: String,
+}
+
+fn writer_tx() -> &'static mpsc::SyncSender<ForensicJob> {
+    static WRITER: OnceLock<mpsc::SyncSender<ForensicJob>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<ForensicJob>(512);
+        let _ = std::thread::Builder::new()
+            .name("corex-forensic".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                    let redacted_details = ForensicLogger::redact_secrets(job.details.trim());
+                    let formatted = format!(
+                        "\n[{}][{:<12}] --- {} ---\n{}\n{}\n",
+                        timestamp,
+                        job.category.to_uppercase(),
+                        job.title,
+                        redacted_details,
+                        "-".repeat(80)
+                    );
+                    ForensicLogger::raw_append(&formatted);
+                }
+            });
+        tx
+    })
+}
 
 pub struct ForensicLogger {
     file: Option<fs::File>,
@@ -32,18 +65,22 @@ impl ForensicLogger {
 
         let log_file_path = log_dir.join(format!("corex-forensic-{}.log", date_str));
         if disabled_by_env() {
+            ENABLED.store(false, Ordering::Relaxed);
             return log_file_path;
         }
         let _ = crate::secure_fs::ensure_private_dir(&log_dir);
 
+        let file_opt = crate::secure_fs::open_private(&log_file_path, true).ok();
+        let has_file = file_opt.is_some();
         let mut global = match LOGGER.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
         *global = Some(ForensicLogger {
             written: fs::metadata(&log_file_path).map(|m| m.len()).unwrap_or(0),
-            file: crate::secure_fs::open_private(&log_file_path, true).ok(),
+            file: file_opt,
         });
+        ENABLED.store(has_file, Ordering::Relaxed);
         drop(global);
 
         let purge_dir = log_dir.clone();
@@ -100,26 +137,18 @@ impl ForensicLogger {
     }
 
     pub fn is_enabled() -> bool {
-        LOGGER.lock().map(|g| g.is_some()).unwrap_or(false)
+        ENABLED.load(Ordering::Relaxed)
     }
 
     pub fn log_event(category: &str, title: &str, details: &str) {
         if !Self::is_enabled() {
             return;
         }
-
-        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        let redacted_details = Self::redact_secrets(details.trim());
-        let formatted = format!(
-            "\n[{}][{:<12}] --- {} ---\n{}\n{}\n",
-            timestamp,
-            category.to_uppercase(),
-            title,
-            redacted_details,
-            "-".repeat(80)
-        );
-
-        Self::raw_append(&formatted);
+        let _ = writer_tx().try_send(ForensicJob {
+            category: category.to_string(),
+            title: title.to_string(),
+            details: details.to_string(),
+        });
     }
 
     pub fn log_llm_request(engine: &str, model: &str, endpoint: &str, messages_count: usize, tools_count: usize, body: &str) {
@@ -159,6 +188,9 @@ impl ForensicLogger {
         finish_reason: Option<&str>,
         usage_opt: Option<&crate::types::Usage>,
     ) {
+        if !Self::is_enabled() {
+            return;
+        }
         let is_local = engine.contains("Local");
         let mut telemetry_lines = Vec::new();
 
@@ -202,7 +234,7 @@ impl ForensicLogger {
                 token_lines.push("  Cost:                $0.000000 USD (local)".to_string());
                 let cloud_saved = crate::pricing::deepseek_rates("deepseek-flash").uncached_cost(usage);
                 token_lines.push(format!("  Cloud Equivalent:    ${:.6} USD", cloud_saved));
-            } else {
+            } else if engine == "DeepSeek Cloud" {
                 let rates = crate::pricing::deepseek_rates(model);
                 let actual_cost = rates.cost(usage);
                 let un_cached_cost = rates.uncached_cost(usage);
@@ -214,6 +246,11 @@ impl ForensicLogger {
                 token_lines.push(format!("  Total Tokens:        {}", total));
                 token_lines.push(format!("  Cost:                ${:.6} USD", actual_cost));
                 token_lines.push(format!("  Cache Savings:       ${:.6} USD ({:.1}%)", savings, savings_pct));
+            } else {
+                token_lines.push(format!("  Prompt Tokens:       {} (cached: {} · {:.1}%)", prompt, cached, hit_rate));
+                token_lines.push(format!("  Completion Tokens:   {}", completion));
+                token_lines.push(format!("  Total Tokens:        {}", total));
+                token_lines.push("  Cost:                billed by provider".to_string());
             }
         } else {
             let tps = if duration_ms > 0 {
@@ -263,27 +300,38 @@ impl ForensicLogger {
     }
 
     pub fn get_subagents_log_dir() -> PathBuf {
-        let base = if let Some(dirs) = BaseDirs::new() {
-            dirs.home_dir().join(".corex").join("logs").join("subagents")
+        static PURGED_ONCE: std::sync::Once = std::sync::Once::new();
+        let preferred = BaseDirs::new()
+            .map(|dirs| dirs.home_dir().join(".corex").join("logs").join("subagents"))
+            .unwrap_or_else(|| PathBuf::from(".corex").join("logs").join("subagents"));
+        let base = if crate::secure_fs::ensure_private_dir(&preferred).is_ok() {
+            preferred
         } else {
-            PathBuf::from(".corex").join("logs").join("subagents")
+            #[cfg(unix)]
+            let root = std::env::temp_dir().join(format!("corex-{}", unsafe { libc::getuid() }));
+            #[cfg(not(unix))]
+            let root = std::env::temp_dir().join("corex");
+            let fallback = root.join(".corex").join("logs").join("subagents");
+            let _ = crate::secure_fs::ensure_private_dir(&fallback);
+            fallback
         };
-        let _ = crate::secure_fs::ensure_private_dir(&base);
-        if let Ok(entries) = fs::read_dir(&base) {
-            let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400);
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("log") {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(modified) = meta.modified() {
-                            if modified < cutoff {
-                                let _ = fs::remove_file(&p);
+        PURGED_ONCE.call_once(|| {
+            if let Ok(entries) = fs::read_dir(&base) {
+                let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400);
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                if modified < cutoff {
+                                    let _ = fs::remove_file(&p);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+        });
         base
     }
 
@@ -383,49 +431,84 @@ impl ForensicLogger {
             "eyJ",
             "Bearer ",
         ];
-        let mut out = String::with_capacity(input.len());
         let bytes = input.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if input[i..].starts_with("$sudo:") {
+        let len = bytes.len();
+        let mut out = String::new();
+        let mut copy_from = 0usize;
+        let mut i = 0usize;
+
+        while i < len {
+            let b0 = bytes[i];
+            // Fast path: none of our secret prefixes can start unless b0 is one of these 7 ASCII bytes
+            // and at least 6 bytes remain. Because all 7 bytes are 7-bit ASCII (< 0x80), they can never
+            // appear as UTF-8 continuation bytes, so `i` is always a valid UTF-8 char boundary on match.
+            if i + 6 > len || !matches!(b0, b'$' | b's' | b'g' | b'A' | b'x' | b'e' | b'B') {
+                i += 1;
+                continue;
+            }
+            let b1 = bytes[i + 1];
+            if b0 == b'$' && b1 == b's' && input[i..].starts_with("$sudo:") {
+                if out.is_empty() {
+                    out.reserve(len);
+                }
+                out.push_str(&input[copy_from..i]);
                 out.push_str("$sudo:[REDACTED]");
                 i += "$sudo:".len();
-                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                while i < len && bytes[i] != b'\n' && bytes[i] != b'\r' {
                     i += 1;
                 }
+                copy_from = i;
                 continue;
             }
-            let mut matched_prefix = None;
-            for &prefix in PREFIXES {
-                if input[i..].starts_with(prefix) {
-                    let after = i + prefix.len();
-                    let mut token_end = after;
-                    while token_end < bytes.len()
-                        && (bytes[token_end].is_ascii_alphanumeric()
-                            || matches!(bytes[token_end], b'_' | b'-' | b'.'))
-                    {
-                        token_end += 1;
-                    }
-                    if token_end - after >= 12 {
-                        matched_prefix = Some((prefix, token_end));
-                        break;
+
+            let might_match = matches!(
+                (b0, b1),
+                (b's', b'k')
+                    | (b'g', b'h' | b'i' | b's' | b'l')
+                    | (b'A', b'I' | b'K' | b'S')
+                    | (b'x', b'o')
+                    | (b'e', b'y')
+                    | (b'B', b'e')
+            );
+            if might_match {
+                let mut matched_prefix = None;
+                for &prefix in PREFIXES {
+                    if input[i..].starts_with(prefix) {
+                        let after = i + prefix.len();
+                        let mut token_end = after;
+                        while token_end < len
+                            && (bytes[token_end].is_ascii_alphanumeric()
+                                || matches!(bytes[token_end], b'_' | b'-' | b'.'))
+                        {
+                            token_end += 1;
+                        }
+                        if token_end - after >= 12 {
+                            matched_prefix = Some((prefix, token_end));
+                            break;
+                        }
                     }
                 }
+                if let Some((prefix, token_end)) = matched_prefix {
+                    if out.is_empty() {
+                        out.reserve(len);
+                    }
+                    out.push_str(&input[copy_from..i]);
+                    out.push_str(prefix);
+                    out.push_str("[REDACTED]");
+                    i = token_end;
+                    copy_from = i;
+                    continue;
+                }
             }
-            if let Some((prefix, token_end)) = matched_prefix {
-                out.push_str(prefix);
-                out.push_str("[REDACTED]");
-                i = token_end;
-                continue;
-            }
-            if let Some(ch) = input[i..].chars().next() {
-                out.push(ch);
-                i += ch.len_utf8();
-            } else {
-                break;
-            }
+            i += 1;
         }
-        out
+
+        if copy_from == 0 {
+            input.to_string()
+        } else {
+            out.push_str(&input[copy_from..]);
+            out
+        }
     }
 }
 

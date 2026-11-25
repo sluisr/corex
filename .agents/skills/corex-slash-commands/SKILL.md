@@ -139,7 +139,10 @@ cx fetch "https://news.ycombinator.com"
 
 |Command | Description |
 |:--- | :--- |
-|`/mcp` | List configured MCP servers, status, and exposed tools |
+|`/mcp` | List configured MCP servers, their `[ON]`/`[OFF]` state, and exposed tools |
+|`/mcp on <name\|all>` | Turn on (enable) an MCP server or `all` servers and load their tools (alias: `/mcp enable`) |
+|`/mcp off <name\|all>` | Turn off (disable) an MCP server or `all` servers without deleting their configuration (alias: `/mcp disable`) |
+|`/mcp toggle <name>` | Toggle an MCP server between `[ON]` and `[OFF]` |
 |`/mcp catalog` | Browse vetted community templates (GitHub, SQLite, Postgres, Memory, etc.) |
 |`/mcp add <id>` | Add a server from catalog (e.g. `/mcp add github`, `/mcp add sqlite app.db`) |
 |`/mcp add <name> <cmd> [args]` | Add a custom MCP server executable directly |

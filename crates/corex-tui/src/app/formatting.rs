@@ -160,6 +160,133 @@ pub fn extract_tool_allow_rules(call: &ToolCall) -> Vec<String> {
     }
 }
 
+/// Extracts deduplicated, trimmed search queries from a `web_search` arguments object,
+/// supporting both single `"query": "..."` and parallel `"queries": ["...", ...]`.
+pub fn extract_web_search_queries(args: &serde_json::Value) -> Vec<String> {
+    let mut queries: Vec<String> = Vec::new();
+    let mut add = |q: &str| {
+        let q = q.trim();
+        if !q.is_empty() && !queries.iter().any(|existing| existing == q) {
+            queries.push(q.to_string());
+        }
+    };
+    if let Some(q) = args.get("query").and_then(|v| v.as_str()) {
+        add(q);
+    }
+    if let Some(list) = args.get("queries").and_then(|v| v.as_array()) {
+        for q in list.iter().filter_map(|v| v.as_str()) {
+            add(q);
+        }
+    }
+    queries
+}
+
+/// Formats one or more `web_search` queries for display as `"q1" · "q2"`, keeping
+/// quotes balanced and appending `(+N)` when additional queries do not fit within `max_chars`.
+pub fn format_web_search_queries(queries: &[String], max_chars: usize, full: bool) -> String {
+    if queries.is_empty() {
+        return String::new();
+    }
+    if queries.len() == 1 {
+        let q = if full {
+            queries[0].clone()
+        } else {
+            corex_core::truncate_ellipsis(&queries[0], max_chars)
+        };
+        return format!("\"{}\"", q);
+    }
+    if full {
+        return queries
+            .iter()
+            .map(|q| format!("\"{}\"", q))
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
+    let all = queries
+        .iter()
+        .map(|q| format!("\"{}\"", q))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if all.chars().count() <= max_chars {
+        return all;
+    }
+
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (idx, q) in queries.iter().enumerate() {
+        let remaining_after = queries.len() - idx - 1;
+        let suffix_reserve = if remaining_after > 0 {
+            format!(" (+{})", remaining_after).chars().count()
+        } else {
+            0
+        };
+        let sep = if idx > 0 { " · " } else { "" };
+        let piece = format!("{}\"{}\"", sep, q);
+        if out.chars().count() + piece.chars().count() + suffix_reserve <= max_chars {
+            out.push_str(&piece);
+            shown += 1;
+        } else {
+            break;
+        }
+    }
+    if shown == 0 {
+        let suffix = format!(" (+{})", queries.len() - 1);
+        let budget = max_chars.saturating_sub(suffix.chars().count() + 2).max(12);
+        return format!("\"{}\"{}", corex_core::truncate_ellipsis(&queries[0], budget), suffix);
+    }
+    let hidden = queries.len() - shown;
+    if hidden > 0 {
+        out.push_str(&format!(" (+{})", hidden));
+    }
+    out
+}
+
+/// Extracts a concise human-readable summary from `ask_user` tool arguments,
+/// avoiding raw JSON like `[{"header":...}]` in chat history and spinners.
+pub fn format_ask_user_summary(args: &serde_json::Value, max_chars: usize, full: bool) -> Option<String> {
+    let mut questions: Vec<&str> = Vec::new();
+    if let Some(arr) = args.get("questions").and_then(|v| v.as_array()) {
+        for item in arr {
+            let text = item
+                .get("question")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    item.get("header")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
+            if let Some(t) = text {
+                questions.push(t);
+            }
+        }
+    } else if let Some(q) = args
+        .get("question")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        questions.push(q);
+    }
+
+    let first = *questions.first()?;
+    if questions.len() == 1 {
+        return Some(if full {
+            first.to_string()
+        } else {
+            corex_core::truncate_ellipsis(first, max_chars)
+        });
+    }
+    if full {
+        return Some(questions.join(" · "));
+    }
+    let suffix = format!(" (+{})", questions.len() - 1);
+    let budget = max_chars.saturating_sub(suffix.chars().count()).max(12);
+    Some(format!("{}{}", corex_core::truncate_ellipsis(first, budget), suffix))
+}
+
 pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
     let name = corex_tools::grouped::canonical_name_raw(name, raw_args);
@@ -227,11 +354,13 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
                 .unwrap_or(".");
             format!("Exploring directory: {}", path)
         }
-        "web_search" => {
-            let q = args_val.as_ref()
-                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
-                .unwrap_or(raw_args);
-            format!("Searching web: {}", corex_core::truncate_ellipsis(q, 50))
+        "web_search" | "google_web_search" => {
+            let display = args_val
+                .as_ref()
+                .map(|v| format_web_search_queries(&extract_web_search_queries(v), 50, false))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| corex_core::truncate_ellipsis(raw_args, 50));
+            format!("Searching web: {}", display)
         }
         "web_fetch" => {
             let url = args_val.as_ref()
@@ -254,18 +383,33 @@ pub fn format_tool_call_summary(name: &str, raw_args: &str) -> String {
         "browser" => {
             format!("Browser: {}", super::browser_run::describe(raw_args))
         }
+        "ask_user" => {
+            let summary = args_val
+                .as_ref()
+                .and_then(|v| format_ask_user_summary(v, 50, false))
+                .unwrap_or_else(|| "question".to_string());
+            format!("Asking user: {}", summary)
+        }
         _ => format!("Executing: {}", name),
     }
 }
 
 pub fn clean_tool_args(name: &str, raw_args: &str) -> String {
+    let canon = corex_tools::grouped::canonical_name_raw(name, raw_args);
+    let name = canon.as_str();
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
     if let Some(val) = &args_val {
         if let Some(obj) = val.as_object() {
             match name {
-                "web_search" => {
-                    if let Some(q) = obj.get("query").and_then(|v| v.as_str()) {
-                        return corex_core::truncate_ellipsis(q, 60).to_string();
+                "web_search" | "google_web_search" => {
+                    let queries = extract_web_search_queries(val);
+                    if !queries.is_empty() {
+                        return format_web_search_queries(&queries, 60, false);
+                    }
+                }
+                "ask_user" => {
+                    if let Some(summary) = format_ask_user_summary(val, 60, false) {
+                        return summary;
                     }
                 }
                 "web_fetch" => {
@@ -529,6 +673,8 @@ pub fn format_relative_path(path_str: &str) -> String {
 /// command is its first line cut to 70 columns; `full` (Ctrl+O) keeps all of it, newlines included,
 /// for [`split_spans_at_newlines`].
 pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme, full: bool) -> Vec<Span<'static>> {
+    let canon = corex_tools::grouped::canonical_name_raw(name, raw_args);
+    let name = canon.as_str();
     let args_val = serde_json::from_str::<serde_json::Value>(raw_args).ok();
     match name {
         "run_shell_command" | "shell" | "run_command" => {
@@ -610,13 +756,19 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme, full: b
                 Span::styled(pattern.to_string(), Style::default().fg(theme.gray)),
             ]
         }
-        "web_search" => {
-            let q = args_val.as_ref()
-                .and_then(|v| v.get("query").and_then(|c| c.as_str()))
-                .unwrap_or(raw_args);
+        "web_search" | "google_web_search" => {
+            let queries = args_val
+                .as_ref()
+                .map(extract_web_search_queries)
+                .unwrap_or_default();
+            let display = if !queries.is_empty() {
+                format_web_search_queries(&queries, 72, full)
+            } else {
+                format!("\"{}\"", corex_core::truncate_ellipsis(raw_args, 60))
+            };
             vec![
                 Span::styled("web ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("\"{}\"", corex_core::truncate_ellipsis(q, 60)), Style::default().fg(theme.gray)),
+                Span::styled(display, Style::default().fg(theme.gray)),
             ]
         }
         "web_fetch" => {
@@ -676,6 +828,16 @@ pub fn format_tool_call_spans(name: &str, raw_args: &str, theme: &Theme, full: b
             vec![
                 Span::styled("agent ", Style::default().fg(theme.accent_purple).add_modifier(Modifier::BOLD)),
                 Span::styled(display_desc, Style::default().fg(theme.gray)),
+            ]
+        }
+        "ask_user" => {
+            let summary = args_val
+                .as_ref()
+                .and_then(|v| format_ask_user_summary(v, 72, full))
+                .unwrap_or_else(|| "...".to_string());
+            vec![
+                Span::styled("ask ", Style::default().fg(theme.accent_cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(summary, Style::default().fg(theme.gray)),
             ]
         }
         _ => {
@@ -1006,4 +1168,62 @@ pub fn truncate_to_width(text: &str, max_cols: usize) -> String {
     }
     out.push_str("...");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_search_formats_single_and_parallel_queries_cleanly() {
+        let theme = Theme::default();
+
+        let single = r#"{"query":"rust ratatui"}"#;
+        let spans = format_tool_call_spans("web_search", single, &theme, false);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "web \"rust ratatui\"");
+
+        let parallel = r#"{"queries":["sluisr deepseek cli","sluisr github corex"]}"#;
+        let spans = format_tool_call_spans("web_search", parallel, &theme, false);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "web \"sluisr deepseek cli\" · \"sluisr github corex\"");
+        assert!(!text.contains("{\"queries\""));
+
+        let summary = format_tool_call_summary("web_search", parallel);
+        assert_eq!(summary, "Searching web: \"sluisr deepseek cli\" · \"sluisr github corex\"");
+    }
+
+    #[test]
+    fn web_search_truncates_many_queries_with_remaining_count() {
+        let theme = Theme::default();
+        let many = r#"{"queries":["sluisr deepseek cli","sluisr github corex","sluisr corex rust terminal agent","sluisr changelog"]}"#;
+        let collapsed: String = format_tool_call_spans("web_search", many, &theme, false)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(collapsed.starts_with("web \"sluisr deepseek cli\" · \"sluisr github corex\" (+2)"), "{collapsed}");
+
+        let expanded: String = format_tool_call_spans("web_search", many, &theme, true)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(expanded.contains("\"sluisr changelog\""), "{expanded}");
+        assert!(!expanded.contains("(+"), "{expanded}");
+    }
+
+    #[test]
+    fn ask_user_formats_question_instead_of_raw_json() {
+        let theme = Theme::default();
+        let raw = r#"{"questions":[{"header":"Comandos","question":"¿De qué tipo quieres los comandos?","options":["Recon","Linux"]}]}"#;
+        let text: String = format_tool_call_spans("ask_user", raw, &theme, false)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(text, "ask ¿De qué tipo quieres los comandos?");
+        assert!(!text.contains("{\"header\""));
+        assert_eq!(
+            format_tool_call_summary("ask_user", raw),
+            "Asking user: ¿De qué tipo quieres los comandos?"
+        );
+    }
 }

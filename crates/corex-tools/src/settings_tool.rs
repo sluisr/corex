@@ -13,6 +13,23 @@ fn is_set(args: &serde_json::Value) -> bool {
     args.get("action").and_then(|v| v.as_str()) == Some("set")
 }
 
+fn apply_setting_value(cfg: &mut Config, key: &str, value: serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Err(e) = cfg.set_agent_setting(key, value.clone()) {
+        // Providers whose tool schema requires `"type": "string"` (e.g. Gemini) may encode
+        // booleans, numbers, null or JSON arrays/objects as a string literal.
+        let recovered = value
+            .as_str()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|parsed| !parsed.is_string());
+        match recovered {
+            Some(parsed) if cfg.set_agent_setting(key, parsed.clone()).is_ok() => Ok(parsed),
+            _ => Err(e),
+        }
+    } else {
+        Ok(value)
+    }
+}
+
 #[async_trait]
 impl Tool for CorexSettingsTool {
     fn name(&self) -> &'static str {
@@ -20,14 +37,9 @@ impl Tool for CorexSettingsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Reads or changes Corex's own settings (~/.corex/settings.json), the only way to reach that file: \
-other tools refuse ~/.corex. 'get' returns the settings with API keys, tokens and passwords hidden. \
-'set' changes one setting after the user approves it, saves it and applies it to this session. \
-Every setting can be set except the API keys, which only the user changes with /key. \
-yolo_mode applies to this session only; providers takes the whole provider list (never stores API keys); \
-mcp_servers takes the whole map and keeps any value left as [hidden]. \
-yolo_mode, allowed_commands, providers and mcp_servers always wait for the user's approval, even in YOLO mode. \
-Use it when the user asks you to configure Corex itself."
+        "Reads or updates Corex settings (~/.corex/settings.json; secrets redacted). \
+'get' shows current settings; 'set' updates one key after user approval (API keys are only changed via /key; \
+yolo_mode is session-only; yolo_mode, allowed_commands, providers and mcp_servers always ask approval even in YOLO)."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -35,8 +47,8 @@ Use it when the user asks you to configure Corex itself."
             "type": "object",
             "properties": {
                 "action": { "type": "string", "enum": ["get", "set"] },
-                "key": { "type": "string", "enum": AGENT_SETTABLE, "description": "Setting to change (set only)." },
-                "value": { "description": "New value with its JSON type (true, 256000, \"deepseek-flash\"); null resets it to the default." }
+                "key": { "type": "string", "enum": AGENT_SETTABLE, "description": "Setting key (set only)." },
+                "value": { "description": "New JSON value (e.g. true, 256000, \"deepseek-flash\"), or null to reset." }
             },
             "required": ["action"],
             "additionalProperties": false
@@ -56,10 +68,11 @@ Use it when the user asks you to configure Corex itself."
         let Some(key) = args.get("key").and_then(|v| v.as_str()) else {
             return Ok(ToolOutput::error("Missing 'key'."));
         };
-        let value = args.get("value").cloned().unwrap_or(serde_json::Value::Null);
-        if let Err(e) = cfg.set_agent_setting(key, value.clone()) {
-            return Ok(ToolOutput::error(e));
-        }
+        let raw_value = args.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        let value = match apply_setting_value(&mut cfg, key, raw_value) {
+            Ok(v) => v,
+            Err(e) => return Ok(ToolOutput::error(e)),
+        };
         if let Err(e) = cfg.save_agent_setting(key, Some(&context.workspace_dir)) {
             return Ok(ToolOutput::error(format!("Could not save settings.json: {e}")));
         }
@@ -151,5 +164,15 @@ mod tests {
             assert!(crate::policy::needs_approval_even_in_yolo("corex_settings", &json!({"action": "set", "key": key})), "{key}");
         }
         assert!(!crate::policy::needs_approval_even_in_yolo("corex_settings", &json!({"action": "set", "key": "auto_compact"})));
+    }
+
+    #[test]
+    fn string_encoded_primitives_from_strict_schema_providers_are_accepted() {
+        let mut cfg = Config::default();
+        assert_eq!(apply_setting_value(&mut cfg, "auto_compact", json!("false")).unwrap(), json!(false));
+        assert!(!cfg.auto_compact);
+        assert_eq!(apply_setting_value(&mut cfg, "context_window_tokens", json!("128000")).unwrap(), json!(128000));
+        assert_eq!(cfg.context_window_tokens, Some(128_000));
+        assert!(apply_setting_value(&mut cfg, "auto_compact", json!("not-a-bool")).is_err());
     }
 }

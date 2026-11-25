@@ -86,22 +86,29 @@ impl RemoteSession {
         }
     }
 
-    /// Tests the SSH connection and probes the initial remote working directory.
+    /// Tests the SSH connection and probes the initial remote working directory in a single SSH round-trip.
     pub async fn connect(&mut self, timeout_secs: u64) -> Result<u64> {
-        let latency = SshExecutor::test_connection(&self.node, timeout_secs).await?;
-        self.last_ping_ms = Some(latency);
-        self.is_connected = true;
-        self.connected_at = Some(Local::now().format("%H:%M:%S").to_string());
-
-        // Probe initial remote directory
-        if let Ok(out) = SshExecutor::execute(&self.node, "pwd", false, timeout_secs.min(6)).await {
-            let pwd = out.stdout.trim();
-            if !pwd.is_empty() {
-                self.current_dir = pwd.to_string();
+        let t0 = std::time::Instant::now();
+        match SshExecutor::execute(&self.node, "pwd", false, timeout_secs).await {
+            Ok(out) if out.exit_code == 0 => {
+                let latency = t0.elapsed().as_millis() as u64;
+                self.last_ping_ms = Some(latency);
+                self.is_connected = true;
+                self.connected_at = Some(Local::now().format("%H:%M:%S").to_string());
+                let pwd = out.stdout.trim();
+                if !pwd.is_empty() {
+                    self.current_dir = pwd.to_string();
+                }
+                Ok(latency)
+            }
+            _ => {
+                let latency = SshExecutor::test_connection(&self.node, timeout_secs).await?;
+                self.last_ping_ms = Some(latency);
+                self.is_connected = true;
+                self.connected_at = Some(Local::now().format("%H:%M:%S").to_string());
+                Ok(latency)
             }
         }
-
-        Ok(latency)
     }
 
     pub fn disconnect(&mut self) {

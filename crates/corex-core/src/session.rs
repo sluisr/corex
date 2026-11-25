@@ -45,7 +45,7 @@ pub struct Session {
 
 /// Longest tool output kept in the history copy; the chat shows tool results collapsed anyway,
 /// and the copy would otherwise double the size of the saved session.
-const HISTORY_TOOL_OUTPUT_MAX_BYTES: usize = 8_000;
+pub const HISTORY_TOOL_OUTPUT_MAX_BYTES: usize = 8_000;
 
 fn history_copy(message: &Message) -> Message {
     let mut copy = message.clone();
@@ -130,10 +130,30 @@ impl Session {
         self
     }
 
+    /// Creates an independent fork of this session with a new UUID while keeping the full
+    /// conversation history, model settings and workspace intact.
+    pub fn fork(&self, tag: Option<String>) -> Self {
+        let now = Utc::now();
+        let mut forked = self.clone();
+        forked.id = Uuid::new_v4().to_string();
+        forked.tag = tag.filter(|t| !t.trim().is_empty());
+        if !forked.title.ends_with(" (fork)") {
+            forked.title = format!("{} (fork)", forked.title);
+        }
+        forked.created_at = now;
+        forked.updated_at = now;
+        forked
+    }
+
     /// The messages the chat should draw: the full history once a compaction has trimmed
     /// `messages`, otherwise `messages` itself.
     pub fn display_messages(&self) -> &[Message] {
         if self.history.is_empty() { &self.messages } else { &self.history }
+    }
+
+    /// True once at least one compaction has split `history` (what the chat shows) from `messages`.
+    pub fn has_compacted_history(&self) -> bool {
+        !self.history.is_empty()
     }
 
     /// Call right after a compaction shortened `messages`, passing them as they were before, so
@@ -296,10 +316,15 @@ impl Session {
     }
 
     pub fn save(&self) -> Result<()> {
-        self.save_in(&self.target_dir())
+        self.clone().save_owned_in(&self.target_dir())
     }
 
+    #[cfg(test)]
     fn save_in(&self, dir: &Path) -> Result<()> {
+        self.clone().save_owned_in(dir)
+    }
+
+    fn save_owned_in(mut self, dir: &Path) -> Result<()> {
         crate::secure_fs::ensure_private_dir(dir)?;
         let safe_id: String = self
             .id
@@ -310,12 +335,10 @@ impl Session {
             bail!("Invalid session identifier.");
         }
         let file = dir.join(format!("{}.json", safe_id));
-        let mut stored = self.clone();
         if let Some(images) = crate::session_images::images_dir(&file) {
-            crate::session_images::externalize(&mut stored.messages, &images);
-            crate::session_images::externalize(&mut stored.history, &images);
+            crate::session_images::externalize_pair(&mut self.messages, &mut self.history, &images);
         }
-        let serialized = serde_json::to_string(&stored)?;
+        let serialized = serde_json::to_string(&self)?;
         crate::secure_fs::write_private_atomic(&file, serialized.as_bytes())?;
         let summary = SessionSummary {
             id: self.id.clone(),
@@ -333,13 +356,14 @@ impl Session {
     /// Offloads session JSON serialization and `fsync` disk writes to the blocking pool so
     /// turn completions never stall the interactive TUI event loop.
     pub fn save_async(&self) {
+        let dir = self.target_dir();
         let snapshot = self.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(move || {
-                let _ = snapshot.save();
+                let _ = snapshot.save_owned_in(&dir);
             });
         } else {
-            let _ = snapshot.save();
+            let _ = snapshot.save_owned_in(&dir);
         }
     }
 
@@ -404,6 +428,21 @@ impl Session {
             crate::session_images::restore(&mut session.history, &images);
         }
         Ok(session)
+    }
+
+    /// Fast text-only session load for UI preview panes (`/resume`): skips walking `.images/`
+    /// and reading/base64-encoding multi-megabyte image files on the render thread.
+    pub fn load_preview_by_id(id: &str) -> Result<Self> {
+        let target = id.trim();
+        if Self::is_safe_session_id(target) {
+            if let Some(direct_file) = Self::find_session_file(target) {
+                let mut session: Session = serde_json::from_str(&fs::read_to_string(&direct_file)?)?;
+                session.history.clear();
+                session.file_edits.clear();
+                return Ok(session);
+            }
+        }
+        Self::load_by_id_or_tag(target)
     }
 
     pub fn load_by_id_or_tag(id_or_tag: &str) -> Result<Self> {

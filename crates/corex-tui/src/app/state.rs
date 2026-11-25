@@ -416,6 +416,9 @@ pub struct App {
     pub balance_rx: mpsc::Receiver<Result<corex_core::types::BalanceResponse, String>>,
     pub is_checking_balance: bool,
     pub pending_balance_msg_index: Option<usize>,
+    /// Background `/compact` result (`(compacted_messages, notice_or_err)`) so manual compaction never freezes the TUI.
+    pub compact_rx: Option<tokio::sync::oneshot::Receiver<(Vec<corex_core::types::Message>, Result<Option<String>, String>)>>,
+    pub compact_cancel: Option<CancellationToken>,
     pub message_queue: VecDeque<String>,
     /// Messages sent with "send now" while the agent works. They skip the queue: the model reads
     /// them at the next safe point (between tool rounds) instead of after the whole task.
@@ -424,6 +427,8 @@ pub struct App {
     pub last_interaction: Instant,
     /// Background startup MCP tool loader so the TUI opens immediately without waiting on MCP handshakes.
     pub mcp_startup_rx: Option<tokio::sync::oneshot::Receiver<Vec<Arc<dyn corex_tools::Tool>>>>,
+    /// True when `FleetConfig` / `~/.ssh/config` exposes at least one remote node.
+    pub fleet_nodes_available: Arc<AtomicBool>,
 }
 
 /// What the status footer shows about the active model, worked out from the provider catalog.

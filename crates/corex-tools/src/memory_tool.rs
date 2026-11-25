@@ -25,12 +25,8 @@ impl Tool for SaveMemoryTool {
     }
 
     fn description(&self) -> &'static str {
-        "Saves a concise fact about the user or this project so it is loaded into the system prompt of every future session. \
-Use it when the user asks you to remember something, or states a lasting preference or fact. \
-Do NOT use it for session-specific context or temporary data.\n\
-Scopes:\n\
-- global (default): personal preferences that apply in every workspace (saved to ~/.corex/COREX.md).\n\
-- project: notes about this workspace, private to the user and never committed (saved under ~/.corex/projects/)."
+        "Saves a lasting user preference or project fact into persistent memory (loaded in future sessions; never for temporary context). \
+Scopes: 'global' (default, ~/.corex/COREX.md) or 'project' (private per-workspace under ~/.corex/projects/)."
     }
 
     fn parameters(&self) -> serde_json::Value {

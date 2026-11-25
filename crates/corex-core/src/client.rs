@@ -66,6 +66,7 @@ pub enum StreamEvent {
     },
     ServerToolCalls(serde_json::Value),
     Title(String),
+    Compacting,
     ContextCompacted {
         compacted_messages: Vec<Message>,
         notice: String,
@@ -159,9 +160,24 @@ with /model (Claude, GPT-4o or Gemini) and send it again.]";
 /// True when an API error message says the model does not accept image input.
 pub fn is_image_rejection_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    ["image_url", "image input", "images are not supported", "does not support image", "unsupported image", "not support vision"]
-        .iter()
-        .any(|needle| m.contains(needle))
+    [
+        "image_url",
+        "image input",
+        "images are not supported",
+        "does not support image",
+        "unsupported image",
+        "not support vision",
+        "does not support vision",
+        "not a multimodal",
+        "multimodal",
+        "vision is not",
+        "cannot read images",
+        "invalid content type",
+        "unsupported content type",
+        "missing mmproj",
+    ]
+    .iter()
+    .any(|needle| m.contains(needle))
 }
 
 /// Tool result returned for every call of a truncated turn so the model re-issues it.
@@ -185,6 +201,7 @@ impl LlmClient {
             // A total timeout would cut long answers mid-stream; only silence ends a request.
             .read_timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(10))
+            .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(8)
@@ -205,7 +222,49 @@ impl LlmClient {
             last_prompt: Arc::new(Mutex::new(None)),
         };
         client.look_up_context_window(&config);
+        client.prewarm_connection(&config);
         client
+    }
+
+    /// Pre-warms DNS, TCP and TLS 1.3 into `self.http`'s keep-alive pool for the active cloud
+    /// provider so the user's first prompt pays 0 ms of connection handshake. Skipped for local
+    /// endpoints, unconfigured keys, and unit tests.
+    fn prewarm_connection(&self, cfg: &Config) {
+        #[cfg(test)]
+        {
+            let _ = cfg;
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            if cfg.local_llm_enabled || cfg.provider_kind() == crate::providers::ProviderKind::Local {
+                return;
+            }
+            let (base_url, api_key) = cfg.endpoint();
+            if api_key.trim().is_empty() || base_url.trim().is_empty() {
+                return;
+            }
+            let Ok(parsed) = reqwest::Url::parse(&base_url) else {
+                return;
+            };
+            let Some(host) = parsed.host_str() else {
+                return;
+            };
+            let origin = match parsed.port() {
+                Some(port) => format!("{}://{}:{}/", parsed.scheme(), host, port),
+                None => format!("{}://{}/", parsed.scheme(), host),
+            };
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            let http = self.http.clone();
+            handle.spawn(async move {
+                // Drain/drop response cleanly so reqwest returns the warm TLS socket to the pool.
+                if let Ok(resp) = http.head(&origin).timeout(Duration::from_secs(5)).send().await {
+                    let _ = resp.bytes().await;
+                }
+            });
+        }
     }
 
     /// Asks the provider, in the background, for the active model's window, unless something
@@ -230,15 +289,42 @@ impl LlmClient {
             .unwrap_or_else(|e| e.into_inner().clone())
     }
 
-    pub fn update_config(&self, new_config: Config) {
-        let local = crate::local_client::LocalLlmClient::new(
-            &new_config.local_llm_url,
-            &new_config.local_llm_model,
-        );
-        if let Ok(mut l) = self.local_client.lock() {
-            *l = local;
+    /// Borrows `Config` under the mutex without cloning its `HashMap`s and `Vec`s.
+    pub fn with_config<R>(&self, f: impl FnOnce(&Config) -> R) -> R {
+        match self.config.lock() {
+            Ok(g) => f(&g),
+            Err(e) => f(&e.into_inner()),
         }
-        self.look_up_context_window(&new_config);
+    }
+
+    pub fn update_config(&self, new_config: Config) {
+        let (rebuild_local, lookup_window, endpoint_changed) = if let Ok(g) = self.config.lock() {
+            let rebuild = g.local_llm_url != new_config.local_llm_url
+                || g.local_llm_model != new_config.local_llm_model;
+            let ep_changed = g.active_provider != new_config.active_provider
+                || g.base_url != new_config.base_url;
+            let lookup = ep_changed
+                || g.model != new_config.model
+                || g.context_window_tokens != new_config.context_window_tokens;
+            (rebuild, lookup, ep_changed)
+        } else {
+            (true, true, true)
+        };
+        if rebuild_local {
+            let local = crate::local_client::LocalLlmClient::new(
+                &new_config.local_llm_url,
+                &new_config.local_llm_model,
+            );
+            if let Ok(mut l) = self.local_client.lock() {
+                *l = local;
+            }
+        }
+        if lookup_window {
+            self.look_up_context_window(&new_config);
+        }
+        if endpoint_changed {
+            self.prewarm_connection(&new_config);
+        }
         if let Ok(mut g) = self.config.lock() {
             *g = new_config;
         }
@@ -601,11 +687,14 @@ impl LlmClient {
             };
 
             if is_truncatable {
-                if let Some(content) = msg.text_content().map(|s| s.to_string()) {
-                    if content.chars().count() > Self::TOOL_OUTPUT_MAX_CHARS
-                        && !content.contains(crate::spill::TRIM_MARKER)
-                        && !content.contains("chars truncated to save tokens")
-                    {
+                let needs_spill = msg.text_content().is_some_and(|s| {
+                    s.len() > Self::TOOL_OUTPUT_MAX_CHARS
+                        && !s.contains(crate::spill::TRIM_MARKER)
+                        && !s.contains("chars truncated to save tokens")
+                        && s.chars().count() > Self::TOOL_OUTPUT_MAX_CHARS
+                });
+                if needs_spill {
+                    if let Some(content) = msg.text_content().map(str::to_string) {
                         msg.content = Some(
                             crate::spill::spill_large_output("tool_output", content).into(),
                         );
@@ -621,43 +710,97 @@ impl LlmClient {
         s.len().div_ceil(3)
     }
 
-    /// Rough total token estimate for a message list (prompt side only).
-    pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
-        messages.iter().map(|m| {
-            let content_toks = match &m.content {
-                Some(MessageContent::Text(s)) => Self::estimate_tokens(s),
-                Some(MessageContent::Parts(parts)) => parts.iter().map(|p| {
+    fn estimate_json_value_bytes(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Null => 4,
+            serde_json::Value::Bool(b) => if *b { 4 } else { 5 },
+            serde_json::Value::Number(n) => n.to_string().len(),
+            serde_json::Value::String(s) => s.len() + 2,
+            serde_json::Value::Array(arr) => 2 + arr.iter().map(|x| Self::estimate_json_value_bytes(x) + 1).sum::<usize>(),
+            serde_json::Value::Object(map) => {
+                2 + map
+                    .iter()
+                    .map(|(k, val)| k.len() + 4 + Self::estimate_json_value_bytes(val))
+                    .sum::<usize>()
+            }
+        }
+    }
+
+    pub fn estimate_message_tokens(m: &Message) -> usize {
+        let content_toks = match &m.content {
+            Some(MessageContent::Text(s)) => Self::estimate_tokens(s),
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .map(|p| {
                     let text_toks = p.text.as_deref().map(Self::estimate_tokens).unwrap_or(0);
                     let img_toks = if p.image_url.is_some() { 1024 } else { 0 };
                     text_toks + img_toks
-                }).sum(),
-                None => 0,
-            };
-            let reasoning_toks = m.reasoning_content.as_deref().map(Self::estimate_tokens).unwrap_or(0);
-            let tool_call_toks = m.tool_calls.as_ref().map(|calls| {
-                calls.iter().map(|c| {
-                    let extra_toks = c.extra_content.as_ref().map(|ec| Self::estimate_tokens(&ec.to_string())).unwrap_or(0);
-                    Self::estimate_tokens(&c.function.name) + Self::estimate_tokens(&c.function.arguments) + extra_toks + 8
-                }).sum::<usize>()
-            }).unwrap_or(0);
-            content_toks + reasoning_toks + tool_call_toks + 4 // per-message overhead
-        }).sum()
+                })
+                .sum(),
+            None => 0,
+        };
+        let reasoning_toks = m.reasoning_content.as_deref().map(Self::estimate_tokens).unwrap_or(0);
+        let tool_call_toks = m
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| {
+                        let extra_toks = c
+                            .extra_content
+                            .as_ref()
+                            .map(|ec| Self::estimate_json_value_bytes(ec).div_ceil(3))
+                            .unwrap_or(0);
+                        Self::estimate_tokens(&c.function.name)
+                            + Self::estimate_tokens(&c.function.arguments)
+                            + extra_toks
+                            + 8
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        content_toks + reasoning_toks + tool_call_toks + 4 // per-message overhead
     }
 
-    /// How many messages at the end stay verbatim: about a quarter of the prompt, at least 4,
-    /// and always leaving 2 or more older messages to summarize.
-    fn recent_tail_len(messages: &[Message], start: usize, current_tokens: usize) -> usize {
-        let budget = current_tokens / 4;
+    /// Rough total token estimate for a message list (prompt side only).
+    pub fn estimate_messages_tokens(messages: &[Message]) -> usize {
+        messages.iter().map(Self::estimate_message_tokens).sum()
+    }
+
+    /// How many messages at the end stay verbatim: up to a quarter of the prompt (capped at a
+    /// quarter of the compaction threshold so an overflowed conversation still shrinks cleanly),
+    /// at least 4 unless single messages are oversized, and always leaving 2 or more older
+    /// messages to summarize.
+    fn recent_tail_len(
+        messages: &[Message],
+        start: usize,
+        current_tokens: usize,
+        effective_threshold: usize,
+    ) -> usize {
+        let budget = (current_tokens / 4).min(effective_threshold / 4);
+        let hard_cap = (effective_threshold / 2).max(budget);
         let mut kept = 0;
         let mut used = 0;
         for m in messages[start..].iter().rev() {
             used += Self::estimate_messages_tokens(std::slice::from_ref(m));
-            if kept >= 4 && used > budget {
+            if (kept >= 4 && used > budget) || (kept >= 2 && used > hard_cap) {
                 break;
             }
             kept += 1;
         }
         kept.min(messages.len().saturating_sub(start + 2))
+    }
+
+    /// Maximum transcript size (in chars) sent to the summarizer model so the compaction request
+    /// itself never overflows smaller (32k–128k) context windows when triggered at 100%.
+    fn compaction_transcript_limit(cfg: &Config) -> usize {
+        if cfg.is_deepseek_endpoint() {
+            return COMPACTION_TRANSCRIPT_CHARS;
+        }
+        let window = cfg.context_window();
+        let usable_tokens = window.saturating_sub(COMPACTION_MAX_TOKENS as usize + 4_000);
+        (usable_tokens.saturating_mul(5) / 2).clamp(12_000, COMPACTION_TRANSCRIPT_CHARS)
     }
 
     /// The compacted turns as the summarizer reads them: every user message, what the assistant
@@ -710,6 +853,17 @@ impl LlmClient {
         messages: &mut Vec<Message>,
         force: bool,
     ) -> Result<Option<String>> {
+        self.compact_messages_cancellable(messages, force, None).await
+    }
+
+    /// Same as [`Self::compact_messages`], aborting any in-flight summarization request immediately
+    /// when `cancel_token` fires and bounding network summarization to [`COMPACTION_TIMEOUT`].
+    pub async fn compact_messages_cancellable(
+        &self,
+        messages: &mut Vec<Message>,
+        force: bool,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
         let cfg = self.get_config();
         let current_tokens = self.context_tokens(messages);
 
@@ -723,22 +877,36 @@ impl LlmClient {
             return Ok(None);
         }
 
+        // Preserve non-message overhead (tool definitions, MCP schemas, tokenizer ratio) reported
+        // by `last_prompt` so pruning/compaction estimates never ignore schema weight.
+        let pre_prune_est = Self::estimate_messages_tokens(messages);
+        let non_msg_overhead = current_tokens.saturating_sub(pre_prune_est);
+
         // Cheapest relief first: cut oversized tool results down to head + tail. It needs no model
-        // call, and if it brings the prompt back under the threshold no summary is needed.
+        // call, and if it brings the prompt comfortably under the threshold (~12.5% hysteresis so
+        // the next turn does not immediately trigger a second KV-cache-busting compaction), stop here.
         let prune = crate::context_prune::prune_tool_results(messages);
+        let post_prune_est = Self::estimate_messages_tokens(messages);
+        let post_prune_tokens = non_msg_overhead + post_prune_est;
         let prune_note = (prune.pruned > 0).then(|| {
-            let freed = current_tokens.saturating_sub(Self::estimate_messages_tokens(messages));
+            let freed = current_tokens.saturating_sub(post_prune_tokens);
             format!(
                 "Trimmed {} oversized tool result(s), freeing ~{} tokens.",
                 prune.pruned, freed
             )
         });
-        if !force && prune_note.is_some() && Self::estimate_messages_tokens(messages) <= effective_threshold {
+        let prune_relief_target = effective_threshold - effective_threshold / 8;
+        if !force && prune_note.is_some() && post_prune_tokens <= prune_relief_target {
+            *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Ok(prune_note);
         }
 
         let total_msgs = messages.len();
-        if total_msgs < 8 {
+        let min_msgs = if force { 5 } else { 8 };
+        if total_msgs < min_msgs {
+            if prune_note.is_some() {
+                *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             return Ok(prune_note);
         }
 
@@ -755,11 +923,14 @@ impl LlmClient {
                     .is_some_and(|t| t.starts_with("TASK_DONE|") || t.starts_with("SUBAGENT_DONE|"))
         });
 
-        // Kept verbatim: the system prompt, the root prompt, a recent tail of about a quarter of the
-        // prompt, and the active user directive even when it falls inside the compacted range.
+        // Kept verbatim: the system prompt, the root prompt, a recent tail of up to a quarter of the
+        // threshold, and the active user directive even when it falls inside the compacted range.
         let middle_start = first_non_system + 1;
-        let tail_len = Self::recent_tail_len(messages, middle_start, current_tokens);
+        let tail_len = Self::recent_tail_len(messages, middle_start, current_tokens, effective_threshold);
         if tail_len == 0 {
+            if prune_note.is_some() {
+                *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             return Ok(prune_note);
         }
         let mut split_at = total_msgs - tail_len;
@@ -767,6 +938,9 @@ impl LlmClient {
             split_at -= 1;
         }
         if split_at.saturating_sub(middle_start) < 2 {
+            if prune_note.is_some() {
+                *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             return Ok(prune_note);
         }
         let kept_directive = last_user_idx.filter(|&i| (middle_start..split_at).contains(&i));
@@ -814,22 +988,53 @@ impl LlmClient {
             }
         }
 
-        let mut summary_opt: Option<String> = None;
-        let mut digest_parts = Vec::new();
-        if let Some(ref prev) = prev_summary {
-            digest_parts.push(format!("Prior Context Summary:\n{}", prev));
+        // Anti-thrashing guard: when uncompactable anchors + tool schemas already hold the prompt
+        // near 80%–95%, avoid re-summarizing `<CONTEXT_SUMMARY>` on every single turn unless new
+        // intermediate turns hold meaningful tokens (at least 10% of the threshold, min 2k).
+        if !force && prev_summary.is_some() {
+            let reclaimable: usize = older_slice
+                .iter()
+                .filter(|m| {
+                    !(m.role == "system"
+                        && m.text_content().is_some_and(|t| t.contains("<CONTEXT_SUMMARY>")))
+                })
+                .map(Self::estimate_message_tokens)
+                .sum();
+            let min_worthwhile = (effective_threshold / 10).max(2_000);
+            if reclaimable < min_worthwhile {
+                if prune_note.is_some() {
+                    *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                return Ok(prune_note);
+            }
         }
-        if !user_requests.is_empty() {
-            digest_parts.push(format!("User Directives:\n{}", user_requests.join("\n")));
-        }
-        if !tool_actions.is_empty() {
-            digest_parts.push(format!("Tool Actions:\n{}", tool_actions.join("\n")));
-        }
-        let digest = digest_parts.join("\n\n");
 
-        // 1. If local SLM is enabled, try local compaction first
+        if cancel_token.is_some_and(|c| c.is_cancelled()) {
+            bail!("Request cancelled by user");
+        }
+
+        let mut summary_opt: Option<String> = None;
+
+        // 1. If local SLM is enabled, try local compaction first with a bounded transcript & timeout
         if cfg.local_llm_enabled {
-            if let Ok(local_summary) = self.local_client().compact_conversation(&digest).await {
+            let local_digest = Self::compaction_transcript(
+                older_slice,
+                prev_summary.as_deref(),
+                LOCAL_COMPACTION_TRANSCRIPT_CHARS,
+            );
+            let local_client = self.local_client();
+            let local_fut = tokio::time::timeout(
+                Duration::from_secs(25),
+                local_client.compact_conversation(&local_digest),
+            );
+            let local_res = match cancel_token {
+                Some(ct) => tokio::select! {
+                    _ = ct.cancelled() => bail!("Request cancelled by user"),
+                    r = local_fut => r,
+                },
+                None => local_fut.await,
+            };
+            if let Ok(Ok(local_summary)) = local_res {
                 if !local_summary.trim().is_empty() {
                     summary_opt = Some(local_summary.trim().to_string());
                 }
@@ -840,105 +1045,121 @@ impl LlmClient {
         let (ep_base_url, ep_api_key) = cfg.endpoint();
         if summary_opt.is_none() && !ep_api_key.trim().is_empty() {
             let summary_system = COMPACTION_PROMPT;
-            let digest = Self::compaction_transcript(older_slice, prev_summary.as_deref(), COMPACTION_TRANSCRIPT_CHARS);
-            if cfg.provider_kind() == crate::providers::ProviderKind::Anthropic {
-                let trimmed_base = ep_base_url.trim_end_matches('/');
-                let url = if trimmed_base.ends_with("/v1") {
-                    format!("{}/messages", trimmed_base)
+            let max_transcript_chars = Self::compaction_transcript_limit(&cfg);
+            let digest = Self::compaction_transcript(older_slice, prev_summary.as_deref(), max_transcript_chars);
+            let cloud_fut = async {
+                if cfg.provider_kind() == crate::providers::ProviderKind::Anthropic {
+                    let trimmed_base = ep_base_url.trim_end_matches('/');
+                    let url = if trimmed_base.ends_with("/v1") {
+                        format!("{}/messages", trimmed_base)
+                    } else {
+                        format!("{}/v1/messages", trimmed_base)
+                    };
+                    let profile = crate::anthropic::model_profile(&cfg.model);
+                    let mut request_body = serde_json::json!({
+                        "model": cfg.model,
+                        "max_tokens": COMPACTION_MAX_TOKENS,
+                        "system": summary_system,
+                        "messages": [
+                            {"role": "user", "content": digest}
+                        ]
+                    });
+                    if profile.accepts_temperature {
+                        request_body["temperature"] = serde_json::json!(0.3);
+                    }
+                    if let Ok(resp) = self.http
+                        .post(&url)
+                        .header("x-api-key", &ep_api_key)
+                        .header("anthropic-version", "2023-06-01")
+                        .header("Content-Type", "application/json")
+                        .json(&request_body)
+                        .send()
+                        .await
+                    {
+                        if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                            if let Some(u) = json_resp.get("usage") {
+                                let field = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                                let hit = field("cache_read_input_tokens");
+                                let miss = field("input_tokens") + field("cache_creation_input_tokens");
+                                let out = field("output_tokens");
+                                self.record_usage(&cfg.model, &Usage {
+                                    prompt_tokens: hit + miss,
+                                    prompt_cache_hit_tokens: hit,
+                                    prompt_cache_miss_tokens: miss,
+                                    completion_tokens: out,
+                                    total_tokens: hit + miss + out,
+                                });
+                            }
+                            let truncated = json_resp.get("stop_reason").and_then(|r| r.as_str()) == Some("max_tokens");
+                            if let Some(text) = json_resp
+                                .get("content")
+                                .filter(|_| !truncated)
+                                .and_then(|c| c.as_array())
+                                .and_then(|arr| arr.iter().find_map(|item| item.get("text").and_then(|t| t.as_str())))
+                            {
+                                return Some(text.trim().to_string());
+                            }
+                        }
+                    }
+                    None
                 } else {
-                    format!("{}/v1/messages", trimmed_base)
-                };
-                let profile = crate::anthropic::model_profile(&cfg.model);
-                let mut request_body = serde_json::json!({
-                    "model": cfg.model,
-                    "max_tokens": COMPACTION_MAX_TOKENS,
-                    "system": summary_system,
-                    "messages": [
-                        {"role": "user", "content": digest}
-                    ]
-                });
-                if profile.accepts_temperature {
-                    request_body["temperature"] = serde_json::json!(0.3);
-                }
-                if let Ok(resp) = self.http
-                    .post(&url)
-                    .header("x-api-key", &ep_api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("Content-Type", "application/json")
-                    .json(&request_body)
-                    .send()
-                    .await
-                {
-                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                        if let Some(u) = json_resp.get("usage") {
-                            let field = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                            let hit = field("cache_read_input_tokens");
-                            let miss = field("input_tokens") + field("cache_creation_input_tokens");
-                            let out = field("output_tokens");
-                            self.record_usage(&cfg.model, &Usage {
-                                prompt_tokens: hit + miss,
-                                prompt_cache_hit_tokens: hit,
-                                prompt_cache_miss_tokens: miss,
-                                completion_tokens: out,
-                                total_tokens: hit + miss + out,
-                            });
-                        }
-                        let truncated = json_resp.get("stop_reason").and_then(|r| r.as_str()) == Some("max_tokens");
-                        if let Some(text) = json_resp
-                            .get("content")
-                            .filter(|_| !truncated)
-                            .and_then(|c| c.as_array())
-                            .and_then(|arr| arr.iter().find_map(|item| item.get("text").and_then(|t| t.as_str())))
-                        {
-                            summary_opt = Some(text.trim().to_string());
-                        }
+                    let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
+                    let supports_temp = crate::providers::applies_temperature(&target_model)
+                        && !target_model.contains("reasoner");
+                    let mut request_body = serde_json::json!({
+                        "model": target_model,
+                        "messages": [
+                            {"role": "system", "content": summary_system},
+                            {"role": "user", "content": digest}
+                        ],
+                        "max_tokens": COMPACTION_MAX_TOKENS
+                    });
+                    // DeepSeek thinks by default, and the reasoning would eat the summary's token budget.
+                    if cfg.is_deepseek_endpoint() {
+                        request_body["thinking"] = serde_json::json!({"type": "disabled"});
                     }
-                }
-            } else {
-                let target_model = if cfg.is_deepseek_endpoint() { "deepseek-flash".to_string() } else { cfg.model.clone() };
-                let supports_temp = crate::providers::applies_temperature(&target_model)
-                    && !target_model.contains("reasoner");
-                let mut request_body = serde_json::json!({
-                    "model": target_model,
-                    "messages": [
-                        {"role": "system", "content": summary_system},
-                        {"role": "user", "content": digest}
-                    ],
-                    "max_tokens": COMPACTION_MAX_TOKENS
-                });
-                // DeepSeek thinks by default, and the reasoning would eat the summary's token budget.
-                if cfg.is_deepseek_endpoint() {
-                    request_body["thinking"] = serde_json::json!({"type": "disabled"});
-                }
-                if supports_temp {
-                    request_body["temperature"] = serde_json::json!(0.3);
-                }
+                    if supports_temp {
+                        request_body["temperature"] = serde_json::json!(0.3);
+                    }
 
-                let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
-                if let Ok(resp) = self.http
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", ep_api_key))
-                    .header("Content-Type", "application/json")
-                    .json(&request_body)
-                    .send()
-                    .await
-                {
-                    if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
-                        if let Some(usage) = json_resp.get("usage").and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok()) {
-                            self.record_usage(&target_model, &usage);
-                        }
-                        let choice = json_resp.get("choices").and_then(|c| c.get(0));
-                        let truncated = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) == Some("length");
-                        if let Some(text) = choice
-                            .filter(|_| !truncated)
-                            .and_then(|c| c.get("message"))
-                            .and_then(|m| m.get("content"))
-                            .and_then(|t| t.as_str())
-                        {
-                            summary_opt = Some(text.trim().to_string());
+                    let url = format!("{}/chat/completions", ep_base_url.trim_end_matches('/'));
+                    if let Ok(resp) = self.http
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", ep_api_key))
+                        .header("Content-Type", "application/json")
+                        .json(&request_body)
+                        .send()
+                        .await
+                    {
+                        if let Ok(json_resp) = resp.json::<serde_json::Value>().await {
+                            if let Some(usage) = json_resp.get("usage").and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok()) {
+                                self.record_usage(&target_model, &usage);
+                            }
+                            let choice = json_resp.get("choices").and_then(|c| c.get(0));
+                            let truncated = choice.and_then(|c| c.get("finish_reason")).and_then(|r| r.as_str()) == Some("length");
+                            if let Some(text) = choice
+                                .filter(|_| !truncated)
+                                .and_then(|c| c.get("message"))
+                                .and_then(|m| m.get("content"))
+                                .and_then(|t| t.as_str())
+                            {
+                                return Some(text.trim().to_string());
+                            }
                         }
                     }
+                    None
                 }
+            };
+            let timed_cloud = tokio::time::timeout(COMPACTION_TIMEOUT, cloud_fut);
+            let cloud_res = match cancel_token {
+                Some(ct) => tokio::select! {
+                    _ = ct.cancelled() => bail!("Request cancelled by user"),
+                    r = timed_cloud => r,
+                },
+                None => timed_cloud.await,
+            };
+            if let Ok(found) = cloud_res {
+                summary_opt = found;
             }
         }
         summary_opt = summary_opt.filter(|s| !s.trim().is_empty());
@@ -986,7 +1207,7 @@ impl LlmClient {
         );
 
         *self.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        let new_tokens = Self::estimate_messages_tokens(messages);
+        let new_tokens = non_msg_overhead + Self::estimate_messages_tokens(messages);
         let saved_tokens = current_tokens.saturating_sub(new_tokens);
         let notice = if force {
             format!(
@@ -1009,7 +1230,8 @@ impl LlmClient {
     const LOCAL_HISTORY_TOKEN_LIMIT: usize = 24_000;
 
     pub fn cap_history_with_limit(messages: &mut Vec<Message>, token_limit: usize) {
-        if Self::estimate_messages_tokens(messages) <= token_limit {
+        let mut current_tokens = Self::estimate_messages_tokens(messages);
+        if current_tokens <= token_limit {
             return;
         }
 
@@ -1020,9 +1242,7 @@ impl LlmClient {
 
         // Prefer dropping after the root user anchor (first_non_system + 1) while there are enough turns;
         // fall back to first_non_system only if the anchor itself makes history exceed the limit.
-        while messages.len() > first_non_system + 2
-            && Self::estimate_messages_tokens(messages) > token_limit
-        {
+        while messages.len() > first_non_system + 2 && current_tokens > token_limit {
             let last_user_idx = messages.iter().rposition(|m| {
                 m.role == "user"
                     && !crate::tool_images::is_tool_image_message(m)
@@ -1052,10 +1272,12 @@ impl LlmClient {
             }
 
             let removed = messages.remove(drop_idx);
+            current_tokens = current_tokens.saturating_sub(Self::estimate_message_tokens(&removed));
             // If we removed an assistant message with tool calls, also remove its immediate tool responses
             if removed.role == "assistant" && removed.tool_calls.is_some() {
                 while drop_idx < messages.len() && messages[drop_idx].role == "tool" {
-                    messages.remove(drop_idx);
+                    let removed_tool = messages.remove(drop_idx);
+                    current_tokens = current_tokens.saturating_sub(Self::estimate_message_tokens(&removed_tool));
                 }
             }
         }
@@ -1063,7 +1285,7 @@ impl LlmClient {
         debug!(
             "[HISTORY] Capped history to limit {}. Estimated tokens now: {}",
             token_limit,
-            Self::estimate_messages_tokens(messages)
+            current_tokens
         );
     }
 
@@ -1071,9 +1293,19 @@ impl LlmClient {
         self.meter.spend()
     }
 
+    pub fn model_spends(&self) -> Vec<crate::pricing::ModelSpend> {
+        self.meter.model_spends()
+    }
+
+    fn record_usage_for(&self, cfg: &Config, model: &str, usage: &Usage) {
+        let label = crate::pricing::model_display_label(cfg);
+        self.meter
+            .record_for(&label, usage, crate::pricing::rates_for(cfg, model));
+    }
+
     fn record_usage(&self, model: &str, usage: &Usage) {
         let cfg = self.get_config();
-        self.meter.record(usage, crate::pricing::rates_for(&cfg, model));
+        self.record_usage_for(&cfg, model, usage);
     }
 
     fn note_prompt_size(&self, usage: &Usage, sent_messages: usize) {
@@ -1141,40 +1373,104 @@ impl LlmClient {
             && messages.iter().any(Self::has_images);
 
         let (tx, out) = mpsc::channel::<StreamEvent>(100);
-        let sent_messages = messages.len();
+        let sent_messages = prefix
+            .iter()
+            .rev()
+            .find_map(|ev| match ev {
+                StreamEvent::ContextCompacted { compacted_messages, .. } => {
+                    Some(compacted_messages.len() + 1)
+                }
+                _ => None,
+            })
+            .unwrap_or(messages.len());
+        // Snapshot the config that served this request so switching models mid-stream
+        // never attributes this turn's usage or cost to the newly selected model.
+        let req_cfg = self.get_config();
         if overflow {
             let mut retry_messages = messages;
-            if let Ok(Some(notice)) = self.compact_messages(&mut retry_messages, true).await {
+            let client = self.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(StreamEvent::Compacting).await;
+                let before_est = Self::estimate_messages_tokens(&retry_messages);
+                let mut notice_opt = match client
+                    .compact_messages_cancellable(&mut retry_messages, true, Some(&cancel_token))
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        return;
+                    }
+                };
+
+                // If history had too few turns to summarize or kept anchors/tail still hold >85%
+                // of the overflowed payload, shed oversized tool outputs and oldest turns directly
+                // so the retry does not hit the exact same 100% wall.
+                let after_compact_est = Self::estimate_messages_tokens(&retry_messages);
+                if notice_opt.is_none() || after_compact_est > before_est.saturating_mul(85) / 100 {
+                    Self::truncate_tool_outputs(&mut retry_messages);
+                    let emergency_cap = (before_est.saturating_mul(70) / 100).max(1_024);
+                    Self::cap_history_with_limit(&mut retry_messages, emergency_cap);
+                    Self::sanitize_tool_call_sequences(&mut retry_messages);
+                    let after_cap_est = Self::estimate_messages_tokens(&retry_messages);
+                    if notice_opt.is_none() && after_cap_est < before_est {
+                        *client.last_prompt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        notice_opt = Some(format!(
+                            "Dropped oldest turns to fit the context window (saved ~{} tokens).",
+                            before_est.saturating_sub(after_cap_est)
+                        ));
+                    }
+                }
+
+                let Some(notice) = notice_opt else {
+                    for ev in prefix {
+                        if tx.send(ev).await.is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(ev) = first {
+                        let _ = tx.send(ev).await;
+                    }
+                    return;
+                };
+
                 let compacted_session = if retry_messages.len() > 1 {
                     retry_messages[1..].to_vec()
                 } else {
                     Vec::new()
                 };
-                let mut retry_rx = self
+                let retry_sent = retry_messages.len();
+                let mut retry_rx = match client
                     .stream_chat_once(retry_messages, tools, cancel_token)
-                    .await?;
-                let notice = format!("The request exceeded the model's context window. {} Retrying.", notice);
-                let client = self.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(StreamEvent::ContextCompacted { compacted_messages: compacted_session, notice })
-                        .await;
-                    while let Some(ev) = retry_rx.recv().await {
-                        if let StreamEvent::UsageUpdate(ref usage) = ev {
-                            client.record_usage(&client.get_config().model, usage);
-                        }
-                        if tx.send(ev).await.is_err() {
-                            break;
-                        }
+                    .await
+                {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                        return;
                     }
-                });
-                return Ok(out);
-            }
+                };
+                let notice = format!("The request exceeded the model's context window. {} Retrying.", notice);
+                let _ = tx
+                    .send(StreamEvent::ContextCompacted { compacted_messages: compacted_session, notice })
+                    .await;
+                while let Some(ev) = retry_rx.recv().await {
+                    if let StreamEvent::UsageUpdate(ref usage) = ev {
+                        client.record_usage_for(&req_cfg, &req_cfg.model, usage);
+                        client.note_prompt_size(usage, retry_sent);
+                    }
+                    if tx.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            return Ok(out);
         } else if image_rejected {
             // The model does not take images after all. Send the same conversation with a note in
             // place of each image; the session keeps the images for a model that can see them.
             let mut retry_messages = messages;
             Self::replace_images_with_notes(&mut retry_messages);
+            let retry_sent = retry_messages.len();
             let mut retry_rx = self.stream_chat_once(retry_messages, tools, cancel_token).await?;
             let notice = "The active model rejected the image, so it was sent as a note. \
                           Switch with /model to one that can see images."
@@ -1184,7 +1480,8 @@ impl LlmClient {
                 let _ = tx.send(StreamEvent::Notice(notice)).await;
                 while let Some(ev) = retry_rx.recv().await {
                     if let StreamEvent::UsageUpdate(ref usage) = ev {
-                        client.record_usage(&client.get_config().model, usage);
+                        client.record_usage_for(&req_cfg, &req_cfg.model, usage);
+                        client.note_prompt_size(usage, retry_sent);
                     }
                     if tx.send(ev).await.is_err() {
                         break;
@@ -1203,7 +1500,7 @@ impl LlmClient {
             }
             if let Some(ev) = first {
                 if let StreamEvent::UsageUpdate(ref usage) = ev {
-                    client.record_usage(&client.get_config().model, usage);
+                    client.record_usage_for(&req_cfg, &req_cfg.model, usage);
                     client.note_prompt_size(usage, sent_messages);
                 }
                 if tx.send(ev).await.is_err() {
@@ -1212,7 +1509,7 @@ impl LlmClient {
             }
             while let Some(ev) = rx.recv().await {
                 if let StreamEvent::UsageUpdate(ref usage) = ev {
-                    client.record_usage(&client.get_config().model, usage);
+                    client.record_usage_for(&req_cfg, &req_cfg.model, usage);
                     client.note_prompt_size(usage, sent_messages);
                 }
                 if tx.send(ev).await.is_err() {
@@ -1238,8 +1535,15 @@ impl LlmClient {
 
         if is_local_model {
             let local_client = self.local_client();
-            if local_client.health_check().await {
-                let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
+            if local_client.ensure_healthy().await {
+                let compact_notice = match self
+                    .compact_messages_cancellable(&mut messages, false, Some(&cancel_token))
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) if cancel_token.is_cancelled() => return Err(e),
+                    Err(_) => None,
+                };
                 Self::sanitize_tool_call_sequences(&mut messages);
                 let auto_compact_event = compact_notice.map(|notice| {
                     let compacted_session_messages = if messages.len() > 1 {
@@ -1253,6 +1557,9 @@ impl LlmClient {
                 Self::sanitize_tool_call_sequences(&mut messages);
                 crate::context_prune::collapse_stale_browser_snapshots(&mut messages);
                 Self::truncate_tool_outputs(&mut messages);
+                if !cfg.can_see_images() {
+                    Self::replace_images_with_notes(&mut messages);
+                }
                 crate::language::sanitize_messages_cjk_drift(&mut messages);
 
                 crate::forensic::ForensicLogger::log_event(
@@ -1308,7 +1615,14 @@ impl LlmClient {
             }
         }
 
-        let compact_notice = self.compact_messages(&mut messages, false).await.ok().flatten();
+        let compact_notice = match self
+            .compact_messages_cancellable(&mut messages, false, Some(&cancel_token))
+            .await
+        {
+            Ok(n) => n,
+            Err(e) if cancel_token.is_cancelled() => return Err(e),
+            Err(_) => None,
+        };
         Self::sanitize_tool_call_sequences(&mut messages);
         // Capture compacted session messages before wire-only mutations
         // (cap_history_with_limit, sanitize_for_google_tool_calls, truncate_tool_outputs).
@@ -1324,6 +1638,9 @@ impl LlmClient {
         Self::sanitize_tool_call_sequences(&mut messages);
         if cfg.provider_kind() == crate::providers::ProviderKind::Google {
             Self::sanitize_for_google_tool_calls(&mut messages);
+            if let Some(ref mut defs) = tools {
+                Self::sanitize_tools_for_google(defs);
+            }
         }
         crate::context_prune::collapse_stale_browser_snapshots(&mut messages);
         Self::truncate_tool_outputs(&mut messages);
@@ -1335,8 +1652,8 @@ impl LlmClient {
 
         // Re-anchor the conversation language at the tail of the context window as a
         // standalone message (never spliced into untrusted tool payloads) so long tool
-        // outputs do not cause DeepSeek to drift into Chinese.
-        if is_deepseek {
+        // outputs do not cause DeepSeek (native or hosted on Azure/OpenRouter) to drift into Chinese.
+        if is_deepseek || cfg.model.to_ascii_lowercase().contains("deepseek") {
             crate::language::apply_recency_anchor(&mut messages);
         }
 
@@ -1376,186 +1693,20 @@ impl LlmClient {
             ).await;
         }
 
-        let has_tools = tools.is_some();
-        if !is_deepseek {
-            for msg in &mut messages {
-                msg.server_tool_calls = None;
-            }
-        }
-
-        // DeepSeek V4 Reasoning spec:
-        for msg in &mut messages {
-            if msg.role == "assistant" {
-                if msg.content.is_none() {
-                    msg.content = Some(MessageContent::Text(String::new()));
-                }
-
-                if has_tools && is_deepseek {
-                    if msg.reasoning_content.is_none() {
-                        if let Some(text) = msg.text_content() {
-                            let key = ReasoningCache::compute_key(text, msg.tool_calls.as_deref());
-                            if let Some(cached) = self.reasoning_cache.get(&key) {
-                                msg.reasoning_content = Some(cached);
-                            }
-                        }
-                    }
-                    if msg.reasoning_content.is_none() {
-                        msg.reasoning_content = Some(String::new());
-                    }
-                } else {
-                    msg.reasoning_content = None;
-                }
-            }
-        }
-
-        let api_model = if !is_deepseek {
-            if provider_kind == crate::providers::ProviderKind::Google {
-                if cfg.model == "gemini-2.5-flash" || cfg.model == "gemini-2.0-flash" || cfg.model == "gemini-1.5-flash" {
-                    "gemini-3.5-flash-lite".to_string()
-                } else if cfg.model == "gemini-2.5-pro" {
-                    "gemini-3.8-flash".to_string()
-                } else {
-                    cfg.model.clone()
-                }
-            } else {
-                cfg.model.clone()
-            }
-        } else if cfg.model == "deepseek-v4-pro"
-            || cfg.model == "deepseek-reasoner"
-            || cfg.model.contains("pro")
-            || cfg.model.contains("reasoner")
-            || cfg.model.contains("Pro")
-        {
-            "deepseek-v4-pro".to_string()
-        } else if cfg.model == "deepseek-flash"
-            || cfg.model == "deepseek-v4.1-flash"
-            || cfg.model == "deepseek-v4.1-flash-1017"
-            || cfg.model == "deepseek-v4-flash"
-            || cfg.model == "deepseek-v4-flash-vision-exp"
-            || cfg.model == "deepseek-chat"
-            || cfg.model.contains("flash")
-            || cfg.model.contains("Flash")
-            || cfg.model.contains("vision")
-            || cfg.model.contains("Vision")
-        {
-            if cfg.model == "deepseek-v4.1-flash-1017" {
-                "deepseek-v4.1-flash-1017".to_string()
-            } else {
-                "deepseek-flash".to_string()
-            }
-        } else {
-            cfg.model.clone()
-        };
-
         let base_url = endpoint_url.trim_end_matches('/');
         let url = format!("{}/chat/completions", base_url);
 
         let tools_count = tools.as_ref().map(|t| t.len()).unwrap_or(0);
         let messages_count = messages.len();
-        let raw_reasoning_effort = match cfg.reasoning_effort.as_str() {
-            // Saved by older versions; DeepSeek has no such level.
-            "dynamic" if is_deepseek => "high".to_string(),
-            other => other.to_string(),
-        };
-
-        // DeepSeek-V4.1-Flash reasoning_effort normalization:
-        // 'minimal' and 'medium' are rejected by DeepSeek-V4.1.
-        // Allowed: 'none', 'low' (25), 'high' (50), 'xhigh' (75), 'max' (100)
-        let normalized_reasoning_effort = match raw_reasoning_effort.to_lowercase().as_str() {
-            "medium" => "high".to_string(),
-            "minimal" => "low".to_string(),
-            other => other.to_string(),
-        };
-
-        let is_thinking_disabled = normalized_reasoning_effort == "none"
-            || normalized_reasoning_effort == "off"
-            || normalized_reasoning_effort == "false";
-
-        let is_openai_reasoning = api_model.starts_with("o1") || api_model.starts_with("o3");
-
-        // `thinking` / `reasoning_effort` are DeepSeek extensions; OpenAI reasoning models (o1/o3)
-        // support standard `reasoning_effort`. Other OpenAI-compatible providers reject unknown fields.
-        let thinking_config = if !is_deepseek {
-            None
-        } else if is_thinking_disabled {
-            Some(ThinkingConfig {
-                thinking_type: "disabled".to_string(),
-            })
-        } else {
-            Some(ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-            })
-        };
-
-        let effective_reasoning_effort = if is_deepseek
-            || (provider_kind == crate::providers::ProviderKind::Azure
-                && api_model.to_ascii_lowercase().contains("deepseek"))
-        {
-            if is_thinking_disabled {
-                Some("none".to_string())
-            } else {
-                Some(normalized_reasoning_effort)
-            }
-        } else if is_openai_reasoning {
-            match normalized_reasoning_effort.to_lowercase().as_str() {
-                "low" => Some("low".to_string()),
-                "high" | "max" | "xhigh" => Some("high".to_string()),
-                _ => Some("medium".to_string()),
-            }
-        } else {
-            None
-        };
-
-        let effective_temperature = if !cfg.temperature_enabled || !crate::providers::applies_temperature(&api_model) {
-            None
-        } else if !is_deepseek {
-            let (lo, hi) = crate::providers::temperature_range(provider_kind, &api_model);
-            Some(cfg.temperature.clamp(lo, hi))
-        } else if is_thinking_disabled {
-            if api_model.contains("flash") {
-                Some(cfg.flash_settings.temperature)
-            } else {
-                Some(cfg.temperature)
-            }
-        } else {
-            None
-        };
-
-        // Only deepseek-flash runs the server web tools; they replace Corex's own search and fetch.
-        // With client tools, DeepSeek accepts the server web tools only in thinking mode.
-        let server_web_tools =
-            is_deepseek && cfg.deepseek_web_tools && api_model == "deepseek-flash" && !is_thinking_disabled;
-        if server_web_tools {
-            if let Some(ref mut list) = tools {
-                list.retain(|t| !SERVER_WEB_REPLACED_TOOLS.contains(&t.function.name.as_str()));
-            }
-            if let Some(MessageContent::Text(prompt)) = messages.first_mut().filter(|m| m.role == "system").and_then(|m| m.content.as_mut()) {
-                prompt.push_str(SERVER_WEB_PROMPT_NOTE);
-            }
-        }
-
-        // DeepSeek writes the conversation title with the first answer; with client tools only in thinking mode.
-        let title = (is_deepseek && !is_thinking_disabled && !messages.iter().any(|m| m.role == "assistant"))
-            .then(|| serde_json::json!({"enabled": true}));
-        if is_deepseek {
-            crate::deepseek_reminder::insert_latest_reminder(&mut messages, chrono::Local::now().date_naive());
-        }
-
-        let request_body = ChatCompletionRequest {
-            model: api_model.clone(),
+        let (api_model, body_bytes) = build_chat_completion_body(
+            &cfg,
+            is_deepseek,
+            provider_kind,
+            &self.reasoning_cache,
             messages,
             tools,
-            stream: true,
-            thinking: thinking_config,
-            reasoning_effort: effective_reasoning_effort,
-            temperature: effective_temperature,
-            top_p: None,
-            max_tokens: None,
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            title,
-        };
+            chrono::Local::now().date_naive(),
+        )?;
 
         let provider_label = match provider_kind {
             crate::providers::ProviderKind::DeepSeek => "DeepSeek Cloud",
@@ -1571,22 +1722,20 @@ impl LlmClient {
             crate::providers::ProviderKind::GenericOpenAi => "OpenAI Compatible",
         };
 
-        let body_bytes = if server_web_tools {
-            let mut body = serde_json::to_value(&request_body)?;
-            with_deepseek_web_tools(&mut body);
-            serde_json::to_vec(&body)?
-        } else {
-            serde_json::to_vec(&request_body)?
-        };
         if crate::forensic::ForensicLogger::is_enabled() {
-            crate::forensic::ForensicLogger::log_llm_request_bytes(
-                provider_label,
-                &api_model,
-                &url,
-                messages_count,
-                tools_count,
-                &body_bytes,
-            );
+            let log_bytes = body_bytes.clone();
+            let log_model = api_model.clone();
+            let log_url = url.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::forensic::ForensicLogger::log_llm_request_bytes(
+                    provider_label,
+                    &log_model,
+                    &log_url,
+                    messages_count,
+                    tools_count,
+                    &log_bytes,
+                );
+            });
         }
 
         debug!("[REQUEST] POST {} (api_model: {})", url, api_model);
@@ -1618,6 +1767,8 @@ impl LlmClient {
             let mut final_usage: Option<Usage> = None;
             let mut final_reason: Option<String> = None;
             let mut server_calls = std::collections::HashMap::new();
+            let idle_sleep = tokio::time::sleep(timeout_duration);
+            tokio::pin!(idle_sleep);
 
             loop {
                 tokio::select! {
@@ -1626,12 +1777,13 @@ impl LlmClient {
                         let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
                         break;
                     }
-                    _ = tokio::time::sleep(timeout_duration) => {
+                    _ = &mut idle_sleep => {
                         crate::forensic::ForensicLogger::log_error("stream_chat", "Stream idle timeout: API did not respond for 180 seconds.");
                         let _ = tx.send(StreamEvent::Error("Stream idle timeout: API did not respond for 180 seconds.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + timeout_duration);
                         match event {
                             Some(Ok(Event::Open)) => {
                                 debug!("[SSE] Stream opened");
@@ -1896,6 +2048,8 @@ impl LlmClient {
             let mut total_reasoning_chars = 0;
             let mut stream_state = crate::anthropic::AnthropicStreamState::new();
             let mut final_reason: Option<String> = None;
+            let idle_sleep = tokio::time::sleep(timeout_duration);
+            tokio::pin!(idle_sleep);
 
             loop {
                 tokio::select! {
@@ -1904,12 +2058,13 @@ impl LlmClient {
                         let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
                         break;
                     }
-                    _ = tokio::time::sleep(timeout_duration) => {
+                    _ = &mut idle_sleep => {
                         crate::forensic::ForensicLogger::log_error("stream_chat_anthropic", "Stream idle timeout: Anthropic API did not respond for 180 seconds.");
                         let _ = tx.send(StreamEvent::Error("Stream idle timeout: Anthropic API did not respond for 180 seconds.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + timeout_duration);
                         match event {
                             Some(Ok(Event::Open)) => {
                                 debug!("[ANTHROPIC SSE] Stream opened");
@@ -2055,6 +2210,8 @@ impl LlmClient {
             let mut stream_state = crate::responses_api::ResponsesStreamState::new(&model_clone);
             let mut final_usage: Option<Usage> = None;
             let mut final_reason: Option<String> = None;
+            let idle_sleep = tokio::time::sleep(timeout_duration);
+            tokio::pin!(idle_sleep);
 
             loop {
                 tokio::select! {
@@ -2063,12 +2220,13 @@ impl LlmClient {
                         let _ = tx.send(StreamEvent::Error("Request cancelled by user".to_string())).await;
                         break;
                     }
-                    _ = tokio::time::sleep(timeout_duration) => {
+                    _ = &mut idle_sleep => {
                         crate::forensic::ForensicLogger::log_error("stream_chat_responses", "Stream idle timeout: Responses API did not respond for 180 seconds.");
                         let _ = tx.send(StreamEvent::Error("Stream idle timeout: Responses API did not respond for 180 seconds.".to_string())).await;
                         break;
                     }
                     event = event_source.next() => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + timeout_duration);
                         match event {
                             Some(Ok(Event::Open)) => {
                                 debug!("[RESPONSES SSE] Stream opened");
@@ -2165,6 +2323,31 @@ impl LlmClient {
         });
 
         Ok(rx)
+    }
+
+    /// Ensures tool parameter schemas conform to Google Gemini's OpenAI-compatibility subset:
+    /// removes `additionalProperties` and ensures every property declares a concrete `type`.
+    pub fn sanitize_tools_for_google(tools: &mut [ToolDefinition]) {
+        fn clean_schema(val: &mut serde_json::Value) {
+            let Some(obj) = val.as_object_mut() else { return };
+            obj.remove("additionalProperties");
+            if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+                for prop_val in props.values_mut() {
+                    if let Some(prop_obj) = prop_val.as_object_mut() {
+                        if !prop_obj.contains_key("type") {
+                            prop_obj.insert("type".to_string(), serde_json::Value::String("string".to_string()));
+                        }
+                    }
+                    clean_schema(prop_val);
+                }
+            }
+            if let Some(items) = obj.get_mut("items") {
+                clean_schema(items);
+            }
+        }
+        for def in tools {
+            clean_schema(&mut def.function.parameters);
+        }
     }
 
     pub async fn check_balance(&self) -> Result<BalanceResponse> {
@@ -2277,6 +2460,8 @@ pub fn parse_openai_sse_data(data: &str) -> Option<Vec<StreamEvent>> {
 
 const COMPACTION_MAX_TOKENS: u32 = 8_000;
 const COMPACTION_TRANSCRIPT_CHARS: usize = 400_000;
+const LOCAL_COMPACTION_TRANSCRIPT_CHARS: usize = 24_000;
+const COMPACTION_TIMEOUT: Duration = Duration::from_secs(60);
 const COMPACTION_PROMPT: &str = "You compact a coding agent's conversation so it can keep working without the original turns. \
 Write in the language the user writes in. Be dense and concrete: exact file paths, function names, commands, error messages, numbers and decisions. \
 Use these sections, skipping any that would be empty:\n\
@@ -2290,12 +2475,208 @@ Use these sections, skipping any that would be empty:\n\
 Do not invent anything that is not in the transcript.";
 
 fn head_tail(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
+    if text.len() <= max_chars {
         return text.to_string();
     }
-    let head: String = text.chars().take(max_chars * 2 / 3).collect();
-    let tail: String = text.chars().rev().take(max_chars / 3).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}\n[…]\n{tail}")
+    let head_count = max_chars * 2 / 3;
+    let tail_count = max_chars / 3;
+    let mut total = 0usize;
+    let mut head_end = text.len();
+    for (idx, (byte_pos, _)) in text.char_indices().enumerate() {
+        if idx == head_count {
+            head_end = byte_pos;
+        }
+        total += 1;
+    }
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let tail_start = if tail_count == 0 {
+        text.len()
+    } else {
+        text.char_indices()
+            .rev()
+            .nth(tail_count - 1)
+            .map_or(0, |(b, _)| b)
+    };
+    format!("{}\n[…]\n{}", &text[..head_end], &text[tail_start..])
+}
+
+fn resolve_api_model(
+    cfg_model: &str,
+    is_deepseek: bool,
+    provider_kind: crate::providers::ProviderKind,
+) -> String {
+    if !is_deepseek {
+        if provider_kind == crate::providers::ProviderKind::Google {
+            if cfg_model == "gemini-2.5-flash" || cfg_model == "gemini-2.0-flash" || cfg_model == "gemini-1.5-flash" {
+                "gemini-3.5-flash-lite".to_string()
+            } else if cfg_model == "gemini-2.5-pro" {
+                "gemini-3.8-flash".to_string()
+            } else {
+                cfg_model.to_string()
+            }
+        } else {
+            cfg_model.to_string()
+        }
+    } else if cfg_model == "deepseek-v4-pro"
+        || cfg_model == "deepseek-reasoner"
+        || cfg_model.contains("pro")
+        || cfg_model.contains("reasoner")
+        || cfg_model.contains("Pro")
+    {
+        "deepseek-v4-pro".to_string()
+    } else if cfg_model == "deepseek-flash"
+        || cfg_model == "deepseek-v4.1-flash"
+        || cfg_model == "deepseek-v4.1-flash-1017"
+        || cfg_model == "deepseek-v4-flash"
+        || cfg_model == "deepseek-v4-flash-vision-exp"
+        || cfg_model == "deepseek-chat"
+        || cfg_model.contains("flash")
+        || cfg_model.contains("Flash")
+        || cfg_model.contains("vision")
+        || cfg_model.contains("Vision")
+    {
+        "deepseek-flash".to_string()
+    } else {
+        cfg_model.to_string()
+    }
+}
+
+fn build_chat_completion_body(
+    cfg: &Config,
+    is_deepseek: bool,
+    provider_kind: crate::providers::ProviderKind,
+    reasoning_cache: &ReasoningCache,
+    mut messages: Vec<Message>,
+    mut tools: Option<Vec<ToolDefinition>>,
+    today: chrono::NaiveDate,
+) -> Result<(String, Vec<u8>)> {
+    let api_model = resolve_api_model(&cfg.model, is_deepseek, provider_kind);
+    let is_deepseek_flash = is_deepseek && api_model == "deepseek-flash";
+
+    let has_tools = tools.is_some();
+    if !is_deepseek_flash {
+        for msg in &mut messages {
+            msg.server_tool_calls = None;
+        }
+    }
+
+    for msg in &mut messages {
+        if msg.role == "assistant" {
+            if msg.content.is_none() {
+                msg.content = Some(MessageContent::Text(String::new()));
+            }
+
+            if has_tools && is_deepseek {
+                if msg.reasoning_content.is_none() {
+                    if let Some(text) = msg.text_content() {
+                        let key = ReasoningCache::compute_key(text, msg.tool_calls.as_deref());
+                        if let Some(cached) = reasoning_cache.get(&key) {
+                            msg.reasoning_content = Some(cached);
+                        }
+                    }
+                }
+                if msg.reasoning_content.is_none() {
+                    msg.reasoning_content = Some(String::new());
+                }
+            } else {
+                msg.reasoning_content = None;
+            }
+        }
+    }
+
+    let raw_reasoning_effort = match cfg.reasoning_effort.as_str() {
+        "dynamic" if is_deepseek => "high".to_string(),
+        other => other.to_string(),
+    };
+
+    let normalized_reasoning_effort = match raw_reasoning_effort.to_lowercase().as_str() {
+        "medium" => "high".to_string(),
+        "minimal" => "low".to_string(),
+        other => other.to_string(),
+    };
+
+    let is_thinking_disabled = normalized_reasoning_effort == "none"
+        || normalized_reasoning_effort == "off"
+        || normalized_reasoning_effort == "false";
+
+    let is_openai_reasoning = api_model.starts_with("o1") || api_model.starts_with("o3");
+
+    let thinking_config = if !is_deepseek {
+        None
+    } else if is_thinking_disabled {
+        Some(ThinkingConfig { thinking_type: "disabled".to_string() })
+    } else {
+        Some(ThinkingConfig { thinking_type: "enabled".to_string() })
+    };
+
+    let effective_reasoning_effort = if is_deepseek {
+        if is_thinking_disabled { Some("none".to_string()) } else { Some(normalized_reasoning_effort) }
+    } else if provider_kind == crate::providers::ProviderKind::Azure
+        && api_model.to_ascii_lowercase().contains("deepseek")
+    {
+        Some(normalize_azure_deepseek_reasoning_effort(&normalized_reasoning_effort).to_string())
+    } else if is_openai_reasoning {
+        match normalized_reasoning_effort.to_lowercase().as_str() {
+            "low" => Some("low".to_string()),
+            "high" | "max" | "xhigh" => Some("high".to_string()),
+            _ => Some("medium".to_string()),
+        }
+    } else {
+        None
+    };
+
+    let effective_temperature = if !cfg.temperature_enabled || !crate::providers::applies_temperature(&api_model) {
+        None
+    } else if !is_deepseek {
+        let (lo, hi) = crate::providers::temperature_range(provider_kind, &api_model);
+        Some(cfg.temperature.clamp(lo, hi))
+    } else if is_thinking_disabled {
+        if api_model.contains("flash") { Some(cfg.flash_settings.temperature) } else { Some(cfg.temperature) }
+    } else {
+        None
+    };
+
+    // Server web tools, title generation and latest_reminder are supported only by deepseek-flash.
+    let server_web_tools = is_deepseek_flash && cfg.deepseek_web_tools && !is_thinking_disabled;
+    if server_web_tools {
+        if let Some(ref mut list) = tools {
+            list.retain(|t| !SERVER_WEB_REPLACED_TOOLS.contains(&t.function.name.as_str()));
+        }
+        if let Some(MessageContent::Text(prompt)) = messages.first_mut().filter(|m| m.role == "system").and_then(|m| m.content.as_mut()) {
+            prompt.push_str(SERVER_WEB_PROMPT_NOTE);
+        }
+    }
+
+    let title = (is_deepseek_flash && !is_thinking_disabled && !messages.iter().any(|m| m.role == "assistant"))
+        .then(|| serde_json::json!({"enabled": true}));
+    if is_deepseek_flash {
+        crate::deepseek_reminder::insert_latest_reminder(&mut messages, today);
+    }
+
+    let request_body = ChatCompletionRequest {
+        model: api_model.clone(),
+        messages,
+        tools,
+        stream: true,
+        thinking: thinking_config,
+        reasoning_effort: effective_reasoning_effort,
+        temperature: effective_temperature,
+        top_p: None,
+        max_tokens: None,
+        stream_options: Some(StreamOptions { include_usage: true }),
+        title,
+    };
+
+    let body_bytes = if server_web_tools {
+        let mut body = serde_json::to_value(&request_body)?;
+        with_deepseek_web_tools(&mut body);
+        serde_json::to_vec(&body)?
+    } else {
+        serde_json::to_vec(&request_body)?
+    };
+    Ok((api_model, body_bytes))
 }
 
 const SERVER_WEB_REPLACED_TOOLS: [&str; 2] = ["web_search", "web_fetch"];
@@ -2567,6 +2948,155 @@ mod tests {
         assert_eq!(client.context_tokens(&messages[..1]), LlmClient::estimate_messages_tokens(&messages[..1]));
     }
 
+    #[test]
+    fn compaction_transcript_limit_scales_down_for_smaller_context_windows() {
+        let mut small = Config::default();
+        small.active_provider = Some("openai".to_string());
+        small.model = "gpt-4o".to_string();
+        small.context_window_tokens = Some(32_000);
+        let limit_32k = LlmClient::compaction_transcript_limit(&small);
+        assert!(limit_32k <= 60_000 && limit_32k >= 12_000, "32k window limit: {limit_32k}");
+
+        small.context_window_tokens = Some(128_000);
+        let limit_128k = LlmClient::compaction_transcript_limit(&small);
+        assert!(limit_128k < COMPACTION_TRANSCRIPT_CHARS, "128k window must stay below 400k chars: {limit_128k}");
+
+        let ds = Config::default();
+        assert_eq!(LlmClient::compaction_transcript_limit(&ds), COMPACTION_TRANSCRIPT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn auto_compact_does_not_recompact_every_turn_when_anchors_stay_above_threshold() {
+        let cfg = Config {
+            auto_compact: true,
+            compact_threshold_tokens: Some(10_000),
+            context_window_tokens: Some(16_000),
+            api_key: String::new(),
+            ..Config::default()
+        };
+        let client = LlmClient::new(cfg);
+        let huge_root = "R".repeat(32_000); // ~10,667 tokens alone (> 10_000 threshold)
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user(huge_root),
+            Message::system("<CONTEXT_SUMMARY>\nprevious summary\n</CONTEXT_SUMMARY>"),
+            Message::assistant("small step 1", None),
+            Message::user("small follow-up"),
+            Message::assistant("small answer 1", None),
+            Message::assistant("small answer 2", None),
+            Message::assistant("small answer 3", None),
+            Message::assistant("small answer 4", None),
+        ];
+        // Even though total tokens exceed 10_000, the turns between `<CONTEXT_SUMMARY>` and the
+        // tail hold almost nothing (< 2_000 tokens), so auto-compact must NOT thrash every turn.
+        let res = client.compact_messages(&mut messages, false).await.unwrap();
+        assert!(res.is_none(), "expected anti-thrashing guard to skip futile re-compaction, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_aborts_in_flight_compaction_immediately() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((_sock, _)) = listener.accept().await else { return };
+            // Hold connection open without answering to simulate a slow 100% compaction call
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = LlmClient::new(Config {
+            base_url: addr,
+            api_key: "test-key".to_string(),
+            model: "some-model".to_string(),
+            context_window_tokens: Some(128_000),
+            ..Config::default()
+        });
+        let mut messages = vec![Message::system("sys"), Message::user("root")];
+        for i in 0..8 {
+            messages.push(Message::user(format!("turn {i}")));
+            messages.push(Message::assistant(format!("ans {i}"), None));
+        }
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            stopper.cancel();
+        });
+        let started = std::time::Instant::now();
+        let res = client.compact_messages_cancellable(&mut messages, true, Some(&cancel)).await;
+        assert!(res.is_err(), "expected cancelled error");
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn overflow_at_100_percent_recovers_with_few_huge_messages_and_tracks_prompt_size() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_srv = calls.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let n = calls_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 256 * 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let response = if n == 0 {
+                        // 1st POST: initial chat request overflows 100%
+                        let body = r#"{"error":{"message":"This model's maximum context length is 16000 tokens"}}"#;
+                        format!("HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else if n == 1 {
+                        // 2nd POST: compaction summary request
+                        let body = r#"{"choices":[{"message":{"content":"Summary of middle turns"},"finish_reason":"stop"}]}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    } else {
+                        // 3rd POST: retried chat stream succeeds and reports prompt_tokens
+                        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":4200,\"completion_tokens\":5,\"total_tokens\":4205}}\n\ndata: [DONE]\n\n";
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let client = LlmClient::new(Config {
+            base_url: addr,
+            api_key: "test-key".to_string(),
+            model: "some-model".to_string(),
+            auto_compact: false,
+            context_window_tokens: Some(128_000),
+            ..Config::default()
+        });
+        // Only 5 messages (< 8!), which previously failed to compact on 100% overflow
+        let messages = vec![
+            Message::system("sys"),
+            Message::user(format!("root {}", "A".repeat(12_000))),
+            Message::assistant(format!("old reply {}", "B".repeat(18_000)), None),
+            Message::assistant(format!("old reply 2 {}", "C".repeat(18_000)), None),
+            Message::user("latest question"),
+        ];
+
+        let mut rx = client.stream_chat(messages, None, CancellationToken::new()).await.unwrap();
+        let mut saw_compacting = false;
+        let mut compacted_len = None;
+        let mut answer = String::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::Compacting => saw_compacting = true,
+                StreamEvent::ContextCompacted { compacted_messages, .. } => {
+                    compacted_len = Some(compacted_messages.len());
+                }
+                StreamEvent::ContentDelta(d) => answer.push_str(&d),
+                _ => {}
+            }
+        }
+        assert!(saw_compacting, "expected StreamEvent::Compacting before overflow retry");
+        let c_len = compacted_len.expect("expected ContextCompacted on overflow recovery");
+        assert_eq!(answer, "recovered");
+        // Verify `last_prompt` recorded the post-overflow `retry_sent` (c_len + 1), not None!
+        let probe: Vec<Message> = (0..=c_len).map(|_| Message::user("x")).collect();
+        assert_eq!(client.context_tokens(&probe), 4200);
+    }
+
     #[tokio::test]
     async fn compaction_ignores_synthetic_image_messages() {
         let client = LlmClient::new(Config::default());
@@ -2710,6 +3240,30 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("<CONTEXT_SUMMARY>")), "{texts:?}");
         assert!(texts.iter().any(|t| t == "latest"));
         assert!(!texts.iter().any(|t| t.starts_with("step 0")));
+    }
+
+    #[test]
+    fn azure_deepseek_reasoning_effort_maps_to_allowed_values() {
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("none"), "none");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("off"), "none");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("false"), "none");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("low"), "high");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("minimal"), "high");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("medium"), "high");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("high"), "high");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("xhigh"), "high");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort("max"), "max");
+        assert_eq!(normalize_azure_deepseek_reasoning_effort(""), "high");
+    }
+}
+
+/// Azure AI Foundry's DeepSeek deployments only accept `none`, `high`, and `max`
+/// (rejecting `low`, `minimal`, `medium`, `xhigh`, and `off`).
+fn normalize_azure_deepseek_reasoning_effort(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "false" => "none",
+        "max" => "max",
+        _ => "high",
     }
 }
 
@@ -2923,5 +3477,84 @@ mod image_fallback_tests {
         LlmClient::dedup_and_sort_tools(&mut tools);
         let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+    }
+
+    #[test]
+    fn deepseek_pro_omits_flash_only_features() {
+        let mut cfg = Config::default();
+        cfg.model = "deepseek-v4-pro".to_string();
+        cfg.reasoning_effort = "high".to_string();
+        cfg.deepseek_web_tools = true;
+
+        let mut prior_assistant = Message::assistant("earlier", None);
+        prior_assistant.server_tool_calls = Some(serde_json::json!([{"index": 0, "calls": [{"id": "s1"}]}]));
+        let first_turn = vec![Message::system("sys"), Message::user("hola, revisa esto por favor")];
+        let tools = Some(vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "web_search".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        }]);
+
+        let (api_model, bytes) = build_chat_completion_body(
+            &cfg,
+            true,
+            crate::providers::ProviderKind::DeepSeek,
+            &ReasoningCache::new(),
+            first_turn,
+            tools,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(api_model, "deepseek-v4-pro");
+        assert_eq!(v["model"], "deepseek-v4-pro");
+        assert!(v.get("title").is_none(), "Pro must not receive title: {v}");
+        let roles: Vec<&str> = v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert!(!roles.contains(&"latest_reminder"), "Pro must not receive latest_reminder: {roles:?}");
+        let tool_types: Vec<&str> = v["tools"].as_array().unwrap().iter().map(|t| t["type"].as_str().unwrap()).collect();
+        assert_eq!(tool_types, vec!["function"]);
+        assert_eq!(v["tools"][0]["function"]["name"], "web_search");
+
+        let (_, follow_bytes) = build_chat_completion_body(
+            &cfg,
+            true,
+            crate::providers::ProviderKind::DeepSeek,
+            &ReasoningCache::new(),
+            vec![Message::system("sys"), Message::user("q1"), prior_assistant, Message::user("q2")],
+            None,
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+        )
+        .unwrap();
+        let fv: serde_json::Value = serde_json::from_slice(&follow_bytes).unwrap();
+        assert!(fv["messages"][2].get("server_tool_calls").is_none());
+    }
+
+    #[test]
+    fn deepseek_flash_and_1017_alias_keep_flash_features() {
+        for model in ["deepseek-flash", "deepseek-v4.1-flash-1017"] {
+            let mut cfg = Config::default();
+            cfg.model = model.to_string();
+            cfg.reasoning_effort = "high".to_string();
+            cfg.deepseek_web_tools = true;
+            let (api_model, bytes) = build_chat_completion_body(
+                &cfg,
+                true,
+                crate::providers::ProviderKind::DeepSeek,
+                &ReasoningCache::new(),
+                vec![Message::system("sys"), Message::user("hola, qué hay para hoy")],
+                None,
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+            )
+            .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(api_model, "deepseek-flash");
+            assert_eq!(v["model"], "deepseek-flash");
+            assert_eq!(v["title"]["enabled"], true);
+            assert_eq!(v["messages"][1]["role"], "latest_reminder");
+            assert_eq!(v["tools"].as_array().unwrap().len(), 2);
+        }
     }
 }

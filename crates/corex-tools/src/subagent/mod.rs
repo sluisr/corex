@@ -10,6 +10,7 @@ use corex_core::client::LlmClient;
 use crate::types::{Tool, ToolContext, ToolOutput};
 
 mod runner;
+pub mod worktree;
 #[cfg(test)]
 mod tests;
 
@@ -71,6 +72,10 @@ impl Tool for DelegateSubagentTool {
                 "background": {
                     "type": "boolean",
                     "description": "If true (default), the sub-task is delegated asynchronously in the background without blocking the turn. The subagent ID is returned immediately."
+                },
+                "isolated": {
+                    "type": "boolean",
+                    "description": "If true, runs the subagent inside a temporary detached git worktree so its file edits and builds never collide with your working tree, returning any produced diff on completion."
                 }
             },
             "required": ["role", "prompt"]
@@ -120,8 +125,31 @@ impl Tool for DelegateSubagentTool {
         };
 
         let is_background = args.get("background").and_then(|b| b.as_bool()).unwrap_or(true);
+        let is_isolated = args.get("isolated").and_then(|b| b.as_bool()).unwrap_or(false);
         if !is_background {
-            let res = run_subagent_task(&task_id, role, prompt, &context.workspace_dir, &context.allowed_commands, &context.extra_dirs).await;
+            let wt = if is_isolated {
+                match worktree::IsolatedWorktree::create(&context.workspace_dir, &task_id) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        let mut mgr = match get_subagent_manager().lock() {
+                            Ok(g) => g,
+                            Err(err) => err.into_inner(),
+                        };
+                        mgr.fail_sync(&task_id, e.clone());
+                        return Ok(ToolOutput::error(format!("Subagent '{}' failed:\n{}", task_id, e)));
+                    }
+                }
+            } else {
+                None
+            };
+            let run_ws = wt.as_ref().map(|w| w.path()).unwrap_or(context.workspace_dir.as_path());
+            let mut res = run_subagent_task(&task_id, role, prompt, run_ws, &context.allowed_commands, &context.extra_dirs).await;
+            if let (Ok(ref mut out), Some(ref w)) = (&mut res, &wt) {
+                if let Some(diff_summary) = w.capture_diff_summary() {
+                    out.push_str(&diff_summary);
+                }
+            }
+            drop(wt);
             let mut mgr = match get_subagent_manager().lock() {
                 Ok(g) => g,
                 Err(e) => e.into_inner(),
@@ -163,7 +191,29 @@ impl Tool for DelegateSubagentTool {
                 }
             }
 
-            let result = run_subagent_task(&id_clone, role, &prompt_str, &ws, &parent_allowed, &extra_dirs).await;
+            let wt = if is_isolated {
+                match worktree::IsolatedWorktree::create(&ws, &id_clone) {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        let mut mgr = match get_subagent_manager().lock() {
+                            Ok(g) => g,
+                            Err(err) => err.into_inner(),
+                        };
+                        mgr.fail(&id_clone, e);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let run_ws = wt.as_ref().map(|w| w.path()).unwrap_or(ws.as_path());
+            let mut result = run_subagent_task(&id_clone, role, &prompt_str, run_ws, &parent_allowed, &extra_dirs).await;
+            if let (Ok(ref mut out), Some(ref w)) = (&mut result, &wt) {
+                if let Some(diff_summary) = w.capture_diff_summary() {
+                    out.push_str(&diff_summary);
+                }
+            }
+            drop(wt);
 
             let mut mgr = match get_subagent_manager().lock() {
                 Ok(g) => g,
@@ -423,6 +473,87 @@ impl Tool for ManageSubagentsTool {
                 }
             }
             _ => Ok(ToolOutput::error(format!("Unknown action '{}'", action))),
+        }
+    }
+}
+
+fn is_delegate_call(args: &serde_json::Value) -> bool {
+    match args.get("action").or_else(|| args.get("Action")).and_then(|v| v.as_str()) {
+        Some(a) => matches!(a.to_ascii_lowercase().as_str(), "delegate" | "spawn" | "run"),
+        None => args.get("prompt").is_some(),
+    }
+}
+
+/// Unified grouped tool exposing both subagent delegation and lifecycle management under one schema,
+/// while `delegate_subagent` and `manage_subagents` remain callable aliases.
+pub struct SubagentTool;
+
+#[async_trait]
+impl Tool for SubagentTool {
+    fn name(&self) -> &str {
+        "subagent"
+    }
+
+    fn description(&self) -> &str {
+        "Spawn or manage isolated background subagents ('delegate' spawns scout/tester/researcher/worker; 'list', 'status', 'log', 'cancel', 'wait' inspect or control them; 'wait' returns a non-blocking snapshot)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["delegate", "list", "status", "log", "cancel", "wait"],
+                    "description": "'delegate' starts a subagent; 'list'/'status'/'log'/'cancel'/'wait' manage existing ones."
+                },
+                "role": {
+                    "type": "string",
+                    "enum": ["scout", "tester", "researcher", "worker"],
+                    "description": "delegate: 'scout' (read-only exploration), 'tester' (background tests/linters), 'researcher' (read-only docs/specs), 'worker' (autonomous edits/commands)."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "delegate: complete task instruction for the subagent."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "delegate: run asynchronously in background (default true)."
+                },
+                "isolated": {
+                    "type": "boolean",
+                    "description": "delegate: run inside a temporary detached git worktree and return produced diff."
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Subagent ID (required for status/log/cancel; optional for wait)."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "wait: max seconds before returning snapshot (default 0, max 30)."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn needs_confirmation(&self, args: &serde_json::Value, context: &ToolContext) -> bool {
+        is_delegate_call(args) && DelegateSubagentTool.needs_confirmation(args, context)
+    }
+
+    fn format_diff(&self, args: &serde_json::Value, workspace: &std::path::Path) -> Option<String> {
+        if is_delegate_call(args) {
+            DelegateSubagentTool.format_diff(args, workspace)
+        } else {
+            None
+        }
+    }
+
+    async fn execute(&self, args: serde_json::Value, context: &ToolContext) -> Result<ToolOutput> {
+        if is_delegate_call(&args) {
+            DelegateSubagentTool.execute(args, context).await
+        } else {
+            ManageSubagentsTool.execute(args, context).await
         }
     }
 }

@@ -1,6 +1,7 @@
 #[cfg(unix)]
 mod bridge;
 mod cdp;
+pub mod diagnostics;
 #[cfg(unix)]
 mod host;
 mod snapshot;
@@ -21,6 +22,8 @@ use serde_json::{json, Value};
 use cdp::Cdp;
 use snapshot::NodeRef;
 
+pub use bridge::diagnose;
+pub use diagnostics::{BrowserDiagnostics, InstalledExtension, EXTENSION_ID, EXTENSION_STORE_URL};
 pub use host::{install_native_host, run_host, run_native_host};
 
 const BLOCKER_CHECK: &str = "function(other) { \

@@ -500,11 +500,15 @@ impl SshExecutor {
             cmd.arg("-o").arg(option);
         }
 
-        // ControlMaster socket in a private 0700 directory for connection multiplexing
-        let socket_dir = directories::BaseDirs::new()
-            .map(|d| d.home_dir().join(".corex").join("ssh"))
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("corex-ssh-{}", std::process::id())));
-        if corex_core::ensure_private_dir(&socket_dir).is_ok() {
+        // ControlMaster socket in a private 0700 directory for connection multiplexing (initialized once)
+        static SSH_SOCKET_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        let socket_dir_opt = SSH_SOCKET_DIR.get_or_init(|| {
+            let dir = directories::BaseDirs::new()
+                .map(|d| d.home_dir().join(".corex").join("ssh"))
+                .unwrap_or_else(|| std::env::temp_dir().join(format!("corex-ssh-{}", std::process::id())));
+            corex_core::ensure_private_dir(&dir).ok().map(|_| dir)
+        });
+        if let Some(socket_dir) = socket_dir_opt {
             let socket_path = socket_dir.join("cx-%r@%h:%p");
             cmd.arg("-o").arg("ControlMaster=auto");
             cmd.arg("-o").arg(format!("ControlPath={}", socket_path.display()));

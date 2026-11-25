@@ -64,7 +64,12 @@ impl App {
 
     /// Copies block `number` (1-based), or the last one when it is `None`.
     pub(crate) fn copy_block(&mut self, number: Option<usize>) {
-        let blocks = chat_blocks(self.session.display_messages());
+        let mut blocks = chat_blocks(self.session.display_messages());
+        if self.is_streaming && self.streaming_md_committed_len > 0 {
+            if let Some(committed) = self.streaming_text.get(..self.streaming_md_committed_len) {
+                blocks.extend(code_blocks(committed));
+            }
+        }
         let picked = match number {
             None => blocks.last().map(|b| (blocks.len(), b.text.clone())),
             Some(n) => n.checked_sub(1).and_then(|i| blocks.get(i)).map(|b| (n, b.text.clone())),
@@ -104,5 +109,24 @@ mod tests {
         assert_eq!(texts, vec!["ls", "pwd", "whoami"]);
         assert_eq!(blocks_before(&messages, 3), 2);
         assert_eq!(blocks_before(&messages, 99), 3);
+    }
+
+    #[test]
+    fn closed_streaming_blocks_get_copy_button_while_open_block_waits() {
+        let streamed = "```bash\nnmap -sS target\n```\n\n```bash\nffuf -u http://target";
+        let split = crate::markdown::safe_markdown_split_point(streamed);
+        let committed = &streamed[..split];
+        let tail = &streamed[split..];
+
+        let committed_lines = crate::markdown::render_markdown_with_copy(committed, &crate::theme::Theme::default(), 80, true);
+        let tail_lines = crate::markdown::render_markdown(tail, &crate::theme::Theme::default(), 80);
+
+        let committed_text: Vec<String> = committed_lines.iter().map(super::super::formatting::line_plain_text).collect();
+        let tail_text: Vec<String> = tail_lines.iter().map(super::super::formatting::line_plain_text).collect();
+
+        assert!(committed_text.iter().any(|l| l.contains("bash  ⧉ copy")), "{committed_text:#?}");
+        assert!(!tail_text.iter().any(|l| l.contains("⧉ copy")), "{tail_text:#?}");
+        assert_eq!(code_blocks(committed).len(), 1);
+        assert_eq!(code_blocks(committed)[0].text, "nmap -sS target");
     }
 }

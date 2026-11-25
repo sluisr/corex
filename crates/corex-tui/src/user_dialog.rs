@@ -200,12 +200,11 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
     let width = width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // 1. The question, behind a prompt bullet; continuation rows align under its text.
+    // 1. Clean bold question title aligned with the rest of the docked panels.
     let bullet = Style::default().fg(theme.accent_blue).add_modifier(Modifier::BOLD);
     let bold = Style::default().add_modifier(Modifier::BOLD);
-    for (i, row) in wrap_rows(&q.question, width.saturating_sub(4).max(10)).into_iter().enumerate() {
-        let lead = if i == 0 { Span::styled(" › ", bullet) } else { Span::raw("   ") };
-        lines.push(Line::from(vec![lead, Span::styled(row, bold)]));
+    for row in wrap_rows(&q.question, width.saturating_sub(4).max(10)) {
+        lines.push(Line::from(vec![Span::raw("  "), Span::styled(row, bold)]));
     }
 
     let mut selected_rows = lines.len()..lines.len();
@@ -307,11 +306,11 @@ fn dialog_lines(q: &UserQuestion, state: &UserDialogState, width: u16, theme: &T
 
 pub fn calculate_dialog_height(state: &UserDialogState, width: u16, max_height: u16) -> u16 {
     let Some(q) = state.questions.get(state.current) else {
-        return 5;
+        return 4;
     };
     let (lines, _) = dialog_lines(q, state, width, &Theme::default());
-    // Borders: top + bottom = 2
-    (lines.len() as u16 + 2).min(max_height.saturating_sub(6)).max(5)
+    // Border: top only = 1
+    (lines.len() as u16 + 1).min(max_height.saturating_sub(6)).max(4)
 }
 
 pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState, theme: &Theme) {
@@ -323,12 +322,12 @@ pub fn render_user_dialog(frame: &mut Frame, area: Rect, state: &UserDialogState
 
     // When the terminal is too short for every row, scroll just enough that the selected option
     // stays fully visible rather than clipping it off the bottom.
-    let inner_h = area.height.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(1) as usize;
     let scroll = selected_rows.end.saturating_sub(inner_h).min(selected_rows.start) as u16;
 
-    // Clean unbroken border line
+    // Clean top border line, matching the other docked panels.
     let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Rgb(75, 110, 155)));
 
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
@@ -449,5 +448,29 @@ mod tests {
         let rows = wrap_rows("see https://example.com/a/very/long/path/that/does/not/fit", 12);
         assert!(rows.iter().all(|r| unicode_width::UnicodeWidthStr::width(r.as_str()) <= 12), "{rows:?}");
         assert_eq!(rows.concat().replace(' ', ""), "seehttps://example.com/a/very/long/path/that/does/not/fit");
+    }
+
+    #[test]
+    fn title_has_no_selector_glyph_and_panel_has_no_bottom_rule() {
+        let state = open_with(r#"{"questions":[{"question":"¿De qué tipo?","options":["A","B"]}]}"#);
+        let q = state.current_question().unwrap();
+        let (lines, _) = dialog_lines(q, &state, 60, &Theme::default());
+        assert_eq!(plain(&lines[0]), "  ¿De qué tipo?");
+        assert!(plain(&lines[1]).starts_with("  › 1."));
+
+        let backend = ratatui::backend::TestBackend::new(60, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_user_dialog(frame, area, &state, &Theme::default());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(rows[0].starts_with("────"), "top rule should exist: {rows:#?}");
+        assert!(!rows.last().unwrap().starts_with("────"), "no bottom rule: {rows:#?}");
     }
 }

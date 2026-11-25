@@ -53,6 +53,18 @@ pub fn observe_tool_call(name: &str, raw_arguments: &str) -> Option<String> {
         return None;
     }
     let args = crate::parse_lenient_json(raw_arguments).unwrap_or(serde_json::Value::Null);
+    if name == "subagent" {
+        let action = args
+            .get("action")
+            .or_else(|| args.get("Action"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_delegate = matches!(action.to_ascii_lowercase().as_str(), "delegate" | "spawn" | "run")
+            || (action.is_empty() && args.get("prompt").is_some());
+        if !is_delegate {
+            return None;
+        }
+    }
     let canon = canonical(&args);
     let key = format!("{}\u{0}{}", name, canon);
 

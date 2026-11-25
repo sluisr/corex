@@ -21,17 +21,19 @@ pub enum Setting {
     AutoCompact,
     RecentImages,
     WheelAcceleration,
+    Notifications,
     DeepseekWebTools,
     LocalPromptLite,
     Temperature,
 }
 
-pub const SETTINGS: [Setting; 7] = [
+pub const SETTINGS: [Setting; 8] = [
     Setting::ContextLimit,
     Setting::AutoCompact,
     Setting::Temperature,
     Setting::RecentImages,
     Setting::WheelAcceleration,
+    Setting::Notifications,
     Setting::DeepseekWebTools,
     Setting::LocalPromptLite,
 ];
@@ -78,10 +80,14 @@ impl SettingsDialogState {
     pub fn handle_key(&mut self, code: crossterm::event::KeyCode) -> SettingsAction {
         use crossterm::event::KeyCode;
         let Some(setting) = self.selected_setting() else {
-            return if code == KeyCode::Esc { SettingsAction::Close } else { SettingsAction::None };
+            return if matches!(code, KeyCode::Esc | KeyCode::Enter) {
+                SettingsAction::Close
+            } else {
+                SettingsAction::None
+            };
         };
         match code {
-            KeyCode::Esc => SettingsAction::Close,
+            KeyCode::Esc | KeyCode::Enter => SettingsAction::Close,
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 SettingsAction::None
@@ -90,7 +96,7 @@ impl SettingsDialogState {
                 self.selected = (self.selected + 1).min(self.rows.len() - 1);
                 SettingsAction::None
             }
-            KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => SettingsAction::Change(setting, true),
+            KeyCode::Right | KeyCode::Char(' ') => SettingsAction::Change(setting, true),
             KeyCode::Left => SettingsAction::Change(setting, false),
             _ => SettingsAction::None,
         }
@@ -113,6 +119,7 @@ pub fn apply(cfg: &mut Config, setting: Setting, forward: bool) {
         Setting::Temperature => cfg.temperature_enabled = !cfg.temperature_enabled,
         Setting::RecentImages => cfg.recent_images = step(&RECENT_IMAGES, cfg.recent_images, forward),
         Setting::WheelAcceleration => cfg.wheel_acceleration = step(&WheelAcceleration::ALL, cfg.wheel_acceleration, forward),
+        Setting::Notifications => cfg.notifications = !cfg.notifications,
         Setting::DeepseekWebTools => cfg.deepseek_web_tools = !cfg.deepseek_web_tools,
         Setting::LocalPromptLite => cfg.local_prompt_lite = !cfg.local_prompt_lite,
     }
@@ -134,6 +141,7 @@ fn toggle(cfg: &Config, setting: Setting) -> Option<bool> {
     match setting {
         Setting::AutoCompact => Some(cfg.auto_compact),
         Setting::Temperature => Some(cfg.temperature_enabled),
+        Setting::Notifications => Some(cfg.notifications),
         Setting::DeepseekWebTools => Some(cfg.deepseek_web_tools),
         Setting::LocalPromptLite => Some(cfg.local_prompt_lite),
         _ => None,
@@ -155,6 +163,7 @@ pub fn label(setting: Setting) -> &'static str {
         Setting::Temperature => "Temperature",
         Setting::RecentImages => "Images per request",
         Setting::WheelAcceleration => "Scroll acceleration",
+        Setting::Notifications => "Notifications",
         Setting::DeepseekWebTools => "DeepSeek web tools",
         Setting::LocalPromptLite => "Lite prompt (local)",
     }
@@ -170,6 +179,7 @@ pub fn value(cfg: &Config, setting: Setting) -> String {
             n => n.to_string(),
         },
         Setting::WheelAcceleration => cfg.wheel_acceleration.label().to_string(),
+        Setting::Notifications => on_off(cfg.notifications),
         Setting::DeepseekWebTools => on_off(cfg.deepseek_web_tools),
         Setting::LocalPromptLite => on_off(cfg.local_prompt_lite),
     }
@@ -190,6 +200,7 @@ fn hint(cfg: &Config, setting: Setting) -> String {
             None => "always 1 line per wheel event".to_string(),
             Some((two, three)) => format!("fast wheel: 2 lines at {two}+ events/120ms, 3 at {three}+"),
         },
+        Setting::Notifications => "bell and desktop alert on approvals or long turns".to_string(),
         Setting::DeepseekWebTools => "deepseek-flash + thinking search on DeepSeek's side".to_string(),
         Setting::LocalPromptLite => "shorter system prompt for small local models".to_string(),
     }
@@ -246,7 +257,7 @@ pub fn render_settings_dialog(frame: &mut Frame, area: Rect, state: &SettingsDia
     }
 
     let mut footer = vec![Span::raw(" ")];
-    footer.extend(key_hints(&[("↑↓", "select"), ("←→", "change"), ("esc", "close")], theme));
+    footer.extend(key_hints(&[("↑↓", "select"), ("←→", "change"), ("enter", "done"), ("esc", "close")], theme));
     frame.render_widget(Paragraph::new(Line::from(footer)), rows[3]);
 }
 
@@ -286,6 +297,7 @@ mod tests {
             state.handle_key(KeyCode::Down);
         }
         assert_eq!(state.selected, state.rows.len() - 1);
+        assert!(matches!(state.handle_key(KeyCode::Enter), SettingsAction::Close));
         assert!(matches!(state.handle_key(KeyCode::Esc), SettingsAction::Close));
     }
 

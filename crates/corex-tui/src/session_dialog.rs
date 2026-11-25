@@ -107,7 +107,7 @@ impl SessionDialogState {
         if let Some(id) = sel_id {
             if self.cached_preview_id.as_deref() != Some(&id) {
                 self.cached_preview_id = Some(id.clone());
-                self.cached_preview_session = Session::load_by_id_or_tag(&id).ok();
+                self.cached_preview_session = Session::load_preview_by_id(&id).ok();
             }
         } else {
             self.cached_preview_id = None;
